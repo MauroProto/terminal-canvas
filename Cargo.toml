@@ -1,0 +1,71 @@
+[package]
+name = "mi-terminal"
+version = "1.2.0"
+edition = "2021"
+description = "An infinite canvas terminal emulator, GPU-accelerated, cross-platform"
+license = "MIT"
+
+[[bin]]
+name = "mi-terminal"
+path = "src/main.rs"
+
+[[test]]
+name = "perf_budget"
+path = "tests/runtime/perf_budget.rs"
+
+[[test]]
+name = "runtime_registry"
+path = "tests/runtime/registry.rs"
+
+[[test]]
+name = "runtime_pty_manager"
+path = "tests/runtime/pty_manager.rs"
+
+[[test]]
+name = "runtime_scheduling"
+path = "tests/runtime/scheduling.rs"
+
+[[test]]
+name = "runtime_render_qos"
+path = "tests/runtime/render_qos.rs"
+
+[[test]]
+name = "runtime_repaint_policy_tests"
+path = "tests/runtime/repaint_policy.rs"
+
+[[test]]
+name = "runtime_load_20_terminals"
+path = "tests/runtime/load_20_terminals.rs"
+
+[dependencies]
+eframe = { version = "0.30", features = ["wgpu"] }
+egui = "0.30"
+alacritty_terminal = "0.25.1"
+portable-pty = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+image = { version = "0.25", default-features = false, features = ["png"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+directories = "5"
+arboard = "3"
+rfd = "0.15"
+minreq = { version = "2", features = ["https-native"] }
+sha2 = "0.10"
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+
+[profile.dist]
+inherits = "release"
+lto = "thin"
