@@ -2,7 +2,10 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
+use crate::collab::TrustedDevice;
+use crate::orchestration::OrchestrationState;
 use crate::state::panel_state::PanelState;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -12,6 +15,16 @@ pub struct AppState {
     pub sidebar_visible: bool,
     pub show_grid: bool,
     pub show_minimap: bool,
+    #[serde(default = "default_local_device_id")]
+    pub local_device_id: String,
+    #[serde(default)]
+    pub trusted_devices: Vec<TrustedDevice>,
+    #[serde(default)]
+    pub orchestration: OrchestrationState,
+}
+
+fn default_local_device_id() -> String {
+    Uuid::new_v4().to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -156,12 +169,15 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Duration;
 
+    use chrono::Utc;
     use uuid::Uuid;
 
     use super::{
         backup_file_path, load_state_from_path, save_state_to_path, temp_file_path, AppState,
         AutosaveController, AutosaveDecision, WorkspaceState,
     };
+    use crate::collab::TrustedDevice;
+    use crate::orchestration::OrchestrationState;
     use crate::state::PanelState;
 
     #[test]
@@ -234,6 +250,7 @@ mod tests {
                 name: format!("Workspace {label}"),
                 cwd: Some(PathBuf::from(format!("/tmp/{label}"))),
                 panels: vec![PanelState {
+                    id: Uuid::new_v4().to_string(),
                     title: "Terminal".to_owned(),
                     custom_title: Some(format!("Terminal {label}")),
                     position: [10.0, 20.0],
@@ -251,6 +268,14 @@ mod tests {
             sidebar_visible: true,
             show_grid: true,
             show_minimap: false,
+            local_device_id: format!("device-{label}"),
+            trusted_devices: vec![TrustedDevice {
+                device_id: format!("trusted-{label}"),
+                last_display_name: format!("Guest {label}"),
+                approved_at: Utc::now(),
+                last_seen_at: Utc::now(),
+            }],
+            orchestration: OrchestrationState::default(),
         }
     }
 
@@ -283,6 +308,7 @@ mod tests {
       "cwd": "/tmp/legacy",
       "panels": [
         {
+          "id": "legacy-panel",
           "title": "Terminal",
           "custom_title": null,
           "position": [10.0, 20.0],
@@ -310,6 +336,8 @@ mod tests {
 
         assert_eq!(loaded.workspaces[0].panels.len(), 1);
         assert_eq!(loaded.workspaces[0].panels[0].title, "Terminal");
+        assert!(!loaded.local_device_id.is_empty());
+        assert!(loaded.trusted_devices.is_empty());
     }
 
     #[test]

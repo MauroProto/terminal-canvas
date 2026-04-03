@@ -3,7 +3,9 @@
 
 mod app;
 mod canvas;
+mod collab;
 mod command_palette;
+mod orchestration;
 mod panel;
 mod runtime;
 mod shortcuts;
@@ -20,6 +22,10 @@ use anyhow::Result;
 
 fn main() -> Result<()> {
     env_logger::init();
+    let pending_join_invite = collab::invite_code_from_launch_sources(
+        std::env::args(),
+        std::env::var("TERMINAL_CANVAS_JOIN_INVITE").ok(),
+    );
 
     let icon = {
         let icon_data = include_bytes!("../assets/icon.png");
@@ -47,7 +53,12 @@ fn main() -> Result<()> {
     eframe::run_native(
         "My Terminal",
         options,
-        Box::new(|cc| Ok(Box::new(app::TerminalApp::new(cc)))),
+        Box::new(move |cc| {
+            Ok(Box::new(app::TerminalApp::new(
+                cc,
+                pending_join_invite.clone(),
+            )))
+        }),
     )
     .map_err(|e| anyhow::anyhow!("eframe error: {e}"))
 }

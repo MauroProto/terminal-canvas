@@ -54,6 +54,30 @@ pub const VOID_SHORTCUTS: &[(Modifiers, Key)] = &[
             shift: true,
             ..Modifiers::NONE
         },
+        Key::A,
+    ),
+    (
+        Modifiers {
+            ctrl: true,
+            shift: true,
+            ..Modifiers::NONE
+        },
+        Key::S,
+    ),
+    (
+        Modifiers {
+            ctrl: true,
+            shift: true,
+            ..Modifiers::NONE
+        },
+        Key::J,
+    ),
+    (
+        Modifiers {
+            ctrl: true,
+            shift: true,
+            ..Modifiers::NONE
+        },
         Key::P,
     ),
 ];

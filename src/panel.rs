@@ -1,6 +1,8 @@
 use egui::{Color32, Pos2, Rect, Vec2};
 use uuid::Uuid;
 
+use crate::collab::{SharedPanelSnapshot, TerminalInputEvent};
+use crate::orchestration::{PanelOverlay, PanelRuntimeObservation};
 use crate::state::PanelState;
 use crate::terminal::panel::{PanelHitArea, PanelInteraction, ResizeHandle, TerminalPanel};
 
@@ -127,15 +129,24 @@ impl CanvasPanel {
         viewport: &crate::canvas::viewport::Viewport,
         canvas_rect: Rect,
         fast_path_render: bool,
+        overlay: Option<&PanelOverlay>,
     ) -> PanelInteraction {
         match self {
-            Self::Terminal(panel) => panel.show(ui, viewport, canvas_rect, fast_path_render),
+            Self::Terminal(panel) => {
+                panel.show(ui, viewport, canvas_rect, fast_path_render, overlay)
+            }
         }
     }
 
     pub fn handle_input(&mut self, ctx: &egui::Context) {
         match self {
             Self::Terminal(panel) => panel.handle_input(ctx),
+        }
+    }
+
+    pub fn apply_remote_input_events(&mut self, events: &[TerminalInputEvent]) {
+        match self {
+            Self::Terminal(panel) => panel.apply_remote_input_events(events),
         }
     }
 
@@ -214,6 +225,18 @@ impl CanvasPanel {
     pub fn to_saved(&self) -> PanelState {
         match self {
             Self::Terminal(panel) => panel.to_saved(),
+        }
+    }
+
+    pub fn orchestration_observation(&self, workspace_id: Uuid) -> PanelRuntimeObservation {
+        match self {
+            Self::Terminal(panel) => panel.orchestration_observation(workspace_id),
+        }
+    }
+
+    pub fn shared_snapshot(&self) -> SharedPanelSnapshot {
+        match self {
+            Self::Terminal(panel) => panel.shared_snapshot(),
         }
     }
 }

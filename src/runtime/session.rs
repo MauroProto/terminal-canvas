@@ -6,6 +6,8 @@ use uuid::Uuid;
 pub struct SessionSpec {
     pub title: String,
     pub cwd: Option<PathBuf>,
+    pub startup_command: Option<String>,
+    pub startup_input: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,6 +31,8 @@ impl Default for SessionSpec {
         Self {
             title: "Terminal".to_owned(),
             cwd: None,
+            startup_command: None,
+            startup_input: None,
         }
     }
 }

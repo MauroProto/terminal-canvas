@@ -1,6 +1,9 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
     NewTerminal,
+    LaunchAgent,
+    ShareWorkspace,
+    JoinSharedSession,
     OpenFolder,
     CloseTerminal,
     RenameTerminal,
@@ -28,6 +31,21 @@ pub const COMMANDS: &[CommandEntry] = &[
         command: Command::NewTerminal,
         label: "New Terminal",
         shortcut: "Ctrl+Shift+T",
+    },
+    CommandEntry {
+        command: Command::LaunchAgent,
+        label: "Launch Agent",
+        shortcut: "Ctrl+Shift+A",
+    },
+    CommandEntry {
+        command: Command::ShareWorkspace,
+        label: "Share Workspace",
+        shortcut: "Ctrl+Shift+S",
+    },
+    CommandEntry {
+        command: Command::JoinSharedSession,
+        label: "Join Shared Session",
+        shortcut: "Ctrl+Shift+J",
     },
     CommandEntry {
         command: Command::OpenFolder,

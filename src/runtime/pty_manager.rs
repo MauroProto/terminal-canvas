@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use uuid::Uuid;
 
@@ -64,10 +65,10 @@ impl ManagedSession {
         }
     }
 
-    fn attached(spec: SessionSpec, handle: PtyHandle) -> Self {
+    fn attached(spec: SessionSpec, handle: SharedPtyHandle) -> Self {
         Self {
             spec,
-            handle: Some(Arc::new(Mutex::new(handle))),
+            handle: Some(handle),
             detached_alive: false,
         }
     }
@@ -228,9 +229,33 @@ impl PtyManager {
     ) -> anyhow::Result<Uuid> {
         let session_id = Uuid::new_v4();
         let _ = ctx;
+        let startup_command = spec.startup_command.clone();
+        let startup_input = spec.startup_input.clone();
         let handle = PtyHandle::spawn(cwd, cols, rows, session_id, Arc::clone(&self.scheduler))?;
+        if let Some(command) = startup_command
+            .as_deref()
+            .map(str::trim)
+            .filter(|command| !command.is_empty())
+        {
+            handle.write_all(format!("{command}\n").as_bytes());
+        }
+        let shared_handle = Arc::new(Mutex::new(handle));
+        if let Some(input) = startup_input
+            .as_deref()
+            .map(str::trim)
+            .filter(|input| !input.is_empty())
+            .map(str::to_owned)
+        {
+            let shared_handle_clone = Arc::clone(&shared_handle);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(600));
+                if let Ok(handle) = shared_handle_clone.lock() {
+                    handle.write_all(format!("{input}\n").as_bytes());
+                }
+            });
+        }
         self.sessions
-            .insert(session_id, ManagedSession::attached(spec, handle));
+            .insert(session_id, ManagedSession::attached(spec, shared_handle));
         Ok(session_id)
     }
 

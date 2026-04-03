@@ -10,6 +10,9 @@ pub fn shortcut_command(modifiers: &Modifiers, key: Key) -> Option<Command> {
 
     match (modifiers.ctrl, modifiers.shift, key) {
         (true, true, T) => Some(NewTerminal),
+        (true, true, A) => Some(LaunchAgent),
+        (true, true, S) => Some(ShareWorkspace),
+        (true, true, J) => Some(JoinSharedSession),
         (true, true, O) => Some(OpenFolder),
         (true, true, W) => Some(CloseTerminal),
         (true, true, OpenBracket) => Some(FocusPrev),

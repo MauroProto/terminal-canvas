@@ -17,6 +17,8 @@ use crate::canvas::config::normalize_panel_size;
 use crate::canvas::config::SNAP_THRESHOLD;
 use crate::canvas::snap::{snap_drag, snap_resize, SnapGuide};
 use crate::canvas::viewport::Viewport;
+use crate::collab::{SerializableModifiers, SharedPanelSnapshot, TerminalInputEvent};
+use crate::orchestration::{PanelOverlay, PanelRuntimeObservation};
 use crate::runtime::{
     PtyManager, RenderInputs, RenderQos, RenderTier, SessionSpec, SharedPtyHandle,
 };
@@ -169,6 +171,7 @@ impl TerminalPanel {
             Color32::from_rgb(saved.color[0], saved.color[1], saved.color[2]),
             saved.z_index,
         );
+        panel.id = Uuid::parse_str(&saved.id).unwrap_or_else(|_| Uuid::new_v4());
         panel.custom_title = saved.custom_title;
         panel.title = panel
             .custom_title
@@ -185,16 +188,28 @@ impl TerminalPanel {
         ctx: &egui::Context,
         cwd: Option<&Path>,
     ) {
+        let spec = SessionSpec {
+            title: self.title.clone(),
+            cwd: cwd.map(Path::to_path_buf),
+            startup_command: None,
+            startup_input: None,
+        };
+        self.attach_session_with_spec(pty_manager, ctx, cwd, spec);
+    }
+
+    pub fn attach_session_with_spec(
+        &mut self,
+        pty_manager: Arc<Mutex<PtyManager>>,
+        ctx: &egui::Context,
+        cwd: Option<&Path>,
+        spec: SessionSpec,
+    ) {
         self.close_runtime_session();
         self.cwd_label = cwd_label(cwd);
         self.shell_label = shell_label();
         let (cols, rows) = compute_grid_size(self.size.x, self.size.y - TITLE_BAR_HEIGHT);
         self.last_cols = cols;
         self.last_rows = rows;
-        let spec = SessionSpec {
-            title: self.title.clone(),
-            cwd: cwd.map(Path::to_path_buf),
-        };
         self.pty_manager = Some(Arc::clone(&pty_manager));
         let spawn_result = match pty_manager.lock() {
             Ok(mut manager) => manager.spawn(ctx, spec, cwd, cols, rows),
@@ -260,6 +275,7 @@ impl TerminalPanel {
 
     pub fn to_saved(&self) -> PanelState {
         PanelState {
+            id: self.id.to_string(),
             title: self.title.clone(),
             custom_title: self.custom_title.clone(),
             position: [self.position.x, self.position.y],
@@ -286,6 +302,32 @@ impl TerminalPanel {
             if let Some(activity_label) = infer_activity_label(&self.title, &self.shell_title, "") {
                 self.activity_label = Some(activity_label);
             }
+        }
+    }
+
+    pub fn orchestration_observation(&self, workspace_id: Uuid) -> PanelRuntimeObservation {
+        let mut visible_text = String::new();
+        let recent_output = self
+            .with_pty(|pty| {
+                if let Ok(term) = pty.term.try_lock() {
+                    visible_text = visible_text_snapshot(&term, 16, 180);
+                }
+                pty.last_output_at
+                    .try_lock()
+                    .ok()
+                    .map(|last_output_at| last_output_at.elapsed() <= Duration::from_secs(4))
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+
+        PanelRuntimeObservation {
+            panel_id: self.id,
+            runtime_session_id: self.runtime_session_id(),
+            workspace_id,
+            title: self.title.clone(),
+            visible_text,
+            alive: self.is_alive(),
+            recent_output,
         }
     }
 
@@ -348,7 +390,42 @@ impl TerminalPanel {
         });
     }
 
+    pub fn apply_remote_input_events(&mut self, events: &[TerminalInputEvent]) {
+        if events.is_empty() {
+            return;
+        }
+
+        let mode = self.with_pty(PtyHandle::input_mode).unwrap_or_default();
+        for event in events {
+            match event {
+                TerminalInputEvent::Text(text) => {
+                    let _ = self.with_pty(|pty| pty.write_all(text.as_bytes()));
+                    self.record_input_text(text);
+                }
+                TerminalInputEvent::Paste(text) => {
+                    let bytes = paste_bytes(text, &mode);
+                    let _ = self.with_pty(|pty| pty.write_all(&bytes));
+                    self.record_input_text(text);
+                }
+                TerminalInputEvent::Key { key, modifiers } => {
+                    let modifiers = egui_modifiers(*modifiers);
+                    if let Some(bytes) = key_to_bytes(&key.to_egui(), &modifiers, &mode) {
+                        let _ = self.with_pty(|pty| pty.write_all(&bytes));
+                    }
+                    self.record_key_input(key.to_egui(), modifiers.ctrl || modifiers.command);
+                }
+                TerminalInputEvent::Scroll { delta } => {
+                    self.apply_scroll_delta(*delta);
+                }
+            }
+        }
+    }
+
     pub fn handle_scroll(&mut self, delta: f32, _ctx: &egui::Context) {
+        self.apply_scroll_delta(delta);
+    }
+
+    fn apply_scroll_delta(&mut self, delta: f32) {
         let Some(mode) = self.with_pty(PtyHandle::input_mode) else {
             return;
         };
@@ -372,6 +449,36 @@ impl TerminalPanel {
                 Scroll::Delta(-lines)
             };
             let _ = self.with_pty(|pty| pty.scroll_display(scroll));
+        }
+    }
+
+    pub fn shared_snapshot(&self) -> SharedPanelSnapshot {
+        let mut visible_text = String::new();
+        let mut history_text = String::new();
+        if let Some(handle) = self.session_handle() {
+            if let Ok(pty) = handle.lock() {
+                if let Ok(term) = pty.term.try_lock() {
+                    visible_text = visible_text_snapshot(&term, 18, 180);
+                    history_text = visible_text_snapshot(&term, 80, 220);
+                }
+            }
+        }
+
+        SharedPanelSnapshot {
+            panel_id: self.id,
+            title: self.title.clone(),
+            position: [self.position.x, self.position.y],
+            size: [self.size.x, self.size.y],
+            color: [self.color.r(), self.color.g(), self.color.b()],
+            z_index: self.z_index,
+            focused: self.focused,
+            alive: self.is_alive(),
+            preview_label: self.preview_label(),
+            visible_text,
+            history_text,
+            controller: None,
+            controller_name: None,
+            queue_len: 0,
         }
     }
 
@@ -486,6 +593,7 @@ impl TerminalPanel {
         viewport: &Viewport,
         canvas_rect: Rect,
         fast_path_render: bool,
+        overlay: Option<&PanelOverlay>,
     ) -> PanelInteraction {
         let mut interaction = PanelInteraction::default();
         let zoom = viewport.zoom;
@@ -601,7 +709,6 @@ impl TerminalPanel {
                 if self.is_alive() { FG } else { DIM_FG },
             );
         }
-
         let content_rect = body_rect.shrink2(vec2(0.0, 0.0));
         let content_clip_rect = content_rect.intersect(canvas_rect);
         let content_painter = painter.with_clip_rect(content_clip_rect);
@@ -609,7 +716,9 @@ impl TerminalPanel {
         let now = ui.ctx().input(|i| i.time);
         let title_snapshot = self.title.clone();
         let shell_title_snapshot = self.shell_title.clone();
-        let fallback_preview_title = if is_generic_terminal_name(&self.title) {
+        let fallback_preview_title = if let Some(overlay) = overlay {
+            overlay.preview_label.clone()
+        } else if is_generic_terminal_name(&self.title) {
             self.cwd_label.clone()
         } else {
             self.title.clone()
@@ -668,8 +777,14 @@ impl TerminalPanel {
                             RenderTier::Preview | RenderTier::Hidden => {}
                         }
                     } else {
-                        let preview_label =
-                            preview_label_text(activity_label.as_deref(), &fallback_preview_title);
+                        let preview_label = overlay
+                            .map(|overlay| overlay.preview_label.clone())
+                            .unwrap_or_else(|| {
+                                preview_label_text(
+                                    activity_label.as_deref(),
+                                    &fallback_preview_title,
+                                )
+                            });
                         render_terminal_preview(
                             &content_painter,
                             content_rect,
@@ -696,8 +811,14 @@ impl TerminalPanel {
                         activity_label_scan_at = Some(now);
                     }
                     if !matches!(render_tier, RenderTier::Hidden) {
-                        let preview_label =
-                            preview_label_text(activity_label.as_deref(), &fallback_preview_title);
+                        let preview_label = overlay
+                            .map(|overlay| overlay.preview_label.clone())
+                            .unwrap_or_else(|| {
+                                preview_label_text(
+                                    activity_label.as_deref(),
+                                    &fallback_preview_title,
+                                )
+                            });
                         render_terminal_preview(
                             &content_painter,
                             content_rect,
@@ -714,8 +835,11 @@ impl TerminalPanel {
                     activity_label_scan_at = Some(now);
                 }
             } else {
-                let preview_label =
-                    preview_label_text(activity_label.as_deref(), &fallback_preview_title);
+                let preview_label = overlay
+                    .map(|overlay| overlay.preview_label.clone())
+                    .unwrap_or_else(|| {
+                        preview_label_text(activity_label.as_deref(), &fallback_preview_title)
+                    });
                 render_terminal_preview(
                     &content_painter,
                     content_rect,
@@ -1291,6 +1415,16 @@ fn should_refresh_activity_label(last_scan_at: f64, time: f64) -> bool {
     (time - last_scan_at) >= 0.45
 }
 
+fn egui_modifiers(modifiers: SerializableModifiers) -> egui::Modifiers {
+    egui::Modifiers {
+        alt: modifiers.alt,
+        ctrl: modifiers.ctrl,
+        shift: modifiers.shift,
+        mac_cmd: modifiers.command,
+        command: modifiers.command,
+    }
+}
+
 fn render_tier_for_panel(
     content_rect: Rect,
     zoom: f32,
@@ -1511,6 +1645,20 @@ fn cwd_label(cwd: Option<&Path>) -> String {
         .filter(|name| !name.is_empty())
         .unwrap_or("Terminal")
         .to_owned()
+}
+
+fn truncate_text(text: &str, max_chars: usize) -> String {
+    let char_count = text.chars().count();
+    if char_count <= max_chars {
+        text.to_owned()
+    } else {
+        format!(
+            "{}…",
+            text.chars()
+                .take(max_chars.saturating_sub(1))
+                .collect::<String>()
+        )
+    }
 }
 
 #[cfg(test)]

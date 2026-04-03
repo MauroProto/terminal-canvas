@@ -7,8 +7,10 @@ use uuid::Uuid;
 use crate::canvas::config::{
     normalize_panel_size, DEFAULT_PANEL_HEIGHT, DEFAULT_PANEL_WIDTH, PANEL_GAP,
 };
+use crate::collab::{SharedPanelSnapshot, TerminalInputEvent};
+use crate::orchestration::PanelRuntimeObservation;
 use crate::panel::CanvasPanel;
-use crate::runtime::{PtyManager, RuntimeWorkspaceSnapshot, UiUpdateBatch};
+use crate::runtime::{PtyManager, RuntimeWorkspaceSnapshot, SessionSpec, UiUpdateBatch};
 use crate::state::WorkspaceState;
 use crate::terminal::panel::TerminalPanel;
 
@@ -34,6 +36,20 @@ pub struct Workspace {
     pub next_z: u32,
     pub next_color: usize,
     pty_manager: Arc<Mutex<PtyManager>>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TerminalSpawnRequest {
+    pub title: Option<String>,
+    pub cwd: Option<PathBuf>,
+    pub startup_command: Option<String>,
+    pub startup_input: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SpawnedTerminal {
+    pub panel_id: Uuid,
+    pub runtime_session_id: Option<Uuid>,
 }
 
 impl Workspace {
@@ -111,18 +127,49 @@ impl Workspace {
     }
 
     pub fn spawn_terminal(&mut self, ctx: &egui::Context) -> Uuid {
+        self.spawn_terminal_with_request(ctx, TerminalSpawnRequest::default())
+            .panel_id
+    }
+
+    pub fn spawn_terminal_with_request(
+        &mut self,
+        ctx: &egui::Context,
+        request: TerminalSpawnRequest,
+    ) -> SpawnedTerminal {
         let size = normalize_panel_size(egui::vec2(DEFAULT_PANEL_WIDTH, DEFAULT_PANEL_HEIGHT));
         let position = self.find_free_position(size);
         let color = PANEL_COLORS[self.next_color % PANEL_COLORS.len()];
         let mut panel = TerminalPanel::new(position, size, color, self.next_z);
+        if let Some(title) = request
+            .title
+            .clone()
+            .filter(|title| !title.trim().is_empty())
+        {
+            panel.rename_title(title);
+        }
         panel.focused = true;
-        panel.attach_session(Arc::clone(&self.pty_manager), ctx, self.cwd.as_deref());
+        let cwd = request.cwd.as_deref().or(self.cwd.as_deref());
+        panel.attach_session_with_spec(
+            Arc::clone(&self.pty_manager),
+            ctx,
+            cwd,
+            SessionSpec {
+                title: panel.title.clone(),
+                cwd: cwd.map(Path::to_path_buf),
+                startup_command: request.startup_command.clone(),
+                startup_input: request.startup_input.clone(),
+            },
+        );
         let id = panel.id;
+        let runtime_session_id = panel.runtime_session_id();
         self.panels.push(CanvasPanel::Terminal(panel));
         self.next_z += 1;
         self.next_color += 1;
         self.bring_to_front(id);
-        id
+        SpawnedTerminal {
+            panel_id: id,
+            runtime_session_id,
+        }
     }
 
     pub fn add_restored_terminal(&mut self, panel: TerminalPanel) {
@@ -272,6 +319,32 @@ impl Workspace {
 
     pub fn panel_count(&self) -> usize {
         self.panels.len()
+    }
+
+    pub fn panel(&self, panel_id: Uuid) -> Option<&CanvasPanel> {
+        self.panels.iter().find(|panel| panel.id() == panel_id)
+    }
+
+    pub fn orchestration_observations(&self) -> Vec<PanelRuntimeObservation> {
+        self.panels
+            .iter()
+            .map(|panel| panel.orchestration_observation(self.id))
+            .collect()
+    }
+
+    pub fn apply_remote_input(&mut self, panel_id: Uuid, events: &[TerminalInputEvent]) -> bool {
+        let Some(panel) = self.panels.iter_mut().find(|panel| panel.id() == panel_id) else {
+            return false;
+        };
+        panel.apply_remote_input_events(events);
+        true
+    }
+
+    pub fn shared_panel_snapshots(&self) -> Vec<SharedPanelSnapshot> {
+        self.panels
+            .iter()
+            .map(CanvasPanel::shared_snapshot)
+            .collect()
     }
 }
 

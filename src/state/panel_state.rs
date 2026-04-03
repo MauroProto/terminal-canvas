@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PanelState {
+    pub id: String,
     pub title: String,
     #[serde(default)]
     pub custom_title: Option<String>,

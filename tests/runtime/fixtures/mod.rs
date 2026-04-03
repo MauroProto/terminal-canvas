@@ -64,6 +64,8 @@ impl RuntimeHarness {
                     cwd: Some(
                         format!("/tmp/workspace-{}/{index}", index % workspace_ids.len()).into(),
                     ),
+                    startup_command: None,
+                    startup_input: None,
                 },
             );
 
