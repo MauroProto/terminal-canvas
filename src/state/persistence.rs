@@ -258,6 +258,7 @@ mod tests {
                     color: [1, 2, 3],
                     z_index: 1,
                     focused: true,
+                    minimized: false,
                 }],
                 viewport_pan: [0.0, 0.0],
                 viewport_zoom: 1.0,

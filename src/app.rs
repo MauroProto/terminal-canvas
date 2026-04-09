@@ -5,13 +5,11 @@ use std::time::{Duration, Instant};
 use chrono::Utc;
 use egui::{
     pos2, vec2, Align2, Area, CentralPanel, Color32, FontId, Id, Key, Order, Pos2, Rect, SidePanel,
-    Stroke,
+    Stroke, TopBottomPanel,
 };
 use uuid::Uuid;
 
 use crate::canvas::config::{CANVAS_BG, SNAP_GUIDE_COLOR, ZOOM_KEYBOARD_FACTOR};
-use crate::canvas::grid::draw_grid;
-use crate::canvas::minimap;
 use crate::canvas::scene::handle_canvas_input;
 use crate::canvas::snap::guide_endpoints;
 use crate::canvas::viewport::Viewport;
@@ -26,6 +24,7 @@ use crate::command_palette::CommandPalette;
 use crate::orchestration::{
     AgentLaunchRequest, AgentProvider, Orchestrator, PanelRuntimeObservation, WorktreeMode,
 };
+use crate::runtime::RenderTier;
 use crate::shortcuts::shortcut_command;
 use crate::sidebar::{Sidebar, SidebarResponse};
 use crate::state::persistence::{AutosaveController, AutosaveDecision};
@@ -35,6 +34,18 @@ use crate::theme::fonts::setup_fonts;
 use crate::update::{RepaintPolicy, UpdateChecker};
 use crate::utils::platform::home_dir;
 
+mod dialogs;
+mod perf;
+mod taskbar;
+
+use self::perf::FramePerfSnapshot;
+use self::taskbar::{
+    apply_taskbar_layout_to_workspace, clamp_rect_to_desktop, clamp_workspace_panels_to_desktop,
+    desktop_canvas_rect, desktop_screen_rect, desktop_snap_rect_for_pointer, taskbar_button_colors,
+    taskbar_provider_accent, taskbar_provider_label, taskbar_summary_label, truncate_taskbar_title,
+    TaskbarLayoutPreset,
+};
+
 const AUTOSAVE_INTERVAL: Duration = Duration::from_secs(2);
 const RUNTIME_REPAINT_BATCH: Duration = Duration::from_millis(33);
 const VIEWPORT_FOCUS_PADDING: f32 = 72.0;
@@ -43,6 +54,8 @@ const VIEWPORT_OVERVIEW_PADDING: f32 = 84.0;
 const VIEWPORT_OVERVIEW_MAX_ZOOM: f32 = 1.0;
 const VIEWPORT_FOCUS_ANIMATION_SECS: f64 = 0.36;
 const ORCHESTRATION_REFRESH_INTERVAL: Duration = Duration::from_millis(750);
+const DESKTOP_MARGIN: f32 = 0.0;
+const DESKTOP_SNAP_EDGE: f32 = 28.0;
 
 #[derive(Clone)]
 struct LaunchAgentDraft {
@@ -121,6 +134,9 @@ pub struct TerminalApp {
     local_device_id: String,
     trusted_devices: HashMap<String, TrustedDevice>,
     last_orchestration_refresh: Instant,
+    last_orchestration_scan_duration: Duration,
+    last_perf_snapshot: FramePerfSnapshot,
+    layout_menu_open: bool,
 }
 
 impl TerminalApp {
@@ -196,6 +212,9 @@ impl TerminalApp {
                 last_orchestration_refresh: Instant::now()
                     .checked_sub(ORCHESTRATION_REFRESH_INTERVAL)
                     .unwrap_or_else(Instant::now),
+                last_orchestration_scan_duration: Duration::ZERO,
+                last_perf_snapshot: FramePerfSnapshot::default(),
+                layout_menu_open: false,
             }
         } else {
             let collab = CollabManager::new();
@@ -244,6 +263,9 @@ impl TerminalApp {
                 last_orchestration_refresh: Instant::now()
                     .checked_sub(ORCHESTRATION_REFRESH_INTERVAL)
                     .unwrap_or_else(Instant::now),
+                last_orchestration_scan_duration: Duration::ZERO,
+                last_perf_snapshot: FramePerfSnapshot::default(),
+                layout_menu_open: false,
             }
         };
 
@@ -358,9 +380,14 @@ impl TerminalApp {
     }
 
     fn maybe_refresh_orchestration(&mut self) {
+        if self.panel_gesture.is_some() {
+            return;
+        }
         if self.last_orchestration_refresh.elapsed() >= ORCHESTRATION_REFRESH_INTERVAL {
             self.reconcile_orchestration();
+            let started_at = Instant::now();
             self.refresh_orchestration();
+            self.last_orchestration_scan_duration = started_at.elapsed();
         }
     }
 
@@ -377,7 +404,16 @@ impl TerminalApp {
             .position(|workspace| workspace.panel(panel_id).is_some())
         {
             self.switch_workspace(index);
-            self.ws_mut().bring_to_front(panel_id);
+            let is_minimized = self
+                .ws()
+                .panel(panel_id)
+                .map(|panel| panel.minimized())
+                .unwrap_or(false);
+            if is_minimized {
+                self.ws_mut().restore_panel(panel_id);
+            } else {
+                self.ws_mut().bring_to_front(panel_id);
+            }
             if let Some(canvas_rect) = canvas_rect {
                 if let Some(panel) = self.ws().panel(panel_id) {
                     self.viewport = self.viewport.focus_on_rect(
@@ -670,13 +706,14 @@ impl TerminalApp {
     }
 
     fn focus_relative(&mut self, direction: isize) {
-        if self.ws().panels.is_empty() {
+        if !self.ws().panels.iter().any(|panel| !panel.minimized()) {
             return;
         }
         let mut order: Vec<_> = self
             .ws()
             .panels
             .iter()
+            .filter(|panel| !panel.minimized())
             .map(|panel| (panel.z_index(), panel.id()))
             .collect();
         order.sort_by_key(|(z, _)| *z);
@@ -691,13 +728,14 @@ impl TerminalApp {
     }
 
     fn zoom_to_fit_all(&mut self, canvas_rect: Rect) {
-        if self.ws().panels.is_empty() {
+        if !self.ws().panels.iter().any(|panel| !panel.minimized()) {
             return;
         }
         let bounds = self
             .ws()
             .panels
             .iter()
+            .filter(|panel| !panel.minimized())
             .map(|panel| panel.rect())
             .reduce(|a, b| a.union(b))
             .unwrap()
@@ -784,6 +822,19 @@ impl TerminalApp {
                     self.ws_mut().close_panel(panel_id);
                     self.reconcile_orchestration();
                 }
+                SidebarResponse::OpenShareWorkspace => self.open_share_workspace_dialog(),
+                SidebarResponse::OpenJoinSession => self.open_join_session_dialog(),
+                SidebarResponse::OpenCollabSession => match self.collab.mode() {
+                    CollabMode::Inactive | CollabMode::Host => {
+                        self.open_share_workspace_dialog();
+                    }
+                    CollabMode::Guest => {
+                        self.open_join_session_dialog();
+                    }
+                },
+                SidebarResponse::StopCollabSession => {
+                    self.collab.stop_session();
+                }
             }
         }
         self.reconcile_orchestration();
@@ -868,553 +919,15 @@ impl TerminalApp {
             ctx.request_repaint();
         }
     }
-
-    fn show_rename_dialog(&mut self, ctx: &egui::Context) {
-        let Some(panel_id) = self.renaming_panel else {
-            return;
-        };
-        Area::new(Id::new("rename-dialog"))
-            .order(Order::Debug)
-            .anchor(egui::Align2::CENTER_CENTER, vec2(0.0, 0.0))
-            .show(ctx, |ui| {
-                egui::Frame::default()
-                    .fill(Color32::from_rgb(24, 24, 28))
-                    .stroke(egui::Stroke::new(1.0, Color32::from_rgb(55, 55, 65)))
-                    .rounding(10.0)
-                    .inner_margin(egui::Margin::same(12.0))
-                    .show(ui, |ui: &mut egui::Ui| {
-                        ui.label("Rename terminal");
-                        let response = ui.add_sized(
-                            vec2(280.0, 28.0),
-                            egui::TextEdit::singleline(&mut self.rename_buf),
-                        );
-                        let confirm = response.lost_focus()
-                            && ui.input(|i: &egui::InputState| i.key_pressed(Key::Enter));
-                        ui.horizontal(|ui: &mut egui::Ui| {
-                            if ui.button("Cancel").clicked() {
-                                self.renaming_panel = None;
-                            }
-                            if ui.button("Save").clicked() || confirm {
-                                let title = self.rename_buf.clone();
-                                self.ws_mut().rename_panel(panel_id, title);
-                                self.renaming_panel = None;
-                            }
-                        });
-                    });
-            });
-    }
-
-    fn show_launch_dialog(&mut self, ctx: &egui::Context) {
-        let Some(mut draft) = self.launch_agent.clone() else {
-            return;
-        };
-        let mut cancel = false;
-        let mut submit = false;
-        Area::new(Id::new("launch-agent-dialog"))
-            .order(Order::Debug)
-            .anchor(egui::Align2::CENTER_CENTER, vec2(0.0, 0.0))
-            .show(ctx, |ui| {
-                egui::Frame::default()
-                    .fill(Color32::from_rgb(24, 24, 28))
-                    .stroke(egui::Stroke::new(1.0, Color32::from_rgb(55, 55, 65)))
-                    .rounding(12.0)
-                    .inner_margin(egui::Margin::same(12.0))
-                    .show(ui, |ui: &mut egui::Ui| {
-                        ui.set_min_width(360.0);
-                        ui.label("Launch agent");
-                        egui::ComboBox::from_id_salt("launch-agent-provider")
-                            .selected_text(draft.provider.label())
-                            .show_ui(ui, |ui| {
-                                for provider in crate::orchestration::launch_presets() {
-                                    ui.selectable_value(
-                                        &mut draft.provider,
-                                        provider,
-                                        provider.label(),
-                                    );
-                                }
-                            });
-                        ui.add_space(6.0);
-                        ui.label("Task");
-                        ui.add_sized(
-                            vec2(336.0, 28.0),
-                            egui::TextEdit::singleline(&mut draft.task_title)
-                                .hint_text("Short task title"),
-                        );
-                        ui.add_space(6.0);
-                        ui.label("Brief");
-                        ui.add_sized(
-                            vec2(336.0, 58.0),
-                            egui::TextEdit::multiline(&mut draft.brief)
-                                .hint_text("What should this agent do?"),
-                        );
-                        ui.add_space(6.0);
-                        ui.horizontal(|ui| {
-                            ui.label("Repo mode");
-                            egui::ComboBox::from_id_salt("launch-agent-worktree")
-                                .selected_text(match draft.worktree_mode {
-                                    WorktreeMode::Auto => "Worktree per agent",
-                                    WorktreeMode::SharedRepo => "Shared repo",
-                                })
-                                .show_ui(ui, |ui| {
-                                    ui.selectable_value(
-                                        &mut draft.worktree_mode,
-                                        WorktreeMode::Auto,
-                                        "Worktree per agent",
-                                    );
-                                    ui.selectable_value(
-                                        &mut draft.worktree_mode,
-                                        WorktreeMode::SharedRepo,
-                                        "Shared repo",
-                                    );
-                                });
-                        });
-                        if let Some(error) = &draft.error {
-                            ui.add_space(6.0);
-                            ui.colored_label(Color32::from_rgb(239, 68, 68), error);
-                        }
-                        ui.add_space(10.0);
-                        ui.horizontal(|ui| {
-                            if ui.button("Cancel").clicked() {
-                                cancel = true;
-                            }
-                            if ui.button("Launch").clicked() {
-                                submit = true;
-                            }
-                        });
-                    });
-            });
-        if cancel {
-            self.launch_agent = None;
-        } else {
-            self.launch_agent = Some(draft);
-            if submit {
-                self.submit_launch_agent(ctx);
-            }
-        }
-    }
-
-    fn show_collab_hud(&mut self, ctx: &egui::Context) {
-        Area::new(Id::new("collab-hud"))
-            .order(Order::Foreground)
-            .anchor(egui::Align2::RIGHT_TOP, vec2(-16.0, 16.0))
-            .show(ctx, |ui| {
-                egui::Frame::default()
-                    .fill(Color32::from_rgba_premultiplied(20, 20, 24, 235))
-                    .stroke(egui::Stroke::new(1.0, Color32::from_rgb(58, 58, 66)))
-                    .rounding(12.0)
-                    .inner_margin(egui::Margin::same(8.0))
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            let (state_label, state_color) =
-                                collab_state_badge(self.collab.session_state());
-                            ui.colored_label(state_color, state_label);
-                            ui.separator();
-                            match self.collab.mode() {
-                                CollabMode::Inactive => {
-                                    if ui.button("Share").clicked() {
-                                        self.open_share_workspace_dialog();
-                                    }
-                                    if ui.button("Join").clicked() {
-                                        self.open_join_session_dialog();
-                                    }
-                                }
-                                CollabMode::Host => {
-                                    if ui.button("Session").clicked() {
-                                        self.open_share_workspace_dialog();
-                                    }
-                                    if ui.button("Stop").clicked() {
-                                        self.collab.stop_session();
-                                    }
-                                }
-                                CollabMode::Guest => {
-                                    if ui.button("Session").clicked() {
-                                        self.join_session_open = true;
-                                    }
-                                    if ui.button("Leave").clicked() {
-                                        self.collab.stop_session();
-                                    }
-                                }
-                            }
-                        });
-                    });
-            });
-    }
-
-    fn show_share_workspace_dialog(&mut self, ctx: &egui::Context) {
-        if !self.share_workspace_open {
-            return;
-        }
-
-        let mut close = false;
-        Area::new(Id::new("share-workspace-dialog"))
-            .order(Order::Debug)
-            .anchor(egui::Align2::CENTER_CENTER, vec2(0.0, 0.0))
-            .show(ctx, |ui| {
-                egui::Frame::default()
-                    .fill(Color32::from_rgb(24, 24, 28))
-                    .stroke(egui::Stroke::new(1.0, Color32::from_rgb(58, 58, 66)))
-                    .rounding(14.0)
-                    .inner_margin(egui::Margin::same(14.0))
-                    .show(ui, |ui| {
-                        ui.set_min_width(460.0);
-                        ui.heading("Share Workspace");
-                        ui.add_space(6.0);
-                        match self.collab.mode() {
-                            CollabMode::Inactive => {
-                                ui.label(
-                                    egui::RichText::new(
-                                        "Trusted Live comparte el workspace actual directo desde esta máquina del host.",
-                                    )
-                                    .color(Color32::from_rgb(170, 170, 176)),
-                                );
-                                ui.add_space(8.0);
-                                ui.label("Reachable URL");
-                                ui.add_sized(
-                                    vec2(420.0, 28.0),
-                                    egui::TextEdit::singleline(
-                                        &mut self.share_workspace_draft.broker_url,
-                                    ),
-                                );
-                                ui.label(
-                                    egui::RichText::new(
-                                        "Usá la IP o dominio al que se van a conectar los invitados. Para acceso desde otra red, esa URL tiene que apuntar a tu máquina y puerto. El modo directo ahora usa HTTPS/WSS con certificado pinneado en el invite.",
-                                    )
-                                    .size(12.0)
-                                    .color(Color32::from_rgb(152, 152, 160)),
-                                );
-                                ui.add_space(8.0);
-                                ui.label("Session passphrase (optional)");
-                                ui.add_sized(
-                                    vec2(420.0, 28.0),
-                                    egui::TextEdit::singleline(
-                                        &mut self.share_workspace_draft.session_passphrase,
-                                    )
-                                    .password(true),
-                                );
-                                ui.label(
-                                    egui::RichText::new(
-                                        "Si la ponés, no viaja en el invite code. La compartís por separado y se pide al entrar.",
-                                    )
-                                    .size(12.0)
-                                    .color(Color32::from_rgb(152, 152, 160)),
-                                );
-                                ui.add_space(8.0);
-                                ui.checkbox(
-                                    &mut self.share_workspace_draft.acknowledge_trusted_live,
-                                    "Entiendo que Trusted Live da acceso a terminales reales del host.",
-                                );
-                                ui.label(
-                                    egui::RichText::new(
-                                        "No es sandbox. Un invitado aprobado puede ejecutar comandos reales en tu máquina dentro de esa terminal.",
-                                    )
-                                    .color(Color32::from_rgb(196, 162, 88)),
-                                );
-                                if let Some(error) = &self.share_workspace_draft.error {
-                                    ui.add_space(6.0);
-                                    ui.colored_label(Color32::from_rgb(239, 68, 68), error);
-                                }
-                                ui.add_space(10.0);
-                                ui.horizontal(|ui| {
-                                    if ui.button("Cancel").clicked() {
-                                        close = true;
-                                    }
-                                    if ui.button("Start sharing").clicked() {
-                                        self.start_share_workspace();
-                                    }
-                                });
-                            }
-                            CollabMode::Host => {
-                                let workspace_name = self
-                                    .shared_workspace()
-                                    .map(|workspace| workspace.name.as_str())
-                                    .unwrap_or("Workspace");
-                                let (state_label, state_color) =
-                                    collab_state_badge(self.collab.session_state());
-                                ui.label(format!("Workspace: {workspace_name}"));
-                                ui.colored_label(state_color, state_label);
-                                ui.add_space(8.0);
-                                if let Some(expires_at) = self.collab.invite_expires_at() {
-                                    ui.horizontal(|ui| {
-                                        ui.label(format!(
-                                            "Expires: {} UTC",
-                                            expires_at.format("%Y-%m-%d %H:%M")
-                                        ));
-                                        if ui.button("Rotate invite").clicked() {
-                                            if let Err(err) = self.collab.rotate_invite() {
-                                                self.share_workspace_draft.error =
-                                                    Some(err.to_string());
-                                            } else {
-                                                self.share_workspace_draft.error = None;
-                                            }
-                                        }
-                                    });
-                                    ui.add_space(8.0);
-                                }
-                                if let Some(invite) = self.collab.invite_code().map(str::to_owned) {
-                                    ui.label("Invite code");
-                                    let mut invite_text = invite.clone();
-                                    ui.add_sized(
-                                        vec2(420.0, 56.0),
-                                        egui::TextEdit::multiline(&mut invite_text)
-                                            .interactive(false),
-                                    );
-                                    if ui.button("Copy invite").clicked() {
-                                        ctx.copy_text(invite);
-                                    }
-                                }
-                                if !self.share_workspace_draft.session_passphrase.trim().is_empty() {
-                                    ui.label(
-                                        egui::RichText::new(
-                                            "Esta sesión también requiere la passphrase que configuraste.",
-                                        )
-                                        .size(12.0)
-                                        .color(Color32::from_rgb(152, 152, 160)),
-                                    );
-                                }
-                                if let Some(error) = self.collab.last_error() {
-                                    ui.add_space(6.0);
-                                    ui.colored_label(Color32::from_rgb(239, 68, 68), error);
-                                }
-
-                                let pending_joins = self.collab.pending_joins().to_vec();
-                                if !pending_joins.is_empty() {
-                                    ui.add_space(10.0);
-                                    ui.label("Pending joins");
-                                    for request in pending_joins {
-                                        ui.horizontal(|ui| {
-                                            ui.label(request.display_name.clone());
-                                            if ui.button("Approve").clicked() {
-                                                let _ = self.collab.approve_join(request.guest_id);
-                                            }
-                                            if ui.button("Trust device").clicked() {
-                                                self.remember_trusted_device(
-                                                    &request.device_id,
-                                                    &request.display_name,
-                                                );
-                                                let _ = self.collab.approve_join(request.guest_id);
-                                            }
-                                            if ui.button("Deny").clicked() {
-                                                let _ = self.collab.deny_join(request.guest_id);
-                                            }
-                                        });
-                                    }
-                                }
-
-                                let pending_controls = self.collab.pending_control_requests().to_vec();
-                                if !pending_controls.is_empty() {
-                                    ui.add_space(10.0);
-                                    ui.label("Control requests");
-                                    for request in pending_controls {
-                                        let panel_title = self
-                                            .shared_workspace()
-                                            .and_then(|workspace| workspace.panel(request.terminal_id))
-                                            .map(|panel| panel.title().to_owned())
-                                            .unwrap_or_else(|| "Terminal".to_owned());
-                                        ui.horizontal(|ui| {
-                                            ui.label(format!("{} -> {}", request.display_name, panel_title));
-                                            if ui.button("Grant").clicked() {
-                                                self.collab.grant_control(
-                                                    request.terminal_id,
-                                                    request.guest_id,
-                                                );
-                                            }
-                                        });
-                                    }
-                                }
-
-                                let guests = self.collab.guests();
-                                if !guests.is_empty() {
-                                    ui.add_space(10.0);
-                                    ui.label("Guests");
-                                    for guest in guests {
-                                        ui.label(format!(
-                                            "{} · {:?}",
-                                            guest.display_name, guest.connection_state
-                                        ));
-                                    }
-                                }
-
-                                if let Some(workspace) = self.shared_workspace() {
-                                    let controlled = workspace
-                                        .panels
-                                        .iter()
-                                        .filter_map(|panel| {
-                                            let guest_id = self.collab.controller_for(panel.id())?;
-                                            Some((panel.id(), panel.title().to_owned(), guest_id))
-                                        })
-                                        .collect::<Vec<_>>();
-                                    if !controlled.is_empty() {
-                                        ui.add_space(10.0);
-                                        ui.label("Live terminals");
-                                        for (panel_id, title, guest_id) in controlled {
-                                            let guest_name = self
-                                                .collab
-                                                .guests()
-                                                .into_iter()
-                                                .find(|guest| guest.id == guest_id)
-                                                .map(|guest| guest.display_name)
-                                                .unwrap_or_else(|| "Guest".to_owned());
-                                            ui.horizontal(|ui| {
-                                                ui.label(format!("{title} · {guest_name}"));
-                                                if ui.button("Revoke").clicked() {
-                                                    self.collab.revoke_control(
-                                                        panel_id,
-                                                        "Revoked by host",
-                                                    );
-                                                }
-                                            });
-                                        }
-                                    }
-                                }
-
-                                ui.add_space(10.0);
-                                ui.horizontal(|ui| {
-                                    if ui.button("Close").clicked() {
-                                        close = true;
-                                    }
-                                    if ui.button("Stop sharing").clicked() {
-                                        self.collab.stop_session();
-                                        close = true;
-                                    }
-                                });
-                            }
-                            CollabMode::Guest => {}
-                        }
-                    });
-            });
-
-        if close {
-            self.share_workspace_open = false;
-        }
-    }
-
-    fn show_join_session_dialog(&mut self, ctx: &egui::Context) {
-        if !self.join_session_open {
-            return;
-        }
-
-        let mut close = false;
-        Area::new(Id::new("join-shared-session-dialog"))
-            .order(Order::Debug)
-            .anchor(egui::Align2::CENTER_CENTER, vec2(0.0, 0.0))
-            .show(ctx, |ui| {
-                egui::Frame::default()
-                    .fill(Color32::from_rgb(24, 24, 28))
-                    .stroke(egui::Stroke::new(1.0, Color32::from_rgb(58, 58, 66)))
-                    .rounding(14.0)
-                    .inner_margin(egui::Margin::same(14.0))
-                    .show(ui, |ui| {
-                        ui.set_min_width(440.0);
-                        match self.collab.mode() {
-                            CollabMode::Guest => {
-                                ui.heading("Shared Session");
-                                let (state_label, state_color) =
-                                    collab_state_badge(self.collab.session_state());
-                                ui.colored_label(state_color, state_label);
-                                if let Some(snapshot) = &self.collab.guest_view().snapshot {
-                                    ui.label(format!("Workspace: {}", snapshot.workspace_name));
-                                    ui.add_space(8.0);
-                                    ui.label("Participants");
-                                    for guest in &snapshot.guests {
-                                        ui.label(format!(
-                                            "{} · {:?}",
-                                            guest.display_name, guest.connection_state
-                                        ));
-                                    }
-                                    let my_guest_id = self.collab.guest_view().my_guest_id;
-                                    let controlled_panels = snapshot
-                                        .panels
-                                        .iter()
-                                        .filter(|panel| panel.controller == my_guest_id)
-                                        .map(|panel| (panel.panel_id, panel.title.clone()))
-                                        .collect::<Vec<_>>();
-                                    if !controlled_panels.is_empty() {
-                                        ui.add_space(8.0);
-                                        ui.label("Your terminals");
-                                        for (panel_id, title) in controlled_panels {
-                                            ui.horizontal(|ui| {
-                                                ui.label(title);
-                                                if ui.button("Release").clicked() {
-                                                    self.collab.release_control(panel_id);
-                                                }
-                                            });
-                                        }
-                                    }
-                                }
-                                if let Some(error) = self.collab.last_error() {
-                                    ui.add_space(6.0);
-                                    ui.colored_label(Color32::from_rgb(239, 68, 68), error);
-                                }
-                                ui.add_space(10.0);
-                                ui.horizontal(|ui| {
-                                    if ui.button("Close").clicked() {
-                                        close = true;
-                                    }
-                                    if ui.button("Leave session").clicked() {
-                                        self.collab.stop_session();
-                                        close = true;
-                                    }
-                                });
-                            }
-                            _ => {
-                                ui.heading("Join Shared Session");
-                                ui.label(
-                                    egui::RichText::new(
-                                        "Entrás al workspace compartido desde la misma app. Si el host te aprueba, ves el canvas en vivo y podés pedir control de una terminal.",
-                                    )
-                                    .color(Color32::from_rgb(170, 170, 176)),
-                                );
-                                ui.add_space(8.0);
-                                ui.label("Display name");
-                                ui.add_sized(
-                                    vec2(400.0, 28.0),
-                                    egui::TextEdit::singleline(
-                                        &mut self.join_session_draft.display_name,
-                                    ),
-                                );
-                                ui.add_space(8.0);
-                                ui.label("Invite code");
-                                ui.add_sized(
-                                    vec2(400.0, 92.0),
-                                    egui::TextEdit::multiline(
-                                        &mut self.join_session_draft.invite_code,
-                                    ),
-                                );
-                                ui.add_space(8.0);
-                                ui.label("Session passphrase (if required)");
-                                ui.add_sized(
-                                    vec2(400.0, 28.0),
-                                    egui::TextEdit::singleline(
-                                        &mut self.join_session_draft.session_passphrase,
-                                    )
-                                    .password(true),
-                                );
-                                if let Some(error) = &self.join_session_draft.error {
-                                    ui.add_space(6.0);
-                                    ui.colored_label(Color32::from_rgb(239, 68, 68), error);
-                                }
-                                ui.add_space(10.0);
-                                ui.horizontal(|ui| {
-                                    if ui.button("Cancel").clicked() {
-                                        close = true;
-                                    }
-                                    if ui.button("Join").clicked() {
-                                        self.submit_join_session();
-                                    }
-                                });
-                            }
-                        }
-                    });
-            });
-
-        if close {
-            self.join_session_open = false;
-        }
-    }
 }
 
 impl eframe::App for TerminalApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let frame_started_at = Instant::now();
+        let mut perf_snapshot = FramePerfSnapshot {
+            orchestration_scan_time: self.last_orchestration_scan_duration,
+            ..FramePerfSnapshot::default()
+        };
         self.ctx = Some(ctx.clone());
         self.handle_collab_events();
         self.maybe_refresh_orchestration();
@@ -1453,6 +966,19 @@ impl eframe::App for TerminalApp {
             }
         }
         let runtime_repaint_now = self.repaint_policy.should_repaint_now();
+        perf_snapshot.runtime_repaint = runtime_repaint_now;
+        let (attached_sessions, detached_sessions) = self
+            .workspaces
+            .iter()
+            .map(Workspace::runtime_session_counts)
+            .fold(
+                (0, 0),
+                |(attached_acc, detached_acc), (attached, detached)| {
+                    (attached_acc + attached, detached_acc + detached)
+                },
+            );
+        perf_snapshot.attached_sessions = attached_sessions;
+        perf_snapshot.detached_sessions = detached_sessions;
 
         if !self.command_palette.open
             && self.renaming_panel.is_none()
@@ -1484,9 +1010,145 @@ impl eframe::App for TerminalApp {
                         &self.workspaces,
                         self.active_ws,
                         &state,
+                        self.collab.mode(),
+                        self.collab.session_state(),
                     );
                     self.handle_sidebar_responses(responses, ctx);
                 });
+        }
+
+        let mut requested_layout = None;
+        if !matches!(self.collab.mode(), CollabMode::Guest) {
+            let mut requested_panel = None;
+            let mut layout_menu_anchor = None;
+            let mut layout_button_hovered = false;
+            let mut taskbar_panels: Vec<_> = self
+                .ws()
+                .panels
+                .iter()
+                .map(|panel| {
+                    let provider = taskbar_provider_label(
+                        self.orchestrator
+                            .panel_overlay(panel.id())
+                            .map(|overlay| overlay.provider),
+                        panel.provider_hint(),
+                        panel.title(),
+                    );
+                    (
+                        panel.z_index(),
+                        panel.id(),
+                        panel.title().to_owned(),
+                        panel.minimized(),
+                        panel.focused(),
+                        provider,
+                    )
+                })
+                .collect();
+            taskbar_panels.sort_by_key(|(z, ..)| *z);
+            let summary =
+                taskbar_summary_label(self.ws().panel_count(), self.ws().minimized_panel_count());
+            TopBottomPanel::bottom("window-taskbar")
+                .resizable(false)
+                .exact_height(42.0)
+                .show(ctx, |ui| {
+                    ui.add_space(4.0);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            egui::RichText::new(summary)
+                                .size(11.5)
+                                .color(Color32::from_rgb(150, 150, 158)),
+                        );
+                        ui.add_space(6.0);
+                        let layout_button = ui.add(
+                            egui::Button::new(
+                                egui::RichText::new("Acomodar")
+                                    .size(11.5)
+                                    .color(Color32::WHITE),
+                            )
+                            .fill(Color32::from_rgb(44, 44, 52))
+                            .stroke(Stroke::new(1.0, Color32::from_rgb(74, 74, 84)))
+                            .rounding(8.0),
+                        );
+                        layout_menu_anchor = Some(layout_button.rect);
+                        layout_button_hovered = layout_button.hovered();
+                        if layout_button.clicked() {
+                            self.layout_menu_open = !self.layout_menu_open;
+                        }
+                        ui.add_space(8.0);
+                        for (_, panel_id, title, minimized, focused, provider) in &taskbar_panels {
+                            let label = if *minimized {
+                                format!("  □ {}", truncate_taskbar_title(title))
+                            } else {
+                                format!("  {}", truncate_taskbar_title(title))
+                            };
+                            let (fill, stroke_color, text_color) =
+                                taskbar_button_colors(*provider, *focused, *minimized);
+                            let accent = taskbar_provider_accent(*provider);
+                            let response = ui.add(
+                                egui::Button::new(
+                                    egui::RichText::new(label).size(11.5).color(text_color),
+                                )
+                                .fill(fill)
+                                .stroke(Stroke::new(1.0, stroke_color))
+                                .rounding(8.0),
+                            );
+                            let accent_rect = Rect::from_min_max(
+                                pos2(response.rect.left() + 5.0, response.rect.top() + 5.0),
+                                pos2(response.rect.left() + 11.0, response.rect.bottom() - 5.0),
+                            );
+                            ui.painter().rect_filled(accent_rect, 3.0, accent);
+                            if response.clicked() {
+                                requested_panel = Some(*panel_id);
+                            }
+                        }
+                    });
+                });
+            if self.layout_menu_open {
+                if let Some(anchor) = layout_menu_anchor {
+                    let menu_response = Area::new(Id::new("taskbar-layout-menu"))
+                        .order(Order::Foreground)
+                        .fixed_pos(pos2(anchor.left(), anchor.top() - 152.0))
+                        .show(ctx, |ui| {
+                            egui::Frame::default()
+                                .fill(Color32::from_rgb(26, 26, 30))
+                                .stroke(Stroke::new(1.0, Color32::from_rgb(74, 74, 84)))
+                                .rounding(12.0)
+                                .show(ui, |ui| {
+                                    ui.set_min_width(180.0);
+                                    ui.label(
+                                        egui::RichText::new("Acomodar ventanas")
+                                            .size(11.5)
+                                            .color(Color32::from_rgb(166, 166, 174)),
+                                    );
+                                    ui.add_space(6.0);
+                                    for preset in [
+                                        TaskbarLayoutPreset::SideBySide,
+                                        TaskbarLayoutPreset::Stacked,
+                                        TaskbarLayoutPreset::Grid,
+                                        TaskbarLayoutPreset::Cascade,
+                                    ] {
+                                        if ui.button(preset.label()).clicked() {
+                                            requested_layout = Some(preset);
+                                            self.layout_menu_open = false;
+                                        }
+                                    }
+                                })
+                                .response
+                        })
+                        .inner;
+                    if ctx.input(|i| i.pointer.primary_clicked())
+                        && !layout_button_hovered
+                        && !menu_response.hovered()
+                    {
+                        self.layout_menu_open = false;
+                    }
+                } else {
+                    self.layout_menu_open = false;
+                }
+            }
+            if let Some(panel_id) = requested_panel {
+                self.focus_panel_across_workspaces(panel_id, Some(ctx.available_rect()));
+            }
         }
 
         CentralPanel::default().show(ctx, |ui| {
@@ -1616,14 +1278,28 @@ impl eframe::App for TerminalApp {
                     i.modifiers,
                 )
             });
+            self.viewport = Viewport::default();
+            self.viewport_animation = None;
+            let desktop_rect = desktop_canvas_rect(canvas_rect);
+            let desktop_screen = desktop_screen_rect(canvas_rect, desktop_rect);
+            if let Some(preset) = requested_layout {
+                apply_taskbar_layout_to_workspace(self.ws_mut(), preset, desktop_rect);
+            }
+            clamp_workspace_panels_to_desktop(self.ws_mut(), desktop_rect);
+            ui.painter()
+                .rect_filled(desktop_screen, 16.0, Color32::from_rgb(16, 16, 20));
+            ui.painter().rect_stroke(
+                desktop_screen,
+                16.0,
+                Stroke::new(1.0, Color32::from_rgb(44, 44, 54)),
+            );
             let pointer_pos = gesture_pointer_pos(latest_pos, interact_pos, hover_pos);
             let hovered_hit = pointer_pos
-                .filter(|pos| canvas_rect.contains(*pos))
+                .filter(|pos| desktop_screen.contains(*pos))
                 .and_then(|pos| top_panel_hit(self.ws(), pos, &self.viewport, canvas_rect));
             let scroll_target = pointer_pos
-                .filter(|pos| canvas_rect.contains(*pos))
+                .filter(|pos| desktop_screen.contains(*pos))
                 .and_then(|pos| top_panel_scroll_hit(self.ws(), pos, &self.viewport, canvas_rect));
-            let panel_interacting = self.panel_gesture.is_some();
             let hovered_panel = hovered_hit.is_some();
             let scroll_capture_active = panel_scroll_capture_active(
                 hovered_panel,
@@ -1636,32 +1312,22 @@ impl eframe::App for TerminalApp {
                 if let (Some(index), scroll_y) = (scroll_target, smooth_scroll_delta.y) {
                     if scroll_y != 0.0 {
                         let panel_id = self.ws().panels[index].id();
+                        let viewport = self.viewport;
                         if matches!(self.collab.mode(), CollabMode::Host)
                             && self.collab.controller_for(panel_id).is_some()
                         {
                             self.collab.revoke_control(panel_id, "Host took control");
                         }
                         let panel = &mut self.ws_mut().panels[index];
-                        panel.handle_scroll(scroll_y, ctx);
+                        panel.handle_scroll(scroll_y, pointer_pos, &viewport, canvas_rect, ctx);
                     }
                 }
             }
 
-            let canvas_input = handle_canvas_input(
-                ui,
-                &mut self.viewport,
-                canvas_rect,
-                hovered_panel || panel_interacting,
-                scroll_capture_active,
-            );
-            let mut fast_path_render = canvas_input.navigating || self.panel_gesture.is_some();
-            let mut needs_interaction_repaint = canvas_input.navigating || scroll_capture_active;
-
-            if primary_pressed || canvas_input.navigating {
-                self.viewport_animation = None;
-            }
-
             let mut guides = Vec::new();
+            let mut snap_preview_rect = None;
+            let fast_path_render = self.panel_gesture.is_some();
+            let needs_interaction_repaint = scroll_capture_active || self.panel_gesture.is_some();
             if primary_pressed {
                 match hovered_hit {
                     Some(hit) => {
@@ -1704,7 +1370,9 @@ impl eframe::App for TerminalApp {
                                     panel.set_resize_virtual_rect(Some(origin));
                                 }
                             }
-                            PanelHitArea::Body | PanelHitArea::CloseButton => {
+                            PanelHitArea::Body
+                            | PanelHitArea::CloseButton
+                            | PanelHitArea::MinimizeButton => {
                                 self.panel_gesture = None;
                             }
                         }
@@ -1721,6 +1389,7 @@ impl eframe::App for TerminalApp {
                     let pointer_delta = pointer - gesture.pointer_origin;
                     let other_rects = self.ws().panel_rects_except(gesture.panel_id);
                     let zoom = self.viewport.zoom;
+                    let pointer_canvas = self.viewport.screen_to_canvas(pointer, canvas_rect);
                     if let Some(panel) = self
                         .ws_mut()
                         .panels
@@ -1730,27 +1399,54 @@ impl eframe::App for TerminalApp {
                         guides = match gesture.kind {
                             PanelGestureKind::Drag { origin } => {
                                 panel.set_drag_virtual_pos(Some(origin));
-                                panel.drag_to(origin, pointer_delta, zoom, &other_rects)
+                                let guides =
+                                    panel.drag_to(origin, pointer_delta, zoom, &other_rects);
+                                let clamped = clamp_rect_to_desktop(panel.rect(), desktop_rect);
+                                panel.apply_resize(clamped);
+                                snap_preview_rect =
+                                    desktop_snap_rect_for_pointer(pointer_canvas, desktop_rect);
+                                guides
                             }
                             PanelGestureKind::Resize { handle, origin } => {
                                 panel.set_resize_virtual_rect(Some(origin));
-                                panel.resize_to(handle, origin, pointer_delta, zoom, &other_rects)
+                                let guides = panel.resize_to(
+                                    handle,
+                                    origin,
+                                    pointer_delta,
+                                    zoom,
+                                    &other_rects,
+                                );
+                                let clamped = clamp_rect_to_desktop(panel.rect(), desktop_rect);
+                                panel.apply_resize(clamped);
+                                guides
                             }
                         };
                     }
                 }
             }
-            fast_path_render |= self.panel_gesture.is_some();
-            needs_interaction_repaint |= self.panel_gesture.is_some();
 
             if primary_released {
                 if let Some(gesture) = self.panel_gesture.take() {
+                    let release_snap = match (gesture.kind, pointer_pos) {
+                        (PanelGestureKind::Drag { .. }, Some(pointer)) => {
+                            let pointer_canvas =
+                                self.viewport.screen_to_canvas(pointer, canvas_rect);
+                            desktop_snap_rect_for_pointer(pointer_canvas, desktop_rect)
+                        }
+                        _ => None,
+                    };
                     if let Some(panel) = self
                         .ws_mut()
                         .panels
                         .iter_mut()
                         .find(|panel| panel.id() == gesture.panel_id)
                     {
+                        if let Some(snap_rect) = release_snap {
+                            panel.apply_resize(snap_rect);
+                        } else {
+                            let clamped = clamp_rect_to_desktop(panel.rect(), desktop_rect);
+                            panel.apply_resize(clamped);
+                        }
                         panel.set_drag_virtual_pos(None);
                         panel.set_resize_virtual_rect(None);
                     }
@@ -1762,6 +1458,10 @@ impl eframe::App for TerminalApp {
                     if matches!(hit.area, PanelHitArea::CloseButton) {
                         let panel_id = self.ws().panels[hit.index].id();
                         self.ws_mut().close_panel(panel_id);
+                        self.reconcile_orchestration();
+                    } else if matches!(hit.area, PanelHitArea::MinimizeButton) {
+                        let panel_id = self.ws().panels[hit.index].id();
+                        self.ws_mut().toggle_minimize_panel(panel_id);
                     }
                 }
             }
@@ -1770,21 +1470,18 @@ impl eframe::App for TerminalApp {
                 if let Some(hit) = hovered_hit {
                     if matches!(hit.area, PanelHitArea::Body | PanelHitArea::TitleBar) {
                         let panel_id = self.ws().panels[hit.index].id();
-                        self.start_focus_animation(panel_id, canvas_rect, ctx.input(|i| i.time));
+                        self.ws_mut().bring_to_front(panel_id);
                     }
                 }
-            }
-
-            self.update_viewport_animation(ctx);
-
-            if self.show_grid {
-                draw_grid(ui.painter(), &self.viewport, canvas_rect);
             }
 
             let mut panel_order: Vec<_> = (0..self.ws().panels.len()).collect();
             panel_order.sort_by_key(|index| self.ws().panels[*index].z_index());
 
             for index in panel_order {
+                if self.ws().panels[index].minimized() {
+                    continue;
+                }
                 if !self
                     .viewport
                     .is_visible(self.ws().panels[index].rect(), canvas_rect)
@@ -1805,7 +1502,26 @@ impl eframe::App for TerminalApp {
                         overlay.as_ref(),
                     )
                 };
+                perf_snapshot.visible_panels += 1;
+                perf_snapshot.note_render(interaction.render_tier, interaction.cache_hit);
                 guides.extend(interaction.guides);
+            }
+
+            if let Some(snap_rect) = snap_preview_rect {
+                let preview_screen = Rect::from_min_size(
+                    self.viewport.canvas_to_screen(snap_rect.min, canvas_rect),
+                    snap_rect.size() * self.viewport.zoom,
+                );
+                ui.painter().rect_filled(
+                    preview_screen,
+                    14.0,
+                    Color32::from_rgba_premultiplied(86, 124, 255, 38),
+                );
+                ui.painter().rect_stroke(
+                    preview_screen,
+                    14.0,
+                    Stroke::new(1.0, Color32::from_rgb(106, 146, 255)),
+                );
             }
 
             for guide in guides {
@@ -1819,29 +1535,10 @@ impl eframe::App for TerminalApp {
             ui.painter().text(
                 canvas_rect.left_bottom() + vec2(12.0, -10.0),
                 Align2::LEFT_BOTTOM,
-                format!(
-                    "Zoom {:.0}% · Pan ({:.0}, {:.0}) · Panels {}",
-                    self.viewport.zoom * 100.0,
-                    self.viewport.pan.x,
-                    self.viewport.pan.y,
-                    self.ws().panel_count()
-                ),
+                format!("Ventanas {}", self.ws().panel_count()),
                 FontId::proportional(11.0),
                 Color32::from_rgb(115, 115, 115),
             );
-
-            if self.show_minimap {
-                let result = minimap::show(ui, &self.ws().panels, &self.viewport, canvas_rect);
-                if result.hide_clicked {
-                    self.show_minimap = false;
-                }
-                if result.focus_all_clicked {
-                    self.start_overview_animation(canvas_rect, ctx.input(|i| i.time));
-                }
-                if let Some(target) = result.navigate_to {
-                    self.viewport.pan_to_center(target, canvas_rect);
-                }
-            }
 
             if needs_interaction_repaint {
                 ui.ctx().request_repaint();
@@ -1853,7 +1550,6 @@ impl eframe::App for TerminalApp {
         }
 
         self.publish_collab_snapshot();
-        self.show_collab_hud(ctx);
         self.show_share_workspace_dialog(ctx);
         self.show_join_session_dialog(ctx);
         self.show_launch_dialog(ctx);
@@ -1874,6 +1570,8 @@ impl eframe::App for TerminalApp {
         {
             ctx.request_repaint_after(Duration::from_millis(120));
         }
+        perf_snapshot.frame_time = frame_started_at.elapsed();
+        self.last_perf_snapshot = perf_snapshot;
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
@@ -1992,6 +1690,7 @@ fn overview_viewport_for_panels(
 ) -> Viewport {
     let Some(bounds) = panels
         .iter()
+        .filter(|panel| !panel.minimized())
         .map(|panel| panel.rect())
         .reduce(|a, b| a.union(b))
     else {
@@ -2096,13 +1795,17 @@ fn top_panel_hit(
     panel_order.reverse();
 
     panel_order.into_iter().find_map(|index| {
-        workspace.panels[index]
-            .hit_test(pointer, viewport, canvas_rect)
-            .map(|area| PanelHit {
-                index,
-                area,
-                pointer,
-            })
+        if workspace.panels[index].minimized() {
+            None
+        } else {
+            workspace.panels[index]
+                .hit_test(pointer, viewport, canvas_rect)
+                .map(|area| PanelHit {
+                    index,
+                    area,
+                    pointer,
+                })
+        }
     })
 }
 
@@ -2118,6 +1821,7 @@ fn top_panel_scroll_hit(
 
     panel_order
         .into_iter()
+        .filter(|index| !workspace.panels[*index].minimized())
         .find(|index| workspace.panels[*index].scroll_hit_test(pointer, viewport, canvas_rect))
 }
 
@@ -2128,13 +1832,18 @@ mod tests {
     use egui::{pos2, vec2, CentralPanel, Color32, Modifiers, RawInput, Rect};
     use uuid::Uuid;
 
+    use super::taskbar::desktop_taskbar_layout_rects;
     use super::{
+        clamp_rect_to_desktop, desktop_canvas_rect, desktop_snap_rect_for_pointer,
         interpolate_viewport, overview_viewport_for_panels, panel_scroll_capture_active,
-        top_panel_hit, top_panel_scroll_hit, upsert_workspace_for_folder,
+        taskbar_button_colors, taskbar_provider_accent, taskbar_provider_label,
+        taskbar_summary_label, top_panel_hit, top_panel_scroll_hit, upsert_workspace_for_folder,
+        TaskbarLayoutPreset,
     };
     use crate::canvas::config::{MINIMAP_BG, MINIMAP_HEIGHT, MINIMAP_PADDING, MINIMAP_WIDTH};
     use crate::canvas::minimap;
     use crate::canvas::viewport::Viewport;
+    use crate::orchestration::AgentProvider;
     use crate::panel::CanvasPanel;
     use crate::state::Workspace;
     use crate::terminal::panel::{TerminalPanel, PANEL_BG};
@@ -2180,6 +1889,188 @@ mod tests {
         );
 
         assert_eq!(hit, Some(1));
+    }
+
+    #[test]
+    fn top_panel_hit_ignores_minimized_panels() {
+        let mut workspace = Workspace::new("Default", None);
+        let back = TerminalPanel::new(pos2(0.0, 0.0), vec2(300.0, 200.0), Color32::WHITE, 0);
+        let front =
+            TerminalPanel::new(pos2(20.0, 20.0), vec2(300.0, 200.0), Color32::LIGHT_BLUE, 1);
+        let front_id = front.id;
+        workspace.add_restored_terminal(back);
+        workspace.add_restored_terminal(front);
+        workspace.bring_to_front(front_id);
+        workspace.toggle_minimize_panel(front_id);
+
+        let hit = top_panel_hit(
+            &workspace,
+            pos2(50.0, 50.0),
+            &Viewport::default(),
+            Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0)),
+        )
+        .unwrap();
+
+        assert_eq!(hit.index, 0);
+    }
+
+    #[test]
+    fn taskbar_summary_reports_total_and_minimized_windows() {
+        assert_eq!(taskbar_summary_label(5, 2), "5 abiertas · 2 minimizadas");
+    }
+
+    #[test]
+    fn taskbar_provider_prefers_overlay_metadata() {
+        let provider = taskbar_provider_label(Some(AgentProvider::CodexCli), None, "Claude Code");
+
+        assert_eq!(provider, AgentProvider::CodexCli);
+    }
+
+    #[test]
+    fn taskbar_provider_falls_back_to_title_detection() {
+        let provider = taskbar_provider_label(None, None, "OpenCode session");
+
+        assert_eq!(provider, AgentProvider::OpenCode);
+    }
+
+    #[test]
+    fn taskbar_provider_uses_panel_hint_before_title_detection() {
+        let provider = taskbar_provider_label(None, Some(AgentProvider::ClaudeCode), "Terminal");
+
+        assert_eq!(provider, AgentProvider::ClaudeCode);
+    }
+
+    #[test]
+    fn taskbar_colors_use_blue_family_for_codex() {
+        let (fill, stroke, text) = taskbar_button_colors(AgentProvider::CodexCli, true, false);
+
+        assert_eq!(fill, Color32::from_rgb(38, 82, 156));
+        assert_eq!(stroke, Color32::from_rgb(126, 184, 255));
+        assert_eq!(text, Color32::from_rgb(232, 242, 255));
+    }
+
+    #[test]
+    fn taskbar_colors_use_orange_family_for_claude() {
+        let (fill, stroke, text) = taskbar_button_colors(AgentProvider::ClaudeCode, false, false);
+
+        assert_eq!(fill, Color32::from_rgb(94, 54, 18));
+        assert_eq!(stroke, Color32::from_rgb(222, 142, 62));
+        assert_eq!(text, Color32::from_rgb(255, 238, 216));
+    }
+
+    #[test]
+    fn taskbar_colors_use_gray_family_for_opencode_minimized() {
+        let (fill, stroke, text) = taskbar_button_colors(AgentProvider::OpenCode, false, true);
+
+        assert_eq!(fill, Color32::from_rgb(36, 36, 42));
+        assert_eq!(stroke, Color32::from_rgb(124, 124, 132));
+        assert_eq!(text, Color32::from_rgb(182, 182, 188));
+    }
+
+    #[test]
+    fn taskbar_accent_is_bright_for_codex() {
+        assert_eq!(
+            taskbar_provider_accent(AgentProvider::CodexCli),
+            Color32::from_rgb(120, 190, 255)
+        );
+    }
+
+    #[test]
+    fn side_by_side_layout_splits_visible_windows_evenly() {
+        let desktop = Rect::from_min_max(pos2(0.0, 0.0), pos2(1200.0, 800.0));
+
+        let rects = desktop_taskbar_layout_rects(TaskbarLayoutPreset::SideBySide, 2, desktop);
+
+        assert_eq!(rects.len(), 2);
+        assert!(approx_rect(
+            rects[0],
+            Rect::from_min_max(pos2(0.0, 0.0), pos2(600.0, 800.0))
+        ));
+        assert!(approx_rect(
+            rects[1],
+            Rect::from_min_max(pos2(600.0, 0.0), pos2(1200.0, 800.0))
+        ));
+    }
+
+    #[test]
+    fn grid_layout_places_three_windows_in_balanced_cells() {
+        let desktop = Rect::from_min_max(pos2(0.0, 0.0), pos2(1200.0, 800.0));
+
+        let rects = desktop_taskbar_layout_rects(TaskbarLayoutPreset::Grid, 3, desktop);
+
+        assert_eq!(rects.len(), 3);
+        assert!(approx_rect(
+            rects[0],
+            Rect::from_min_max(pos2(0.0, 0.0), pos2(600.0, 400.0))
+        ));
+        assert!(approx_rect(
+            rects[1],
+            Rect::from_min_max(pos2(600.0, 0.0), pos2(1200.0, 400.0))
+        ));
+        assert!(approx_rect(
+            rects[2],
+            Rect::from_min_max(pos2(0.0, 400.0), pos2(600.0, 800.0))
+        ));
+    }
+
+    #[test]
+    fn cascade_layout_offsets_each_window_and_stays_inside_desktop() {
+        let desktop = Rect::from_min_max(pos2(0.0, 0.0), pos2(1200.0, 800.0));
+
+        let rects = desktop_taskbar_layout_rects(TaskbarLayoutPreset::Cascade, 3, desktop);
+
+        assert_eq!(rects.len(), 3);
+        assert!(desktop.contains_rect(rects[0]));
+        assert!(desktop.contains_rect(rects[1]));
+        assert!(desktop.contains_rect(rects[2]));
+        assert!(rects[1].min.x > rects[0].min.x);
+        assert!(rects[1].min.y > rects[0].min.y);
+        assert!(rects[2].min.x > rects[1].min.x);
+        assert!(rects[2].min.y > rects[1].min.y);
+    }
+
+    #[test]
+    fn desktop_canvas_rect_reaches_platform_edges() {
+        let canvas_rect = Rect::from_min_max(pos2(0.0, 0.0), pos2(1280.0, 720.0));
+
+        let desktop = desktop_canvas_rect(canvas_rect);
+
+        assert_eq!(desktop.min, pos2(0.0, 0.0));
+        assert_eq!(desktop.max, pos2(1280.0, 720.0));
+    }
+
+    #[test]
+    fn clamp_rect_to_desktop_keeps_window_inside_bounds() {
+        let desktop = Rect::from_min_max(pos2(16.0, 16.0), pos2(1016.0, 716.0));
+        let rect = Rect::from_min_size(pos2(900.0, 660.0), vec2(320.0, 220.0));
+
+        let clamped = clamp_rect_to_desktop(rect, desktop);
+
+        assert!(desktop.contains_rect(clamped));
+    }
+
+    #[test]
+    fn snap_rect_for_pointer_uses_left_half_on_left_edge() {
+        let desktop = Rect::from_min_max(pos2(16.0, 16.0), pos2(1016.0, 716.0));
+
+        let snap = desktop_snap_rect_for_pointer(pos2(18.0, 320.0), desktop).unwrap();
+
+        assert_eq!(snap.left(), desktop.left());
+        assert_eq!(snap.top(), desktop.top());
+        assert_eq!(snap.bottom(), desktop.bottom());
+        assert!((snap.width() - desktop.width() * 0.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn snap_rect_for_pointer_uses_top_right_quadrant_on_corner() {
+        let desktop = Rect::from_min_max(pos2(16.0, 16.0), pos2(1016.0, 716.0));
+
+        let snap = desktop_snap_rect_for_pointer(pos2(1014.0, 18.0), desktop).unwrap();
+
+        assert_eq!(snap.right(), desktop.right());
+        assert_eq!(snap.top(), desktop.top());
+        assert!((snap.width() - desktop.width() * 0.5).abs() < 0.001);
+        assert!((snap.height() - desktop.height() * 0.5).abs() < 0.001);
     }
 
     #[test]

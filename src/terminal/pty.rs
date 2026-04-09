@@ -1,12 +1,12 @@
 use std::io::{Read, Write};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Instant;
 
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
-use alacritty_terminal::grid::Scroll;
+use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::term::{Config as TermConfig, Term, TermMode};
 use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
@@ -44,9 +44,18 @@ pub struct PtyHandle {
     pub last_input_at: Arc<Mutex<Instant>>,
     pub last_output_at: Arc<Mutex<Instant>>,
     window_size: Arc<Mutex<WindowSize>>,
+    render_revision: Arc<AtomicU64>,
+    scrollback_limit: usize,
     master: Box<dyn MasterPty + Send>,
     killer: Box<dyn ChildKiller + Send + Sync>,
     _reader_thread: thread::JoinHandle<()>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct TerminalScrollState {
+    pub display_offset: usize,
+    pub visible_rows: usize,
+    pub history_size: usize,
 }
 
 impl PtyHandle {
@@ -83,9 +92,12 @@ impl PtyHandle {
             cell_width: 0,
             cell_height: 0,
         }));
+        let render_revision = Arc::new(AtomicU64::new(0));
         let (event_tx, event_rx) = mpsc::channel::<Event>();
+        let term_config = TermConfig::default();
+        let scrollback_limit = term_config.scrolling_history;
         let term = Arc::new(Mutex::new(Term::new(
-            TermConfig::default(),
+            term_config,
             &TermSize::new(cols as usize, rows as usize),
             EventProxy::new(event_tx),
         )));
@@ -98,6 +110,7 @@ impl PtyHandle {
         let output_for_reader = Arc::clone(&last_output_at);
         let term_for_reader = Arc::clone(&term);
         let window_size_for_reader = Arc::clone(&window_size);
+        let render_revision_for_reader = Arc::clone(&render_revision);
         let scheduler_for_reader = Arc::clone(&scheduler);
         let reader_thread = thread::spawn(move || {
             let mut buf = [0_u8; 4096];
@@ -115,6 +128,7 @@ impl PtyHandle {
                         if let Ok(mut term) = term_for_reader.lock() {
                             processor.advance(&mut *term, &buf[..read]);
                         }
+                        render_revision_for_reader.fetch_add(1, Ordering::Relaxed);
                         *output_for_reader.lock().unwrap() = Instant::now();
                         if let Ok(mut scheduler) = scheduler_for_reader.lock() {
                             scheduler.record_output(session_id);
@@ -160,6 +174,8 @@ impl PtyHandle {
             last_input_at,
             last_output_at,
             window_size,
+            render_revision,
+            scrollback_limit,
             master: pair.master,
             killer,
             _reader_thread: reader_thread,
@@ -182,6 +198,7 @@ impl PtyHandle {
         if let Ok(mut term) = self.term.lock() {
             term.resize(TermSize::new(cols as usize, rows as usize));
         }
+        self.mark_render_dirty();
     }
 
     pub fn write_all(&self, bytes: &[u8]) {
@@ -207,6 +224,7 @@ impl PtyHandle {
         if let Ok(mut term) = self.term.lock() {
             term.scroll_display(scroll);
         }
+        self.mark_render_dirty();
     }
 
     pub fn selected_text(&self) -> Option<String> {
@@ -226,6 +244,36 @@ impl PtyHandle {
         if let Ok(mut term) = self.term.try_lock() {
             term.selection = None;
         }
+        self.mark_render_dirty();
+    }
+
+    pub fn render_revision(&self) -> u64 {
+        self.render_revision.load(Ordering::Relaxed)
+    }
+
+    pub fn mark_render_dirty(&self) {
+        self.render_revision.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn scroll_state(&self) -> Option<TerminalScrollState> {
+        let term = self.term.try_lock().ok()?;
+        Some(TerminalScrollState {
+            display_offset: term.grid().display_offset(),
+            visible_rows: term.screen_lines(),
+            history_size: term.grid().history_size().min(self.scrollback_limit),
+        })
+    }
+
+    pub fn scroll_to_display_offset(&self, target: usize) {
+        if let Ok(mut term) = self.term.try_lock() {
+            let current = term.grid().display_offset() as i32;
+            let target = target.min(term.grid().history_size()) as i32;
+            let delta = target - current;
+            if delta != 0 {
+                term.scroll_display(Scroll::Delta(delta));
+            }
+        }
+        self.mark_render_dirty();
     }
 
     pub fn take_bell(&self) -> bool {

@@ -360,6 +360,8 @@ pub struct PanelRuntimeObservation {
     pub visible_text: String,
     pub alive: bool,
     pub recent_output: bool,
+    pub attached: bool,
+    pub minimized: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -821,7 +823,13 @@ impl Orchestrator {
                 &observation.visible_text,
                 session.review_summary.last_error.as_deref(),
             );
-            let git = session.cwd.as_deref().and_then(inspect_git_state);
+            let should_inspect_git = observation.attached
+                && !observation.minimized
+                && session.cwd.is_some()
+                && (session.provider != AgentProvider::Unknown || session.task_id.is_some());
+            let git = should_inspect_git
+                .then(|| session.cwd.as_deref().and_then(inspect_git_state))
+                .flatten();
             if let Some(git) = git {
                 session.repo_root = Some(git.repo_root.clone());
                 session.branch = Some(git.branch.clone());
@@ -1909,6 +1917,8 @@ mod tests {
             visible_text: "mauro % claude\nTests passed. Ready for review.".to_owned(),
             alive: true,
             recent_output: true,
+            attached: true,
+            minimized: false,
         }]);
 
         let session = orchestrator
@@ -1983,6 +1993,8 @@ mod tests {
             visible_text: "Waiting for approval to run command".to_owned(),
             alive: true,
             recent_output: true,
+            attached: true,
+            minimized: false,
         }]);
 
         let matching = orchestrator.session_items(

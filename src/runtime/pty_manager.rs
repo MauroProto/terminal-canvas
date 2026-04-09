@@ -96,6 +96,10 @@ impl ManagedSession {
 
         Some(self.spec.title.clone())
     }
+
+    fn is_attached(&self) -> bool {
+        self.handle.is_some()
+    }
 }
 
 impl RuntimeScheduler {
@@ -228,11 +232,46 @@ impl PtyManager {
         rows: u16,
     ) -> anyhow::Result<Uuid> {
         let session_id = Uuid::new_v4();
+        let detached_spec = SessionSpec {
+            title: spec.title.clone(),
+            cwd: spec.cwd.clone().or_else(|| cwd.map(Path::to_path_buf)),
+            startup_command: spec.startup_command.clone(),
+            startup_input: spec.startup_input.clone(),
+        };
+        self.sessions
+            .insert(session_id, ManagedSession::detached(detached_spec));
+        if let Err(err) = self.attach_detached(ctx, session_id, cols, rows) {
+            self.sessions.remove(&session_id);
+            return Err(err);
+        }
+        Ok(session_id)
+    }
+
+    pub fn attach_detached(
+        &mut self,
+        ctx: &egui::Context,
+        session_id: Uuid,
+        cols: u16,
+        rows: u16,
+    ) -> anyhow::Result<()> {
         let _ = ctx;
-        let startup_command = spec.startup_command.clone();
-        let startup_input = spec.startup_input.clone();
-        let handle = PtyHandle::spawn(cwd, cols, rows, session_id, Arc::clone(&self.scheduler))?;
-        if let Some(command) = startup_command
+        let Some(session) = self.sessions.get_mut(&session_id) else {
+            anyhow::bail!("Runtime session not found");
+        };
+        if session.is_attached() {
+            return Ok(());
+        }
+
+        let spec = session.spec.clone();
+        let handle = PtyHandle::spawn(
+            spec.cwd.as_deref(),
+            cols,
+            rows,
+            session_id,
+            Arc::clone(&self.scheduler),
+        )?;
+        if let Some(command) = spec
+            .startup_command
             .as_deref()
             .map(str::trim)
             .filter(|command| !command.is_empty())
@@ -240,7 +279,8 @@ impl PtyManager {
             handle.write_all(format!("{command}\n").as_bytes());
         }
         let shared_handle = Arc::new(Mutex::new(handle));
-        if let Some(input) = startup_input
+        if let Some(input) = spec
+            .startup_input
             .as_deref()
             .map(str::trim)
             .filter(|input| !input.is_empty())
@@ -254,9 +294,9 @@ impl PtyManager {
                 }
             });
         }
-        self.sessions
-            .insert(session_id, ManagedSession::attached(spec, shared_handle));
-        Ok(session_id)
+        session.handle = Some(shared_handle);
+        session.detached_alive = false;
+        Ok(())
     }
 
     pub fn handle(&self, session_id: Uuid) -> Option<SharedPtyHandle> {
@@ -269,11 +309,38 @@ impl PtyManager {
         self.sessions.get(&session_id)?.title_snapshot()
     }
 
+    pub fn update_spec_title(&mut self, session_id: Uuid, title: String) {
+        if let Some(session) = self.sessions.get_mut(&session_id) {
+            session.spec.title = title;
+        }
+    }
+
     pub fn is_alive(&self, session_id: Uuid) -> bool {
         self.sessions
             .get(&session_id)
             .map(ManagedSession::is_alive)
             .unwrap_or(false)
+    }
+
+    pub fn is_attached(&self, session_id: Uuid) -> bool {
+        self.sessions
+            .get(&session_id)
+            .map(ManagedSession::is_attached)
+            .unwrap_or(false)
+    }
+
+    pub fn attached_session_count(&self) -> usize {
+        self.sessions
+            .values()
+            .filter(|session| session.is_attached())
+            .count()
+    }
+
+    pub fn detached_session_count(&self) -> usize {
+        self.sessions
+            .values()
+            .filter(|session| !session.is_attached() && session.is_alive())
+            .count()
     }
 
     pub fn drain_ui_updates(&self) -> UiUpdateBatch {

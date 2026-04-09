@@ -28,6 +28,8 @@ pub fn draw_terminal_list(ui: &mut Ui, workspace: &Workspace) -> Vec<SidebarResp
             FontId::proportional(11.0),
             if panel.focused() {
                 TEXT_PRIMARY
+            } else if panel.minimized() {
+                Color32::from_rgb(126, 126, 134)
             } else {
                 TEXT_SECONDARY
             },

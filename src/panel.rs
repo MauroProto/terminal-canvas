@@ -2,7 +2,7 @@ use egui::{Color32, Pos2, Rect, Vec2};
 use uuid::Uuid;
 
 use crate::collab::{SharedPanelSnapshot, TerminalInputEvent};
-use crate::orchestration::{PanelOverlay, PanelRuntimeObservation};
+use crate::orchestration::{AgentProvider, PanelOverlay, PanelRuntimeObservation};
 use crate::state::PanelState;
 use crate::terminal::panel::{PanelHitArea, PanelInteraction, ResizeHandle, TerminalPanel};
 
@@ -20,6 +20,12 @@ impl CanvasPanel {
     pub fn runtime_session_id(&self) -> Option<Uuid> {
         match self {
             Self::Terminal(panel) => panel.runtime_session_id(),
+        }
+    }
+
+    pub fn runtime_session_attached(&self) -> bool {
+        match self {
+            Self::Terminal(panel) => panel.runtime_session_attached(),
         }
     }
 
@@ -63,6 +69,12 @@ impl CanvasPanel {
         }
     }
 
+    pub fn provider_hint(&self) -> Option<AgentProvider> {
+        match self {
+            Self::Terminal(panel) => panel.provider_hint(),
+        }
+    }
+
     pub fn z_index(&self) -> u32 {
         match self {
             Self::Terminal(panel) => panel.z_index,
@@ -81,9 +93,21 @@ impl CanvasPanel {
         }
     }
 
+    pub fn minimized(&self) -> bool {
+        match self {
+            Self::Terminal(panel) => panel.minimized(),
+        }
+    }
+
     pub fn set_focused(&mut self, focused: bool) {
         match self {
             Self::Terminal(panel) => panel.focused = focused,
+        }
+    }
+
+    pub fn set_minimized(&mut self, minimized: bool) {
+        match self {
+            Self::Terminal(panel) => panel.set_minimized(minimized),
         }
     }
 
@@ -150,9 +174,18 @@ impl CanvasPanel {
         }
     }
 
-    pub fn handle_scroll(&mut self, delta: f32, ctx: &egui::Context) {
+    pub fn handle_scroll(
+        &mut self,
+        delta: f32,
+        pointer: Option<egui::Pos2>,
+        viewport: &crate::canvas::viewport::Viewport,
+        canvas_rect: Rect,
+        ctx: &egui::Context,
+    ) {
         match self {
-            Self::Terminal(panel) => panel.handle_scroll(delta, ctx),
+            Self::Terminal(panel) => {
+                panel.handle_scroll(delta, pointer, viewport, canvas_rect, ctx)
+            }
         }
     }
 

@@ -82,6 +82,9 @@ pub fn show(
 
     let mut bounds = viewport.visible_canvas_rect(canvas_rect);
     for panel in panels {
+        if panel.minimized() {
+            continue;
+        }
         bounds = bounds.union(panel.rect());
     }
     bounds = bounds.expand(100.0);
@@ -102,6 +105,9 @@ pub fn show(
     };
 
     for panel in panels {
+        if panel.minimized() {
+            continue;
+        }
         let panel_rect = panel.rect();
         let mini_rect = Rect::from_min_max(to_minimap(panel_rect.min), to_minimap(panel_rect.max));
         let color = panel.color();

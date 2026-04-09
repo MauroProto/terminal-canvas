@@ -1,5 +1,11 @@
 use egui::{Key, Modifiers};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GridPoint {
+    pub line: usize,
+    pub column: usize,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct InputMode {
     pub app_cursor: bool,
@@ -12,6 +18,66 @@ pub struct InputMode {
 pub struct InputResult {
     pub bytes: Vec<u8>,
     pub copy_selection: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WheelAction {
+    Pty(Vec<u8>),
+    Scrollback(i32),
+}
+
+pub fn wheel_action(delta: f32, mode: &InputMode, point: Option<GridPoint>) -> Option<WheelAction> {
+    if delta.abs() <= f32::EPSILON {
+        return None;
+    }
+
+    if mode.alt_screen {
+        return Some(WheelAction::Pty(alt_screen_scroll_sequence(delta).to_vec()));
+    }
+
+    if mode.mouse_mode {
+        let point = point.unwrap_or(GridPoint { line: 0, column: 0 });
+        return Some(WheelAction::Pty(mouse_scroll_sgr_sequence(
+            mouse_scroll_button(delta),
+            point.column,
+            point.line,
+        )));
+    }
+
+    Some(WheelAction::Scrollback(scrollback_delta_from_input(delta)))
+}
+
+pub fn scroll_lines_from_input_delta(delta: f32) -> i32 {
+    ((delta.abs() / 24.0).round() as i32).max(1)
+}
+
+pub fn alt_screen_scroll_sequence(delta: f32) -> &'static [u8] {
+    if delta < 0.0 {
+        b"\x1b[A"
+    } else {
+        b"\x1b[B"
+    }
+}
+
+pub fn mouse_scroll_button(delta: f32) -> u8 {
+    if delta < 0.0 {
+        64
+    } else {
+        65
+    }
+}
+
+pub fn mouse_scroll_sgr_sequence(button: u8, column: usize, row: usize) -> Vec<u8> {
+    format!("\x1b[<{};{};{}M", button, column + 1, row + 1).into_bytes()
+}
+
+pub fn scrollback_delta_from_input(delta: f32) -> i32 {
+    let lines = scroll_lines_from_input_delta(delta);
+    if delta < 0.0 {
+        lines
+    } else {
+        -lines
+    }
 }
 
 pub fn modifier_param(modifiers: &Modifiers) -> u8 {
@@ -239,7 +305,8 @@ mod tests {
     use egui::{Key, Modifiers};
 
     use super::{
-        cursor_key_sequence, is_paste_shortcut, paste_bytes, should_copy_selection, InputMode,
+        cursor_key_sequence, is_paste_shortcut, paste_bytes, should_copy_selection, wheel_action,
+        GridPoint, InputMode, WheelAction,
     };
 
     #[test]
@@ -314,6 +381,30 @@ mod tests {
         let modifiers = copy_modifiers();
         assert!(should_copy_selection(&modifiers, &Key::C, true));
         assert!(!should_copy_selection(&modifiers, &Key::C, false));
+    }
+
+    #[test]
+    fn wheel_action_uses_pointer_cell_when_mouse_mode_is_enabled() {
+        let mode = InputMode {
+            mouse_mode: true,
+            ..InputMode::default()
+        };
+
+        let action = wheel_action(-48.0, &mode, Some(GridPoint { line: 2, column: 3 })).unwrap();
+
+        assert_eq!(action, WheelAction::Pty(b"\x1b[<64;4;3M".to_vec()));
+    }
+
+    #[test]
+    fn wheel_action_falls_back_to_scrollback_without_mouse_mode() {
+        let action = wheel_action(
+            48.0,
+            &InputMode::default(),
+            Some(GridPoint { line: 0, column: 0 }),
+        )
+        .unwrap();
+
+        assert_eq!(action, WheelAction::Scrollback(-2));
     }
 
     fn copy_modifiers() -> Modifiers {

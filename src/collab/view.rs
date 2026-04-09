@@ -34,6 +34,9 @@ pub fn draw_remote_workspace(
     panels.sort_by_key(|panel| panel.z_index);
 
     for panel in panels {
+        if panel.minimized {
+            continue;
+        }
         let rect = Rect::from_min_size(
             pos2(panel.position[0], panel.position[1]),
             vec2(panel.size[0], panel.size[1]),

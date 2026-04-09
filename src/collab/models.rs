@@ -93,6 +93,8 @@ pub struct SharedPanelSnapshot {
     pub color: [u8; 3],
     pub z_index: u32,
     pub focused: bool,
+    #[serde(default)]
+    pub minimized: bool,
     pub alive: bool,
     #[serde(default)]
     pub preview_label: String,

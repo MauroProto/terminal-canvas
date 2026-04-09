@@ -99,7 +99,7 @@ impl Workspace {
                 Arc::clone(&pty_manager),
             )));
         }
-        Self {
+        let mut workspace = Self {
             id: workspace_id,
             name: cwd.as_deref().map(workspace_name_from_path).unwrap_or(name),
             cwd: cwd.clone(),
@@ -110,7 +110,17 @@ impl Workspace {
             next_z,
             next_color,
             pty_manager,
+        };
+        if workspace
+            .panels
+            .iter()
+            .filter(|panel| panel.focused() && !panel.minimized())
+            .count()
+            != 1
+        {
+            workspace.focus_topmost_visible_panel();
         }
+        workspace
     }
 
     pub fn to_saved(&self) -> WorkspaceState {
@@ -177,6 +187,15 @@ impl Workspace {
     }
 
     pub fn bring_to_front(&mut self, panel_id: Uuid) {
+        if self
+            .panels
+            .iter()
+            .find(|panel| panel.id() == panel_id)
+            .map(|panel| panel.minimized())
+            .unwrap_or(false)
+        {
+            return;
+        }
         self.next_z += 1;
         for panel in &mut self.panels {
             if panel.id() == panel_id {
@@ -196,29 +215,36 @@ impl Workspace {
 
     pub fn close_panel(&mut self, panel_id: Uuid) {
         self.panels.retain(|panel| panel.id() != panel_id);
-        if let Some(last) = self.panels.iter_mut().max_by_key(|panel| panel.z_index()) {
-            last.set_focused(true);
-        }
+        self.focus_topmost_visible_panel();
     }
 
     pub fn focused_panel_mut(&mut self) -> Option<&mut CanvasPanel> {
-        self.panels.iter_mut().find(|panel| panel.focused())
+        self.panels
+            .iter_mut()
+            .find(|panel| panel.focused() && !panel.minimized())
     }
 
     pub fn focused_panel(&self) -> Option<&CanvasPanel> {
-        self.panels.iter().find(|panel| panel.focused())
+        self.panels
+            .iter()
+            .find(|panel| panel.focused() && !panel.minimized())
     }
 
     pub fn panel_rects_except(&self, panel_id: Uuid) -> Vec<Rect> {
         self.panels
             .iter()
-            .filter(|panel| panel.id() != panel_id)
+            .filter(|panel| panel.id() != panel_id && !panel.minimized())
             .map(CanvasPanel::rect)
             .collect()
     }
 
     pub fn find_free_position(&self, size: Vec2) -> Pos2 {
-        if self.panels.is_empty() {
+        let visible_panels: Vec<_> = self
+            .panels
+            .iter()
+            .filter(|panel| !panel.minimized())
+            .collect();
+        if visible_panels.is_empty() {
             return pos2(50.0, 50.0);
         }
 
@@ -226,7 +252,7 @@ impl Workspace {
         let mut x_edges = Vec::new();
         let mut y_edges = Vec::new();
 
-        for panel in &self.panels {
+        for panel in &visible_panels {
             let rect = panel.rect();
             x_edges.extend_from_slice(&[
                 rect.left(),
@@ -243,10 +269,9 @@ impl Workspace {
         }
 
         let mut best = None;
-        let current_bbox = self
-            .panels
+        let current_bbox = visible_panels
             .iter()
-            .map(CanvasPanel::rect)
+            .map(|panel| panel.rect())
             .reduce(|a, b| a.union(b))
             .unwrap();
         let center = current_bbox.center();
@@ -276,12 +301,15 @@ impl Workspace {
 
     fn overlaps_any(&self, candidate_rect: Rect, gap: f32) -> bool {
         let effective_gap = (gap - 0.1).max(0.0);
-        self.panels.iter().any(|panel| {
-            panel
-                .rect()
-                .expand(effective_gap)
-                .intersects(candidate_rect)
-        })
+        self.panels
+            .iter()
+            .filter(|panel| !panel.minimized())
+            .any(|panel| {
+                panel
+                    .rect()
+                    .expand(effective_gap)
+                    .intersects(candidate_rect)
+            })
     }
 
     pub fn rename_panel(&mut self, panel_id: Uuid, title: String) {
@@ -300,6 +328,19 @@ impl Workspace {
 
     pub fn runtime_snapshot(&self) -> RuntimeWorkspaceSnapshot {
         RuntimeWorkspaceSnapshot::new(self.id, self.name.clone(), self.cwd.clone())
+    }
+
+    pub fn runtime_session_counts(&self) -> (usize, usize) {
+        self.pty_manager
+            .lock()
+            .ok()
+            .map(|manager| {
+                (
+                    manager.attached_session_count(),
+                    manager.detached_session_count(),
+                )
+            })
+            .unwrap_or((0, 0))
     }
 
     pub fn drain_runtime_updates(&self) -> UiUpdateBatch {
@@ -321,8 +362,36 @@ impl Workspace {
         self.panels.len()
     }
 
+    pub fn minimized_panel_count(&self) -> usize {
+        self.panels.iter().filter(|panel| panel.minimized()).count()
+    }
+
     pub fn panel(&self, panel_id: Uuid) -> Option<&CanvasPanel> {
         self.panels.iter().find(|panel| panel.id() == panel_id)
+    }
+
+    pub fn toggle_minimize_panel(&mut self, panel_id: Uuid) {
+        let Some(index) = self.panels.iter().position(|panel| panel.id() == panel_id) else {
+            return;
+        };
+        if self.panels[index].minimized() {
+            self.restore_panel(panel_id);
+            return;
+        }
+        let was_focused = self.panels[index].focused();
+        self.panels[index].set_minimized(true);
+        if was_focused {
+            self.focus_topmost_visible_panel();
+        }
+    }
+
+    pub fn restore_panel(&mut self, panel_id: Uuid) {
+        if let Some(panel) = self.panels.iter_mut().find(|panel| panel.id() == panel_id) {
+            panel.set_minimized(false);
+        } else {
+            return;
+        }
+        self.bring_to_front(panel_id);
     }
 
     pub fn orchestration_observations(&self) -> Vec<PanelRuntimeObservation> {
@@ -345,6 +414,19 @@ impl Workspace {
             .iter()
             .map(CanvasPanel::shared_snapshot)
             .collect()
+    }
+
+    fn focus_topmost_visible_panel(&mut self) {
+        let target = self
+            .panels
+            .iter()
+            .enumerate()
+            .filter(|(_, panel)| !panel.minimized())
+            .max_by_key(|(_, panel)| panel.z_index())
+            .map(|(index, _)| index);
+        for (index, panel) in self.panels.iter_mut().enumerate() {
+            panel.set_focused(Some(index) == target);
+        }
     }
 }
 
@@ -371,12 +453,14 @@ fn paths_match(left: &Path, right: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::path::PathBuf;
 
     use egui::{pos2, vec2};
     use uuid::Uuid;
 
     use super::Workspace;
     use crate::canvas::config::PANEL_GAP;
+    use crate::state::{PanelState, WorkspaceState};
     use crate::terminal::panel::TerminalPanel;
 
     #[test]
@@ -436,6 +520,148 @@ mod tests {
         let workspace = Workspace::from_folder(path);
 
         assert!(workspace.matches_cwd(&alias));
+    }
+
+    #[test]
+    fn minimizing_a_panel_hides_it_until_restored() {
+        let mut workspace = Workspace::new("Default", None);
+        let first = TerminalPanel::new(pos2(0.0, 0.0), vec2(300.0, 200.0), egui::Color32::WHITE, 0);
+        let second = TerminalPanel::new(
+            pos2(40.0, 40.0),
+            vec2(300.0, 200.0),
+            egui::Color32::LIGHT_BLUE,
+            1,
+        );
+        let first_id = first.id;
+        let second_id = second.id;
+        workspace.add_restored_terminal(first);
+        workspace.add_restored_terminal(second);
+        workspace.bring_to_front(second_id);
+
+        workspace.toggle_minimize_panel(second_id);
+
+        assert!(workspace.panel(second_id).unwrap().minimized());
+        assert_eq!(
+            workspace.focused_panel().map(|panel| panel.id()),
+            Some(first_id)
+        );
+
+        workspace.restore_panel(second_id);
+
+        assert!(!workspace.panel(second_id).unwrap().minimized());
+        assert_eq!(
+            workspace.focused_panel().map(|panel| panel.id()),
+            Some(second_id)
+        );
+    }
+
+    #[test]
+    fn restoring_workspace_keeps_terminal_sessions_detached_until_focus() {
+        let ctx = egui::Context::default();
+        let state = WorkspaceState {
+            id: Uuid::new_v4().to_string(),
+            name: "Restored".to_owned(),
+            cwd: Some(PathBuf::from("/tmp/restored")),
+            panels: vec![PanelState {
+                id: Uuid::new_v4().to_string(),
+                title: "Terminal".to_owned(),
+                custom_title: None,
+                position: [20.0, 30.0],
+                size: [420.0, 260.0],
+                color: [90, 130, 200],
+                z_index: 1,
+                focused: true,
+                minimized: false,
+            }],
+            viewport_pan: [0.0, 0.0],
+            viewport_zoom: 1.0,
+            next_z: 2,
+            next_color: 1,
+        };
+        let mut workspace = Workspace::from_saved(state, &ctx);
+
+        assert_eq!(workspace.runtime_session_counts(), (0, 1));
+
+        workspace
+            .focused_panel_mut()
+            .expect("focused panel")
+            .handle_input(&ctx);
+
+        assert_eq!(workspace.runtime_session_counts(), (1, 0));
+    }
+
+    #[test]
+    fn shared_snapshot_does_not_attach_detached_sessions() {
+        let ctx = egui::Context::default();
+        let state = WorkspaceState {
+            id: Uuid::new_v4().to_string(),
+            name: "Shared".to_owned(),
+            cwd: Some(PathBuf::from("/tmp/shared")),
+            panels: vec![PanelState {
+                id: Uuid::new_v4().to_string(),
+                title: "Terminal".to_owned(),
+                custom_title: None,
+                position: [20.0, 30.0],
+                size: [420.0, 260.0],
+                color: [90, 130, 200],
+                z_index: 1,
+                focused: false,
+                minimized: false,
+            }],
+            viewport_pan: [0.0, 0.0],
+            viewport_zoom: 1.0,
+            next_z: 2,
+            next_color: 1,
+        };
+        let workspace = Workspace::from_saved(state, &ctx);
+
+        let before = workspace.runtime_session_counts();
+        let snapshots = workspace.shared_panel_snapshots();
+        let after = workspace.runtime_session_counts();
+
+        assert_eq!(before, (0, 1));
+        assert_eq!(after, before);
+        assert_eq!(snapshots.len(), 1);
+        assert!(snapshots[0].visible_text.is_empty());
+        assert!(snapshots[0].history_text.is_empty());
+    }
+
+    #[test]
+    fn restored_workspace_budget_keeps_twenty_sessions_detached_until_needed() {
+        let ctx = egui::Context::default();
+        let panels = (0..20)
+            .map(|index| PanelState {
+                id: Uuid::new_v4().to_string(),
+                title: format!("Terminal {index}"),
+                custom_title: None,
+                position: [20.0 + index as f32 * 8.0, 30.0 + index as f32 * 6.0],
+                size: [420.0, 260.0],
+                color: [90, 130, 200],
+                z_index: index as u32,
+                focused: index == 19,
+                minimized: false,
+            })
+            .collect();
+        let state = WorkspaceState {
+            id: Uuid::new_v4().to_string(),
+            name: "Budget".to_owned(),
+            cwd: Some(PathBuf::from("/tmp/budget")),
+            panels,
+            viewport_pan: [0.0, 0.0],
+            viewport_zoom: 1.0,
+            next_z: 21,
+            next_color: 4,
+        };
+        let mut workspace = Workspace::from_saved(state, &ctx);
+
+        assert_eq!(workspace.runtime_session_counts(), (0, 20));
+
+        workspace
+            .focused_panel_mut()
+            .expect("focused panel")
+            .handle_input(&ctx);
+
+        assert_eq!(workspace.runtime_session_counts(), (1, 19));
     }
 
     fn unique_temp_dir(name: &str) -> std::path::PathBuf {

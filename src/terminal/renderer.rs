@@ -4,7 +4,7 @@ use alacritty_terminal::term::{point_to_viewport, RenderableCursor, Term};
 use alacritty_terminal::vte::ansi::{
     Color as AnsiColor, CursorShape as VteCursorShape, NamedColor,
 };
-use egui::{pos2, vec2, Align2, Color32, FontId, Rect, Rounding, Stroke};
+use egui::{pos2, vec2, Align2, Color32, FontId, Rect, Rounding, Shape, Stroke};
 
 use crate::terminal::colors::{brighten, dim_color, indexed_to_egui};
 use crate::terminal::pty::EventProxy;
@@ -28,6 +28,61 @@ struct RenderMetrics {
     pad_x: f32,
     pad_y: f32,
     zoom: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct GridCacheKey {
+    rect_min_x_bits: u32,
+    rect_min_y_bits: u32,
+    rect_width_bits: u32,
+    rect_height_bits: u32,
+    zoom_bits: u32,
+    display_offset: usize,
+    revision: u64,
+    row_stride: usize,
+}
+
+impl GridCacheKey {
+    pub(crate) fn new(
+        rect: Rect,
+        zoom: f32,
+        display_offset: usize,
+        revision: u64,
+        row_stride: usize,
+    ) -> Self {
+        Self {
+            rect_min_x_bits: rect.min.x.to_bits(),
+            rect_min_y_bits: rect.min.y.to_bits(),
+            rect_width_bits: rect.width().to_bits(),
+            rect_height_bits: rect.height().to_bits(),
+            zoom_bits: zoom.to_bits(),
+            display_offset,
+            revision,
+            row_stride,
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct TerminalGridCache {
+    key: Option<GridCacheKey>,
+    shapes: Vec<Shape>,
+}
+
+impl TerminalGridCache {
+    pub fn matches(&self, key: GridCacheKey) -> bool {
+        self.key == Some(key)
+    }
+
+    pub fn store(&mut self, key: GridCacheKey, shapes: Vec<Shape>) {
+        self.key = Some(key);
+        self.shapes = shapes;
+    }
+
+    pub fn clear(&mut self) {
+        self.key = None;
+        self.shapes.clear();
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,7 +125,9 @@ pub fn render_terminal(
     time: f64,
     zoom: f32,
     background_rounding: Rounding,
-) {
+    cache: Option<&mut TerminalGridCache>,
+    revision: u64,
+) -> bool {
     render_terminal_with_row_stride(
         painter,
         content_rect,
@@ -80,7 +137,9 @@ pub fn render_terminal(
         zoom,
         background_rounding,
         1,
-    );
+        cache,
+        revision,
+    )
 }
 
 pub fn render_terminal_reduced(
@@ -91,7 +150,10 @@ pub fn render_terminal_reduced(
     time: f64,
     zoom: f32,
     background_rounding: Rounding,
-) {
+    cache: Option<&mut TerminalGridCache>,
+    revision: u64,
+) -> bool {
+    let row_stride = reduced_row_stride(content_rect, zoom);
     render_terminal_with_row_stride(
         painter,
         content_rect,
@@ -100,8 +162,24 @@ pub fn render_terminal_reduced(
         time,
         zoom,
         background_rounding,
-        1,
-    );
+        row_stride,
+        cache,
+        revision,
+    )
+}
+
+fn reduced_row_stride(content_rect: Rect, zoom: f32) -> usize {
+    let metrics = scaled_metrics(zoom);
+    if metrics.cell_height <= 0.0 {
+        return 1;
+    }
+
+    let estimated_rows = (content_rect.height() / metrics.cell_height).floor() as usize;
+    match estimated_rows {
+        0..=12 => 1,
+        13..=28 => 2,
+        _ => 3,
+    }
 }
 
 fn render_terminal_with_row_stride(
@@ -113,9 +191,11 @@ fn render_terminal_with_row_stride(
     zoom: f32,
     background_rounding: Rounding,
     row_stride: usize,
-) {
+    mut cache: Option<&mut TerminalGridCache>,
+    revision: u64,
+) -> bool {
     if content_rect.width() <= 0.0 || content_rect.height() <= 0.0 {
-        return;
+        return false;
     }
 
     let content = term.renderable_content();
@@ -123,10 +203,7 @@ fn render_terminal_with_row_stride(
     let cursor = content.cursor;
     let selection = content.selection;
     let colors = content.colors;
-    let cells: Vec<_> = content.display_iter.collect();
     let metrics = scaled_metrics(zoom);
-    let base_x = content_rect.left() + metrics.pad_x;
-    let base_y = content_rect.top() + metrics.pad_y;
 
     painter.rect_filled(
         content_rect,
@@ -134,6 +211,53 @@ fn render_terminal_with_row_stride(
         terminal_background_color(colors),
     );
 
+    let cache_key = GridCacheKey::new(content_rect, zoom, display_offset, revision, row_stride);
+    let selection_active = selection.is_some();
+    if let Some(cache) = cache.as_deref_mut() {
+        if !selection_active && cache.matches(cache_key) {
+            painter.extend(cache.shapes.iter().cloned());
+            if cursor_visible(focused, row_stride > 1, time) {
+                draw_cursor(painter, content_rect, display_offset, cursor, metrics);
+            }
+            return true;
+        }
+    }
+
+    let shapes = build_grid_shapes(painter.ctx(), content_rect, content, metrics, row_stride);
+    painter.extend(shapes.iter().cloned());
+
+    if let Some(cache) = cache.as_deref_mut() {
+        if selection_active {
+            cache.clear();
+        } else {
+            cache.store(cache_key, shapes);
+        }
+    }
+
+    if cursor_visible(focused, row_stride > 1, time) {
+        draw_cursor(painter, content_rect, display_offset, cursor, metrics);
+    }
+
+    false
+}
+
+fn build_grid_shapes(
+    ctx: &egui::Context,
+    content_rect: Rect,
+    content: alacritty_terminal::term::RenderableContent<'_>,
+    metrics: RenderMetrics,
+    row_stride: usize,
+) -> Vec<Shape> {
+    let display_offset = content.display_offset;
+    let cursor = content.cursor;
+    let selection = content.selection;
+    let colors = content.colors;
+    let cells: Vec<_> = content.display_iter.collect();
+    let base_x = content_rect.left() + metrics.pad_x;
+    let base_y = content_rect.top() + metrics.pad_y;
+
+    let mut background_shapes = Vec::new();
+    let mut foreground_shapes = Vec::new();
     let mut current_run: Option<(Color32, f32, f32, f32)> = None;
 
     for indexed in &cells {
@@ -161,24 +285,94 @@ fn render_terminal_with_row_stride(
                 *run_w += width;
                 continue;
             }
-            painter.rect_filled(
+            background_shapes.push(Shape::rect_filled(
                 Rect::from_min_size(pos2(*run_x, *run_y), vec2(*run_w, metrics.cell_height)),
                 0.0,
                 *run_color,
-            );
+            ));
         }
         current_run = Some((bg, sx, sy, width));
     }
 
     if let Some((color, x, y, width)) = current_run {
-        painter.rect_filled(
+        background_shapes.push(Shape::rect_filled(
             Rect::from_min_size(pos2(x, y), vec2(width, metrics.cell_height)),
             0.0,
             color,
-        );
+        ));
     }
 
-    for indexed in &cells {
+    ctx.fonts(|fonts| {
+        let mut push_text = |foreground_shapes: &mut Vec<Shape>,
+                             pos: egui::Pos2,
+                             text: String,
+                             fg: Color32,
+                             italic_offset: f32| {
+            if metrics.font_size < MIN_TEXT_RENDER_FONT_SIZE || text.is_empty() {
+                return;
+            }
+            foreground_shapes.push(Shape::text(
+                fonts,
+                pos + vec2(italic_offset * metrics.zoom.max(0.25), 0.0),
+                Align2::LEFT_TOP,
+                text,
+                FontId::monospace(metrics.font_size),
+                fg,
+            ));
+        };
+        if row_stride > 1 {
+            build_reduced_foreground_shapes(
+                &cells,
+                display_offset,
+                cursor,
+                selection,
+                colors,
+                base_x,
+                base_y,
+                metrics,
+                row_stride,
+                &mut background_shapes,
+                &mut foreground_shapes,
+                &mut push_text,
+            );
+        } else {
+            build_full_foreground_shapes(
+                &cells,
+                display_offset,
+                cursor,
+                selection,
+                colors,
+                base_x,
+                base_y,
+                metrics,
+                row_stride,
+                &mut background_shapes,
+                &mut foreground_shapes,
+                &mut push_text,
+            );
+        }
+    });
+
+    background_shapes.extend(foreground_shapes);
+    background_shapes
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_full_foreground_shapes(
+    cells: &[alacritty_terminal::grid::Indexed<&Cell>],
+    display_offset: usize,
+    cursor: RenderableCursor,
+    selection: Option<alacritty_terminal::selection::SelectionRange>,
+    colors: &Colors,
+    base_x: f32,
+    base_y: f32,
+    metrics: RenderMetrics,
+    row_stride: usize,
+    background_shapes: &mut Vec<Shape>,
+    foreground_shapes: &mut Vec<Shape>,
+    push_text: &mut impl FnMut(&mut Vec<Shape>, egui::Pos2, String, Color32, f32),
+) {
+    for indexed in cells {
         let Some(point) = point_to_viewport(display_offset, indexed.point) else {
             continue;
         };
@@ -198,11 +392,11 @@ fn render_terminal_with_row_stride(
                     ),
                     vec2(metrics.cell_width, metrics.cell_height),
                 );
-                painter.rect_filled(
+                background_shapes.push(Shape::rect_filled(
                     rect,
                     0.0,
                     Color32::from_rgba_premultiplied(80, 130, 200, 80),
-                );
+                ));
             }
         }
 
@@ -215,57 +409,173 @@ fn render_terminal_with_row_stride(
             base_x + col as f32 * metrics.cell_width,
             base_y + row as f32 * metrics.cell_height,
         );
-        let mut fg = foreground_color(cell, colors);
-        if cell.flags.contains(Flags::BOLD) {
-            fg = brighten(fg);
-        }
-        if cell.flags.contains(Flags::DIM) {
-            fg = dim_color(fg);
-        }
+        let (fg, italic_offset) = effective_text_style(cell, colors);
         if cell.flags.contains(Flags::HIDDEN) {
             continue;
         }
+        push_text(
+            foreground_shapes,
+            text_pos,
+            ch.to_string(),
+            fg,
+            italic_offset,
+        );
 
-        let italic_offset = if cell.flags.contains(Flags::ITALIC) {
-            1.5
-        } else {
-            0.0
+        draw_decoration_shapes(foreground_shapes, text_pos, metrics, cell.flags, fg);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_reduced_foreground_shapes(
+    cells: &[alacritty_terminal::grid::Indexed<&Cell>],
+    display_offset: usize,
+    cursor: RenderableCursor,
+    selection: Option<alacritty_terminal::selection::SelectionRange>,
+    colors: &Colors,
+    base_x: f32,
+    base_y: f32,
+    metrics: RenderMetrics,
+    row_stride: usize,
+    background_shapes: &mut Vec<Shape>,
+    foreground_shapes: &mut Vec<Shape>,
+    push_text: &mut impl FnMut(&mut Vec<Shape>, egui::Pos2, String, Color32, f32),
+) {
+    #[derive(Default)]
+    struct TextRun {
+        text: String,
+        x: f32,
+        y: f32,
+        next_x: f32,
+        fg: Color32,
+        italic_offset: f32,
+    }
+
+    let mut run = TextRun::default();
+    let mut flush_run = |run: &mut TextRun, foreground_shapes: &mut Vec<Shape>| {
+        if run.text.is_empty() {
+            run.text.clear();
+            return;
+        }
+        push_text(
+            foreground_shapes,
+            pos2(run.x, run.y),
+            run.text.clone(),
+            run.fg,
+            run.italic_offset,
+        );
+        run.text.clear();
+    };
+
+    for indexed in cells {
+        let Some(point) = point_to_viewport(display_offset, indexed.point) else {
+            continue;
         };
+        let row = point.line;
+        if row % row_stride != 0 {
+            continue;
+        }
+        let col = point.column.0;
+        let cell = indexed.cell;
+        let text_pos = pos2(
+            base_x + col as f32 * metrics.cell_width,
+            base_y + row as f32 * metrics.cell_height,
+        );
 
-        if metrics.font_size >= MIN_TEXT_RENDER_FONT_SIZE {
-            painter.text(
-                text_pos + vec2(italic_offset * metrics.zoom.max(0.25), 0.0),
-                Align2::LEFT_TOP,
-                ch.to_string(),
-                FontId::monospace(metrics.font_size),
-                fg,
-            );
+        if let Some(selection) = selection {
+            if selection.contains_cell(indexed, cursor.point, cursor.shape) {
+                background_shapes.push(Shape::rect_filled(
+                    Rect::from_min_size(text_pos, vec2(metrics.cell_width, metrics.cell_height)),
+                    0.0,
+                    Color32::from_rgba_premultiplied(80, 130, 200, 80),
+                ));
+            }
         }
 
-        if cell.flags.intersects(Flags::ALL_UNDERLINES) {
-            let y = text_pos.y + metrics.cell_height - 1.0;
-            painter.line_segment(
-                [
-                    pos2(text_pos.x, y),
-                    pos2(text_pos.x + metrics.cell_width, y),
-                ],
-                Stroke::new(1.0, fg),
-            );
+        let ch = cell.c;
+        let (fg, italic_offset) = effective_text_style(cell, colors);
+        let width = metrics.cell_width
+            * if cell.flags.contains(Flags::WIDE_CHAR) {
+                2.0
+            } else {
+                1.0
+            };
+        let drawable = ch != ' '
+            && ch != '\0'
+            && !cell.flags.contains(Flags::WIDE_CHAR_SPACER)
+            && !cell.flags.contains(Flags::HIDDEN)
+            && !cell.flags.intersects(Flags::ALL_UNDERLINES)
+            && !cell.flags.contains(Flags::STRIKEOUT);
+        let same_run = !run.text.is_empty()
+            && run.fg == fg
+            && (run.y - text_pos.y).abs() < 0.1
+            && (run.next_x - text_pos.x).abs() < 0.5
+            && (run.italic_offset - italic_offset).abs() < 0.1;
+
+        if drawable && same_run {
+            run.text.push(ch);
+            run.next_x += width;
+            continue;
         }
-        if cell.flags.contains(Flags::STRIKEOUT) {
-            let y = text_pos.y + metrics.cell_height * 0.5;
-            painter.line_segment(
-                [
-                    pos2(text_pos.x, y),
-                    pos2(text_pos.x + metrics.cell_width, y),
-                ],
-                Stroke::new(1.0, fg),
-            );
+
+        flush_run(&mut run, foreground_shapes);
+
+        if drawable {
+            run.text.push(ch);
+            run.x = text_pos.x;
+            run.y = text_pos.y;
+            run.next_x = text_pos.x + width;
+            run.fg = fg;
+            run.italic_offset = italic_offset;
+        } else {
+            draw_decoration_shapes(foreground_shapes, text_pos, metrics, cell.flags, fg);
         }
     }
 
-    if cursor_visible(focused, row_stride > 1, time) {
-        draw_cursor(painter, content_rect, display_offset, cursor, metrics);
+    flush_run(&mut run, foreground_shapes);
+}
+
+fn effective_text_style(cell: &Cell, colors: &Colors) -> (Color32, f32) {
+    let mut fg = foreground_color(cell, colors);
+    if cell.flags.contains(Flags::BOLD) {
+        fg = brighten(fg);
+    }
+    if cell.flags.contains(Flags::DIM) {
+        fg = dim_color(fg);
+    }
+    let italic_offset = if cell.flags.contains(Flags::ITALIC) {
+        1.5
+    } else {
+        0.0
+    };
+    (fg, italic_offset)
+}
+
+fn draw_decoration_shapes(
+    foreground_shapes: &mut Vec<Shape>,
+    text_pos: egui::Pos2,
+    metrics: RenderMetrics,
+    flags: Flags,
+    fg: Color32,
+) {
+    if flags.intersects(Flags::ALL_UNDERLINES) {
+        let y = text_pos.y + metrics.cell_height - 1.0;
+        foreground_shapes.push(Shape::line_segment(
+            [
+                pos2(text_pos.x, y),
+                pos2(text_pos.x + metrics.cell_width, y),
+            ],
+            Stroke::new(1.0, fg),
+        ));
+    }
+    if flags.contains(Flags::STRIKEOUT) {
+        let y = text_pos.y + metrics.cell_height * 0.5;
+        foreground_shapes.push(Shape::line_segment(
+            [
+                pos2(text_pos.x, y),
+                pos2(text_pos.x + metrics.cell_width, y),
+            ],
+            Stroke::new(1.0, fg),
+        ));
     }
 }
 
@@ -514,7 +824,7 @@ mod tests {
 
     use super::{
         blink_phase_visible, cursor_visible, render_terminal, render_terminal_reduced,
-        terminal_background_color,
+        terminal_background_color, GridCacheKey, TerminalGridCache,
     };
 
     #[test]
@@ -553,6 +863,8 @@ mod tests {
                     0.0,
                     1.0,
                     Rounding::ZERO,
+                    None,
+                    0,
                 );
             });
         });
@@ -590,6 +902,8 @@ mod tests {
                     0.0,
                     1.0,
                     body_rounding,
+                    None,
+                    0,
                 );
             });
         });
@@ -608,6 +922,29 @@ mod tests {
             .expect("expected terminal background rect");
 
         assert_eq!(background.rounding, body_rounding);
+    }
+
+    #[test]
+    fn grid_cache_key_tracks_revision_and_display_offset() {
+        let rect = Rect::from_min_size(pos2(20.0, 20.0), vec2(220.0, 120.0));
+        let first = GridCacheKey::new(rect, 1.0, 0, 7, 1);
+        let different_revision = GridCacheKey::new(rect, 1.0, 0, 8, 1);
+        let different_offset = GridCacheKey::new(rect, 1.0, 1, 7, 1);
+
+        assert_ne!(first, different_revision);
+        assert_ne!(first, different_offset);
+    }
+
+    #[test]
+    fn grid_cache_reuses_shapes_only_for_identical_keys() {
+        let rect = Rect::from_min_size(pos2(20.0, 20.0), vec2(220.0, 120.0));
+        let key = GridCacheKey::new(rect, 1.0, 0, 7, 1);
+        let mut cache = TerminalGridCache::default();
+
+        assert!(!cache.matches(key));
+        cache.store(key, Vec::new());
+        assert!(cache.matches(key));
+        assert!(!cache.matches(GridCacheKey::new(rect, 1.0, 0, 8, 1)));
     }
 
     fn sample_term(text: &str) -> Term<EventProxy> {

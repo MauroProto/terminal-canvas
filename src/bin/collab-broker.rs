@@ -60,6 +60,7 @@ struct BrokerState {
 }
 
 struct SessionRecord {
+    #[allow(dead_code)]
     session_secret: String,
     invite_secret: String,
     invite_expires_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -78,6 +79,7 @@ struct SessionRecord {
 struct GuestRecord {
     token: String,
     display_name: String,
+    #[allow(dead_code)]
     device_id: String,
     joined_at: chrono::DateTime<chrono::Utc>,
     connection_state: GuestConnectionState,

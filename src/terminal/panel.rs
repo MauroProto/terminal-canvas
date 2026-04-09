@@ -18,26 +18,36 @@ use crate::canvas::config::SNAP_THRESHOLD;
 use crate::canvas::snap::{snap_drag, snap_resize, SnapGuide};
 use crate::canvas::viewport::Viewport;
 use crate::collab::{SerializableModifiers, SharedPanelSnapshot, TerminalInputEvent};
-use crate::orchestration::{PanelOverlay, PanelRuntimeObservation};
+use crate::orchestration::{AgentProvider, PanelOverlay, PanelRuntimeObservation};
 use crate::runtime::{
     PtyManager, RenderInputs, RenderQos, RenderTier, SessionSpec, SharedPtyHandle,
 };
 use crate::state::PanelState;
-use crate::terminal::input::{is_paste_shortcut, key_to_bytes, paste_bytes, should_copy_selection};
+use crate::terminal::input::{
+    is_paste_shortcut, key_to_bytes, paste_bytes, should_copy_selection, wheel_action, WheelAction,
+};
+use crate::terminal::layout::{
+    cell_side_from_position, grid_metrics, grid_point_from_position, terminal_cell_from_pointer,
+};
 use crate::terminal::pty::PtyHandle;
 use crate::terminal::renderer::{
     compute_grid_size, render_terminal, render_terminal_preview, render_terminal_reduced,
-    CELL_HEIGHT_FACTOR, CELL_WIDTH_FACTOR, FONT_SIZE, MIN_TEXT_RENDER_FONT_SIZE, PAD_X, PAD_Y,
+    TerminalGridCache, FONT_SIZE, MIN_TEXT_RENDER_FONT_SIZE, PAD_X, PAD_Y,
 };
+use crate::terminal::scrollbar::{
+    render_scrollbar, scrollbar_pointer_to_scrollback, scrollbar_thumb_height, terminal_body_rect,
+    terminal_scrollbar_rect,
+};
+use crate::terminal::session_controller::{session_spec, SessionController};
 use crate::utils::platform::default_shell;
 
 pub const TITLE_BAR_HEIGHT: f32 = 42.0;
 pub const BORDER_RADIUS: f32 = 16.0;
 pub const MIN_WIDTH: f32 = 260.0;
 pub const MIN_HEIGHT: f32 = 180.0;
-pub const RESIZE_GRIP_SIZE: f32 = 28.0;
-pub const RESIZE_HIT_THICKNESS: f32 = 8.0;
-pub const RESIZE_CORNER_SIZE: f32 = 22.0;
+pub const RESIZE_GRIP_SIZE: f32 = 32.0;
+pub const RESIZE_HIT_THICKNESS: f32 = 12.0;
+pub const RESIZE_CORNER_SIZE: f32 = 28.0;
 pub const PANEL_BG: Color32 = Color32::from_rgb(30, 30, 30);
 pub const TITLE_BG: Color32 = Color32::from_rgb(38, 38, 58);
 pub const BORDER_DEFAULT: Color32 = Color32::from_rgb(72, 72, 84);
@@ -79,6 +89,7 @@ pub enum ResizeHandle {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PanelHitArea {
     CloseButton,
+    MinimizeButton,
     TitleBar,
     Body,
     Resize(ResizeHandle),
@@ -104,6 +115,8 @@ pub struct PanelInteraction {
     pub hovered_terminal: bool,
     pub guides: Vec<SnapGuide>,
     pub action: Option<PanelAction>,
+    pub render_tier: Option<RenderTier>,
+    pub cache_hit: bool,
 }
 
 pub struct TerminalPanel {
@@ -118,17 +131,15 @@ pub struct TerminalPanel {
     pub color: Color32,
     pub z_index: u32,
     pub focused: bool,
-    pty_manager: Option<Arc<Mutex<PtyManager>>>,
-    session_id: Option<Uuid>,
-    last_cols: u16,
-    last_rows: u16,
-    spawn_error: Option<String>,
+    minimized: bool,
+    session: SessionController,
     pub drag_virtual_pos: Option<Pos2>,
     pub resize_virtual_rect: Option<Rect>,
     bell_flash_until: f64,
     activity_label: Option<String>,
     command_buffer: String,
     last_activity_scan_at: f64,
+    render_cache: TerminalGridCache,
 }
 
 impl TerminalPanel {
@@ -145,23 +156,21 @@ impl TerminalPanel {
             color,
             z_index,
             focused: false,
-            pty_manager: None,
-            session_id: None,
-            last_cols: 0,
-            last_rows: 0,
-            spawn_error: None,
+            minimized: false,
+            session: SessionController::default(),
             drag_virtual_pos: None,
             resize_virtual_rect: None,
             bell_flash_until: 0.0,
             activity_label: None,
             command_buffer: String::new(),
             last_activity_scan_at: 0.0,
+            render_cache: TerminalGridCache::default(),
         }
     }
 
     pub fn from_saved(
         saved: PanelState,
-        ctx: &egui::Context,
+        _ctx: &egui::Context,
         cwd: Option<&Path>,
         pty_manager: Arc<Mutex<PtyManager>>,
     ) -> Self {
@@ -177,8 +186,15 @@ impl TerminalPanel {
             .custom_title
             .clone()
             .unwrap_or_else(|| saved.title.clone());
-        panel.focused = saved.focused;
-        panel.attach_session(pty_manager, ctx, cwd);
+        panel.focused = saved.focused && !saved.minimized;
+        panel.minimized = saved.minimized;
+        let (cols, rows) = compute_grid_size(panel.size.x, panel.size.y - TITLE_BAR_HEIGHT);
+        panel.session.restore_detached_with_spec(
+            pty_manager,
+            session_spec(panel.title.clone(), cwd.map(Path::to_path_buf), None, None),
+            cols,
+            rows,
+        );
         panel
     }
 
@@ -204,54 +220,39 @@ impl TerminalPanel {
         cwd: Option<&Path>,
         spec: SessionSpec,
     ) {
-        self.close_runtime_session();
+        let (cols, rows) = compute_grid_size(self.size.x, self.size.y - TITLE_BAR_HEIGHT);
         self.cwd_label = cwd_label(cwd);
         self.shell_label = shell_label();
-        let (cols, rows) = compute_grid_size(self.size.x, self.size.y - TITLE_BAR_HEIGHT);
-        self.last_cols = cols;
-        self.last_rows = rows;
-        self.pty_manager = Some(Arc::clone(&pty_manager));
-        let spawn_result = match pty_manager.lock() {
-            Ok(mut manager) => manager.spawn(ctx, spec, cwd, cols, rows),
-            Err(_) => Err(anyhow::anyhow!("PTY manager lock poisoned")),
-        };
-        match spawn_result {
-            Ok(session_id) => {
-                self.session_id = Some(session_id);
-                self.spawn_error = None;
-            }
-            Err(err) => {
-                self.session_id = None;
-                self.spawn_error = Some(err.to_string());
-            }
-        }
+        self.session
+            .attach_new_with_spec(pty_manager, ctx, spec, cwd, cols, rows);
     }
 
     pub fn runtime_session_id(&self) -> Option<Uuid> {
-        self.session_id
+        self.session.runtime_session_id()
+    }
+
+    pub fn runtime_session_attached(&self) -> bool {
+        self.session.is_attached()
+    }
+
+    pub fn provider_hint(&self) -> Option<AgentProvider> {
+        self.activity_label
+            .as_deref()
+            .and_then(AgentProvider::detect)
+            .or_else(|| AgentProvider::detect(&self.title))
+            .or_else(|| AgentProvider::detect(&self.shell_title))
     }
 
     fn session_handle(&self) -> Option<SharedPtyHandle> {
-        let manager = self.pty_manager.as_ref()?;
-        let session_id = self.session_id?;
-        manager.lock().ok()?.handle(session_id)
+        self.session.session_handle()
     }
 
     fn close_runtime_session(&mut self) {
-        let Some(session_id) = self.session_id.take() else {
-            return;
-        };
-        if let Some(manager) = &self.pty_manager {
-            if let Ok(mut manager) = manager.lock() {
-                manager.close(session_id);
-            }
-        }
+        self.session.close();
     }
 
     fn with_pty<R>(&self, f: impl FnOnce(&PtyHandle) -> R) -> Option<R> {
-        let handle = self.session_handle()?;
-        let pty = handle.lock().ok()?;
-        Some(f(&pty))
+        self.session.with_pty(f)
     }
 
     pub fn apply_resize(&mut self, rect: Rect) {
@@ -260,17 +261,7 @@ impl TerminalPanel {
     }
 
     pub fn is_alive(&self) -> bool {
-        let Some(manager) = &self.pty_manager else {
-            return false;
-        };
-        let Some(session_id) = self.session_id else {
-            return false;
-        };
-        manager
-            .lock()
-            .ok()
-            .map(|manager| manager.is_alive(session_id))
-            .unwrap_or(false)
+        self.session.is_alive()
     }
 
     pub fn to_saved(&self) -> PanelState {
@@ -283,20 +274,25 @@ impl TerminalPanel {
             color: [self.color.r(), self.color.g(), self.color.b()],
             z_index: self.z_index,
             focused: self.focused,
+            minimized: self.minimized,
+        }
+    }
+
+    pub fn minimized(&self) -> bool {
+        self.minimized
+    }
+
+    pub fn set_minimized(&mut self, minimized: bool) {
+        self.minimized = minimized;
+        if minimized {
+            self.focused = false;
+            self.drag_virtual_pos = None;
+            self.resize_virtual_rect = None;
         }
     }
 
     pub fn sync_title(&mut self) {
-        let shell_title =
-            self.pty_manager
-                .as_ref()
-                .zip(self.session_id)
-                .and_then(|(manager, session_id)| {
-                    manager
-                        .lock()
-                        .ok()
-                        .and_then(|manager| manager.session_title(session_id))
-                });
+        let shell_title = self.session.title_snapshot();
         if let Some(shell_title) = shell_title {
             self.apply_shell_title(shell_title);
             if let Some(activity_label) = infer_activity_label(&self.title, &self.shell_title, "") {
@@ -307,6 +303,7 @@ impl TerminalPanel {
 
     pub fn orchestration_observation(&self, workspace_id: Uuid) -> PanelRuntimeObservation {
         let mut visible_text = String::new();
+        let attached = self.runtime_session_attached();
         let recent_output = self
             .with_pty(|pty| {
                 if let Ok(term) = pty.term.try_lock() {
@@ -325,9 +322,19 @@ impl TerminalPanel {
             runtime_session_id: self.runtime_session_id(),
             workspace_id,
             title: self.title.clone(),
-            visible_text,
+            visible_text: if self.minimized || !attached {
+                String::new()
+            } else {
+                visible_text
+            },
             alive: self.is_alive(),
-            recent_output,
+            recent_output: if self.minimized || !attached {
+                false
+            } else {
+                recent_output
+            },
+            attached,
+            minimized: self.minimized,
         }
     }
 
@@ -336,7 +343,9 @@ impl TerminalPanel {
             return;
         }
 
-        let mode = self.with_pty(PtyHandle::input_mode).unwrap_or_default();
+        let _ = ctx;
+        self.session.ensure_attached();
+        let mode = self.session.input_mode();
         let has_selection = self
             .with_pty(|pty| pty.with_term(|term| term.selection.is_some()))
             .flatten()
@@ -395,7 +404,8 @@ impl TerminalPanel {
             return;
         }
 
-        let mode = self.with_pty(PtyHandle::input_mode).unwrap_or_default();
+        self.session.ensure_attached();
+        let mode = self.session.input_mode();
         for event in events {
             match event {
                 TerminalInputEvent::Text(text) => {
@@ -415,40 +425,46 @@ impl TerminalPanel {
                     self.record_key_input(key.to_egui(), modifiers.ctrl || modifiers.command);
                 }
                 TerminalInputEvent::Scroll { delta } => {
-                    self.apply_scroll_delta(*delta);
+                    self.apply_scroll_delta(*delta, None, &Viewport::default(), Rect::EVERYTHING);
                 }
             }
         }
     }
 
-    pub fn handle_scroll(&mut self, delta: f32, _ctx: &egui::Context) {
-        self.apply_scroll_delta(delta);
+    pub fn handle_scroll(
+        &mut self,
+        delta: f32,
+        pointer: Option<Pos2>,
+        viewport: &Viewport,
+        canvas_rect: Rect,
+        _ctx: &egui::Context,
+    ) {
+        self.apply_scroll_delta(delta, pointer, viewport, canvas_rect);
     }
 
-    fn apply_scroll_delta(&mut self, delta: f32) {
-        let Some(mode) = self.with_pty(PtyHandle::input_mode) else {
+    fn apply_scroll_delta(
+        &mut self,
+        delta: f32,
+        pointer: Option<Pos2>,
+        viewport: &Viewport,
+        canvas_rect: Rect,
+    ) {
+        self.session.ensure_attached();
+        if !self.session.is_attached() {
             return;
-        };
-        let lines = (delta.abs() / 24.0).max(1.0) as i32;
+        }
+        let mode = self.session.input_mode();
+        let point = pointer
+            .and_then(|pointer| self.mouse_cell_from_pointer(pointer, viewport, canvas_rect));
 
-        if mode.alt_screen {
-            for _ in 0..lines {
-                let seq = if delta > 0.0 { b"\x1b[A" } else { b"\x1b[B" };
-                let _ = self.with_pty(|pty| pty.write_all(seq));
+        match wheel_action(delta, &mode, point) {
+            Some(WheelAction::Pty(bytes)) => {
+                let _ = self.with_pty(|pty| pty.write_all(&bytes));
             }
-        } else if mode.mouse_mode {
-            for _ in 0..lines {
-                let button = if delta > 0.0 { 64 } else { 65 };
-                let seq = format!("\x1b[<{};1;1M", button);
-                let _ = self.with_pty(|pty| pty.write_all(seq.as_bytes()));
+            Some(WheelAction::Scrollback(lines)) => {
+                let _ = self.with_pty(|pty| pty.scroll_display(Scroll::Delta(lines)));
             }
-        } else {
-            let scroll = if delta > 0.0 {
-                Scroll::Delta(lines)
-            } else {
-                Scroll::Delta(-lines)
-            };
-            let _ = self.with_pty(|pty| pty.scroll_display(scroll));
+            None => {}
         }
     }
 
@@ -472,6 +488,7 @@ impl TerminalPanel {
             color: [self.color.r(), self.color.g(), self.color.b()],
             z_index: self.z_index,
             focused: self.focused,
+            minimized: self.minimized,
             alive: self.is_alive(),
             preview_label: self.preview_label(),
             visible_text,
@@ -483,12 +500,41 @@ impl TerminalPanel {
     }
 
     pub fn scroll_hit_test(&self, pos: Pos2, viewport: &Viewport, canvas_rect: Rect) -> bool {
-        self.body_screen_rect(viewport, canvas_rect)
+        if self.minimized {
+            return false;
+        }
+        self.content_screen_rect(viewport, canvas_rect)
             .intersect(canvas_rect)
             .contains(pos)
+            || self
+                .scrollbar_screen_rect(viewport, canvas_rect)
+                .intersect(canvas_rect)
+                .contains(pos)
+    }
+
+    fn mouse_cell_from_pointer(
+        &self,
+        pointer: Pos2,
+        viewport: &Viewport,
+        canvas_rect: Rect,
+    ) -> Option<crate::terminal::input::GridPoint> {
+        let content_rect = self
+            .content_screen_rect(viewport, canvas_rect)
+            .intersect(canvas_rect);
+        let (column, row) = terminal_mouse_cell_from_pointer(content_rect, pointer, viewport.zoom)?;
+        let (last_cols, last_rows) = self.session.last_grid_size();
+        let max_column = last_cols as usize - 1;
+        let max_row = last_rows as usize - 1;
+        Some(crate::terminal::input::GridPoint {
+            column: column.min(max_column),
+            line: row.min(max_row),
+        })
     }
 
     pub fn contains_screen_pos(&self, pos: Pos2, viewport: &Viewport, canvas_rect: Rect) -> bool {
+        if self.minimized {
+            return false;
+        }
         let (screen_rect, _, _) = self.screen_geometry(viewport, canvas_rect);
         screen_rect.intersect(canvas_rect).contains(pos)
     }
@@ -499,6 +545,9 @@ impl TerminalPanel {
         viewport: &Viewport,
         canvas_rect: Rect,
     ) -> Option<PanelHitArea> {
+        if self.minimized {
+            return None;
+        }
         let (screen_rect, title_rect, body_rect) = self.screen_geometry(viewport, canvas_rect);
         let lod = panel_lod(screen_rect, title_rect);
         if !screen_rect.intersect(canvas_rect).contains(pos) {
@@ -509,6 +558,13 @@ impl TerminalPanel {
             && close_rect(title_rect).intersect(canvas_rect).contains(pos)
         {
             return Some(PanelHitArea::CloseButton);
+        }
+        if should_draw_window_controls(screen_rect, title_rect)
+            && minimize_rect(title_rect)
+                .intersect(canvas_rect)
+                .contains(pos)
+        {
+            return Some(PanelHitArea::MinimizeButton);
         }
 
         for handle in ResizeHandle::ALL {
@@ -598,9 +654,14 @@ impl TerminalPanel {
         let mut interaction = PanelInteraction::default();
         let zoom = viewport.zoom;
         let (screen_rect, title_rect, body_rect) = self.screen_geometry(viewport, canvas_rect);
+        let content_rect = terminal_body_rect(body_rect);
+        let scrollbar_rect = terminal_scrollbar_rect(body_rect);
         let lod = panel_lod(screen_rect, title_rect);
         let painter = ui.painter().with_clip_rect(canvas_rect);
-        let body_hit_rect = body_input_rect(body_rect).intersect(canvas_rect);
+        let body_hit_rect = body_input_rect(content_rect).intersect(canvas_rect);
+        let scrollbar_hit_rect = scrollbar_rect
+            .expand2(vec2(2.0, 2.0))
+            .intersect(canvas_rect);
 
         if !body_behaves_like_title_bar(lod)
             && body_hit_rect.width() > 0.0
@@ -613,7 +674,7 @@ impl TerminalPanel {
             );
             if body_response.clicked() {
                 interaction.clicked = true;
-                let _ = self.with_pty(|pty| pty.clear_selection());
+                self.session.clear_selection();
             }
             interaction.hovered_terminal = body_response.hovered();
 
@@ -638,12 +699,45 @@ impl TerminalPanel {
             interaction.hovered_terminal = false;
         }
 
+        let scrollbar_response =
+            if scrollbar_hit_rect.width() > 0.0 && scrollbar_hit_rect.height() > 0.0 {
+                Some(ui.interact(
+                    scrollbar_hit_rect,
+                    ui.id().with(("scrollbar", self.id)),
+                    Sense::click_and_drag(),
+                ))
+            } else {
+                None
+            };
+        if let Some(scrollbar_response) = &scrollbar_response {
+            if scrollbar_response.clicked() || scrollbar_response.dragged() {
+                if let Some(pointer) = scrollbar_response.interact_pointer_pos() {
+                    let _ = self.with_pty(|pty| {
+                        if let Some(scroll_state) = pty.scroll_state() {
+                            let thumb_height = scrollbar_thumb_height(
+                                scrollbar_rect.height(),
+                                scroll_state.visible_rows,
+                                scroll_state.history_size,
+                            );
+                            let target = scrollbar_pointer_to_scrollback(
+                                pointer,
+                                scrollbar_rect,
+                                thumb_height,
+                                scroll_state.history_size,
+                            );
+                            pty.scroll_to_display_offset(target);
+                        }
+                    });
+                }
+            }
+        }
+
         if !ui.ctx().input(|i| i.pointer.primary_down()) {
             self.drag_virtual_pos = None;
             self.resize_virtual_rect = None;
         }
 
-        if self.with_pty(PtyHandle::take_bell).unwrap_or(false) {
+        if self.session.take_bell() {
             self.bell_flash_until = ui.ctx().input(|i| i.time) + 0.15;
         }
 
@@ -709,7 +803,6 @@ impl TerminalPanel {
                 if self.is_alive() { FG } else { DIM_FG },
             );
         }
-        let content_rect = body_rect.shrink2(vec2(0.0, 0.0));
         let content_clip_rect = content_rect.intersect(canvas_rect);
         let content_painter = painter.with_clip_rect(content_clip_rect);
         let content_rounding = roundings.body;
@@ -725,29 +818,35 @@ impl TerminalPanel {
         };
         let mut activity_label = self.activity_label.clone();
         let mut activity_label_scan_at = None;
+        let mut scrollbar_state = None;
+        let render_tier = render_tier_for_panel(
+            content_rect,
+            zoom,
+            lod,
+            fast_path_render,
+            self.focused,
+            self.session.with_pty(is_streaming_output).unwrap_or(false),
+        );
+        interaction.render_tier = Some(render_tier);
+        if matches!(render_tier, RenderTier::Full | RenderTier::ReducedLive) {
+            let (cols, rows) = compute_grid_size(self.size.x, self.size.y - TITLE_BAR_HEIGHT);
+            let defer_resize =
+                should_defer_terminal_resize(fast_path_render, self.resize_virtual_rect);
+            self.session.sync_grid_size(cols, rows, defer_resize);
+        }
+
         if let Some(handle) = self.session_handle() {
-            if let Ok(mut pty) = handle.lock() {
-                let (cols, rows) = compute_grid_size(self.size.x, self.size.y - TITLE_BAR_HEIGHT);
-                let defer_resize =
-                    should_defer_terminal_resize(fast_path_render, self.resize_virtual_rect);
-                if !defer_resize && (cols != self.last_cols || rows != self.last_rows) {
-                    self.last_cols = cols;
-                    self.last_rows = rows;
-                    pty.resize(cols, rows);
-                }
-                let render_tier = render_tier_for_panel(
-                    content_rect,
-                    zoom,
-                    lod,
-                    fast_path_render,
-                    self.focused,
-                    is_streaming_output(&pty),
-                );
+            if let Ok(pty) = handle.lock() {
                 let scan_activity = should_refresh_activity_label(self.last_activity_scan_at, now);
                 let mut scanned_activity_label = None;
                 if matches!(render_tier, RenderTier::Full | RenderTier::ReducedLive) {
                     if let Ok(mut term) = pty.term.try_lock() {
                         term.is_focused = self.focused;
+                        scrollbar_state = Some((
+                            term.grid().display_offset(),
+                            term.screen_lines(),
+                            term.grid().history_size(),
+                        ));
                         if scan_activity {
                             scanned_activity_label = Some(infer_activity_label_from_term(
                                 &title_snapshot,
@@ -756,24 +855,32 @@ impl TerminalPanel {
                             ));
                         }
                         match render_tier {
-                            RenderTier::Full => render_terminal(
-                                &content_painter,
-                                content_rect,
-                                &term,
-                                self.focused,
-                                now,
-                                zoom,
-                                content_rounding,
-                            ),
-                            RenderTier::ReducedLive => render_terminal_reduced(
-                                &content_painter,
-                                content_rect,
-                                &term,
-                                self.focused,
-                                now,
-                                zoom,
-                                content_rounding,
-                            ),
+                            RenderTier::Full => {
+                                interaction.cache_hit = render_terminal(
+                                    &content_painter,
+                                    content_rect,
+                                    &term,
+                                    self.focused,
+                                    now,
+                                    zoom,
+                                    content_rounding,
+                                    Some(&mut self.render_cache),
+                                    pty.render_revision(),
+                                );
+                            }
+                            RenderTier::ReducedLive => {
+                                interaction.cache_hit = render_terminal_reduced(
+                                    &content_painter,
+                                    content_rect,
+                                    &term,
+                                    self.focused,
+                                    now,
+                                    zoom,
+                                    content_rounding,
+                                    Some(&mut self.render_cache),
+                                    pty.render_revision(),
+                                );
+                            }
                             RenderTier::Preview | RenderTier::Hidden => {}
                         }
                     } else {
@@ -796,19 +903,11 @@ impl TerminalPanel {
                 } else {
                     if let Ok(mut term) = pty.term.try_lock() {
                         term.is_focused = self.focused;
-                        if scan_activity {
-                            scanned_activity_label = Some(infer_activity_label_from_term(
-                                &title_snapshot,
-                                &shell_title_snapshot,
-                                &term,
-                            ));
-                        }
-                    }
-                    if let Some(detected_label) = scanned_activity_label.take() {
-                        activity_label = detected_label.or_else(|| {
-                            infer_activity_label(&title_snapshot, &shell_title_snapshot, "")
-                        });
-                        activity_label_scan_at = Some(now);
+                        scrollbar_state = Some((
+                            term.grid().display_offset(),
+                            term.screen_lines(),
+                            term.grid().history_size(),
+                        ));
                     }
                     if !matches!(render_tier, RenderTier::Hidden) {
                         let preview_label = overlay
@@ -848,7 +947,7 @@ impl TerminalPanel {
                     Some(preview_label.as_str()),
                 );
             }
-        } else if let Some(error) = &self.spawn_error {
+        } else if let Some(error) = self.session.spawn_error() {
             painter.text(
                 content_rect.left_top() + vec2(12.0, 12.0),
                 Align2::LEFT_TOP,
@@ -860,6 +959,20 @@ impl TerminalPanel {
         self.activity_label = activity_label;
         if let Some(scanned_at) = activity_label_scan_at {
             self.last_activity_scan_at = scanned_at;
+        }
+
+        if let Some((display_offset, visible_rows, history_size)) = scrollbar_state {
+            render_scrollbar(
+                &chrome_painter,
+                scrollbar_rect.intersect(canvas_rect),
+                display_offset,
+                visible_rows,
+                history_size,
+                self.focused
+                    || scrollbar_response
+                        .as_ref()
+                        .is_some_and(|response| response.hovered()),
+            );
         }
 
         chrome_painter.rect_stroke(stroke_rect, panel_rounding, Stroke::new(1.0, border_color));
@@ -899,7 +1012,7 @@ impl TerminalPanel {
     }
 
     fn selected_text(&self) -> Option<String> {
-        self.with_pty(PtyHandle::selected_text).flatten()
+        self.session.selected_text()
     }
 
     fn record_input_text(&mut self, text: &str) {
@@ -960,6 +1073,14 @@ impl TerminalPanel {
         )
     }
 
+    fn content_screen_rect(&self, viewport: &Viewport, canvas_rect: Rect) -> Rect {
+        terminal_body_rect(self.body_screen_rect(viewport, canvas_rect))
+    }
+
+    fn scrollbar_screen_rect(&self, viewport: &Viewport, canvas_rect: Rect) -> Rect {
+        terminal_scrollbar_rect(self.body_screen_rect(viewport, canvas_rect))
+    }
+
     fn apply_shell_title(&mut self, title: String) {
         self.shell_title = if title.trim().is_empty() {
             "Terminal".to_owned()
@@ -974,11 +1095,11 @@ impl TerminalPanel {
             .custom_title
             .clone()
             .unwrap_or_else(|| self.shell_title.clone());
+        self.session.update_session_title_hint(&self.title);
     }
 
     fn window_title(&self, screen_width: f32) -> String {
-        let cols = self.last_cols.max(1);
-        let rows = self.last_rows.max(1);
+        let (cols, rows) = self.session.last_grid_size();
         if screen_width < 340.0 {
             return format!("{}×{}", cols, rows);
         }
@@ -1018,6 +1139,7 @@ impl TerminalPanel {
             return;
         };
         term.selection = Some(Selection::new(selection_type, point, side));
+        pty.mark_render_dirty();
     }
 
     fn update_selection(
@@ -1046,6 +1168,7 @@ impl TerminalPanel {
         } else {
             term.selection = Some(Selection::new(SelectionType::Simple, point, side));
         }
+        pty.mark_render_dirty();
     }
 
     fn point_from_pointer(
@@ -1059,31 +1182,20 @@ impl TerminalPanel {
         if !content_rect.intersect(canvas_rect).contains(pointer) {
             return None;
         }
-
-        let zoom = zoom.max(0.01);
-        let cell_width = FONT_SIZE * CELL_WIDTH_FACTOR * zoom;
-        let cell_height = FONT_SIZE * CELL_HEIGHT_FACTOR * zoom;
-        let pad_x = PAD_X * zoom;
-        let pad_y = PAD_Y * zoom;
-        let local_x = (pointer.x - content_rect.left() - pad_x).max(0.0);
-        let local_y = (pointer.y - content_rect.top() - pad_y).max(0.0);
         let term = pty.term.try_lock().ok()?;
-
-        let row =
-            ((local_y / cell_height).floor() as usize).min(term.screen_lines().saturating_sub(1));
-        let column =
-            ((local_x / cell_width).floor() as usize).min(term.columns().saturating_sub(1));
-        let cell_left = column as f32 * cell_width;
-        let side = if local_x - cell_left >= cell_width * 0.5 {
-            Side::Right
-        } else {
-            Side::Left
-        };
+        let point = terminal_cell_from_pointer(
+            content_rect,
+            pointer,
+            zoom,
+            term.screen_lines() as u16,
+            term.columns() as u16,
+        )?;
+        let side = cell_side_from_position(content_rect, pointer, zoom, point);
 
         Some((
             viewport_to_point(
                 term.grid().display_offset(),
-                Point::new(row, Column(column)),
+                Point::new(point.line, Column(point.column)),
             ),
             side,
         ))
@@ -1259,6 +1371,17 @@ fn close_rect(title_rect: Rect) -> Rect {
     )
 }
 
+fn minimize_rect(title_rect: Rect) -> Rect {
+    let chrome_zoom = chrome_zoom_from_title_rect(title_rect);
+    Rect::from_center_size(
+        pos2(
+            title_rect.left() + 46.0 * chrome_zoom,
+            title_rect.center().y,
+        ),
+        vec2(18.0, 18.0) * chrome_zoom,
+    )
+}
+
 fn resize_handle_rect(screen_rect: Rect) -> Rect {
     Rect::from_min_size(
         screen_rect.right_bottom() - vec2(RESIZE_GRIP_SIZE, RESIZE_GRIP_SIZE),
@@ -1411,6 +1534,23 @@ fn body_behaves_like_title_bar(lod: PanelLod) -> bool {
     !matches!(lod, PanelLod::Full)
 }
 
+fn terminal_mouse_cell_from_pointer(
+    content_rect: Rect,
+    pointer: Pos2,
+    zoom: f32,
+) -> Option<(usize, usize)> {
+    let metrics = grid_metrics(zoom);
+    let rect = Rect::from_min_max(
+        Pos2::new(
+            content_rect.left() + PAD_X * zoom.max(0.01),
+            content_rect.top() + PAD_Y * zoom.max(0.01),
+        ),
+        content_rect.right_bottom(),
+    );
+    let point = grid_point_from_position(rect, pointer, &metrics, u16::MAX, u16::MAX)?;
+    Some((point.column, point.line))
+}
+
 fn should_refresh_activity_label(last_scan_at: f64, time: f64) -> bool {
     (time - last_scan_at) >= 0.45
 }
@@ -1429,7 +1569,7 @@ fn render_tier_for_panel(
     content_rect: Rect,
     zoom: f32,
     lod: PanelLod,
-    _fast_path_render: bool,
+    fast_path_render: bool,
     focused: bool,
     streaming: bool,
 ) -> RenderTier {
@@ -1447,7 +1587,7 @@ fn render_tier_for_panel(
         focused,
         screen_area,
         streaming,
-        fast_path: false,
+        fast_path: fast_path_render && !focused,
         renderable: true,
     })
 }
@@ -1666,18 +1806,26 @@ mod tests {
     use crate::app::gesture_pointer_pos;
     use crate::canvas::viewport::Viewport;
     use crate::runtime::RenderTier;
+    use crate::terminal::input::{
+        alt_screen_scroll_sequence, mouse_scroll_button, mouse_scroll_sgr_sequence,
+        scroll_lines_from_input_delta, scrollback_delta_from_input,
+    };
+    use crate::terminal::layout::{grid_point_from_position, GridMetrics};
+    use crate::terminal::scrollbar::{
+        scrollbar_pointer_to_scrollback, scrollbar_thumb_height, terminal_scrollbar_rect,
+    };
     use egui::{pos2, vec2, Color32};
 
     use super::{
-        chrome_zoom, close_rect, drag_target_from_origin, infer_activity_label,
+        chrome_zoom, close_rect, drag_target_from_origin, infer_activity_label, minimize_rect,
         panel_corner_radius, panel_lod, panel_roundings, preview_label_text, render_tier_for_panel,
         resize_target_from_origin, shell_label, should_defer_terminal_resize,
         should_draw_resize_grip, should_draw_title_text, should_draw_window_controls,
-        should_render_live_terminal, should_render_terminal_contents, title_bar_height,
-        title_drag_hit_rect, PanelHitArea, PanelLod, ResizeHandle, TerminalPanel, BORDER_RADIUS,
-        MIN_HEIGHT, MIN_WIDTH, TITLE_BAR_HEIGHT,
+        should_render_live_terminal, should_render_terminal_contents,
+        terminal_mouse_cell_from_pointer, title_bar_height, title_drag_hit_rect, PanelHitArea,
+        PanelLod, ResizeHandle, TerminalPanel, BORDER_RADIUS, MIN_HEIGHT, MIN_WIDTH,
+        TITLE_BAR_HEIGHT,
     };
-
     #[test]
     fn custom_title_survives_shell_title_updates() {
         let mut panel = TerminalPanel::new(pos2(0.0, 0.0), vec2(400.0, 300.0), Color32::WHITE, 0);
@@ -1701,8 +1849,7 @@ mod tests {
         let mut panel = TerminalPanel::new(pos2(0.0, 0.0), vec2(400.0, 300.0), Color32::WHITE, 0);
         panel.cwd_label = "mauro".to_owned();
         panel.shell_label = shell_label();
-        panel.last_cols = 80;
-        panel.last_rows = 24;
+        panel.session.set_last_grid_size_for_tests(80, 24);
 
         assert_eq!(panel.window_title(720.0), "mauro — -zsh — 80×24");
     }
@@ -1714,6 +1861,15 @@ mod tests {
 
         assert!(close.center().x < title_rect.center().x);
         assert!((close.center().x - 126.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn minimize_button_sits_to_right_of_close_button() {
+        let title_rect = egui::Rect::from_min_size(pos2(100.0, 50.0), vec2(500.0, 42.0));
+        let close = close_rect(title_rect);
+        let minimize = minimize_rect(title_rect);
+
+        assert!(minimize.center().x > close.center().x);
     }
 
     #[test]
@@ -1750,8 +1906,7 @@ mod tests {
     #[test]
     fn narrow_windows_use_compact_title() {
         let mut panel = TerminalPanel::new(pos2(0.0, 0.0), vec2(400.0, 300.0), Color32::WHITE, 0);
-        panel.last_cols = 42;
-        panel.last_rows = 25;
+        panel.session.set_last_grid_size_for_tests(42, 25);
 
         assert_eq!(panel.window_title(420.0), "Terminal — 42×25");
     }
@@ -1830,7 +1985,7 @@ mod tests {
     }
 
     #[test]
-    fn fast_path_keeps_live_terminal_rendering_when_panel_is_readable() {
+    fn fast_path_drops_background_panels_to_preview() {
         let content_rect = egui::Rect::from_min_size(pos2(0.0, 42.0), vec2(420.0, 218.0));
 
         assert!(should_render_live_terminal(
@@ -1839,7 +1994,7 @@ mod tests {
             PanelLod::Full,
             false
         ));
-        assert!(should_render_live_terminal(
+        assert!(!should_render_live_terminal(
             content_rect,
             1.0,
             PanelLod::Full,
@@ -1853,6 +2008,16 @@ mod tests {
 
         assert_eq!(
             render_tier_for_panel(content_rect, 1.0, PanelLod::Full, false, true, false),
+            RenderTier::Full
+        );
+    }
+
+    #[test]
+    fn fast_path_still_keeps_focused_panels_live() {
+        let content_rect = egui::Rect::from_min_size(pos2(0.0, 42.0), vec2(420.0, 218.0));
+
+        assert_eq!(
+            render_tier_for_panel(content_rect, 1.0, PanelLod::Full, true, true, false),
             RenderTier::Full
         );
     }
@@ -1908,6 +2073,49 @@ mod tests {
     }
 
     #[test]
+    fn upward_input_scroll_moves_scrollback_toward_history() {
+        assert_eq!(scroll_lines_from_input_delta(-48.0), 2);
+        assert_eq!(scrollback_delta_from_input(-48.0), 2);
+        assert_eq!(alt_screen_scroll_sequence(-1.0), b"\x1b[A");
+        assert_eq!(mouse_scroll_button(-1.0), 64);
+    }
+
+    #[test]
+    fn downward_input_scroll_moves_scrollback_toward_recent_output() {
+        assert_eq!(scroll_lines_from_input_delta(48.0), 2);
+        assert_eq!(scrollback_delta_from_input(48.0), -2);
+        assert_eq!(alt_screen_scroll_sequence(1.0), b"\x1b[B");
+        assert_eq!(mouse_scroll_button(1.0), 65);
+    }
+
+    #[test]
+    fn mouse_mode_scroll_reports_pointer_cell_instead_of_fixed_origin() {
+        let content_rect = egui::Rect::from_min_size(pos2(10.0, 20.0), vec2(400.0, 240.0));
+        let pointer = pos2(10.0 + 7.2 * 5.4, 20.0 + 14.4 * 3.2);
+
+        let (column, row) = terminal_mouse_cell_from_pointer(content_rect, pointer, 1.0).unwrap();
+        let seq = mouse_scroll_sgr_sequence(64, column, row);
+
+        assert_eq!((column, row), (3, 2));
+        assert_eq!(seq, b"\x1b[<64;4;3M".to_vec());
+    }
+
+    #[test]
+    fn grid_point_from_position_clamps_to_visible_terminal_bounds() {
+        let rect = egui::Rect::from_min_size(pos2(100.0, 80.0), vec2(80.0, 48.0));
+        let metrics = GridMetrics {
+            char_width: 8.0,
+            line_height: 16.0,
+        };
+
+        let point =
+            grid_point_from_position(rect, pos2(179.0, 127.0), &metrics, 3, 10).expect("point");
+
+        assert_eq!(point.line, 2);
+        assert_eq!(point.column, 9);
+    }
+
+    #[test]
     fn tiny_title_bar_keeps_a_real_drag_hit_area() {
         let screen_rect = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(90.0, 52.0));
         let title_rect = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(90.0, 4.0));
@@ -1939,5 +2147,71 @@ mod tests {
         let hit = panel.hit_test(pos2(40.0, 34.0), &viewport, canvas_rect);
 
         assert!(matches!(hit, Some(PanelHitArea::TitleBar)));
+    }
+
+    #[test]
+    fn hit_test_detects_minimize_button() {
+        let panel = TerminalPanel::new(pos2(0.0, 0.0), vec2(400.0, 300.0), Color32::WHITE, 0);
+        let viewport = Viewport::default();
+        let canvas_rect = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0));
+        let title_rect = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(400.0, 42.0));
+        let hit = panel.hit_test(minimize_rect(title_rect).center(), &viewport, canvas_rect);
+
+        assert_eq!(hit, Some(PanelHitArea::MinimizeButton));
+    }
+
+    #[test]
+    fn resize_hit_areas_are_slightly_more_generous() {
+        let screen_rect = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(420.0, 260.0));
+
+        assert!(ResizeHandle::Right.hit_rect(screen_rect).width() >= 12.0);
+        assert!(ResizeHandle::Bottom.hit_rect(screen_rect).height() >= 12.0);
+        assert!(ResizeHandle::BottomRight.hit_rect(screen_rect).width() >= 28.0);
+        assert!(ResizeHandle::BottomRight.hit_rect(screen_rect).height() >= 28.0);
+    }
+
+    #[test]
+    fn scrollbar_thumb_height_stays_within_track_bounds() {
+        assert!((scrollbar_thumb_height(12.0, 50, 0) - 12.0).abs() <= f32::EPSILON);
+
+        let thumb_height = scrollbar_thumb_height(120.0, 24, 240);
+        assert!(thumb_height >= 18.0);
+        assert!(thumb_height <= 120.0);
+    }
+
+    #[test]
+    fn scrollbar_pointer_maps_to_expected_scrollback_extremes() {
+        let track_rect = egui::Rect::from_min_size(pos2(10.0, 20.0), vec2(12.0, 100.0));
+        let thumb_height = 20.0;
+
+        assert_eq!(
+            scrollbar_pointer_to_scrollback(
+                pos2(16.0, track_rect.max.y),
+                track_rect,
+                thumb_height,
+                200
+            ),
+            0
+        );
+        assert_eq!(
+            scrollbar_pointer_to_scrollback(
+                pos2(16.0, track_rect.min.y),
+                track_rect,
+                thumb_height,
+                200
+            ),
+            200
+        );
+    }
+
+    #[test]
+    fn scroll_hit_target_includes_scrollbar_track() {
+        let panel = TerminalPanel::new(pos2(0.0, 0.0), vec2(400.0, 300.0), Color32::WHITE, 0);
+        let viewport = Viewport::default();
+        let canvas_rect = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0));
+        let body_rect = egui::Rect::from_min_max(pos2(0.0, 42.0), pos2(400.0, 300.0));
+        let pointer = terminal_scrollbar_rect(body_rect).center();
+
+        assert!(panel.scroll_hit_test(pointer, &viewport, canvas_rect));
     }
 }

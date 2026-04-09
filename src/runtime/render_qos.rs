@@ -38,3 +38,68 @@ impl RenderQos {
         RenderTier::Preview
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{RenderInputs, RenderQos, RenderTier};
+
+    #[test]
+    fn focused_renderable_panel_gets_full_tier() {
+        assert_eq!(
+            RenderQos::decide(RenderInputs {
+                visible: true,
+                focused: true,
+                screen_area: 24_000.0,
+                streaming: false,
+                fast_path: false,
+                renderable: true,
+            }),
+            RenderTier::Full
+        );
+    }
+
+    #[test]
+    fn large_background_panel_gets_reduced_live_tier() {
+        assert_eq!(
+            RenderQos::decide(RenderInputs {
+                visible: true,
+                focused: false,
+                screen_area: 24_000.0,
+                streaming: false,
+                fast_path: false,
+                renderable: true,
+            }),
+            RenderTier::ReducedLive
+        );
+    }
+
+    #[test]
+    fn fast_path_for_background_panel_drops_to_preview() {
+        assert_eq!(
+            RenderQos::decide(RenderInputs {
+                visible: true,
+                focused: false,
+                screen_area: 24_000.0,
+                streaming: false,
+                fast_path: true,
+                renderable: true,
+            }),
+            RenderTier::Preview
+        );
+    }
+
+    #[test]
+    fn non_renderable_panel_is_hidden() {
+        assert_eq!(
+            RenderQos::decide(RenderInputs {
+                visible: true,
+                focused: false,
+                screen_area: 24_000.0,
+                streaming: false,
+                fast_path: false,
+                renderable: false,
+            }),
+            RenderTier::Hidden
+        );
+    }
+}

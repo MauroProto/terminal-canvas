@@ -1,4 +1,6 @@
 mod terminal {
+    #![allow(dead_code)]
+
     #[path = "/Users/mauro/Desktop/proyectos/terminalcanvas/src/terminal/colors.rs"]
     pub mod colors;
     #[path = "/Users/mauro/Desktop/proyectos/terminalcanvas/src/terminal/input.rs"]
@@ -8,6 +10,8 @@ mod terminal {
 }
 
 mod utils {
+    #![allow(dead_code)]
+
     #[path = "/Users/mauro/Desktop/proyectos/terminalcanvas/src/utils/platform.rs"]
     pub mod platform;
 }

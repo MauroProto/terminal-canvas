@@ -1,6 +1,6 @@
 use egui::{Align2, Color32, FontId, RichText, ScrollArea, Sense, Stroke, Ui};
 
-use crate::sidebar::terminal_list::draw_terminal_list;
+use crate::collab::{CollabMode, CollabSessionState};
 use crate::sidebar::workspace_list::draw_workspace_tree;
 use crate::state::Workspace;
 use crate::update::{UpdateState, UpdateStatus};
@@ -21,7 +21,7 @@ pub const ITEM_BG: Color32 = Color32::from_rgb(39, 39, 42);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SidebarTab {
     Workspaces,
-    Terminals,
+    Online,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,10 +29,49 @@ pub enum SidebarResponse {
     SwitchWorkspace(usize),
     OpenFolder,
     DeleteWorkspace(usize),
+    OpenShareWorkspace,
+    OpenJoinSession,
+    OpenCollabSession,
+    StopCollabSession,
     FocusPanel(uuid::Uuid),
     SpawnTerminal(usize),
     RenamePanel(uuid::Uuid),
     ClosePanel(uuid::Uuid),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SidebarCollabControls {
+    state_label: &'static str,
+    primary_label: &'static str,
+    secondary_label: Option<&'static str>,
+}
+
+fn sidebar_collab_controls(mode: CollabMode, state: CollabSessionState) -> SidebarCollabControls {
+    let state_label = match state {
+        CollabSessionState::NotSharing => "Not sharing",
+        CollabSessionState::Starting => "Connecting",
+        CollabSessionState::Live => "Live",
+        CollabSessionState::Disconnected => "Waiting",
+        CollabSessionState::Ended => "Ended",
+    };
+
+    match mode {
+        CollabMode::Inactive => SidebarCollabControls {
+            state_label,
+            primary_label: "Share",
+            secondary_label: Some("Join"),
+        },
+        CollabMode::Host => SidebarCollabControls {
+            state_label,
+            primary_label: "Session",
+            secondary_label: Some("Stop"),
+        },
+        CollabMode::Guest => SidebarCollabControls {
+            state_label,
+            primary_label: "Session",
+            secondary_label: Some("Leave"),
+        },
+    }
 }
 
 pub struct Sidebar {
@@ -55,6 +94,8 @@ impl Sidebar {
         workspaces: &[Workspace],
         active_ws: usize,
         update_state: &UpdateState,
+        collab_mode: CollabMode,
+        collab_state: CollabSessionState,
     ) -> Vec<SidebarResponse> {
         let mut responses = Vec::new();
 
@@ -110,17 +151,15 @@ impl Sidebar {
         });
 
         ui.add_space(8.0);
-        self.show_tabs(ui);
+        responses.extend(self.show_tabs(ui));
         ui.add_space(8.0);
 
         ScrollArea::vertical().show(ui, |ui| match self.active_tab {
             SidebarTab::Workspaces => {
                 responses.extend(draw_workspace_tree(ui, workspaces, active_ws));
             }
-            SidebarTab::Terminals => {
-                if let Some(ws) = workspaces.get(active_ws) {
-                    responses.extend(draw_terminal_list(ui, ws));
-                }
+            SidebarTab::Online => {
+                responses.extend(self.show_online_panel(ui, collab_mode, collab_state));
             }
         });
 
@@ -136,7 +175,8 @@ impl Sidebar {
         responses
     }
 
-    fn show_tabs(&mut self, ui: &mut Ui) {
+    fn show_tabs(&mut self, ui: &mut Ui) -> Vec<SidebarResponse> {
+        let responses = Vec::new();
         let total = ui.available_width();
         let (rect, _) = ui.allocate_exact_size(egui::vec2(total, 34.0), Sense::hover());
         ui.painter().rect_filled(rect, 8.0, INPUT_BG);
@@ -144,11 +184,10 @@ impl Sidebar {
         let half = rect.width() * 0.5;
         let workspaces =
             egui::Rect::from_min_max(rect.min, egui::pos2(rect.left() + half, rect.bottom()));
-        let terminals =
-            egui::Rect::from_min_max(egui::pos2(rect.left() + half, rect.top()), rect.max);
+        let online = egui::Rect::from_min_max(egui::pos2(rect.left() + half, rect.top()), rect.max);
         let active_rect = match self.active_tab {
             SidebarTab::Workspaces => workspaces.shrink(2.0),
-            SidebarTab::Terminals => terminals.shrink(2.0),
+            SidebarTab::Online => online.shrink(2.0),
         };
         ui.painter().rect_filled(active_rect, 6.0, ACTIVE_TAB_BG);
         ui.painter().line_segment(
@@ -170,14 +209,10 @@ impl Sidebar {
             self.active_tab = SidebarTab::Workspaces;
         }
         if ui
-            .interact(
-                terminals,
-                ui.id().with("sidebar-tab-terminals"),
-                Sense::click(),
-            )
+            .interact(online, ui.id().with("sidebar-tab-online"), Sense::click())
             .clicked()
         {
-            self.active_tab = SidebarTab::Terminals;
+            self.active_tab = SidebarTab::Online;
         }
 
         ui.painter().text(
@@ -188,11 +223,136 @@ impl Sidebar {
             TEXT_PRIMARY,
         );
         ui.painter().text(
-            terminals.center(),
+            online.center(),
             Align2::CENTER_CENTER,
-            "Terminals",
+            "Online",
             FontId::proportional(11.5),
             TEXT_PRIMARY,
         );
+
+        responses
+    }
+
+    fn show_online_panel(
+        &mut self,
+        ui: &mut Ui,
+        collab_mode: CollabMode,
+        collab_state: CollabSessionState,
+    ) -> Vec<SidebarResponse> {
+        let mut responses = Vec::new();
+        let controls = sidebar_collab_controls(collab_mode, collab_state);
+        let status_color = match collab_state {
+            CollabSessionState::NotSharing | CollabSessionState::Ended => TEXT_MUTED,
+            CollabSessionState::Starting | CollabSessionState::Disconnected => {
+                Color32::from_rgb(245, 158, 11)
+            }
+            CollabSessionState::Live => Color32::from_rgb(74, 222, 128),
+        };
+        let description = match collab_mode {
+            CollabMode::Inactive => "Comparte este workspace o unite a una sesion existente.",
+            CollabMode::Host => "Esta maquina esta compartiendo el workspace actual.",
+            CollabMode::Guest => "Estas dentro de una sesion remota como invitado.",
+        };
+
+        egui::Frame::default()
+            .fill(INPUT_BG)
+            .stroke(Stroke::new(1.0, SIDEBAR_BORDER))
+            .rounding(10.0)
+            .inner_margin(egui::Margin::same(12.0))
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new("Online")
+                        .size(14.0)
+                        .strong()
+                        .color(TEXT_PRIMARY),
+                );
+                ui.add_space(4.0);
+                ui.label(RichText::new(description).size(11.0).color(TEXT_SECONDARY));
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Estado").size(10.5).color(TEXT_MUTED));
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(controls.state_label)
+                            .size(10.5)
+                            .strong()
+                            .color(status_color),
+                    );
+                });
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_sized(
+                            [88.0, 30.0],
+                            egui::Button::new(
+                                RichText::new(controls.primary_label)
+                                    .size(11.0)
+                                    .color(TEXT_PRIMARY),
+                            )
+                            .fill(ACTIVE_TAB_BG)
+                            .stroke(Stroke::new(1.0, SIDEBAR_BORDER))
+                            .rounding(8.0),
+                        )
+                        .clicked()
+                    {
+                        responses.push(match collab_mode {
+                            CollabMode::Inactive => SidebarResponse::OpenShareWorkspace,
+                            CollabMode::Host | CollabMode::Guest => {
+                                SidebarResponse::OpenCollabSession
+                            }
+                        });
+                    }
+
+                    if let Some(label) = controls.secondary_label {
+                        if ui
+                            .add_sized(
+                                [88.0, 30.0],
+                                egui::Button::new(
+                                    RichText::new(label).size(11.0).color(TEXT_PRIMARY),
+                                )
+                                .fill(ACTIVE_TAB_BG)
+                                .stroke(Stroke::new(1.0, SIDEBAR_BORDER))
+                                .rounding(8.0),
+                            )
+                            .clicked()
+                        {
+                            responses.push(match collab_mode {
+                                CollabMode::Inactive => SidebarResponse::OpenJoinSession,
+                                CollabMode::Host | CollabMode::Guest => {
+                                    SidebarResponse::StopCollabSession
+                                }
+                            });
+                        }
+                    }
+                });
+            });
+
+        responses
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::collab::{CollabMode, CollabSessionState};
+
+    use super::sidebar_collab_controls;
+
+    #[test]
+    fn inactive_sidebar_collab_controls_match_share_join_flow() {
+        let controls =
+            sidebar_collab_controls(CollabMode::Inactive, CollabSessionState::NotSharing);
+
+        assert_eq!(controls.state_label, "Not sharing");
+        assert_eq!(controls.primary_label, "Share");
+        assert_eq!(controls.secondary_label, Some("Join"));
+    }
+
+    #[test]
+    fn guest_sidebar_collab_controls_match_session_leave_flow() {
+        let controls = sidebar_collab_controls(CollabMode::Guest, CollabSessionState::Live);
+
+        assert_eq!(controls.state_label, "Live");
+        assert_eq!(controls.primary_label, "Session");
+        assert_eq!(controls.secondary_label, Some("Leave"));
     }
 }

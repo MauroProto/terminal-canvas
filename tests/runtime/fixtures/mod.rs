@@ -85,6 +85,78 @@ impl RuntimeHarness {
         }
     }
 
+    #[allow(dead_code)]
+    pub fn seed_budget(
+        &mut self,
+        open_terminals: usize,
+        visible_terminals: usize,
+        streaming_terminals: usize,
+    ) {
+        assert!(
+            open_terminals > 0,
+            "open_terminals must be greater than zero"
+        );
+        assert!(
+            visible_terminals <= open_terminals,
+            "visible_terminals cannot exceed open_terminals"
+        );
+        assert!(
+            streaming_terminals <= visible_terminals.saturating_sub(1),
+            "streaming_terminals should target non-focused visible terminals"
+        );
+
+        let workspace_count = open_terminals.min(5).max(1);
+        self.registry = RuntimeRegistry::new();
+        self.scheduler = RuntimeScheduler::new_for_tests();
+        self.sessions.clear();
+        self.drained_batches = 0;
+        self.idle_after_step = false;
+
+        let workspace_ids = (0..workspace_count)
+            .map(|index| {
+                self.registry.create_workspace(
+                    format!("workspace-{index}"),
+                    Some(format!("/tmp/workspace-{index}").into()),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        for index in 0..open_terminals {
+            let workspace_id = workspace_ids[index % workspace_ids.len()];
+            let session_id = self.registry.create_session_with_spec(
+                workspace_id,
+                SessionSpec {
+                    title: format!("budget-session-{index}"),
+                    cwd: Some(
+                        format!("/tmp/workspace-{}/{index}", index % workspace_ids.len()).into(),
+                    ),
+                    startup_command: None,
+                    startup_input: None,
+                },
+            );
+
+            let visible = index < visible_terminals;
+            let focused = index == 0;
+            let streaming = visible && !focused && index <= streaming_terminals;
+            let screen_area = if !visible {
+                0.0
+            } else if focused {
+                180_000.0
+            } else {
+                32_000.0
+            };
+
+            self.sessions.push(HarnessSession {
+                id: session_id,
+                workspace_id,
+                visible,
+                focused,
+                streaming,
+                screen_area,
+            });
+        }
+    }
+
     pub fn emit_output_bursts(&mut self) {
         for session in &self.sessions {
             if session.streaming {
@@ -191,5 +263,31 @@ impl RuntimeHarness {
         self.sessions
             .iter()
             .all(|session| seeded_workspaces.contains(&session.workspace_id))
+    }
+
+    #[allow(dead_code)]
+    pub fn render_tier_counts(&self) -> (usize, usize, usize, usize) {
+        let mut full = 0;
+        let mut reduced = 0;
+        let mut preview = 0;
+        let mut hidden = 0;
+
+        for session in &self.sessions {
+            match RenderQos::decide(RenderInputs {
+                visible: session.visible,
+                focused: session.focused,
+                screen_area: session.screen_area,
+                streaming: session.streaming,
+                fast_path: false,
+                renderable: true,
+            }) {
+                RenderTier::Full => full += 1,
+                RenderTier::ReducedLive => reduced += 1,
+                RenderTier::Preview => preview += 1,
+                RenderTier::Hidden => hidden += 1,
+            }
+        }
+
+        (full, reduced, preview, hidden)
     }
 }
