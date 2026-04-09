@@ -29,7 +29,7 @@ use crate::terminal::input::{
 use crate::terminal::layout::{
     cell_side_from_position, grid_metrics, grid_point_from_position, terminal_cell_from_pointer,
 };
-use crate::terminal::pty::PtyHandle;
+use crate::terminal::pty::{PtyHandle, TerminalScrollState};
 use crate::terminal::renderer::{
     compute_grid_size, render_terminal, render_terminal_preview, render_terminal_reduced,
     TerminalGridCache, FONT_SIZE, MIN_TEXT_RENDER_FONT_SIZE, PAD_X, PAD_Y,
@@ -140,6 +140,7 @@ pub struct TerminalPanel {
     command_buffer: String,
     last_activity_scan_at: f64,
     render_cache: TerminalGridCache,
+    last_scrollbar_state: Option<TerminalScrollState>,
 }
 
 impl TerminalPanel {
@@ -165,6 +166,7 @@ impl TerminalPanel {
             command_buffer: String::new(),
             last_activity_scan_at: 0.0,
             render_cache: TerminalGridCache::default(),
+            last_scrollbar_state: None,
         }
     }
 
@@ -818,7 +820,7 @@ impl TerminalPanel {
         };
         let mut activity_label = self.activity_label.clone();
         let mut activity_label_scan_at = None;
-        let mut scrollbar_state = None;
+        let mut scrollbar_state = self.last_scrollbar_state;
         let render_tier = render_tier_for_panel(
             content_rect,
             zoom,
@@ -842,11 +844,11 @@ impl TerminalPanel {
                 if matches!(render_tier, RenderTier::Full | RenderTier::ReducedLive) {
                     if let Ok(mut term) = pty.term.try_lock() {
                         term.is_focused = self.focused;
-                        scrollbar_state = Some((
-                            term.grid().display_offset(),
-                            term.screen_lines(),
-                            term.grid().history_size(),
-                        ));
+                        scrollbar_state = Some(TerminalScrollState {
+                            display_offset: term.grid().display_offset(),
+                            visible_rows: term.screen_lines(),
+                            history_size: term.grid().history_size(),
+                        });
                         if scan_activity {
                             scanned_activity_label = Some(infer_activity_label_from_term(
                                 &title_snapshot,
@@ -901,14 +903,6 @@ impl TerminalPanel {
                         );
                     }
                 } else {
-                    if let Ok(mut term) = pty.term.try_lock() {
-                        term.is_focused = self.focused;
-                        scrollbar_state = Some((
-                            term.grid().display_offset(),
-                            term.screen_lines(),
-                            term.grid().history_size(),
-                        ));
-                    }
                     if !matches!(render_tier, RenderTier::Hidden) {
                         let preview_label = overlay
                             .map(|overlay| overlay.preview_label.clone())
@@ -948,6 +942,7 @@ impl TerminalPanel {
                 );
             }
         } else if let Some(error) = self.session.spawn_error() {
+            scrollbar_state = None;
             painter.text(
                 content_rect.left_top() + vec2(12.0, 12.0),
                 Align2::LEFT_TOP,
@@ -960,14 +955,15 @@ impl TerminalPanel {
         if let Some(scanned_at) = activity_label_scan_at {
             self.last_activity_scan_at = scanned_at;
         }
+        self.last_scrollbar_state = scrollbar_state;
 
-        if let Some((display_offset, visible_rows, history_size)) = scrollbar_state {
+        if let Some(scroll_state) = scrollbar_state {
             render_scrollbar(
                 &chrome_painter,
                 scrollbar_rect.intersect(canvas_rect),
-                display_offset,
-                visible_rows,
-                history_size,
+                scroll_state.display_offset,
+                scroll_state.visible_rows,
+                scroll_state.history_size,
                 self.focused
                     || scrollbar_response
                         .as_ref()

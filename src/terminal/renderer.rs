@@ -37,36 +37,36 @@ pub(crate) struct GridCacheKey {
     rect_width_bits: u32,
     rect_height_bits: u32,
     zoom_bits: u32,
-    display_offset: usize,
     revision: u64,
     row_stride: usize,
 }
 
 impl GridCacheKey {
-    pub(crate) fn new(
-        rect: Rect,
-        zoom: f32,
-        display_offset: usize,
-        revision: u64,
-        row_stride: usize,
-    ) -> Self {
+    pub(crate) fn new(rect: Rect, zoom: f32, revision: u64, row_stride: usize) -> Self {
         Self {
             rect_min_x_bits: rect.min.x.to_bits(),
             rect_min_y_bits: rect.min.y.to_bits(),
             rect_width_bits: rect.width().to_bits(),
             rect_height_bits: rect.height().to_bits(),
             zoom_bits: zoom.to_bits(),
-            display_offset,
             revision,
             row_stride,
         }
     }
 }
 
+#[derive(Clone, Copy)]
+struct CachedRenderState {
+    background_fill: Color32,
+    display_offset: usize,
+    cursor: RenderableCursor,
+}
+
 #[derive(Clone, Default)]
 pub struct TerminalGridCache {
     key: Option<GridCacheKey>,
     shapes: Vec<Shape>,
+    state: Option<CachedRenderState>,
 }
 
 impl TerminalGridCache {
@@ -74,14 +74,35 @@ impl TerminalGridCache {
         self.key == Some(key)
     }
 
-    pub fn store(&mut self, key: GridCacheKey, shapes: Vec<Shape>) {
+    fn state_for(&self, key: GridCacheKey) -> Option<CachedRenderState> {
+        if self.matches(key) {
+            self.state
+        } else {
+            None
+        }
+    }
+
+    pub fn store(
+        &mut self,
+        key: GridCacheKey,
+        shapes: Vec<Shape>,
+        background_fill: Color32,
+        display_offset: usize,
+        cursor: RenderableCursor,
+    ) {
         self.key = Some(key);
         self.shapes = shapes;
+        self.state = Some(CachedRenderState {
+            background_fill,
+            display_offset,
+            cursor,
+        });
     }
 
     pub fn clear(&mut self) {
         self.key = None;
         self.shapes.clear();
+        self.state = None;
     }
 }
 
@@ -198,40 +219,38 @@ fn render_terminal_with_row_stride(
         return false;
     }
 
-    let content = term.renderable_content();
-    let display_offset = content.display_offset;
-    let cursor = content.cursor;
-    let selection = content.selection;
-    let colors = content.colors;
     let metrics = scaled_metrics(zoom);
-
-    painter.rect_filled(
-        content_rect,
-        background_rounding,
-        terminal_background_color(colors),
-    );
-
-    let cache_key = GridCacheKey::new(content_rect, zoom, display_offset, revision, row_stride);
-    let selection_active = selection.is_some();
+    let cache_key = GridCacheKey::new(content_rect, zoom, revision, row_stride);
     if let Some(cache) = cache.as_deref_mut() {
-        if !selection_active && cache.matches(cache_key) {
+        if let Some(state) = cache.state_for(cache_key) {
+            painter.rect_filled(content_rect, background_rounding, state.background_fill);
             painter.extend(cache.shapes.iter().cloned());
             if cursor_visible(focused, row_stride > 1, time) {
-                draw_cursor(painter, content_rect, display_offset, cursor, metrics);
+                draw_cursor(
+                    painter,
+                    content_rect,
+                    state.display_offset,
+                    state.cursor,
+                    metrics,
+                );
             }
             return true;
         }
     }
 
+    let content = term.renderable_content();
+    let display_offset = content.display_offset;
+    let cursor = content.cursor;
+    let colors = content.colors;
+    let background_fill = terminal_background_color(colors);
+
+    painter.rect_filled(content_rect, background_rounding, background_fill);
+
     let shapes = build_grid_shapes(painter.ctx(), content_rect, content, metrics, row_stride);
     painter.extend(shapes.iter().cloned());
 
     if let Some(cache) = cache.as_deref_mut() {
-        if selection_active {
-            cache.clear();
-        } else {
-            cache.store(cache_key, shapes);
-        }
+        cache.store(cache_key, shapes, background_fill, display_offset, cursor);
     }
 
     if cursor_visible(focused, row_stride > 1, time) {
@@ -927,24 +946,79 @@ mod tests {
     #[test]
     fn grid_cache_key_tracks_revision_and_display_offset() {
         let rect = Rect::from_min_size(pos2(20.0, 20.0), vec2(220.0, 120.0));
-        let first = GridCacheKey::new(rect, 1.0, 0, 7, 1);
-        let different_revision = GridCacheKey::new(rect, 1.0, 0, 8, 1);
-        let different_offset = GridCacheKey::new(rect, 1.0, 1, 7, 1);
+        let first = GridCacheKey::new(rect, 1.0, 7, 1);
+        let different_revision = GridCacheKey::new(rect, 1.0, 8, 1);
+        let different_offset = GridCacheKey::new(rect, 1.0, 7, 1);
 
         assert_ne!(first, different_revision);
-        assert_ne!(first, different_offset);
+        assert_eq!(first, different_offset);
     }
 
     #[test]
     fn grid_cache_reuses_shapes_only_for_identical_keys() {
         let rect = Rect::from_min_size(pos2(20.0, 20.0), vec2(220.0, 120.0));
-        let key = GridCacheKey::new(rect, 1.0, 0, 7, 1);
+        let key = GridCacheKey::new(rect, 1.0, 7, 1);
         let mut cache = TerminalGridCache::default();
 
         assert!(!cache.matches(key));
-        cache.store(key, Vec::new());
+        cache.store(
+            key,
+            Vec::new(),
+            terminal_background_color(sample_term("hello").renderable_content().colors),
+            0,
+            sample_term("hello").renderable_content().cursor,
+        );
         assert!(cache.matches(key));
-        assert!(!cache.matches(GridCacheKey::new(rect, 1.0, 0, 8, 1)));
+        assert!(!cache.matches(GridCacheKey::new(rect, 1.0, 8, 1)));
+    }
+
+    #[test]
+    fn render_cache_hits_on_unchanged_revision() {
+        let ctx = egui::Context::default();
+        let raw_input = RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(320.0, 240.0))),
+            ..Default::default()
+        };
+        let content_rect = Rect::from_min_size(pos2(20.0, 20.0), vec2(220.0, 120.0));
+        let term = sample_term("hello");
+        let mut cache = TerminalGridCache::default();
+        let mut first_hit = false;
+        let mut second_hit = false;
+
+        let _ = ctx.run(raw_input.clone(), |ctx| {
+            CentralPanel::default().show(ctx, |ui| {
+                first_hit = render_terminal(
+                    ui.painter(),
+                    content_rect,
+                    &term,
+                    true,
+                    0.0,
+                    1.0,
+                    Rounding::ZERO,
+                    Some(&mut cache),
+                    7,
+                );
+            });
+        });
+
+        let _ = ctx.run(raw_input, |ctx| {
+            CentralPanel::default().show(ctx, |ui| {
+                second_hit = render_terminal(
+                    ui.painter(),
+                    content_rect,
+                    &term,
+                    true,
+                    0.0,
+                    1.0,
+                    Rounding::ZERO,
+                    Some(&mut cache),
+                    7,
+                );
+            });
+        });
+
+        assert!(!first_hit);
+        assert!(second_hit);
     }
 
     fn sample_term(text: &str) -> Term<EventProxy> {
