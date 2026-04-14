@@ -52,7 +52,7 @@ pub fn scroll_lines_from_input_delta(delta: f32) -> i32 {
 }
 
 pub fn alt_screen_scroll_sequence(delta: f32) -> &'static [u8] {
-    if delta < 0.0 {
+    if scrollback_delta_from_input(delta) > 0 {
         b"\x1b[A"
     } else {
         b"\x1b[B"
@@ -60,7 +60,7 @@ pub fn alt_screen_scroll_sequence(delta: f32) -> &'static [u8] {
 }
 
 pub fn mouse_scroll_button(delta: f32) -> u8 {
-    if delta < 0.0 {
+    if scrollback_delta_from_input(delta) > 0 {
         64
     } else {
         65
@@ -73,10 +73,22 @@ pub fn mouse_scroll_sgr_sequence(button: u8, column: usize, row: usize) -> Vec<u
 
 pub fn scrollback_delta_from_input(delta: f32) -> i32 {
     let lines = scroll_lines_from_input_delta(delta);
-    if delta < 0.0 {
+    if native_scrolls_toward_history(delta) {
         lines
     } else {
         -lines
+    }
+}
+
+#[inline]
+fn native_scrolls_toward_history(delta: f32) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        delta > 0.0
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        delta < 0.0
     }
 }
 
@@ -392,6 +404,9 @@ mod tests {
 
         let action = wheel_action(-48.0, &mode, Some(GridPoint { line: 2, column: 3 })).unwrap();
 
+        #[cfg(target_os = "macos")]
+        assert_eq!(action, WheelAction::Pty(b"\x1b[<65;4;3M".to_vec()));
+        #[cfg(not(target_os = "macos"))]
         assert_eq!(action, WheelAction::Pty(b"\x1b[<64;4;3M".to_vec()));
     }
 
@@ -404,6 +419,9 @@ mod tests {
         )
         .unwrap();
 
+        #[cfg(target_os = "macos")]
+        assert_eq!(action, WheelAction::Scrollback(2));
+        #[cfg(not(target_os = "macos"))]
         assert_eq!(action, WheelAction::Scrollback(-2));
     }
 

@@ -19,9 +19,7 @@ use crate::canvas::snap::{snap_drag, snap_resize, SnapGuide};
 use crate::canvas::viewport::Viewport;
 use crate::collab::{SerializableModifiers, SharedPanelSnapshot, TerminalInputEvent};
 use crate::orchestration::{AgentProvider, PanelOverlay, PanelRuntimeObservation};
-use crate::runtime::{
-    PtyManager, RenderInputs, RenderQos, RenderTier, SessionSpec, SharedPtyHandle,
-};
+use crate::runtime::{PtyManager, RenderTier, SessionSpec, SharedPtyHandle};
 use crate::state::PanelState;
 use crate::terminal::input::{
     is_paste_shortcut, key_to_bytes, paste_bytes, should_copy_selection, wheel_action, WheelAction,
@@ -1565,9 +1563,9 @@ fn render_tier_for_panel(
     content_rect: Rect,
     zoom: f32,
     lod: PanelLod,
-    fast_path_render: bool,
-    focused: bool,
-    streaming: bool,
+    _fast_path_render: bool,
+    _focused: bool,
+    _streaming: bool,
 ) -> RenderTier {
     let previewable = content_rect.width() >= 24.0 && content_rect.height() >= 18.0;
     if !previewable {
@@ -1576,16 +1574,7 @@ fn render_tier_for_panel(
     if matches!(lod, PanelLod::Minimal) || !should_render_terminal_contents(content_rect, zoom) {
         return RenderTier::Preview;
     }
-
-    let screen_area = content_rect.width().max(0.0) * content_rect.height().max(0.0);
-    RenderQos::decide(RenderInputs {
-        visible: true,
-        focused,
-        screen_area,
-        streaming,
-        fast_path: fast_path_render && !focused,
-        renderable: true,
-    })
+    RenderTier::Full
 }
 
 fn is_streaming_output(pty: &PtyHandle) -> bool {
@@ -1981,7 +1970,7 @@ mod tests {
     }
 
     #[test]
-    fn fast_path_drops_background_panels_to_preview() {
+    fn fast_path_keeps_background_panels_live() {
         let content_rect = egui::Rect::from_min_size(pos2(0.0, 42.0), vec2(420.0, 218.0));
 
         assert!(should_render_live_terminal(
@@ -1990,7 +1979,7 @@ mod tests {
             PanelLod::Full,
             false
         ));
-        assert!(!should_render_live_terminal(
+        assert!(should_render_live_terminal(
             content_rect,
             1.0,
             PanelLod::Full,
@@ -2019,12 +2008,12 @@ mod tests {
     }
 
     #[test]
-    fn background_streaming_panels_drop_to_preview_tier() {
+    fn background_streaming_panels_stay_live_when_renderable() {
         let content_rect = egui::Rect::from_min_size(pos2(0.0, 42.0), vec2(200.0, 120.0));
 
         assert_eq!(
             render_tier_for_panel(content_rect, 1.0, PanelLod::Compact, false, false, true),
-            RenderTier::Preview
+            RenderTier::Full
         );
     }
 
@@ -2069,19 +2058,37 @@ mod tests {
     }
 
     #[test]
-    fn upward_input_scroll_moves_scrollback_toward_history() {
+    fn mac_native_upward_input_scroll_moves_toward_recent_output() {
         assert_eq!(scroll_lines_from_input_delta(-48.0), 2);
-        assert_eq!(scrollback_delta_from_input(-48.0), 2);
-        assert_eq!(alt_screen_scroll_sequence(-1.0), b"\x1b[A");
-        assert_eq!(mouse_scroll_button(-1.0), 64);
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(scrollback_delta_from_input(-48.0), -2);
+            assert_eq!(alt_screen_scroll_sequence(-1.0), b"\x1b[B");
+            assert_eq!(mouse_scroll_button(-1.0), 65);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert_eq!(scrollback_delta_from_input(-48.0), 2);
+            assert_eq!(alt_screen_scroll_sequence(-1.0), b"\x1b[A");
+            assert_eq!(mouse_scroll_button(-1.0), 64);
+        }
     }
 
     #[test]
-    fn downward_input_scroll_moves_scrollback_toward_recent_output() {
+    fn mac_native_downward_input_scroll_moves_toward_history() {
         assert_eq!(scroll_lines_from_input_delta(48.0), 2);
-        assert_eq!(scrollback_delta_from_input(48.0), -2);
-        assert_eq!(alt_screen_scroll_sequence(1.0), b"\x1b[B");
-        assert_eq!(mouse_scroll_button(1.0), 65);
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(scrollback_delta_from_input(48.0), 2);
+            assert_eq!(alt_screen_scroll_sequence(1.0), b"\x1b[A");
+            assert_eq!(mouse_scroll_button(1.0), 64);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert_eq!(scrollback_delta_from_input(48.0), -2);
+            assert_eq!(alt_screen_scroll_sequence(1.0), b"\x1b[B");
+            assert_eq!(mouse_scroll_button(1.0), 65);
+        }
     }
 
     #[test]
