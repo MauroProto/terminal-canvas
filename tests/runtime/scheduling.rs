@@ -1,18 +1,18 @@
 mod terminal {
     #![allow(dead_code)]
 
-    #[path = "/Users/mauro/Desktop/proyectos/terminalcanvas/src/terminal/colors.rs"]
+    #[path = "../../../src/terminal/colors.rs"]
     pub mod colors;
-    #[path = "/Users/mauro/Desktop/proyectos/terminalcanvas/src/terminal/input.rs"]
+    #[path = "../../../src/terminal/input.rs"]
     pub mod input;
-    #[path = "/Users/mauro/Desktop/proyectos/terminalcanvas/src/terminal/pty.rs"]
+    #[path = "../../../src/terminal/pty.rs"]
     pub mod pty;
 }
 
 mod utils {
     #![allow(dead_code)]
 
-    #[path = "/Users/mauro/Desktop/proyectos/terminalcanvas/src/utils/platform.rs"]
+    #[path = "../../../src/utils/platform.rs"]
     pub mod platform;
 }
 
