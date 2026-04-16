@@ -2,7 +2,7 @@
 name = "mi-terminal"
 version = "1.2.0"
 edition = "2021"
-description = "An infinite canvas terminal emulator, GPU-accelerated, cross-platform"
+description = "A native desktop terminal and agent workspace manager, GPU-accelerated, cross-platform"
 license = "MIT"
 
 [[bin]]

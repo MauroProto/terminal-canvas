@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use uuid::Uuid;
 
@@ -45,6 +44,12 @@ struct ManagedSession {
     spec: SessionSpec,
     handle: Option<SharedPtyHandle>,
     detached_alive: bool,
+    pending_startup_input: Option<PendingStartupInput>,
+}
+
+struct PendingStartupInput {
+    input: String,
+    baseline_render_revision: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,14 +67,7 @@ impl ManagedSession {
             spec,
             handle: None,
             detached_alive: true,
-        }
-    }
-
-    fn attached(spec: SessionSpec, handle: SharedPtyHandle) -> Self {
-        Self {
-            spec,
-            handle: Some(handle),
-            detached_alive: false,
+            pending_startup_input: None,
         }
     }
 
@@ -102,6 +100,12 @@ impl ManagedSession {
     }
 }
 
+impl PendingStartupInput {
+    fn is_ready(&self, current_render_revision: u64) -> bool {
+        current_render_revision > self.baseline_render_revision
+    }
+}
+
 impl RuntimeScheduler {
     pub fn new() -> Self {
         Self {
@@ -111,10 +115,12 @@ impl RuntimeScheduler {
         }
     }
 
+    #[allow(dead_code)]
     pub fn new_for_tests() -> Self {
         Self::new()
     }
 
+    #[allow(dead_code)]
     pub fn with_batch_limit_for_tests(max_batch_size: usize) -> Self {
         Self {
             max_batch_size: max_batch_size.max(1),
@@ -122,6 +128,7 @@ impl RuntimeScheduler {
         }
     }
 
+    #[allow(dead_code)]
     pub fn enqueue_output_batch(&mut self, sessions: usize, updates_per_session: usize) {
         for session_index in 0..sessions {
             let session_id = Uuid::from_u128((session_index + 1) as u128);
@@ -212,6 +219,7 @@ impl PtyManager {
         }
     }
 
+    #[allow(dead_code)]
     pub fn new_for_tests() -> Self {
         Self::new()
     }
@@ -225,7 +233,6 @@ impl PtyManager {
 
     pub fn spawn(
         &mut self,
-        ctx: &egui::Context,
         spec: SessionSpec,
         cwd: Option<&Path>,
         cols: u16,
@@ -240,7 +247,7 @@ impl PtyManager {
         };
         self.sessions
             .insert(session_id, ManagedSession::detached(detached_spec));
-        if let Err(err) = self.attach_detached(ctx, session_id, cols, rows) {
+        if let Err(err) = self.attach_detached(session_id, cols, rows) {
             self.sessions.remove(&session_id);
             return Err(err);
         }
@@ -249,12 +256,10 @@ impl PtyManager {
 
     pub fn attach_detached(
         &mut self,
-        ctx: &egui::Context,
         session_id: Uuid,
         cols: u16,
         rows: u16,
     ) -> anyhow::Result<()> {
-        let _ = ctx;
         let Some(session) = self.sessions.get_mut(&session_id) else {
             anyhow::bail!("Runtime session not found");
         };
@@ -286,13 +291,25 @@ impl PtyManager {
             .filter(|input| !input.is_empty())
             .map(str::to_owned)
         {
-            let shared_handle_clone = Arc::clone(&shared_handle);
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(600));
-                if let Ok(handle) = shared_handle_clone.lock() {
-                    handle.write_all(format!("{input}\n").as_bytes());
-                }
-            });
+            let baseline_render_revision = shared_handle
+                .lock()
+                .ok()
+                .map(|handle| handle.render_revision())
+                .unwrap_or(0);
+            if spec
+                .startup_command
+                .as_deref()
+                .map(str::trim)
+                .filter(|command| !command.is_empty())
+                .is_some()
+            {
+                session.pending_startup_input = Some(PendingStartupInput {
+                    input,
+                    baseline_render_revision,
+                });
+            } else if let Ok(handle) = shared_handle.lock() {
+                handle.write_all(format!("{input}\n").as_bytes());
+            }
         }
         session.handle = Some(shared_handle);
         session.detached_alive = false;
@@ -343,7 +360,8 @@ impl PtyManager {
             .count()
     }
 
-    pub fn drain_ui_updates(&self) -> UiUpdateBatch {
+    pub fn drain_ui_updates(&mut self) -> UiUpdateBatch {
+        self.flush_pending_startup_inputs();
         self.scheduler
             .lock()
             .ok()
@@ -353,5 +371,46 @@ impl PtyManager {
 
     pub fn close(&mut self, session_id: Uuid) -> bool {
         self.sessions.remove(&session_id).is_some()
+    }
+
+    fn flush_pending_startup_inputs(&mut self) {
+        for session in self.sessions.values_mut() {
+            let Some(pending) = session.pending_startup_input.as_ref() else {
+                continue;
+            };
+            let Some(handle) = session.handle.as_ref() else {
+                continue;
+            };
+            let ready = handle
+                .lock()
+                .ok()
+                .map(|handle| pending.is_ready(handle.render_revision()))
+                .unwrap_or(false);
+            if !ready {
+                continue;
+            }
+            let Some(pending) = session.pending_startup_input.take() else {
+                continue;
+            };
+            if let Ok(handle) = handle.lock() {
+                handle.write_all(format!("{}\n", pending.input).as_bytes());
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PendingStartupInput;
+
+    #[test]
+    fn pending_startup_input_waits_for_render_revision_to_advance() {
+        let pending = PendingStartupInput {
+            input: "prompt".to_owned(),
+            baseline_render_revision: 4,
+        };
+
+        assert!(!pending.is_ready(4));
+        assert!(pending.is_ready(5));
     }
 }

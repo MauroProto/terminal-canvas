@@ -8,19 +8,27 @@ use crate::collab::TrustedDevice;
 use crate::orchestration::OrchestrationState;
 use crate::state::panel_state::PanelState;
 
+const APP_STATE_SCHEMA_VERSION: u32 = 2;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AppState {
+    #[serde(default = "current_schema_version")]
+    pub schema_version: u32,
     pub workspaces: Vec<WorkspaceState>,
     pub active_ws: usize,
     pub sidebar_visible: bool,
-    pub show_grid: bool,
-    pub show_minimap: bool,
+    #[serde(default)]
+    pub legacy_canvas_ui: LegacyCanvasUiState,
     #[serde(default = "default_local_device_id")]
     pub local_device_id: String,
     #[serde(default)]
     pub trusted_devices: Vec<TrustedDevice>,
     #[serde(default)]
     pub orchestration: OrchestrationState,
+}
+
+fn current_schema_version() -> u32 {
+    APP_STATE_SCHEMA_VERSION
 }
 
 fn default_local_device_id() -> String {
@@ -33,10 +41,138 @@ pub struct WorkspaceState {
     pub name: String,
     pub cwd: Option<PathBuf>,
     pub panels: Vec<PanelState>,
-    pub viewport_pan: [f32; 2],
-    pub viewport_zoom: f32,
+    #[serde(default)]
+    pub desktop: WorkspaceDesktopState,
+    #[serde(default)]
+    pub legacy_canvas: LegacyCanvasState,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct WorkspaceDesktopState {
+    #[serde(default)]
     pub next_z: u32,
+    #[serde(default)]
     pub next_color: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LegacyCanvasState {
+    #[serde(default)]
+    pub viewport_pan: [f32; 2],
+    #[serde(default = "default_viewport_zoom")]
+    pub viewport_zoom: f32,
+}
+
+impl Default for LegacyCanvasState {
+    fn default() -> Self {
+        Self {
+            viewport_pan: [0.0, 0.0],
+            viewport_zoom: default_viewport_zoom(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LegacyCanvasUiState {
+    #[serde(default = "default_show_grid")]
+    pub show_grid: bool,
+    #[serde(default = "default_show_minimap")]
+    pub show_minimap: bool,
+}
+
+impl Default for LegacyCanvasUiState {
+    fn default() -> Self {
+        Self {
+            show_grid: default_show_grid(),
+            show_minimap: default_show_minimap(),
+        }
+    }
+}
+
+fn default_viewport_zoom() -> f32 {
+    1.0
+}
+
+fn default_show_grid() -> bool {
+    true
+}
+
+fn default_show_minimap() -> bool {
+    false
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct LegacyAppState {
+    pub workspaces: Vec<LegacyWorkspaceState>,
+    pub active_ws: usize,
+    pub sidebar_visible: bool,
+    #[serde(default = "default_show_grid")]
+    pub show_grid: bool,
+    #[serde(default = "default_show_minimap")]
+    pub show_minimap: bool,
+    #[serde(default = "default_local_device_id")]
+    pub local_device_id: String,
+    #[serde(default)]
+    pub trusted_devices: Vec<TrustedDevice>,
+    #[serde(default)]
+    pub orchestration: OrchestrationState,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct LegacyWorkspaceState {
+    pub id: String,
+    pub name: String,
+    pub cwd: Option<PathBuf>,
+    pub panels: Vec<PanelState>,
+    #[serde(default)]
+    pub viewport_pan: [f32; 2],
+    #[serde(default = "default_viewport_zoom")]
+    pub viewport_zoom: f32,
+    #[serde(default)]
+    pub next_z: u32,
+    #[serde(default)]
+    pub next_color: usize,
+}
+
+impl From<LegacyAppState> for AppState {
+    fn from(value: LegacyAppState) -> Self {
+        Self {
+            schema_version: APP_STATE_SCHEMA_VERSION,
+            workspaces: value
+                .workspaces
+                .into_iter()
+                .map(WorkspaceState::from)
+                .collect(),
+            active_ws: value.active_ws,
+            sidebar_visible: value.sidebar_visible,
+            legacy_canvas_ui: LegacyCanvasUiState {
+                show_grid: value.show_grid,
+                show_minimap: value.show_minimap,
+            },
+            local_device_id: value.local_device_id,
+            trusted_devices: value.trusted_devices,
+            orchestration: value.orchestration,
+        }
+    }
+}
+
+impl From<LegacyWorkspaceState> for WorkspaceState {
+    fn from(value: LegacyWorkspaceState) -> Self {
+        Self {
+            id: value.id,
+            name: value.name,
+            cwd: value.cwd,
+            panels: value.panels,
+            desktop: WorkspaceDesktopState {
+                next_z: value.next_z,
+                next_color: value.next_color,
+            },
+            legacy_canvas: LegacyCanvasState {
+                viewport_pan: value.viewport_pan,
+                viewport_zoom: value.viewport_zoom,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -139,7 +275,19 @@ pub fn save_state_to_path(path: &Path, state: &AppState) -> anyhow::Result<()> {
 
 fn read_state_file(path: &Path) -> Option<AppState> {
     let data = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&data).ok()
+    let json: serde_json::Value = serde_json::from_str(&data).ok()?;
+    let has_schema_version = json
+        .as_object()
+        .map(|object| object.contains_key("schema_version"))
+        .unwrap_or(false);
+
+    if has_schema_version {
+        serde_json::from_value(json).ok()
+    } else {
+        serde_json::from_value::<LegacyAppState>(json)
+            .ok()
+            .map(AppState::from)
+    }
 }
 
 fn write_json_file(path: &Path, state: &AppState) -> anyhow::Result<()> {
@@ -174,10 +322,12 @@ mod tests {
 
     use super::{
         backup_file_path, load_state_from_path, save_state_to_path, temp_file_path, AppState,
-        AutosaveController, AutosaveDecision, WorkspaceState,
+        AutosaveController, AutosaveDecision, LegacyCanvasState, LegacyCanvasUiState,
+        WorkspaceDesktopState, WorkspaceState, APP_STATE_SCHEMA_VERSION,
     };
-    use crate::collab::TrustedDevice;
+    use crate::collab::{PanelShareScope, TrustedDevice};
     use crate::orchestration::OrchestrationState;
+    use crate::state::panel_state::{PanelPlacement, SavedPanelBounds};
     use crate::state::PanelState;
 
     #[test]
@@ -245,6 +395,7 @@ mod tests {
 
     fn sample_state(label: &str) -> AppState {
         AppState {
+            schema_version: APP_STATE_SCHEMA_VERSION,
             workspaces: vec![WorkspaceState {
                 id: Uuid::new_v4().to_string(),
                 name: format!("Workspace {label}"),
@@ -259,16 +410,26 @@ mod tests {
                     z_index: 1,
                     focused: true,
                     minimized: false,
+                    placement: PanelPlacement::Floating,
+                    restore_placement: None,
+                    restore_bounds: Some(SavedPanelBounds::new([10.0, 20.0], [300.0, 200.0])),
+                    share_scope: PanelShareScope::VisibleOnly,
                 }],
-                viewport_pan: [0.0, 0.0],
-                viewport_zoom: 1.0,
-                next_z: 2,
-                next_color: 1,
+                desktop: WorkspaceDesktopState {
+                    next_z: 2,
+                    next_color: 1,
+                },
+                legacy_canvas: LegacyCanvasState {
+                    viewport_pan: [0.0, 0.0],
+                    viewport_zoom: 1.0,
+                },
             }],
             active_ws: 0,
             sidebar_visible: true,
-            show_grid: true,
-            show_minimap: false,
+            legacy_canvas_ui: LegacyCanvasUiState {
+                show_grid: true,
+                show_minimap: false,
+            },
             local_device_id: format!("device-{label}"),
             trusted_devices: vec![TrustedDevice {
                 device_id: format!("trusted-{label}"),
@@ -335,8 +496,15 @@ mod tests {
 
         let loaded = load_state_from_path(&path).unwrap();
 
+        assert_eq!(loaded.schema_version, APP_STATE_SCHEMA_VERSION);
         assert_eq!(loaded.workspaces[0].panels.len(), 1);
         assert_eq!(loaded.workspaces[0].panels[0].title, "Terminal");
+        assert_eq!(
+            loaded.workspaces[0].panels[0].share_scope,
+            PanelShareScope::VisibleOnly
+        );
+        assert_eq!(loaded.workspaces[0].desktop.next_z, 2);
+        assert_eq!(loaded.workspaces[0].legacy_canvas.viewport_zoom, 1.0);
         assert!(!loaded.local_device_id.is_empty());
         assert!(loaded.trusted_devices.is_empty());
     }
@@ -350,6 +518,9 @@ mod tests {
         save_state_to_path(&path, &state).unwrap();
 
         let serialized = fs::read_to_string(&path).unwrap();
+        assert!(serialized.contains("\"schema_version\": 2"));
+        assert!(serialized.contains("\"legacy_canvas_ui\""));
+        assert!(serialized.contains("\"desktop\""));
         assert!(!serialized.contains("runtime_session_id"));
         assert!(!serialized.contains("runtime_sessions"));
     }

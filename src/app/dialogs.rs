@@ -445,7 +445,7 @@ impl TerminalApp {
                                 ui.heading("Join Shared Session");
                                 ui.label(
                                     egui::RichText::new(
-                                        "Entrás al workspace compartido desde la misma app. Si el host te aprueba, ves el canvas en vivo y podés pedir control de una terminal.",
+                                        "Entrás al workspace compartido desde la misma app. Si el host te aprueba, ves el desktop remoto con sus paneles y podés pedir control de una terminal.",
                                     )
                                     .color(Color32::from_rgb(170, 170, 176)),
                                 );

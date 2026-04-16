@@ -50,7 +50,7 @@ struct BrokerState {
 }
 
 struct SessionRecord {
-    session_secret: String,
+    _session_secret: String,
     invite_secret: String,
     invite_expires_at: Option<chrono::DateTime<chrono::Utc>>,
     passphrase_hash: Option<String>,
@@ -68,7 +68,7 @@ struct SessionRecord {
 struct GuestRecord {
     token: String,
     display_name: String,
-    device_id: String,
+    _device_id: String,
     joined_at: chrono::DateTime<chrono::Utc>,
     connection_state: GuestConnectionState,
     tx: Option<mpsc::UnboundedSender<Message>>,
@@ -177,7 +177,7 @@ async fn create_share_session(
     let session_id = ShareSessionId(Uuid::new_v4());
     let host_token = random_token();
     let session = SessionRecord {
-        session_secret: body.session_secret,
+        _session_secret: body.session_secret,
         invite_secret: body.invite_secret,
         invite_expires_at: body.invite_expires_at,
         passphrase_hash: body.passphrase_hash,
@@ -288,7 +288,7 @@ async fn join_share_session(
         GuestRecord {
             token: guest_token.clone(),
             display_name: body.display_name.clone(),
-            device_id: body.device_id.clone(),
+            _device_id: body.device_id.clone(),
             joined_at: Utc::now(),
             connection_state: if auto_approved {
                 GuestConnectionState::Approved

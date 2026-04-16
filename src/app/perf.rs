@@ -13,7 +13,6 @@ pub(super) struct FramePerfSnapshot {
     pub(super) cache_hits: usize,
     pub(super) cache_misses: usize,
     pub(super) runtime_repaint: bool,
-    pub(super) orchestration_scan_time: Duration,
 }
 
 impl FramePerfSnapshot {

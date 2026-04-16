@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 use crate::runtime::{PtyManager, SessionSpec, SharedPtyHandle};
 use crate::terminal::input::InputMode;
-use crate::terminal::pty::{PtyHandle, TerminalScrollState};
+use crate::terminal::pty::PtyHandle;
 
 #[derive(Default)]
 pub struct SessionController {
@@ -20,7 +20,6 @@ impl SessionController {
     pub fn attach_new_with_spec(
         &mut self,
         pty_manager: Arc<Mutex<PtyManager>>,
-        ctx: &egui::Context,
         spec: SessionSpec,
         cwd: Option<&Path>,
         cols: u16,
@@ -31,7 +30,7 @@ impl SessionController {
         self.last_rows = rows.max(1);
         self.pty_manager = Some(Arc::clone(&pty_manager));
         let spawn_result = match pty_manager.lock() {
-            Ok(mut manager) => manager.spawn(ctx, spec, cwd, self.last_cols, self.last_rows),
+            Ok(mut manager) => manager.spawn(spec, cwd, self.last_cols, self.last_rows),
             Err(_) => Err(anyhow::anyhow!("PTY manager lock poisoned")),
         };
         match spawn_result {
@@ -112,18 +111,16 @@ impl SessionController {
         let cols = self.last_cols.max(1);
         let rows = self.last_rows.max(1);
         match manager.lock() {
-            Ok(mut manager) => {
-                match manager.attach_detached(&egui::Context::default(), session_id, cols, rows) {
-                    Ok(()) => {
-                        self.spawn_error = None;
-                        true
-                    }
-                    Err(err) => {
-                        self.spawn_error = Some(err.to_string());
-                        false
-                    }
+            Ok(mut manager) => match manager.attach_detached(session_id, cols, rows) {
+                Ok(()) => {
+                    self.spawn_error = None;
+                    true
                 }
-            }
+                Err(err) => {
+                    self.spawn_error = Some(err.to_string());
+                    false
+                }
+            },
             Err(_) => {
                 self.spawn_error = Some("PTY manager lock poisoned".to_owned());
                 false
@@ -167,18 +164,10 @@ impl SessionController {
         let _ = self.with_pty(PtyHandle::clear_selection);
     }
 
-    pub fn render_revision(&self) -> Option<u64> {
-        self.with_pty(PtyHandle::render_revision)
-    }
-
     pub fn title_snapshot(&self) -> Option<String> {
         let manager = self.pty_manager.as_ref()?;
         let session_id = self.session_id?;
         manager.lock().ok()?.session_title(session_id)
-    }
-
-    pub fn scroll_state(&self) -> Option<TerminalScrollState> {
-        self.with_pty(PtyHandle::scroll_state).flatten()
     }
 
     pub fn take_bell(&self) -> bool {
@@ -189,6 +178,7 @@ impl SessionController {
         (self.last_cols.max(1), self.last_rows.max(1))
     }
 
+    #[cfg(test)]
     pub fn set_last_grid_size_for_tests(&mut self, cols: u16, rows: u16) {
         self.last_cols = cols.max(1);
         self.last_rows = rows.max(1);

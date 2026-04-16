@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::fmt::Write as _;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -88,6 +90,7 @@ impl RepaintPolicy {
 
 #[derive(Debug, Clone)]
 pub enum UpdateStatus {
+    Disabled,
     Checking,
     UpToDate,
     Available,
@@ -111,7 +114,7 @@ impl Default for UpdateState {
             latest_version: None,
             download_url: None,
             installer_path: None,
-            status: UpdateStatus::Checking,
+            status: UpdateStatus::Disabled,
         }
     }
 }
@@ -122,6 +125,11 @@ pub struct UpdateChecker {
 
 impl UpdateChecker {
     pub fn new(ctx: &egui::Context) -> Self {
+        if update_checker_disabled() {
+            return Self {
+                state: Arc::new(Mutex::new(UpdateState::default())),
+            };
+        }
         let state = Arc::new(Mutex::new(UpdateState::default()));
         let state_clone = Arc::clone(&state);
         let ctx = ctx.clone();
@@ -142,6 +150,10 @@ impl UpdateChecker {
     pub fn snapshot(&self) -> UpdateState {
         self.state.lock().unwrap().clone()
     }
+}
+
+fn update_checker_disabled() -> bool {
+    RELEASES_URL.contains("/owner/repo/")
 }
 
 pub fn version_newer(latest: &str, current: &str) -> bool {
@@ -283,7 +295,7 @@ pub fn checksum_string(bytes: &[u8]) -> String {
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use super::{checksum_string, verify_checksum, version_newer};
+    use super::{checksum_string, update_checker_disabled, verify_checksum, version_newer};
 
     #[test]
     fn version_comparison() {
@@ -318,6 +330,11 @@ mod tests {
             Path::new("/definitely/missing/file"),
             "deadbeef"
         ));
+    }
+
+    #[test]
+    fn placeholder_release_url_disables_update_checker() {
+        assert!(update_checker_disabled());
     }
 
     fn tempfile_dir() -> PathBuf {

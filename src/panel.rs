@@ -1,16 +1,19 @@
 use egui::{Color32, Pos2, Rect, Vec2};
 use uuid::Uuid;
 
+use crate::collab::PanelShareScope;
 use crate::collab::{SharedPanelSnapshot, TerminalInputEvent};
 use crate::orchestration::{AgentProvider, PanelOverlay, PanelRuntimeObservation};
-use crate::state::PanelState;
+use crate::state::{PanelPlacement, PanelState, SnapSlot};
 use crate::terminal::panel::{PanelHitArea, PanelInteraction, ResizeHandle, TerminalPanel};
 
-pub enum CanvasPanel {
+pub enum WorkspacePanel {
     Terminal(TerminalPanel),
 }
 
-impl CanvasPanel {
+pub type CanvasPanel = WorkspacePanel;
+
+impl WorkspacePanel {
     pub fn id(&self) -> Uuid {
         match self {
             Self::Terminal(panel) => panel.id,
@@ -20,12 +23,6 @@ impl CanvasPanel {
     pub fn runtime_session_id(&self) -> Option<Uuid> {
         match self {
             Self::Terminal(panel) => panel.runtime_session_id(),
-        }
-    }
-
-    pub fn runtime_session_attached(&self) -> bool {
-        match self {
-            Self::Terminal(panel) => panel.runtime_session_attached(),
         }
     }
 
@@ -44,12 +41,6 @@ impl CanvasPanel {
     pub fn position(&self) -> Pos2 {
         match self {
             Self::Terminal(panel) => panel.position,
-        }
-    }
-
-    pub fn set_position(&mut self, pos: Pos2) {
-        match self {
-            Self::Terminal(panel) => panel.position = pos,
         }
     }
 
@@ -99,6 +90,12 @@ impl CanvasPanel {
         }
     }
 
+    pub fn set_share_scope(&mut self, scope: PanelShareScope) {
+        match self {
+            Self::Terminal(panel) => panel.set_share_scope(scope),
+        }
+    }
+
     pub fn set_focused(&mut self, focused: bool) {
         match self {
             Self::Terminal(panel) => panel.focused = focused,
@@ -117,21 +114,9 @@ impl CanvasPanel {
         }
     }
 
-    pub fn drag_virtual_pos(&self) -> Option<Pos2> {
-        match self {
-            Self::Terminal(panel) => panel.drag_virtual_pos,
-        }
-    }
-
     pub fn set_drag_virtual_pos(&mut self, pos: Option<Pos2>) {
         match self {
             Self::Terminal(panel) => panel.drag_virtual_pos = pos,
-        }
-    }
-
-    pub fn resize_virtual_rect(&self) -> Option<Rect> {
-        match self {
-            Self::Terminal(panel) => panel.resize_virtual_rect,
         }
     }
 
@@ -144,6 +129,54 @@ impl CanvasPanel {
     pub fn apply_resize(&mut self, rect: Rect) {
         match self {
             Self::Terminal(panel) => panel.apply_resize(rect),
+        }
+    }
+
+    pub fn placement(&self) -> &PanelPlacement {
+        match self {
+            Self::Terminal(panel) => panel.placement(),
+        }
+    }
+
+    pub fn set_placement(&mut self, placement: PanelPlacement) {
+        match self {
+            Self::Terminal(panel) => panel.set_placement(placement),
+        }
+    }
+
+    pub fn set_restore_bounds(&mut self, rect: Option<Rect>) {
+        match self {
+            Self::Terminal(panel) => panel.set_restore_bounds(rect),
+        }
+    }
+
+    pub fn set_restore_placement(&mut self, placement: Option<PanelPlacement>) {
+        match self {
+            Self::Terminal(panel) => panel.set_restore_placement(placement),
+        }
+    }
+
+    pub fn current_or_restore_rect(&self) -> Rect {
+        match self {
+            Self::Terminal(panel) => panel.current_or_restore_rect(),
+        }
+    }
+
+    pub fn maximize(&mut self, desktop_rect: Rect) {
+        match self {
+            Self::Terminal(panel) => panel.maximize(desktop_rect),
+        }
+    }
+
+    pub fn snap_to(&mut self, slot: SnapSlot, desktop_rect: Rect) {
+        match self {
+            Self::Terminal(panel) => panel.snap_to(slot, desktop_rect),
+        }
+    }
+
+    pub fn restore_window_placement(&mut self, desktop_rect: Rect) {
+        match self {
+            Self::Terminal(panel) => panel.restore_window_placement(desktop_rect),
         }
     }
 
@@ -203,17 +236,6 @@ impl CanvasPanel {
     ) -> bool {
         match self {
             Self::Terminal(panel) => panel.scroll_hit_test(pos, viewport, canvas_rect),
-        }
-    }
-
-    pub fn contains_screen_pos(
-        &self,
-        pos: egui::Pos2,
-        viewport: &crate::canvas::viewport::Viewport,
-        canvas_rect: Rect,
-    ) -> bool {
-        match self {
-            Self::Terminal(panel) => panel.contains_screen_pos(pos, viewport, canvas_rect),
         }
     }
 

@@ -112,9 +112,16 @@ pub fn draw_remote_workspace(
             action = Some(RemotePanelAction::Focus(panel.panel_id));
         }
 
-        let mut lines: Vec<&str> = panel.history_text.lines().collect();
-        if lines.is_empty() {
+        let mut lines: Vec<&str> = if panel.share_scope.allows_history() {
+            panel.history_text.lines().collect()
+        } else {
+            Vec::new()
+        };
+        if lines.is_empty() && panel.share_scope.allows_visible_text() {
             lines = panel.visible_text.lines().collect();
+        }
+        if !panel.share_scope.allows_visible_text() {
+            lines = vec!["Private panel"];
         }
         let scroll_offset = scroll_offsets.get(&panel.panel_id).copied().unwrap_or(0);
         let start = scroll_offset.min(lines.len());
@@ -135,7 +142,10 @@ pub fn draw_remote_workspace(
             y += line_height;
         }
 
-        if panel.controller != my_guest_id && matches!(session_state, CollabSessionState::Live) {
+        if panel.share_scope.allows_control()
+            && panel.controller != my_guest_id
+            && matches!(session_state, CollabSessionState::Live)
+        {
             let cta_rect = Rect::from_min_size(
                 pos2(body_rect.right() - 138.0, body_rect.bottom() - 38.0),
                 vec2(124.0, 26.0),

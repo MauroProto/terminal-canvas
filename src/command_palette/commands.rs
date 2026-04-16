@@ -7,6 +7,10 @@ pub enum Command {
     OpenFolder,
     CloseTerminal,
     RenameTerminal,
+    SharePanelPrivate,
+    SharePanelVisibleOnly,
+    SharePanelVisibleAndHistory,
+    SharePanelControllable,
     FocusNext,
     FocusPrev,
     ZoomToFitAll,
@@ -61,6 +65,26 @@ pub const COMMANDS: &[CommandEntry] = &[
         command: Command::RenameTerminal,
         label: "Rename Terminal",
         shortcut: "F2",
+    },
+    CommandEntry {
+        command: Command::SharePanelPrivate,
+        label: "Set Panel Private",
+        shortcut: "",
+    },
+    CommandEntry {
+        command: Command::SharePanelVisibleOnly,
+        label: "Set Panel Shared: Visible Only",
+        shortcut: "",
+    },
+    CommandEntry {
+        command: Command::SharePanelVisibleAndHistory,
+        label: "Set Panel Shared: Visible + History",
+        shortcut: "",
+    },
+    CommandEntry {
+        command: Command::SharePanelControllable,
+        label: "Set Panel Shared: Controllable",
+        shortcut: "",
     },
     CommandEntry {
         command: Command::FocusNext,

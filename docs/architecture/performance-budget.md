@@ -1,50 +1,69 @@
 # Performance Budget
 
-This document defines the first runtime budget target for the app while the architecture is being split into a headless runtime and a thinner UI layer.
-The budget is an acceptance gate for performance work in this stage, not a nice-to-have note.
+Este documento define el budget operativo de la app mientras se consolida el runtime desacoplado.
 
-## Baseline Target
+No es un benchmark público. Es una restricción de ingeniería para que el producto se mantenga estable como **desktop nativo de terminales y agentes**.
 
-- `20` open terminals
-- `6` visible terminals
-- `3` terminals producing sustained output
+## Baseline target
 
-## Acceptance Criteria
+- `20` terminales abiertas
+- `6` paneles visibles
+- `3` terminales con output sostenido
 
-The budget is not a public benchmark claim. It is a required engineering constraint for the runtime and render tiers:
+## Acceptance criteria
 
-- open terminals should stay cheap when hidden or offscreen
-- visible terminals should degrade to lighter render tiers when they are not focused
-- bursty output should be coalesced instead of repainted synchronously per event
-- restored terminals should remain detached until the user focuses or interacts with them
-- drag/resize interaction should defer orchestration scans and avoid unnecessary runtime work
+El baseline sólo se considera sano si, sobre hardware moderado:
+
+- las sesiones restauradas arrancan `detached`
+- las terminales minimizadas u offscreen no fuerzan trabajo inútil
+- el output bursty se coalescea, no dispara repaint por cada evento
+- drag/resize difieren scans caros de orquestación
+- la terminal enfocada mantiene latencia de input aceptable aun con otras sesiones activas
+
+## Importante: contrato actual de render
+
+La infraestructura de runtime sigue modelando tiers como `Full`, `ReducedLive`, `Preview` y `Hidden`.
+
+Pero la UX actual prioriza fidelidad visual:
+
+- paneles normales y renderables usan `Full`
+- `Preview` queda como backstop para tamaños mínimos o estados no renderables
+- `ReducedLive` sigue siendo una herramienta del runtime, no el comportamiento visual por defecto del desktop
+
+El budget y los smoke tests deben leerse con esa decisión en mente. No se debe reintroducir “low power mode” visible sin una decisión explícita de producto y una validación real de UX.
 
 ## Instrumentation
 
-Development builds should expose enough internal signal to explain regressions while keeping telemetry invisible to end users:
+En builds de desarrollo debe seguir siendo posible medir:
 
 - frame time
-- visible panel count
-- attached vs detached PTY sessions
-- render tier counts per frame
+- cantidad de paneles visibles
+- sesiones attached vs detached
 - cache hits vs misses
-- repaint reason
-- orchestration scan duration
+- motivo de repaint
+- duración de scans de orquestación
 
-## Scenario Coverage
+## Scenario coverage
 
-The stage is not complete until the baseline shape is covered by repeatable smoke tests:
+La etapa no se considera cerrada sin smoke tests repetibles para:
 
-- `1` open / `1` visible / `0` streaming
-- `4` open / `2` visible / `1` streaming
-- `20` open / `6` visible / `3` streaming
+- `1` abierta / `1` visible / `0` con output sostenido
+- `4` abiertas / `2` visibles / `1` con output sostenido
+- `20` abiertas / `6` visibles / `3` con output sostenido
 
-## Acceptance Rule
+## Acceptance rule
 
-The implementation is acceptable only when the app can keep the baseline target stable on moderate hardware without changing the visual language or product behavior.
+Una implementación es aceptable sólo si mantiene el baseline sin cambiar la experiencia principal del producto:
+
+- desktop acotado
+- ventanas/paneles reales
+- taskbar
+- workspaces
+- colaboración
+- orquestación
 
 ## Notes
 
-- This budget is intentionally conservative.
-- The runtime can exceed it, but regressions should be measured against it.
-- Future phases may tighten latency targets once the runtime layer is isolated.
+- El budget es conservador a propósito.
+- Si la implementación actual no usa un tier más bajo en background, la documentación y los tests deben reflejarlo.
+- Las optimizaciones futuras deben ser medibles y no degradar la legibilidad del contenido terminal sin decisión explícita.

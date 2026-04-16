@@ -1,7 +1,11 @@
 mod pty_manager;
+#[allow(dead_code)]
 mod registry;
+#[allow(dead_code)]
 mod render_qos;
+#[allow(dead_code)]
 mod session;
+#[allow(dead_code)]
 mod workspace;
 
 #[allow(unused_imports)]

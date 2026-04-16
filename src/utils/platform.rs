@@ -17,6 +17,7 @@ pub fn home_dir() -> Option<PathBuf> {
     directories::UserDirs::new().map(|dirs| dirs.home_dir().to_path_buf())
 }
 
+#[allow(dead_code)]
 pub fn open_in_file_manager(path: &Path) -> anyhow::Result<()> {
     #[cfg(target_os = "macos")]
     let mut command = {

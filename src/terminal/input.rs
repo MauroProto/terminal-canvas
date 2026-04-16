@@ -14,12 +14,6 @@ pub struct InputMode {
     pub alt_screen: bool,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct InputResult {
-    pub bytes: Vec<u8>,
-    pub copy_selection: bool,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WheelAction {
     Pty(Vec<u8>),

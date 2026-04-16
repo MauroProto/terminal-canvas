@@ -2,9 +2,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use egui::{
-    pos2, vec2, Align2, Color32, CursorIcon, FontId, Pos2, Rect, Rounding, Sense, Stroke, Vec2,
-};
+use egui::{pos2, vec2, Align2, Color32, FontId, Pos2, Rect, Rounding, Sense, Stroke, Vec2};
 use uuid::Uuid;
 
 use alacritty_terminal::grid::{Dimensions, Scroll};
@@ -17,9 +15,12 @@ use crate::canvas::config::normalize_panel_size;
 use crate::canvas::config::SNAP_THRESHOLD;
 use crate::canvas::snap::{snap_drag, snap_resize, SnapGuide};
 use crate::canvas::viewport::Viewport;
-use crate::collab::{SerializableModifiers, SharedPanelSnapshot, TerminalInputEvent};
+use crate::collab::{
+    PanelShareScope, SerializableModifiers, SharedPanelSnapshot, TerminalInputEvent,
+};
 use crate::orchestration::{AgentProvider, PanelOverlay, PanelRuntimeObservation};
 use crate::runtime::{PtyManager, RenderTier, SessionSpec, SharedPtyHandle};
+use crate::state::panel_state::{PanelPlacement, SavedPanelBounds, SnapSlot};
 use crate::state::PanelState;
 use crate::terminal::input::{
     is_paste_shortcut, key_to_bytes, paste_bytes, should_copy_selection, wheel_action, WheelAction,
@@ -52,7 +53,6 @@ pub const BORDER_DEFAULT: Color32 = Color32::from_rgb(72, 72, 84);
 pub const BORDER_FOCUS: Color32 = Color32::from_rgb(110, 110, 124);
 pub const FG: Color32 = Color32::from_rgb(232, 232, 234);
 pub const DIM_FG: Color32 = Color32::from_rgb(146, 146, 152);
-pub const SELECTION_BG: Color32 = Color32::from_rgba_premultiplied(80, 130, 200, 80);
 pub const MAC_RED: Color32 = Color32::from_rgb(255, 95, 87);
 pub const MAC_YELLOW: Color32 = Color32::from_rgb(254, 188, 46);
 pub const MAC_GREEN: Color32 = Color32::from_rgb(40, 200, 64);
@@ -66,10 +66,29 @@ pub const MIN_TERMINAL_RENDER_WIDTH: f32 = 40.0;
 pub const MIN_TERMINAL_RENDER_HEIGHT: f32 = 28.0;
 const STREAMING_OUTPUT_WINDOW: Duration = Duration::from_millis(350);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PanelAction {
-    Close,
-    Rename,
+fn share_scope_badge_colors(scope: PanelShareScope) -> (Color32, Color32, Color32) {
+    match scope {
+        PanelShareScope::Private => (
+            Color32::from_rgb(70, 42, 46),
+            Color32::from_rgb(176, 92, 102),
+            Color32::from_rgb(248, 212, 218),
+        ),
+        PanelShareScope::VisibleOnly => (
+            Color32::from_rgb(48, 56, 78),
+            Color32::from_rgb(104, 138, 212),
+            Color32::from_rgb(222, 232, 255),
+        ),
+        PanelShareScope::VisibleAndHistory => (
+            Color32::from_rgb(68, 58, 34),
+            Color32::from_rgb(188, 164, 92),
+            Color32::from_rgb(248, 238, 204),
+        ),
+        PanelShareScope::Controllable => (
+            Color32::from_rgb(42, 72, 48),
+            Color32::from_rgb(98, 186, 122),
+            Color32::from_rgb(224, 248, 230),
+        ),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,7 +131,6 @@ pub struct PanelInteraction {
     pub clicked: bool,
     pub hovered_terminal: bool,
     pub guides: Vec<SnapGuide>,
-    pub action: Option<PanelAction>,
     pub render_tier: Option<RenderTier>,
     pub cache_hit: bool,
 }
@@ -130,6 +148,9 @@ pub struct TerminalPanel {
     pub z_index: u32,
     pub focused: bool,
     minimized: bool,
+    placement: PanelPlacement,
+    restore_placement: Option<PanelPlacement>,
+    restore_bounds: Option<Rect>,
     session: SessionController,
     pub drag_virtual_pos: Option<Pos2>,
     pub resize_virtual_rect: Option<Rect>,
@@ -137,6 +158,7 @@ pub struct TerminalPanel {
     activity_label: Option<String>,
     command_buffer: String,
     last_activity_scan_at: f64,
+    share_scope: PanelShareScope,
     render_cache: TerminalGridCache,
     last_scrollbar_state: Option<TerminalScrollState>,
 }
@@ -156,6 +178,9 @@ impl TerminalPanel {
             z_index,
             focused: false,
             minimized: false,
+            placement: PanelPlacement::Floating,
+            restore_placement: None,
+            restore_bounds: Some(Rect::from_min_size(position, normalize_panel_size(size))),
             session: SessionController::default(),
             drag_virtual_pos: None,
             resize_virtual_rect: None,
@@ -163,6 +188,7 @@ impl TerminalPanel {
             activity_label: None,
             command_buffer: String::new(),
             last_activity_scan_at: 0.0,
+            share_scope: PanelShareScope::VisibleOnly,
             render_cache: TerminalGridCache::default(),
             last_scrollbar_state: None,
         }
@@ -188,6 +214,13 @@ impl TerminalPanel {
             .unwrap_or_else(|| saved.title.clone());
         panel.focused = saved.focused && !saved.minimized;
         panel.minimized = saved.minimized;
+        panel.placement = saved.placement.clone();
+        panel.restore_placement = saved.restore_placement.clone();
+        panel.restore_bounds = saved
+            .restore_bounds
+            .map(saved_bounds_to_rect)
+            .or_else(|| Some(panel.rect()));
+        panel.share_scope = saved.share_scope;
         let (cols, rows) = compute_grid_size(panel.size.x, panel.size.y - TITLE_BAR_HEIGHT);
         panel.session.restore_detached_with_spec(
             pty_manager,
@@ -198,25 +231,9 @@ impl TerminalPanel {
         panel
     }
 
-    pub fn attach_session(
-        &mut self,
-        pty_manager: Arc<Mutex<PtyManager>>,
-        ctx: &egui::Context,
-        cwd: Option<&Path>,
-    ) {
-        let spec = SessionSpec {
-            title: self.title.clone(),
-            cwd: cwd.map(Path::to_path_buf),
-            startup_command: None,
-            startup_input: None,
-        };
-        self.attach_session_with_spec(pty_manager, ctx, cwd, spec);
-    }
-
     pub fn attach_session_with_spec(
         &mut self,
         pty_manager: Arc<Mutex<PtyManager>>,
-        ctx: &egui::Context,
         cwd: Option<&Path>,
         spec: SessionSpec,
     ) {
@@ -224,7 +241,7 @@ impl TerminalPanel {
         self.cwd_label = cwd_label(cwd);
         self.shell_label = shell_label();
         self.session
-            .attach_new_with_spec(pty_manager, ctx, spec, cwd, cols, rows);
+            .attach_new_with_spec(pty_manager, spec, cwd, cols, rows);
     }
 
     pub fn runtime_session_id(&self) -> Option<Uuid> {
@@ -233,6 +250,10 @@ impl TerminalPanel {
 
     pub fn runtime_session_attached(&self) -> bool {
         self.session.is_attached()
+    }
+
+    pub fn set_share_scope(&mut self, scope: PanelShareScope) {
+        self.share_scope = scope;
     }
 
     pub fn provider_hint(&self) -> Option<AgentProvider> {
@@ -260,6 +281,10 @@ impl TerminalPanel {
         self.size = rect.size();
     }
 
+    pub fn rect(&self) -> Rect {
+        Rect::from_min_size(self.position, self.size)
+    }
+
     pub fn is_alive(&self) -> bool {
         self.session.is_alive()
     }
@@ -275,6 +300,12 @@ impl TerminalPanel {
             z_index: self.z_index,
             focused: self.focused,
             minimized: self.minimized,
+            placement: self.placement.clone(),
+            restore_placement: self.restore_placement.clone(),
+            restore_bounds: Some(rect_to_saved_bounds(
+                self.restore_bounds.unwrap_or_else(|| self.rect()),
+            )),
+            share_scope: self.share_scope,
         }
     }
 
@@ -288,6 +319,85 @@ impl TerminalPanel {
             self.focused = false;
             self.drag_virtual_pos = None;
             self.resize_virtual_rect = None;
+        }
+    }
+
+    pub fn placement(&self) -> &PanelPlacement {
+        &self.placement
+    }
+
+    pub fn set_placement(&mut self, placement: PanelPlacement) {
+        self.placement = placement;
+    }
+
+    pub fn set_restore_placement(&mut self, placement: Option<PanelPlacement>) {
+        self.restore_placement = placement;
+    }
+
+    pub fn set_restore_bounds(&mut self, rect: Option<Rect>) {
+        self.restore_bounds = rect;
+    }
+
+    pub fn current_or_restore_rect(&self) -> Rect {
+        self.restore_bounds.unwrap_or_else(|| self.rect())
+    }
+
+    pub fn capture_restore_bounds(&mut self) {
+        self.restore_bounds = Some(self.rect());
+    }
+
+    pub fn maximize(&mut self, desktop_rect: Rect) {
+        if !matches!(self.placement, PanelPlacement::Maximized) {
+            self.capture_restore_bounds();
+            self.restore_placement = Some(self.placement.clone());
+        }
+        self.placement = PanelPlacement::Maximized;
+        self.apply_resize(desktop_rect);
+    }
+
+    pub fn snap_to(&mut self, slot: SnapSlot, desktop_rect: Rect) {
+        if matches!(self.placement, PanelPlacement::Floating) {
+            self.capture_restore_bounds();
+        }
+        self.placement = PanelPlacement::Snapped(slot);
+        self.restore_placement = None;
+        self.apply_resize(snap_slot_rect(slot, desktop_rect));
+    }
+
+    pub fn restore_window_placement(&mut self, desktop_rect: Rect) {
+        match self.placement {
+            PanelPlacement::Floating => {
+                if let Some(rect) = self.restore_bounds {
+                    self.apply_resize(rect);
+                }
+            }
+            PanelPlacement::Snapped(slot) => {
+                let rect = self.rect();
+                self.apply_resize(normalize_snapped_rect(slot, rect, desktop_rect));
+            }
+            PanelPlacement::Maximized => {
+                match self
+                    .restore_placement
+                    .take()
+                    .unwrap_or(PanelPlacement::Floating)
+                {
+                    PanelPlacement::Floating => {
+                        self.placement = PanelPlacement::Floating;
+                        if let Some(rect) = self.restore_bounds {
+                            self.apply_resize(rect);
+                        }
+                    }
+                    PanelPlacement::Snapped(slot) => {
+                        self.placement = PanelPlacement::Snapped(slot);
+                        let rect = self.current_or_restore_rect();
+                        self.apply_resize(normalize_snapped_rect(slot, rect, desktop_rect));
+                    }
+                    PanelPlacement::Maximized => {
+                        self.placement = PanelPlacement::Maximized;
+                        self.apply_resize(desktop_rect);
+                    }
+                }
+            }
         }
     }
 
@@ -471,11 +581,15 @@ impl TerminalPanel {
     pub fn shared_snapshot(&self) -> SharedPanelSnapshot {
         let mut visible_text = String::new();
         let mut history_text = String::new();
-        if let Some(handle) = self.session_handle() {
-            if let Ok(pty) = handle.lock() {
-                if let Ok(term) = pty.term.try_lock() {
-                    visible_text = visible_text_snapshot(&term, 18, 180);
-                    history_text = visible_text_snapshot(&term, 80, 220);
+        if self.share_scope.allows_visible_text() {
+            if let Some(handle) = self.session_handle() {
+                if let Ok(pty) = handle.lock() {
+                    if let Ok(term) = pty.term.try_lock() {
+                        visible_text = visible_text_snapshot(&term, 18, 180);
+                        if self.share_scope.allows_history() {
+                            history_text = visible_text_snapshot(&term, 80, 220);
+                        }
+                    }
                 }
             }
         }
@@ -491,6 +605,7 @@ impl TerminalPanel {
             minimized: self.minimized,
             alive: self.is_alive(),
             preview_label: self.preview_label(),
+            share_scope: self.share_scope,
             visible_text,
             history_text,
             controller: None,
@@ -529,14 +644,6 @@ impl TerminalPanel {
             column: column.min(max_column),
             line: row.min(max_row),
         })
-    }
-
-    pub fn contains_screen_pos(&self, pos: Pos2, viewport: &Viewport, canvas_rect: Rect) -> bool {
-        if self.minimized {
-            return false;
-        }
-        let (screen_rect, _, _) = self.screen_geometry(viewport, canvas_rect);
-        screen_rect.intersect(canvas_rect).contains(pos)
     }
 
     pub fn hit_test(
@@ -803,6 +910,29 @@ impl TerminalPanel {
                 if self.is_alive() { FG } else { DIM_FG },
             );
         }
+        if matches!(lod, PanelLod::Full | PanelLod::Compact) && title_rect.width() >= 220.0 {
+            let badge_text = self.share_scope.label();
+            let badge_width =
+                ((badge_text.len() as f32 * 7.2 + 18.0) * chrome_zoom).clamp(52.0, 96.0);
+            let badge_height = (20.0 * chrome_zoom).clamp(16.0, 20.0);
+            let badge_rect = Rect::from_center_size(
+                pos2(
+                    title_rect.right() - (14.0 * chrome_zoom).clamp(8.0, 14.0) - badge_width * 0.5,
+                    title_rect.center().y,
+                ),
+                vec2(badge_width, badge_height),
+            );
+            let (fill, stroke, text) = share_scope_badge_colors(self.share_scope);
+            chrome_painter.rect_filled(badge_rect, badge_height * 0.5, fill);
+            chrome_painter.rect_stroke(badge_rect, badge_height * 0.5, Stroke::new(1.0, stroke));
+            chrome_painter.text(
+                badge_rect.center(),
+                Align2::CENTER_CENTER,
+                badge_text,
+                FontId::proportional((11.0 * chrome_zoom).clamp(7.0, 11.0)),
+                text,
+            );
+        }
         let content_clip_rect = content_rect.intersect(canvas_rect);
         let content_painter = painter.with_clip_rect(content_clip_rect);
         let content_rounding = roundings.body;
@@ -1040,12 +1170,6 @@ impl TerminalPanel {
         self.command_buffer.clear();
     }
 
-    fn apply_activity_label_update(&mut self, activity_label: Option<String>, time: f64) {
-        self.activity_label =
-            activity_label.or_else(|| infer_activity_label(&self.title, &self.shell_title, ""));
-        self.last_activity_scan_at = time;
-    }
-
     fn preview_label(&self) -> String {
         let fallback = if is_generic_terminal_name(&self.title) {
             &self.cwd_label
@@ -1227,15 +1351,6 @@ impl ResizeHandle {
         Self::Top,
         Self::Bottom,
     ];
-
-    fn cursor_icon(self) -> CursorIcon {
-        match self {
-            Self::Left | Self::Right => CursorIcon::ResizeHorizontal,
-            Self::Top | Self::Bottom => CursorIcon::ResizeVertical,
-            Self::TopLeft | Self::BottomRight => CursorIcon::ResizeNwSe,
-            Self::TopRight | Self::BottomLeft => CursorIcon::ResizeNeSw,
-        }
-    }
 
     fn resizes_left(self) -> bool {
         matches!(self, Self::Left | Self::TopLeft | Self::BottomLeft)
@@ -1508,6 +1623,152 @@ fn should_render_terminal_contents(content_rect: Rect, zoom: f32) -> bool {
         && content_rect.height() >= MIN_TERMINAL_RENDER_HEIGHT
 }
 
+fn rect_to_saved_bounds(rect: Rect) -> SavedPanelBounds {
+    SavedPanelBounds::new([rect.min.x, rect.min.y], [rect.width(), rect.height()])
+}
+
+fn saved_bounds_to_rect(bounds: SavedPanelBounds) -> Rect {
+    Rect::from_min_size(
+        pos2(bounds.position[0], bounds.position[1]),
+        vec2(bounds.size[0], bounds.size[1]),
+    )
+}
+
+pub fn snap_slot_rect(slot: SnapSlot, desktop_rect: Rect) -> Rect {
+    let half_width = desktop_rect.width() * 0.5;
+    let half_height = desktop_rect.height() * 0.5;
+
+    match slot {
+        SnapSlot::LeftHalf => {
+            Rect::from_min_size(desktop_rect.min, vec2(half_width, desktop_rect.height()))
+        }
+        SnapSlot::RightHalf => Rect::from_min_size(
+            pos2(desktop_rect.center().x, desktop_rect.top()),
+            vec2(half_width, desktop_rect.height()),
+        ),
+        SnapSlot::TopHalf => {
+            Rect::from_min_size(desktop_rect.min, vec2(desktop_rect.width(), half_height))
+        }
+        SnapSlot::BottomHalf => Rect::from_min_size(
+            pos2(desktop_rect.left(), desktop_rect.center().y),
+            vec2(desktop_rect.width(), half_height),
+        ),
+        SnapSlot::TopLeft => Rect::from_min_size(desktop_rect.min, vec2(half_width, half_height)),
+        SnapSlot::TopRight => Rect::from_min_size(
+            pos2(desktop_rect.center().x, desktop_rect.top()),
+            vec2(half_width, half_height),
+        ),
+        SnapSlot::BottomLeft => Rect::from_min_size(
+            pos2(desktop_rect.left(), desktop_rect.center().y),
+            vec2(half_width, half_height),
+        ),
+        SnapSlot::BottomRight => {
+            Rect::from_min_size(desktop_rect.center(), vec2(half_width, half_height))
+        }
+        SnapSlot::Maximized => desktop_rect,
+    }
+}
+
+pub fn normalize_snapped_rect(slot: SnapSlot, rect: Rect, desktop_rect: Rect) -> Rect {
+    let min_width = MIN_WIDTH.min(desktop_rect.width());
+    let min_height = MIN_HEIGHT.min(desktop_rect.height());
+
+    match slot {
+        SnapSlot::LeftHalf => {
+            let width = rect.width().clamp(min_width, desktop_rect.width());
+            Rect::from_min_max(
+                desktop_rect.min,
+                pos2(
+                    (desktop_rect.left() + width).min(desktop_rect.right()),
+                    desktop_rect.bottom(),
+                ),
+            )
+        }
+        SnapSlot::RightHalf => {
+            let width = rect.width().clamp(min_width, desktop_rect.width());
+            Rect::from_min_max(
+                pos2(
+                    (desktop_rect.right() - width).max(desktop_rect.left()),
+                    desktop_rect.top(),
+                ),
+                desktop_rect.max,
+            )
+        }
+        SnapSlot::TopHalf => {
+            let height = rect.height().clamp(min_height, desktop_rect.height());
+            Rect::from_min_max(
+                desktop_rect.min,
+                pos2(
+                    desktop_rect.right(),
+                    (desktop_rect.top() + height).min(desktop_rect.bottom()),
+                ),
+            )
+        }
+        SnapSlot::BottomHalf => {
+            let height = rect.height().clamp(min_height, desktop_rect.height());
+            Rect::from_min_max(
+                pos2(
+                    desktop_rect.left(),
+                    (desktop_rect.bottom() - height).max(desktop_rect.top()),
+                ),
+                desktop_rect.max,
+            )
+        }
+        SnapSlot::TopLeft => {
+            let width = rect.width().clamp(min_width, desktop_rect.width());
+            let height = rect.height().clamp(min_height, desktop_rect.height());
+            Rect::from_min_max(
+                desktop_rect.min,
+                pos2(
+                    (desktop_rect.left() + width).min(desktop_rect.right()),
+                    (desktop_rect.top() + height).min(desktop_rect.bottom()),
+                ),
+            )
+        }
+        SnapSlot::TopRight => {
+            let width = rect.width().clamp(min_width, desktop_rect.width());
+            let height = rect.height().clamp(min_height, desktop_rect.height());
+            Rect::from_min_max(
+                pos2(
+                    (desktop_rect.right() - width).max(desktop_rect.left()),
+                    desktop_rect.top(),
+                ),
+                pos2(
+                    desktop_rect.right(),
+                    (desktop_rect.top() + height).min(desktop_rect.bottom()),
+                ),
+            )
+        }
+        SnapSlot::BottomLeft => {
+            let width = rect.width().clamp(min_width, desktop_rect.width());
+            let height = rect.height().clamp(min_height, desktop_rect.height());
+            Rect::from_min_max(
+                pos2(
+                    desktop_rect.left(),
+                    (desktop_rect.bottom() - height).max(desktop_rect.top()),
+                ),
+                pos2(
+                    (desktop_rect.left() + width).min(desktop_rect.right()),
+                    desktop_rect.bottom(),
+                ),
+            )
+        }
+        SnapSlot::BottomRight => {
+            let width = rect.width().clamp(min_width, desktop_rect.width());
+            let height = rect.height().clamp(min_height, desktop_rect.height());
+            Rect::from_min_max(
+                pos2(
+                    (desktop_rect.right() - width).max(desktop_rect.left()),
+                    (desktop_rect.bottom() - height).max(desktop_rect.top()),
+                ),
+                desktop_rect.max,
+            )
+        }
+        SnapSlot::Maximized => desktop_rect,
+    }
+}
+
+#[cfg(test)]
 fn should_render_live_terminal(
     content_rect: Rect,
     zoom: f32,
@@ -1772,24 +2033,11 @@ fn cwd_label(cwd: Option<&Path>) -> String {
         .to_owned()
 }
 
-fn truncate_text(text: &str, max_chars: usize) -> String {
-    let char_count = text.chars().count();
-    if char_count <= max_chars {
-        text.to_owned()
-    } else {
-        format!(
-            "{}…",
-            text.chars()
-                .take(max_chars.saturating_sub(1))
-                .collect::<String>()
-        )
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use crate::app::gesture_pointer_pos;
     use crate::canvas::viewport::Viewport;
+    use crate::collab::PanelShareScope;
     use crate::runtime::RenderTier;
     use crate::terminal::input::{
         alt_screen_scroll_sequence, mouse_scroll_button, mouse_scroll_sgr_sequence,
@@ -2216,5 +2464,17 @@ mod tests {
         let pointer = terminal_scrollbar_rect(body_rect).center();
 
         assert!(panel.scroll_hit_test(pointer, &viewport, canvas_rect));
+    }
+
+    #[test]
+    fn shared_snapshot_reports_private_scope() {
+        let mut panel = TerminalPanel::new(pos2(0.0, 0.0), vec2(400.0, 300.0), Color32::WHITE, 0);
+        panel.set_share_scope(PanelShareScope::Private);
+
+        let snapshot = panel.shared_snapshot();
+
+        assert_eq!(snapshot.share_scope, PanelShareScope::Private);
+        assert!(snapshot.visible_text.is_empty());
+        assert!(snapshot.history_text.is_empty());
     }
 }

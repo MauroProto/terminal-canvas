@@ -10,8 +10,10 @@ use crate::canvas::config::{
 use crate::collab::{SharedPanelSnapshot, TerminalInputEvent};
 use crate::orchestration::PanelRuntimeObservation;
 use crate::panel::CanvasPanel;
-use crate::runtime::{PtyManager, RuntimeWorkspaceSnapshot, SessionSpec, UiUpdateBatch};
+use crate::runtime::{PtyManager, SessionSpec, UiUpdateBatch};
+use crate::state::persistence::{LegacyCanvasState, WorkspaceDesktopState};
 use crate::state::WorkspaceState;
+use crate::state::{PanelPlacement, SnapSlot};
 use crate::terminal::panel::TerminalPanel;
 
 const PANEL_COLORS: &[Color32] = &[
@@ -83,10 +85,8 @@ impl Workspace {
             name,
             cwd,
             panels: saved_panels,
-            viewport_pan,
-            viewport_zoom,
-            next_z,
-            next_color,
+            desktop,
+            legacy_canvas,
         } = saved;
         let workspace_id = Uuid::parse_str(&id).unwrap_or_else(|_| Uuid::new_v4());
         let pty_manager = Arc::new(Mutex::new(PtyManager::new()));
@@ -105,10 +105,10 @@ impl Workspace {
             cwd: cwd.clone(),
             folder_path_label: cwd.as_deref().map(workspace_path_label),
             panels,
-            viewport_pan: egui::vec2(viewport_pan[0], viewport_pan[1]),
-            viewport_zoom,
-            next_z,
-            next_color,
+            viewport_pan: egui::vec2(legacy_canvas.viewport_pan[0], legacy_canvas.viewport_pan[1]),
+            viewport_zoom: legacy_canvas.viewport_zoom,
+            next_z: desktop.next_z,
+            next_color: desktop.next_color,
             pty_manager,
         };
         if workspace
@@ -129,10 +129,14 @@ impl Workspace {
             name: self.name.clone(),
             cwd: self.cwd.clone(),
             panels: self.panels.iter().map(CanvasPanel::to_saved).collect(),
-            viewport_pan: [self.viewport_pan.x, self.viewport_pan.y],
-            viewport_zoom: self.viewport_zoom,
-            next_z: self.next_z,
-            next_color: self.next_color,
+            desktop: WorkspaceDesktopState {
+                next_z: self.next_z,
+                next_color: self.next_color,
+            },
+            legacy_canvas: LegacyCanvasState {
+                viewport_pan: [self.viewport_pan.x, self.viewport_pan.y],
+                viewport_zoom: self.viewport_zoom,
+            },
         }
     }
 
@@ -143,7 +147,7 @@ impl Workspace {
 
     pub fn spawn_terminal_with_request(
         &mut self,
-        ctx: &egui::Context,
+        _ctx: &egui::Context,
         request: TerminalSpawnRequest,
     ) -> SpawnedTerminal {
         let size = normalize_panel_size(egui::vec2(DEFAULT_PANEL_WIDTH, DEFAULT_PANEL_HEIGHT));
@@ -161,7 +165,6 @@ impl Workspace {
         let cwd = request.cwd.as_deref().or(self.cwd.as_deref());
         panel.attach_session_with_spec(
             Arc::clone(&self.pty_manager),
-            ctx,
             cwd,
             SessionSpec {
                 title: panel.title.clone(),
@@ -182,6 +185,7 @@ impl Workspace {
         }
     }
 
+    #[cfg(test)]
     pub fn add_restored_terminal(&mut self, panel: TerminalPanel) {
         self.panels.push(CanvasPanel::Terminal(panel));
     }
@@ -326,10 +330,6 @@ impl Workspace {
         self.folder_path_label.as_deref()
     }
 
-    pub fn runtime_snapshot(&self) -> RuntimeWorkspaceSnapshot {
-        RuntimeWorkspaceSnapshot::new(self.id, self.name.clone(), self.cwd.clone())
-    }
-
     pub fn runtime_session_counts(&self) -> (usize, usize) {
         self.pty_manager
             .lock()
@@ -347,7 +347,7 @@ impl Workspace {
         self.pty_manager
             .lock()
             .ok()
-            .map(|manager| manager.drain_ui_updates())
+            .map(|mut manager| manager.drain_ui_updates())
             .unwrap_or_default()
     }
 
@@ -370,6 +370,25 @@ impl Workspace {
         self.panels.iter().find(|panel| panel.id() == panel_id)
     }
 
+    pub fn panel_pair_mut(
+        &mut self,
+        first_id: Uuid,
+        second_id: Uuid,
+    ) -> Option<(&mut CanvasPanel, &mut CanvasPanel)> {
+        let first_index = self.panels.iter().position(|panel| panel.id() == first_id)?;
+        let second_index = self.panels.iter().position(|panel| panel.id() == second_id)?;
+        if first_index == second_index {
+            return None;
+        }
+        if first_index < second_index {
+            let (left, right) = self.panels.split_at_mut(second_index);
+            Some((&mut left[first_index], &mut right[0]))
+        } else {
+            let (left, right) = self.panels.split_at_mut(first_index);
+            Some((&mut right[0], &mut left[second_index]))
+        }
+    }
+
     pub fn toggle_minimize_panel(&mut self, panel_id: Uuid) {
         let Some(index) = self.panels.iter().position(|panel| panel.id() == panel_id) else {
             return;
@@ -388,9 +407,46 @@ impl Workspace {
     pub fn restore_panel(&mut self, panel_id: Uuid) {
         if let Some(panel) = self.panels.iter_mut().find(|panel| panel.id() == panel_id) {
             panel.set_minimized(false);
+            if matches!(panel.placement(), PanelPlacement::Floating) {
+                let rect = panel.current_or_restore_rect();
+                panel.apply_resize(rect);
+            }
         } else {
             return;
         }
+        self.bring_to_front(panel_id);
+    }
+
+    pub fn maximize_panel(&mut self, panel_id: Uuid, desktop_rect: Rect) {
+        let Some(panel) = self.panels.iter_mut().find(|panel| panel.id() == panel_id) else {
+            return;
+        };
+        if matches!(panel.placement(), PanelPlacement::Maximized) {
+            panel.restore_window_placement(desktop_rect);
+            panel.set_minimized(false);
+        } else {
+            panel.maximize(desktop_rect);
+            panel.set_minimized(false);
+        }
+        self.bring_to_front(panel_id);
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn snap_panel(&mut self, panel_id: Uuid, slot: SnapSlot, desktop_rect: Rect) {
+        let Some(panel) = self.panels.iter_mut().find(|panel| panel.id() == panel_id) else {
+            return;
+        };
+        panel.set_minimized(false);
+        panel.snap_to(slot, desktop_rect);
+        self.bring_to_front(panel_id);
+    }
+
+    pub fn restore_panel_with_desktop(&mut self, panel_id: Uuid, desktop_rect: Rect) {
+        let Some(panel) = self.panels.iter_mut().find(|panel| panel.id() == panel_id) else {
+            return;
+        };
+        panel.set_minimized(false);
+        panel.restore_window_placement(desktop_rect);
         self.bring_to_front(panel_id);
     }
 
@@ -455,12 +511,16 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
-    use egui::{pos2, vec2};
+    use egui::{pos2, vec2, Rect};
     use uuid::Uuid;
 
     use super::Workspace;
     use crate::canvas::config::PANEL_GAP;
-    use crate::state::{PanelState, WorkspaceState};
+    use crate::collab::PanelShareScope;
+    use crate::state::panel_state::{PanelPlacement, PanelState, SavedPanelBounds};
+    use crate::state::persistence::{LegacyCanvasState, WorkspaceDesktopState};
+    use crate::state::SnapSlot;
+    use crate::state::WorkspaceState;
     use crate::terminal::panel::TerminalPanel;
 
     #[test]
@@ -572,11 +632,19 @@ mod tests {
                 z_index: 1,
                 focused: true,
                 minimized: false,
+                placement: PanelPlacement::Floating,
+                restore_placement: None,
+                restore_bounds: Some(SavedPanelBounds::new([20.0, 30.0], [420.0, 260.0])),
+                share_scope: PanelShareScope::VisibleOnly,
             }],
-            viewport_pan: [0.0, 0.0],
-            viewport_zoom: 1.0,
-            next_z: 2,
-            next_color: 1,
+            desktop: WorkspaceDesktopState {
+                next_z: 2,
+                next_color: 1,
+            },
+            legacy_canvas: LegacyCanvasState {
+                viewport_pan: [0.0, 0.0],
+                viewport_zoom: 1.0,
+            },
         };
         let mut workspace = Workspace::from_saved(state, &ctx);
 
@@ -607,11 +675,19 @@ mod tests {
                 z_index: 1,
                 focused: false,
                 minimized: false,
+                placement: PanelPlacement::Floating,
+                restore_placement: None,
+                restore_bounds: Some(SavedPanelBounds::new([20.0, 30.0], [420.0, 260.0])),
+                share_scope: PanelShareScope::VisibleOnly,
             }],
-            viewport_pan: [0.0, 0.0],
-            viewport_zoom: 1.0,
-            next_z: 2,
-            next_color: 1,
+            desktop: WorkspaceDesktopState {
+                next_z: 2,
+                next_color: 1,
+            },
+            legacy_canvas: LegacyCanvasState {
+                viewport_pan: [0.0, 0.0],
+                viewport_zoom: 1.0,
+            },
         };
         let workspace = Workspace::from_saved(state, &ctx);
 
@@ -640,6 +716,13 @@ mod tests {
                 z_index: index as u32,
                 focused: index == 19,
                 minimized: false,
+                placement: PanelPlacement::Floating,
+                restore_placement: None,
+                restore_bounds: Some(SavedPanelBounds::new(
+                    [20.0 + index as f32 * 8.0, 30.0 + index as f32 * 6.0],
+                    [420.0, 260.0],
+                )),
+                share_scope: PanelShareScope::VisibleOnly,
             })
             .collect();
         let state = WorkspaceState {
@@ -647,10 +730,14 @@ mod tests {
             name: "Budget".to_owned(),
             cwd: Some(PathBuf::from("/tmp/budget")),
             panels,
-            viewport_pan: [0.0, 0.0],
-            viewport_zoom: 1.0,
-            next_z: 21,
-            next_color: 4,
+            desktop: WorkspaceDesktopState {
+                next_z: 21,
+                next_color: 4,
+            },
+            legacy_canvas: LegacyCanvasState {
+                viewport_pan: [0.0, 0.0],
+                viewport_zoom: 1.0,
+            },
         };
         let mut workspace = Workspace::from_saved(state, &ctx);
 
@@ -662,6 +749,98 @@ mod tests {
             .handle_input(&ctx);
 
         assert_eq!(workspace.runtime_session_counts(), (1, 19));
+    }
+
+    #[test]
+    fn maximize_toggle_restores_previous_floating_bounds() {
+        let mut workspace = Workspace::new("Desktop", None);
+        let mut panel = TerminalPanel::new(
+            pos2(48.0, 64.0),
+            vec2(480.0, 320.0),
+            egui::Color32::WHITE,
+            0,
+        );
+        let panel_id = panel.id;
+        panel.focused = true;
+        workspace.add_restored_terminal(panel);
+        let desktop = Rect::from_min_max(pos2(0.0, 0.0), pos2(1280.0, 720.0));
+
+        workspace.maximize_panel(panel_id, desktop);
+
+        let panel = workspace.panel(panel_id).expect("panel exists");
+        assert!(matches!(panel.placement(), PanelPlacement::Maximized));
+        assert_eq!(panel.rect(), desktop);
+
+        workspace.maximize_panel(panel_id, desktop);
+
+        let panel = workspace.panel(panel_id).expect("panel exists");
+        assert!(matches!(panel.placement(), PanelPlacement::Floating));
+        assert_eq!(
+            panel.rect(),
+            Rect::from_min_size(pos2(48.0, 64.0), vec2(480.0, 320.0))
+        );
+    }
+
+    #[test]
+    fn maximize_toggle_restores_previous_snapped_slot() {
+        let mut workspace = Workspace::new("Desktop", None);
+        let panel = TerminalPanel::new(
+            pos2(48.0, 64.0),
+            vec2(480.0, 320.0),
+            egui::Color32::WHITE,
+            0,
+        );
+        let panel_id = panel.id;
+        workspace.add_restored_terminal(panel);
+        let desktop = Rect::from_min_max(pos2(0.0, 0.0), pos2(1280.0, 720.0));
+
+        workspace.snap_panel(panel_id, SnapSlot::LeftHalf, desktop);
+        workspace.maximize_panel(panel_id, desktop);
+
+        let panel = workspace.panel(panel_id).expect("panel exists");
+        assert!(matches!(panel.placement(), PanelPlacement::Maximized));
+        assert_eq!(panel.rect(), desktop);
+
+        workspace.maximize_panel(panel_id, desktop);
+
+        let panel = workspace.panel(panel_id).expect("panel exists");
+        assert!(matches!(
+            panel.placement(),
+            PanelPlacement::Snapped(SnapSlot::LeftHalf)
+        ));
+        assert_eq!(
+            panel.rect(),
+            Rect::from_min_max(pos2(0.0, 0.0), pos2(640.0, 720.0))
+        );
+    }
+
+    #[test]
+    fn minimize_and_restore_with_desktop_keeps_snapped_slot() {
+        let mut workspace = Workspace::new("Desktop", None);
+        let panel = TerminalPanel::new(
+            pos2(48.0, 64.0),
+            vec2(480.0, 320.0),
+            egui::Color32::WHITE,
+            0,
+        );
+        let panel_id = panel.id;
+        workspace.add_restored_terminal(panel);
+        let desktop = Rect::from_min_max(pos2(0.0, 0.0), pos2(1280.0, 720.0));
+
+        workspace.snap_panel(panel_id, SnapSlot::RightHalf, desktop);
+        workspace.toggle_minimize_panel(panel_id);
+        workspace.restore_panel_with_desktop(panel_id, desktop);
+
+        let panel = workspace.panel(panel_id).expect("panel exists");
+        assert!(!panel.minimized());
+        assert!(matches!(
+            panel.placement(),
+            PanelPlacement::Snapped(SnapSlot::RightHalf)
+        ));
+        assert_eq!(
+            panel.rect(),
+            Rect::from_min_max(pos2(640.0, 0.0), pos2(1280.0, 720.0))
+        );
     }
 
     fn unique_temp_dir(name: &str) -> std::path::PathBuf {

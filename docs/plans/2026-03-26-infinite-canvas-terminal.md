@@ -1,5 +1,7 @@
 # Infinite Canvas Terminal Implementation Plan
 
+> Historical note: this document captures the original canvas-first phase. The current product direction is a bounded desktop/panel manager for terminals and agents.
+
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Build a native Rust infinite-canvas terminal emulator matching `documentacion-completa.md`.

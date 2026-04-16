@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 use std::net::TcpStream;
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -10,13 +10,15 @@ use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{client, client_tls_with_config, Message, WebSocket};
 use url::Url;
 
+const COMMAND_WAIT_SLICE: Duration = Duration::from_millis(50);
+const SOCKET_IO_TIMEOUT: Duration = Duration::from_millis(50);
+
 #[derive(Debug)]
 pub enum TransportCommand {
     Connect {
         websocket_url: String,
         tls_cert_pem: Option<String>,
     },
-    SendText(String),
     SendBinary(Vec<u8>),
     Close,
 }
@@ -69,38 +71,36 @@ fn transport_thread(command_rx: Receiver<TransportCommand>, event_tx: Sender<Tra
     let mut next_reconnect_at: Option<Instant> = None;
 
     loop {
+        if socket.is_none() {
+            if !wait_for_commands_or_reconnect(
+                &command_rx,
+                &event_tx,
+                &mut socket,
+                &mut outbound,
+                &mut desired_websocket_url,
+                &mut desired_tls_cert_pem,
+                &mut reconnect_attempts,
+                &mut next_reconnect_at,
+            ) {
+                return;
+            }
+            if socket.is_none() && desired_websocket_url.is_none() {
+                continue;
+            }
+        }
+
         loop {
             match command_rx.try_recv() {
-                Ok(TransportCommand::Connect {
-                    websocket_url,
-                    tls_cert_pem,
-                }) => {
-                    desired_websocket_url = Some(websocket_url);
-                    desired_tls_cert_pem = tls_cert_pem;
-                    reconnect_attempts = 0;
-                    next_reconnect_at = Some(Instant::now());
-                    if let Some(mut active_socket) = socket.take() {
-                        let _ = active_socket.close(None);
-                        let _ = event_tx.send(TransportEvent::Disconnected);
-                    }
-                }
-                Ok(TransportCommand::SendText(message)) => {
-                    outbound.push_back(Message::Text(message))
-                }
-                Ok(TransportCommand::SendBinary(message)) => {
-                    outbound.push_back(Message::Binary(message))
-                }
-                Ok(TransportCommand::Close) => {
-                    desired_websocket_url = None;
-                    desired_tls_cert_pem = None;
-                    reconnect_attempts = 0;
-                    next_reconnect_at = None;
-                    outbound.clear();
-                    if let Some(mut active_socket) = socket.take() {
-                        let _ = active_socket.close(None);
-                    }
-                    let _ = event_tx.send(TransportEvent::Disconnected);
-                }
+                Ok(command) => handle_command(
+                    command,
+                    &event_tx,
+                    &mut socket,
+                    &mut outbound,
+                    &mut desired_websocket_url,
+                    &mut desired_tls_cert_pem,
+                    &mut reconnect_attempts,
+                    &mut next_reconnect_at,
+                ),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => return,
             }
@@ -118,12 +118,11 @@ fn transport_thread(command_rx: Receiver<TransportCommand>, event_tx: Sender<Tra
                     .clone();
                 match connect_websocket(websocket_url.as_str(), desired_tls_cert_pem.as_deref()) {
                     Ok((mut ws, _)) => {
-                        if let Err(err) = set_websocket_nonblocking(&mut ws) {
+                        if let Err(err) = set_websocket_timeouts(&mut ws) {
                             reconnect_attempts = reconnect_attempts.saturating_add(1);
                             next_reconnect_at =
                                 Some(Instant::now() + reconnect_delay(reconnect_attempts));
                             let _ = event_tx.send(TransportEvent::Error(err.to_string()));
-                            thread::sleep(Duration::from_millis(16));
                             continue;
                         }
                         socket = Some(ws);
@@ -160,7 +159,6 @@ fn transport_thread(command_rx: Receiver<TransportCommand>, event_tx: Sender<Tra
                 }
                 socket = None;
                 let _ = event_tx.send(TransportEvent::Disconnected);
-                thread::sleep(Duration::from_millis(16));
                 continue;
             }
 
@@ -190,7 +188,8 @@ fn transport_thread(command_rx: Receiver<TransportCommand>, event_tx: Sender<Tra
                     Ok(Message::Pong(_)) => {}
                     Ok(Message::Frame(_)) => {}
                     Err(tungstenite::Error::Io(err))
-                        if err.kind() == std::io::ErrorKind::WouldBlock => {}
+                        if err.kind() == std::io::ErrorKind::WouldBlock
+                            || err.kind() == std::io::ErrorKind::TimedOut => {}
                     Err(err) => {
                         disconnect_error = Some(err.to_string());
                         disconnect_now = true;
@@ -210,8 +209,6 @@ fn transport_thread(command_rx: Receiver<TransportCommand>, event_tx: Sender<Tra
                 }
             }
         }
-
-        thread::sleep(Duration::from_millis(16));
     }
 }
 
@@ -220,13 +217,105 @@ fn reconnect_delay(attempt: u32) -> Duration {
     Duration::from_millis(250 * (1 << capped_attempt))
 }
 
-fn set_websocket_nonblocking(
+fn set_websocket_timeouts(
     socket: &mut WebSocket<MaybeTlsStream<TcpStream>>,
 ) -> std::io::Result<()> {
     match socket.get_mut() {
-        MaybeTlsStream::Plain(stream) => stream.set_nonblocking(true),
-        MaybeTlsStream::Rustls(stream) => stream.sock.set_nonblocking(true),
+        MaybeTlsStream::Plain(stream) => {
+            stream.set_read_timeout(Some(SOCKET_IO_TIMEOUT))?;
+            stream.set_write_timeout(Some(SOCKET_IO_TIMEOUT))
+        }
+        MaybeTlsStream::Rustls(stream) => {
+            stream.sock.set_read_timeout(Some(SOCKET_IO_TIMEOUT))?;
+            stream.sock.set_write_timeout(Some(SOCKET_IO_TIMEOUT))
+        }
         _ => Ok(()),
+    }
+}
+
+fn wait_for_commands_or_reconnect(
+    command_rx: &Receiver<TransportCommand>,
+    event_tx: &Sender<TransportEvent>,
+    socket: &mut Option<WebSocket<MaybeTlsStream<TcpStream>>>,
+    outbound: &mut VecDeque<Message>,
+    desired_websocket_url: &mut Option<String>,
+    desired_tls_cert_pem: &mut Option<String>,
+    reconnect_attempts: &mut u32,
+    next_reconnect_at: &mut Option<Instant>,
+) -> bool {
+    let wait_duration = if desired_websocket_url.is_some() {
+        next_reconnect_at
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+            .unwrap_or(Duration::ZERO)
+            .min(COMMAND_WAIT_SLICE)
+    } else {
+        COMMAND_WAIT_SLICE
+    };
+
+    let command = if desired_websocket_url.is_none() {
+        match command_rx.recv() {
+            Ok(command) => Some(command),
+            Err(_) => return false,
+        }
+    } else {
+        match command_rx.recv_timeout(wait_duration) {
+            Ok(command) => Some(command),
+            Err(RecvTimeoutError::Timeout) => None,
+            Err(RecvTimeoutError::Disconnected) => return false,
+        }
+    };
+
+    if let Some(command) = command {
+        handle_command(
+            command,
+            event_tx,
+            socket,
+            outbound,
+            desired_websocket_url,
+            desired_tls_cert_pem,
+            reconnect_attempts,
+            next_reconnect_at,
+        );
+    }
+    true
+}
+
+fn handle_command(
+    command: TransportCommand,
+    event_tx: &Sender<TransportEvent>,
+    socket: &mut Option<WebSocket<MaybeTlsStream<TcpStream>>>,
+    outbound: &mut VecDeque<Message>,
+    desired_websocket_url: &mut Option<String>,
+    desired_tls_cert_pem: &mut Option<String>,
+    reconnect_attempts: &mut u32,
+    next_reconnect_at: &mut Option<Instant>,
+) {
+    match command {
+        TransportCommand::Connect {
+            websocket_url,
+            tls_cert_pem,
+        } => {
+            *desired_websocket_url = Some(websocket_url);
+            *desired_tls_cert_pem = tls_cert_pem;
+            *reconnect_attempts = 0;
+            *next_reconnect_at = Some(Instant::now());
+            if let Some(mut active_socket) = socket.take() {
+                let _ = active_socket.close(None);
+                let _ = event_tx.send(TransportEvent::Disconnected);
+            }
+        }
+        TransportCommand::SendBinary(message) => outbound.push_back(Message::Binary(message)),
+        TransportCommand::Close => {
+            *desired_websocket_url = None;
+            *desired_tls_cert_pem = None;
+            *reconnect_attempts = 0;
+            *next_reconnect_at = None;
+            outbound.clear();
+            if let Some(mut active_socket) = socket.take() {
+                let _ = active_socket.close(None);
+            }
+            let _ = event_tx.send(TransportEvent::Disconnected);
+        }
     }
 }
 

@@ -16,7 +16,7 @@ use crate::canvas::viewport::Viewport;
 use crate::collab::auth::normalize_optional_passphrase;
 use crate::collab::{
     bind_addr_for_share_url, draw_remote_workspace, CollabEvent, CollabManager, CollabMode,
-    CollabSessionState, HostShareOptions, RemotePanelAction, SerializableKey,
+    CollabSessionState, HostShareOptions, PanelShareScope, RemotePanelAction, SerializableKey,
     SerializableModifiers, SharedWorkspaceSnapshot, TerminalInputEvent, TrustedDevice,
 };
 use crate::command_palette::commands::Command;
@@ -28,31 +28,37 @@ use crate::runtime::RenderTier;
 use crate::shortcuts::shortcut_command;
 use crate::sidebar::{Sidebar, SidebarResponse};
 use crate::state::persistence::{AutosaveController, AutosaveDecision};
-use crate::state::{load_state, save_state, AppState, TerminalSpawnRequest, Workspace};
-use crate::terminal::panel::{PanelHitArea, ResizeHandle};
+use crate::state::{
+    load_state, save_state, AppState, PanelPlacement, SnapSlot, TerminalSpawnRequest, Workspace,
+};
+use crate::terminal::panel::{PanelHitArea, ResizeHandle, TITLE_BAR_HEIGHT};
 use crate::theme::fonts::setup_fonts;
 use crate::update::{RepaintPolicy, UpdateChecker};
 use crate::utils::platform::home_dir;
 
+mod desktop;
 mod dialogs;
 mod perf;
 mod taskbar;
 
+#[cfg(test)]
+use self::desktop::{interpolate_viewport, overview_viewport_for_panels};
+use self::desktop::{
+    panel_scroll_capture_active, panel_zoom_gesture_active, split_resize_hit, top_panel_hit,
+    top_panel_scroll_hit, upsert_workspace_for_folder, SplitResizeAxis,
+};
 use self::perf::FramePerfSnapshot;
 use self::taskbar::{
     apply_taskbar_layout_to_workspace, clamp_rect_to_desktop, clamp_workspace_panels_to_desktop,
-    desktop_canvas_rect, desktop_screen_rect, desktop_snap_rect_for_pointer, taskbar_button_colors,
-    taskbar_provider_accent, taskbar_provider_label, taskbar_summary_label, truncate_taskbar_title,
-    TaskbarLayoutPreset,
+    desktop_canvas_rect, desktop_screen_rect, desktop_snap_rect_for_pointer,
+    desktop_snap_slot_for_pointer, taskbar_button_colors, taskbar_provider_accent,
+    taskbar_provider_label, taskbar_summary_label, truncate_taskbar_title, TaskbarLayoutPreset,
 };
 
 const AUTOSAVE_INTERVAL: Duration = Duration::from_secs(2);
 const RUNTIME_REPAINT_BATCH: Duration = Duration::from_millis(33);
 const VIEWPORT_FOCUS_PADDING: f32 = 72.0;
 const VIEWPORT_FOCUS_MAX_ZOOM: f32 = 2.0;
-const VIEWPORT_OVERVIEW_PADDING: f32 = 84.0;
-const VIEWPORT_OVERVIEW_MAX_ZOOM: f32 = 1.0;
-const VIEWPORT_FOCUS_ANIMATION_SECS: f64 = 0.36;
 const ORCHESTRATION_REFRESH_INTERVAL: Duration = Duration::from_millis(750);
 const DESKTOP_MARGIN: f32 = 0.0;
 const DESKTOP_SNAP_EDGE: f32 = 28.0;
@@ -87,6 +93,13 @@ struct JoinSessionDraft {
 enum PanelGestureKind {
     Drag { origin: Pos2 },
     Resize { handle: ResizeHandle, origin: Rect },
+    SplitResize {
+        other_panel_id: Uuid,
+        axis: SplitResizeAxis,
+        origin: Rect,
+        other_origin: Rect,
+        boundary: f32,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -96,12 +109,38 @@ struct PanelGesture {
     kind: PanelGestureKind,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WindowTransitionKind {
+    Minimizing,
+    Restoring,
+}
+
 #[derive(Clone, Copy)]
-struct ViewportAnimation {
-    start: Viewport,
-    target: Viewport,
+struct WindowTransition {
+    kind: WindowTransitionKind,
+    from_rect: Rect,
+    to_rect: Rect,
     started_at: f64,
     duration: f64,
+}
+
+impl WindowTransition {
+    fn progress(self, now: f64) -> f32 {
+        ((now - self.started_at) / self.duration).clamp(0.0, 1.0) as f32
+    }
+
+    fn finished(self, now: f64) -> bool {
+        self.progress(now) >= 1.0
+    }
+
+    fn current_rect(self, now: f64) -> Rect {
+        let t = self.progress(now);
+        let eased = 1.0 - (1.0 - t).powi(3);
+        Rect::from_min_max(
+            self.from_rect.min + (self.to_rect.min - self.from_rect.min) * eased,
+            self.from_rect.max + (self.to_rect.max - self.from_rect.max) * eased,
+        )
+    }
 }
 
 pub struct TerminalApp {
@@ -124,7 +163,6 @@ pub struct TerminalApp {
     panel_gesture: Option<PanelGesture>,
     autosave: AutosaveController,
     persisted_state: Option<AppState>,
-    viewport_animation: Option<ViewportAnimation>,
     repaint_policy: RepaintPolicy,
     launch_agent: Option<LaunchAgentDraft>,
     share_workspace_open: bool,
@@ -137,6 +175,8 @@ pub struct TerminalApp {
     last_orchestration_scan_duration: Duration,
     last_perf_snapshot: FramePerfSnapshot,
     layout_menu_open: bool,
+    taskbar_button_rects: HashMap<Uuid, Rect>,
+    window_transitions: HashMap<Uuid, WindowTransition>,
 }
 
 impl TerminalApp {
@@ -177,8 +217,8 @@ impl TerminalApp {
                 collab,
                 viewport,
                 sidebar_visible: saved.sidebar_visible,
-                show_grid: saved.show_grid,
-                show_minimap: saved.show_minimap,
+                show_grid: saved.legacy_canvas_ui.show_grid,
+                show_minimap: saved.legacy_canvas_ui.show_minimap,
                 ctx: Some(cc.egui_ctx.clone()),
                 command_palette: CommandPalette::default(),
                 renaming_panel: None,
@@ -190,7 +230,6 @@ impl TerminalApp {
                 panel_gesture: None,
                 autosave: AutosaveController::new(AUTOSAVE_INTERVAL),
                 persisted_state: None,
-                viewport_animation: None,
                 repaint_policy: RepaintPolicy::new(RUNTIME_REPAINT_BATCH),
                 launch_agent: None,
                 share_workspace_open: false,
@@ -215,6 +254,8 @@ impl TerminalApp {
                 last_orchestration_scan_duration: Duration::ZERO,
                 last_perf_snapshot: FramePerfSnapshot::default(),
                 layout_menu_open: false,
+                taskbar_button_rects: HashMap::new(),
+                window_transitions: HashMap::new(),
             }
         } else {
             let collab = CollabManager::new();
@@ -241,7 +282,6 @@ impl TerminalApp {
                 panel_gesture: None,
                 autosave: AutosaveController::new(AUTOSAVE_INTERVAL),
                 persisted_state: None,
-                viewport_animation: None,
                 repaint_policy: RepaintPolicy::new(RUNTIME_REPAINT_BATCH),
                 launch_agent: None,
                 share_workspace_open: false,
@@ -266,6 +306,8 @@ impl TerminalApp {
                 last_orchestration_scan_duration: Duration::ZERO,
                 last_perf_snapshot: FramePerfSnapshot::default(),
                 layout_menu_open: false,
+                taskbar_button_rects: HashMap::new(),
+                window_transitions: HashMap::new(),
             }
         };
 
@@ -306,19 +348,22 @@ impl TerminalApp {
             .map(|(index, workspace)| {
                 let mut saved = workspace.to_saved();
                 if index == self.active_ws {
-                    saved.viewport_pan = [self.viewport.pan.x, self.viewport.pan.y];
-                    saved.viewport_zoom = self.viewport.zoom;
+                    saved.legacy_canvas.viewport_pan = [self.viewport.pan.x, self.viewport.pan.y];
+                    saved.legacy_canvas.viewport_zoom = self.viewport.zoom;
                 }
                 saved
             })
             .collect();
 
         AppState {
+            schema_version: 2,
             workspaces,
             active_ws: self.active_ws,
             sidebar_visible: self.sidebar_visible,
-            show_grid: self.show_grid,
-            show_minimap: self.show_minimap,
+            legacy_canvas_ui: crate::state::persistence::LegacyCanvasUiState {
+                show_grid: self.show_grid,
+                show_minimap: self.show_minimap,
+            },
             local_device_id: self.local_device_id.clone(),
             trusted_devices: self.trusted_devices_snapshot(),
             orchestration: self.orchestrator.snapshot(),
@@ -410,7 +455,13 @@ impl TerminalApp {
                 .map(|panel| panel.minimized())
                 .unwrap_or(false);
             if is_minimized {
-                self.ws_mut().restore_panel(panel_id);
+                if let Some(canvas_rect) = canvas_rect {
+                    let desktop_rect = desktop_canvas_rect(canvas_rect);
+                    self.ws_mut()
+                        .restore_panel_with_desktop(panel_id, desktop_rect);
+                } else {
+                    self.ws_mut().restore_panel(panel_id);
+                }
             } else {
                 self.ws_mut().bring_to_front(panel_id);
             }
@@ -424,6 +475,80 @@ impl TerminalApp {
                     );
                 }
             }
+        }
+    }
+
+    fn is_panel_transitioning(&self, panel_id: Uuid) -> bool {
+        self.window_transitions.contains_key(&panel_id)
+    }
+
+    fn start_window_transition(
+        &mut self,
+        panel_id: Uuid,
+        kind: WindowTransitionKind,
+        from_rect: Rect,
+        to_rect: Rect,
+        now: f64,
+    ) {
+        self.window_transitions.insert(
+            panel_id,
+            WindowTransition {
+                kind,
+                from_rect,
+                to_rect,
+                started_at: now,
+                duration: 0.14,
+            },
+        );
+    }
+
+    fn panel_screen_rect(&self, panel_rect: Rect, canvas_rect: Rect) -> Rect {
+        Rect::from_min_size(
+            self.viewport.canvas_to_screen(panel_rect.min, canvas_rect),
+            panel_rect.size() * self.viewport.zoom,
+        )
+    }
+
+    fn sync_window_transitions(&mut self, ctx: &egui::Context) {
+        let now = ctx.input(|i| i.time);
+        self.window_transitions
+            .retain(|_, transition| !transition.finished(now));
+        if !self.window_transitions.is_empty() {
+            ctx.request_repaint();
+        }
+    }
+
+    fn draw_window_transitions(&self, ui: &egui::Ui) {
+        let now = ui.ctx().input(|i| i.time);
+        let painter = ui.painter();
+        for transition in self.window_transitions.values() {
+            let rect = transition.current_rect(now);
+            let progress = transition.progress(now);
+            let alpha = match transition.kind {
+                WindowTransitionKind::Minimizing => (1.0 - progress) * 110.0 + 18.0,
+                WindowTransitionKind::Restoring => (1.0 - progress) * 80.0 + 12.0,
+            }
+            .round()
+            .clamp(0.0, 255.0) as u8;
+            let stroke_alpha = match transition.kind {
+                WindowTransitionKind::Minimizing => (1.0 - progress) * 150.0 + 40.0,
+                WindowTransitionKind::Restoring => (1.0 - progress) * 120.0 + 34.0,
+            }
+            .round()
+            .clamp(0.0, 255.0) as u8;
+            painter.rect_filled(
+                rect,
+                14.0,
+                Color32::from_rgba_premultiplied(34, 36, 44, alpha),
+            );
+            painter.rect_stroke(
+                rect,
+                14.0,
+                Stroke::new(
+                    1.0,
+                    Color32::from_rgba_premultiplied(126, 148, 210, stroke_alpha),
+                ),
+            );
         }
     }
 
@@ -654,7 +779,6 @@ impl TerminalApp {
         {
             return;
         }
-        self.viewport_animation = None;
         match command {
             Command::NewTerminal => {
                 self.ws_mut().spawn_terminal(ctx);
@@ -677,6 +801,18 @@ impl TerminalApp {
                     self.renaming_panel = Some(panel_id);
                     self.rename_buf = panel_title;
                 }
+            }
+            Command::SharePanelPrivate => {
+                self.set_focused_panel_share_scope(PanelShareScope::Private)
+            }
+            Command::SharePanelVisibleOnly => {
+                self.set_focused_panel_share_scope(PanelShareScope::VisibleOnly)
+            }
+            Command::SharePanelVisibleAndHistory => {
+                self.set_focused_panel_share_scope(PanelShareScope::VisibleAndHistory)
+            }
+            Command::SharePanelControllable => {
+                self.set_focused_panel_share_scope(PanelShareScope::Controllable)
             }
             Command::FocusNext => self.focus_relative(1),
             Command::FocusPrev => self.focus_relative(-1),
@@ -702,6 +838,12 @@ impl TerminalApp {
                 self.fullscreen = !self.fullscreen;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
             }
+        }
+    }
+
+    fn set_focused_panel_share_scope(&mut self, scope: PanelShareScope) {
+        if let Some(panel) = self.ws_mut().focused_panel_mut() {
+            panel.set_share_scope(scope);
         }
     }
 
@@ -751,7 +893,6 @@ impl TerminalApp {
         if index == self.active_ws || index >= self.workspaces.len() {
             return;
         }
-        self.viewport_animation = None;
         self.workspaces[self.active_ws].viewport_pan = self.viewport.pan;
         self.workspaces[self.active_ws].viewport_zoom = self.viewport.zoom;
         self.active_ws = index;
@@ -818,10 +959,6 @@ impl TerminalApp {
                         self.rename_buf = panel.title().to_owned();
                     }
                 }
-                SidebarResponse::ClosePanel(panel_id) => {
-                    self.ws_mut().close_panel(panel_id);
-                    self.reconcile_orchestration();
-                }
                 SidebarResponse::OpenShareWorkspace => self.open_share_workspace_dialog(),
                 SidebarResponse::OpenJoinSession => self.open_join_session_dialog(),
                 SidebarResponse::OpenCollabSession => match self.collab.mode() {
@@ -863,73 +1000,15 @@ impl TerminalApp {
             }
         }
     }
-
-    fn start_focus_animation(&mut self, panel_id: Uuid, canvas_rect: Rect, now: f64) {
-        let Some(panel) = self.ws().panels.iter().find(|panel| panel.id() == panel_id) else {
-            return;
-        };
-        let target = self.viewport.focus_on_rect(
-            panel.rect(),
-            canvas_rect,
-            VIEWPORT_FOCUS_PADDING,
-            VIEWPORT_FOCUS_MAX_ZOOM,
-        );
-        if target.pan == self.viewport.pan && (target.zoom - self.viewport.zoom).abs() < 0.001 {
-            self.viewport_animation = None;
-            return;
-        }
-        self.viewport_animation = Some(ViewportAnimation {
-            start: self.viewport,
-            target,
-            started_at: now,
-            duration: VIEWPORT_FOCUS_ANIMATION_SECS,
-        });
-    }
-
-    fn start_overview_animation(&mut self, canvas_rect: Rect, now: f64) {
-        let target = overview_viewport_for_panels(
-            &self.ws().panels,
-            canvas_rect,
-            VIEWPORT_OVERVIEW_PADDING,
-            VIEWPORT_OVERVIEW_MAX_ZOOM,
-        );
-        if target.pan == self.viewport.pan && (target.zoom - self.viewport.zoom).abs() < 0.001 {
-            self.viewport_animation = None;
-            return;
-        }
-        self.viewport_animation = Some(ViewportAnimation {
-            start: self.viewport,
-            target,
-            started_at: now,
-            duration: VIEWPORT_FOCUS_ANIMATION_SECS,
-        });
-    }
-
-    fn update_viewport_animation(&mut self, ctx: &egui::Context) {
-        let Some(animation) = self.viewport_animation else {
-            return;
-        };
-        let now = ctx.input(|i| i.time);
-        let progress = ((now - animation.started_at) / animation.duration).clamp(0.0, 1.0) as f32;
-        let eased = ease_in_out_cubic(progress);
-        self.viewport = interpolate_viewport(animation.start, animation.target, eased);
-        if progress >= 1.0 {
-            self.viewport_animation = None;
-        } else {
-            ctx.request_repaint();
-        }
-    }
 }
 
 impl eframe::App for TerminalApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let frame_started_at = Instant::now();
-        let mut perf_snapshot = FramePerfSnapshot {
-            orchestration_scan_time: self.last_orchestration_scan_duration,
-            ..FramePerfSnapshot::default()
-        };
+        let mut perf_snapshot = FramePerfSnapshot::default();
         self.ctx = Some(ctx.clone());
         self.handle_collab_events();
+        self.sync_window_transitions(ctx);
         self.maybe_refresh_orchestration();
 
         if let Some(command) = self.handle_shortcuts(ctx) {
@@ -1022,6 +1101,7 @@ impl eframe::App for TerminalApp {
             let mut requested_panel = None;
             let mut layout_menu_anchor = None;
             let mut layout_button_hovered = false;
+            let mut taskbar_button_rects = HashMap::new();
             let mut taskbar_panels: Vec<_> = self
                 .ws()
                 .panels
@@ -1097,12 +1177,14 @@ impl eframe::App for TerminalApp {
                                 pos2(response.rect.left() + 11.0, response.rect.bottom() - 5.0),
                             );
                             ui.painter().rect_filled(accent_rect, 3.0, accent);
+                            taskbar_button_rects.insert(*panel_id, response.rect);
                             if response.clicked() {
                                 requested_panel = Some(*panel_id);
                             }
                         }
                     });
                 });
+            self.taskbar_button_rects = taskbar_button_rects;
             if self.layout_menu_open {
                 if let Some(anchor) = layout_menu_anchor {
                     let menu_response = Area::new(Id::new("taskbar-layout-menu"))
@@ -1147,7 +1229,36 @@ impl eframe::App for TerminalApp {
                 }
             }
             if let Some(panel_id) = requested_panel {
-                self.focus_panel_across_workspaces(panel_id, Some(ctx.available_rect()));
+                if self
+                    .ws()
+                    .panel(panel_id)
+                    .map(|panel| panel.minimized())
+                    .unwrap_or(false)
+                {
+                    if let (Some(canvas_rect), Some(button_rect)) = (
+                        Some(ctx.available_rect()),
+                        self.taskbar_button_rects.get(&panel_id).copied(),
+                    ) {
+                        let desktop_rect = desktop_canvas_rect(canvas_rect);
+                        self.ws_mut()
+                            .restore_panel_with_desktop(panel_id, desktop_rect);
+                        if let Some(panel) = self.ws().panel(panel_id) {
+                            let target_rect = self.panel_screen_rect(panel.rect(), canvas_rect);
+                            let now = ctx.input(|i| i.time);
+                            self.start_window_transition(
+                                panel_id,
+                                WindowTransitionKind::Restoring,
+                                button_rect,
+                                target_rect,
+                                now,
+                            );
+                        }
+                    } else {
+                        self.focus_panel_across_workspaces(panel_id, Some(ctx.available_rect()));
+                    }
+                } else {
+                    self.focus_panel_across_workspaces(panel_id, Some(ctx.available_rect()));
+                }
             }
         }
 
@@ -1279,7 +1390,6 @@ impl eframe::App for TerminalApp {
                 )
             });
             self.viewport = Viewport::default();
-            self.viewport_animation = None;
             let desktop_rect = desktop_canvas_rect(canvas_rect);
             let desktop_screen = desktop_screen_rect(canvas_rect, desktop_rect);
             if let Some(preset) = requested_layout {
@@ -1294,19 +1404,39 @@ impl eframe::App for TerminalApp {
                 Stroke::new(1.0, Color32::from_rgb(44, 44, 54)),
             );
             let pointer_pos = gesture_pointer_pos(latest_pos, interact_pos, hover_pos);
+            let split_hit = pointer_pos
+                .filter(|pos| desktop_screen.contains(*pos))
+                .map(|pos| self.viewport.screen_to_canvas(pos, canvas_rect))
+                .and_then(|pointer_canvas| split_resize_hit(self.ws(), pointer_canvas))
+                .filter(|hit| {
+                    !self.is_panel_transitioning(self.ws().panels[hit.leading_index].id())
+                        && !self.is_panel_transitioning(self.ws().panels[hit.trailing_index].id())
+                });
             let hovered_hit = pointer_pos
                 .filter(|pos| desktop_screen.contains(*pos))
                 .and_then(|pos| top_panel_hit(self.ws(), pos, &self.viewport, canvas_rect));
             let scroll_target = pointer_pos
                 .filter(|pos| desktop_screen.contains(*pos))
                 .and_then(|pos| top_panel_scroll_hit(self.ws(), pos, &self.viewport, canvas_rect));
-            let hovered_panel = hovered_hit.is_some();
+            let hovered_hit = hovered_hit
+                .filter(|hit| !self.is_panel_transitioning(self.ws().panels[hit.index].id()));
+            let scroll_target = scroll_target
+                .filter(|index| !self.is_panel_transitioning(self.ws().panels[*index].id()));
+            let hovered_panel = split_hit.is_none() && hovered_hit.is_some();
             let scroll_capture_active = panel_scroll_capture_active(
                 hovered_panel,
                 smooth_scroll_delta,
                 zoom_delta,
                 modifiers,
             );
+            if let Some(split_hit) = split_hit {
+                ctx.output_mut(|output| {
+                    output.cursor_icon = match split_hit.axis {
+                        SplitResizeAxis::Vertical => egui::CursorIcon::ResizeHorizontal,
+                        SplitResizeAxis::Horizontal => egui::CursorIcon::ResizeVertical,
+                    };
+                });
+            }
 
             if scroll_capture_active {
                 if let (Some(index), scroll_y) = (scroll_target, smooth_scroll_delta.y) {
@@ -1326,11 +1456,29 @@ impl eframe::App for TerminalApp {
 
             let mut guides = Vec::new();
             let mut snap_preview_rect = None;
+            let mut split_preview_rect = split_hit.map(|hit| hit.hit_rect);
             let fast_path_render = self.panel_gesture.is_some();
             let needs_interaction_repaint = scroll_capture_active || self.panel_gesture.is_some();
             if primary_pressed {
-                match hovered_hit {
-                    Some(hit) => {
+                match (split_hit, hovered_hit) {
+                    (Some(split_hit), _) => {
+                        let leading_id = self.ws().panels[split_hit.leading_index].id();
+                        let trailing_id = self.ws().panels[split_hit.trailing_index].id();
+                        let leading_rect = self.ws().panels[split_hit.leading_index].rect();
+                        let trailing_rect = self.ws().panels[split_hit.trailing_index].rect();
+                        self.panel_gesture = Some(PanelGesture {
+                            panel_id: leading_id,
+                            pointer_origin: pointer_pos.unwrap_or_default(),
+                            kind: PanelGestureKind::SplitResize {
+                                other_panel_id: trailing_id,
+                                axis: split_hit.axis,
+                                origin: leading_rect,
+                                other_origin: trailing_rect,
+                                boundary: split_hit.boundary,
+                            },
+                        });
+                    }
+                    (None, Some(hit)) => {
                         let panel_id = self.ws().panels[hit.index].id();
                         let already_focused =
                             self.ws().focused_panel().map(|panel| panel.id()) == Some(panel_id);
@@ -1339,7 +1487,43 @@ impl eframe::App for TerminalApp {
                         }
                         match hit.area {
                             PanelHitArea::TitleBar => {
-                                let origin = self.ws().panels[hit.index].position();
+                                let pointer_canvas =
+                                    self.viewport.screen_to_canvas(hit.pointer, canvas_rect);
+                                let origin = {
+                                    let panel = &mut self.ws_mut().panels[hit.index];
+                                    let current_rect = panel.rect();
+                                    if !matches!(panel.placement(), PanelPlacement::Floating) {
+                                        let restore_rect = clamp_rect_to_desktop(
+                                            panel.current_or_restore_rect(),
+                                            desktop_rect,
+                                        );
+                                        let relative_x = if current_rect.width() > 0.0 {
+                                            ((pointer_canvas.x - current_rect.left())
+                                                / current_rect.width())
+                                            .clamp(0.12, 0.88)
+                                        } else {
+                                            0.5
+                                        };
+                                        let relative_y = (pointer_canvas.y - current_rect.top())
+                                            .clamp(8.0, TITLE_BAR_HEIGHT - 8.0);
+                                        let floated = clamp_rect_to_desktop(
+                                            Rect::from_min_size(
+                                                pos2(
+                                                    pointer_canvas.x
+                                                        - restore_rect.width() * relative_x,
+                                                    pointer_canvas.y - relative_y,
+                                                ),
+                                                restore_rect.size(),
+                                            ),
+                                            desktop_rect,
+                                        );
+                                        panel.apply_resize(floated);
+                                        panel.set_placement(PanelPlacement::Floating);
+                                        panel.set_restore_placement(None);
+                                        panel.set_restore_bounds(Some(floated));
+                                    }
+                                    panel.position()
+                                };
                                 self.panel_gesture = Some(PanelGesture {
                                     panel_id,
                                     pointer_origin: hit.pointer,
@@ -1355,7 +1539,20 @@ impl eframe::App for TerminalApp {
                                 }
                             }
                             PanelHitArea::Resize(handle) => {
-                                let origin = self.ws().panels[hit.index].rect();
+                                let origin = {
+                                    let panel = &mut self.ws_mut().panels[hit.index];
+                                    if !matches!(panel.placement(), PanelPlacement::Floating) {
+                                        let restore_rect = clamp_rect_to_desktop(
+                                            panel.current_or_restore_rect(),
+                                            desktop_rect,
+                                        );
+                                        panel.apply_resize(restore_rect);
+                                        panel.set_placement(PanelPlacement::Floating);
+                                        panel.set_restore_placement(None);
+                                        panel.set_restore_bounds(Some(restore_rect));
+                                    }
+                                    panel.rect()
+                                };
                                 self.panel_gesture = Some(PanelGesture {
                                     panel_id,
                                     pointer_origin: hit.pointer,
@@ -1377,7 +1574,7 @@ impl eframe::App for TerminalApp {
                             }
                         }
                     }
-                    None => {
+                    (None, None) => {
                         self.panel_gesture = None;
                         self.ws_mut().unfocus_all();
                     }
@@ -1387,27 +1584,38 @@ impl eframe::App for TerminalApp {
             if primary_down {
                 if let (Some(gesture), Some(pointer)) = (self.panel_gesture, pointer_pos) {
                     let pointer_delta = pointer - gesture.pointer_origin;
-                    let other_rects = self.ws().panel_rects_except(gesture.panel_id);
                     let zoom = self.viewport.zoom;
                     let pointer_canvas = self.viewport.screen_to_canvas(pointer, canvas_rect);
-                    if let Some(panel) = self
-                        .ws_mut()
-                        .panels
-                        .iter_mut()
-                        .find(|panel| panel.id() == gesture.panel_id)
-                    {
-                        guides = match gesture.kind {
-                            PanelGestureKind::Drag { origin } => {
+                    guides = match gesture.kind {
+                        PanelGestureKind::Drag { origin } => {
+                            let other_rects = self.ws().panel_rects_except(gesture.panel_id);
+                            if let Some(panel) = self
+                                .ws_mut()
+                                .panels
+                                .iter_mut()
+                                .find(|panel| panel.id() == gesture.panel_id)
+                            {
                                 panel.set_drag_virtual_pos(Some(origin));
                                 let guides =
                                     panel.drag_to(origin, pointer_delta, zoom, &other_rects);
                                 let clamped = clamp_rect_to_desktop(panel.rect(), desktop_rect);
                                 panel.apply_resize(clamped);
+                                panel.set_restore_bounds(Some(clamped));
                                 snap_preview_rect =
                                     desktop_snap_rect_for_pointer(pointer_canvas, desktop_rect);
                                 guides
+                            } else {
+                                Vec::new()
                             }
-                            PanelGestureKind::Resize { handle, origin } => {
+                        }
+                        PanelGestureKind::Resize { handle, origin } => {
+                            let other_rects = self.ws().panel_rects_except(gesture.panel_id);
+                            if let Some(panel) = self
+                                .ws_mut()
+                                .panels
+                                .iter_mut()
+                                .find(|panel| panel.id() == gesture.panel_id)
+                            {
                                 panel.set_resize_virtual_rect(Some(origin));
                                 let guides = panel.resize_to(
                                     handle,
@@ -1418,10 +1626,78 @@ impl eframe::App for TerminalApp {
                                 );
                                 let clamped = clamp_rect_to_desktop(panel.rect(), desktop_rect);
                                 panel.apply_resize(clamped);
+                                panel.set_placement(PanelPlacement::Floating);
+                                panel.set_restore_placement(None);
+                                panel.set_restore_bounds(Some(clamped));
                                 guides
+                            } else {
+                                Vec::new()
                             }
-                        };
-                    }
+                        }
+                        PanelGestureKind::SplitResize {
+                            other_panel_id,
+                            axis,
+                            origin,
+                            other_origin,
+                            boundary,
+                        } => {
+                            if let Some((leading, trailing)) =
+                                self.ws_mut().panel_pair_mut(gesture.panel_id, other_panel_id)
+                            {
+                                match axis {
+                                    SplitResizeAxis::Vertical => {
+                                        let min_boundary = origin.left()
+                                            + crate::terminal::panel::MIN_WIDTH;
+                                        let max_boundary = other_origin.right()
+                                            - crate::terminal::panel::MIN_WIDTH;
+                                        let new_boundary = (boundary + pointer_delta.x / zoom.max(0.01))
+                                            .clamp(min_boundary, max_boundary);
+                                        let leading_rect = Rect::from_min_max(
+                                            origin.min,
+                                            pos2(new_boundary, origin.max.y),
+                                        );
+                                        let trailing_rect = Rect::from_min_max(
+                                            pos2(new_boundary, other_origin.min.y),
+                                            other_origin.max,
+                                        );
+                                        leading.apply_resize(leading_rect);
+                                        trailing.apply_resize(trailing_rect);
+                                        leading.set_restore_bounds(Some(leading_rect));
+                                        trailing.set_restore_bounds(Some(trailing_rect));
+                                        split_preview_rect = Some(Rect::from_min_max(
+                                            pos2(new_boundary - 2.0, origin.top().max(other_origin.top())),
+                                            pos2(new_boundary + 2.0, origin.bottom().min(other_origin.bottom())),
+                                        ));
+                                    }
+                                    SplitResizeAxis::Horizontal => {
+                                        let min_boundary = origin.top()
+                                            + crate::terminal::panel::MIN_HEIGHT;
+                                        let max_boundary = other_origin.bottom()
+                                            - crate::terminal::panel::MIN_HEIGHT;
+                                        let new_boundary = (boundary + pointer_delta.y / zoom.max(0.01))
+                                            .clamp(min_boundary, max_boundary);
+                                        let leading_rect = Rect::from_min_max(
+                                            origin.min,
+                                            pos2(origin.max.x, new_boundary),
+                                        );
+                                        let trailing_rect = Rect::from_min_max(
+                                            pos2(other_origin.min.x, new_boundary),
+                                            other_origin.max,
+                                        );
+                                        leading.apply_resize(leading_rect);
+                                        trailing.apply_resize(trailing_rect);
+                                        leading.set_restore_bounds(Some(leading_rect));
+                                        trailing.set_restore_bounds(Some(trailing_rect));
+                                        split_preview_rect = Some(Rect::from_min_max(
+                                            pos2(origin.left().max(other_origin.left()), new_boundary - 2.0),
+                                            pos2(origin.right().min(other_origin.right()), new_boundary + 2.0),
+                                        ));
+                                    }
+                                }
+                            }
+                            Vec::new()
+                        }
+                    };
                 }
             }
 
@@ -1431,21 +1707,39 @@ impl eframe::App for TerminalApp {
                         (PanelGestureKind::Drag { .. }, Some(pointer)) => {
                             let pointer_canvas =
                                 self.viewport.screen_to_canvas(pointer, canvas_rect);
-                            desktop_snap_rect_for_pointer(pointer_canvas, desktop_rect)
+                            desktop_snap_slot_for_pointer(pointer_canvas, desktop_rect)
                         }
                         _ => None,
                     };
-                    if let Some(panel) = self
+                    if matches!(gesture.kind, PanelGestureKind::SplitResize { .. }) {
+                        if let PanelGestureKind::SplitResize { other_panel_id, .. } = gesture.kind {
+                            if let Some((leading, trailing)) =
+                                self.ws_mut().panel_pair_mut(gesture.panel_id, other_panel_id)
+                            {
+                                leading.set_drag_virtual_pos(None);
+                                leading.set_resize_virtual_rect(None);
+                                trailing.set_drag_virtual_pos(None);
+                                trailing.set_resize_virtual_rect(None);
+                            }
+                        }
+                    } else if let Some(panel) = self
                         .ws_mut()
                         .panels
                         .iter_mut()
                         .find(|panel| panel.id() == gesture.panel_id)
                     {
-                        if let Some(snap_rect) = release_snap {
-                            panel.apply_resize(snap_rect);
+                        if let Some(slot) = release_snap {
+                            if matches!(slot, SnapSlot::Maximized) {
+                                panel.maximize(desktop_rect);
+                            } else {
+                                panel.snap_to(slot, desktop_rect);
+                            }
                         } else {
                             let clamped = clamp_rect_to_desktop(panel.rect(), desktop_rect);
                             panel.apply_resize(clamped);
+                            panel.set_placement(PanelPlacement::Floating);
+                            panel.set_restore_placement(None);
+                            panel.set_restore_bounds(Some(clamped));
                         }
                         panel.set_drag_virtual_pos(None);
                         panel.set_resize_virtual_rect(None);
@@ -1461,16 +1755,28 @@ impl eframe::App for TerminalApp {
                         self.reconcile_orchestration();
                     } else if matches!(hit.area, PanelHitArea::MinimizeButton) {
                         let panel_id = self.ws().panels[hit.index].id();
+                        let from_rect =
+                            self.panel_screen_rect(self.ws().panels[hit.index].rect(), canvas_rect);
                         self.ws_mut().toggle_minimize_panel(panel_id);
+                        if let Some(to_rect) = self.taskbar_button_rects.get(&panel_id).copied() {
+                            let now = ctx.input(|i| i.time);
+                            self.start_window_transition(
+                                panel_id,
+                                WindowTransitionKind::Minimizing,
+                                from_rect,
+                                to_rect,
+                                now,
+                            );
+                        }
                     }
                 }
             }
 
             if primary_double_clicked {
                 if let Some(hit) = hovered_hit {
-                    if matches!(hit.area, PanelHitArea::Body | PanelHitArea::TitleBar) {
+                    if matches!(hit.area, PanelHitArea::TitleBar) {
                         let panel_id = self.ws().panels[hit.index].id();
-                        self.ws_mut().bring_to_front(panel_id);
+                        self.ws_mut().maximize_panel(panel_id, desktop_rect);
                     }
                 }
             }
@@ -1480,6 +1786,9 @@ impl eframe::App for TerminalApp {
 
             for index in panel_order {
                 if self.ws().panels[index].minimized() {
+                    continue;
+                }
+                if self.is_panel_transitioning(self.ws().panels[index].id()) {
                     continue;
                 }
                 if !self
@@ -1524,6 +1833,18 @@ impl eframe::App for TerminalApp {
                 );
             }
 
+            if let Some(split_rect) = split_preview_rect {
+                let preview_screen = Rect::from_min_size(
+                    self.viewport.canvas_to_screen(split_rect.min, canvas_rect),
+                    split_rect.size() * self.viewport.zoom,
+                );
+                ui.painter().rect_filled(
+                    preview_screen,
+                    4.0,
+                    Color32::from_rgba_premultiplied(132, 164, 255, 150),
+                );
+            }
+
             for guide in guides {
                 let [start, end] = guide_endpoints(guide);
                 let start = self.viewport.canvas_to_screen(start, canvas_rect);
@@ -1531,6 +1852,8 @@ impl eframe::App for TerminalApp {
                 ui.painter()
                     .line_segment([start, end], egui::Stroke::new(1.0, SNAP_GUIDE_COLOR));
             }
+
+            self.draw_window_transitions(ui);
 
             ui.painter().text(
                 canvas_rect.left_bottom() + vec2(12.0, -10.0),
@@ -1592,13 +1915,6 @@ fn load_brand_texture(cc: &eframe::CreationContext<'_>) -> Option<egui::TextureH
     ))
 }
 
-#[derive(Clone, Copy)]
-struct PanelHit {
-    index: usize,
-    area: PanelHitArea,
-    pointer: Pos2,
-}
-
 pub(crate) fn gesture_pointer_pos(
     latest_pos: Option<Pos2>,
     interact_pos: Option<Pos2>,
@@ -1650,91 +1966,12 @@ fn collect_guest_terminal_input(ctx: &egui::Context) -> Vec<TerminalInputEvent> 
     })
 }
 
-fn panel_scroll_capture_active(
-    hovered_panel: bool,
-    smooth_scroll_delta: egui::Vec2,
-    zoom_delta: f32,
-    modifiers: egui::Modifiers,
-) -> bool {
-    hovered_panel
-        && smooth_scroll_delta != egui::Vec2::ZERO
-        && !panel_zoom_gesture_active(smooth_scroll_delta, zoom_delta, modifiers)
-}
-
-fn panel_zoom_gesture_active(
-    smooth_scroll_delta: egui::Vec2,
-    zoom_delta: f32,
-    modifiers: egui::Modifiers,
-) -> bool {
-    (zoom_delta - 1.0).abs() > f32::EPSILON
-        || ((modifiers.ctrl || modifiers.command) && smooth_scroll_delta != egui::Vec2::ZERO)
-}
-
-fn upsert_workspace_for_folder(workspaces: &mut Vec<Workspace>, path: PathBuf) -> usize {
-    if let Some(index) = workspaces
-        .iter()
-        .position(|workspace| workspace.matches_cwd(&path))
-    {
-        return index;
-    }
-
-    workspaces.push(Workspace::from_folder(path));
-    workspaces.len() - 1
-}
-
-fn overview_viewport_for_panels(
-    panels: &[crate::panel::CanvasPanel],
-    screen_rect: Rect,
-    padding: f32,
-    max_zoom: f32,
-) -> Viewport {
-    let Some(bounds) = panels
-        .iter()
-        .filter(|panel| !panel.minimized())
-        .map(|panel| panel.rect())
-        .reduce(|a, b| a.union(b))
-    else {
-        return Viewport::default();
-    };
-
-    Viewport::fit_rect(bounds.expand(48.0), screen_rect, padding, max_zoom)
-}
-
-fn interpolate_viewport(start: Viewport, target: Viewport, progress: f32) -> Viewport {
-    let progress = progress.clamp(0.0, 1.0);
-    Viewport {
-        pan: start.pan + (target.pan - start.pan) * progress,
-        zoom: start.zoom + (target.zoom - start.zoom) * progress,
-    }
-}
-
-fn ease_in_out_cubic(progress: f32) -> f32 {
-    let progress = progress.clamp(0.0, 1.0);
-    if progress < 0.5 {
-        4.0 * progress * progress * progress
-    } else {
-        1.0 - (-2.0 * progress + 2.0).powi(3) * 0.5
-    }
-}
-
 fn default_guest_display_name() -> String {
     std::env::var("USER")
         .or_else(|_| std::env::var("USERNAME"))
         .ok()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| "Guest".to_owned())
-}
-
-fn collab_state_badge(state: CollabSessionState) -> (&'static str, Color32) {
-    match state {
-        CollabSessionState::NotSharing => ("Not sharing", Color32::from_rgb(170, 170, 176)),
-        CollabSessionState::Starting => ("Connecting", Color32::from_rgb(196, 162, 88)),
-        CollabSessionState::Live => ("Live", Color32::from_rgb(110, 202, 144)),
-        CollabSessionState::Disconnected => {
-            ("Waiting for reconnect", Color32::from_rgb(239, 146, 68))
-        }
-        CollabSessionState::Ended => ("Ended", Color32::from_rgb(239, 68, 68)),
-    }
 }
 
 fn draw_guest_session_banner(ui: &egui::Ui, canvas_rect: Rect, session_state: CollabSessionState) {
@@ -1784,47 +2021,6 @@ fn draw_guest_session_banner(ui: &egui::Ui, canvas_rect: Rect, session_state: Co
     );
 }
 
-fn top_panel_hit(
-    workspace: &Workspace,
-    pointer: Pos2,
-    viewport: &Viewport,
-    canvas_rect: Rect,
-) -> Option<PanelHit> {
-    let mut panel_order: Vec<_> = (0..workspace.panels.len()).collect();
-    panel_order.sort_by_key(|index| workspace.panels[*index].z_index());
-    panel_order.reverse();
-
-    panel_order.into_iter().find_map(|index| {
-        if workspace.panels[index].minimized() {
-            None
-        } else {
-            workspace.panels[index]
-                .hit_test(pointer, viewport, canvas_rect)
-                .map(|area| PanelHit {
-                    index,
-                    area,
-                    pointer,
-                })
-        }
-    })
-}
-
-fn top_panel_scroll_hit(
-    workspace: &Workspace,
-    pointer: Pos2,
-    viewport: &Viewport,
-    canvas_rect: Rect,
-) -> Option<usize> {
-    let mut panel_order: Vec<_> = (0..workspace.panels.len()).collect();
-    panel_order.sort_by_key(|index| workspace.panels[*index].z_index());
-    panel_order.reverse();
-
-    panel_order
-        .into_iter()
-        .filter(|index| !workspace.panels[*index].minimized())
-        .find(|index| workspace.panels[*index].scroll_hit_test(pointer, viewport, canvas_rect))
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -1832,20 +2028,20 @@ mod tests {
     use egui::{pos2, vec2, CentralPanel, Color32, Modifiers, RawInput, Rect};
     use uuid::Uuid;
 
-    use super::taskbar::desktop_taskbar_layout_rects;
+    use super::taskbar::{desktop_snap_slot_for_pointer, desktop_taskbar_layout_rects};
     use super::{
         clamp_rect_to_desktop, desktop_canvas_rect, desktop_snap_rect_for_pointer,
         interpolate_viewport, overview_viewport_for_panels, panel_scroll_capture_active,
-        taskbar_button_colors, taskbar_provider_accent, taskbar_provider_label,
+        split_resize_hit, taskbar_button_colors, taskbar_provider_accent, taskbar_provider_label,
         taskbar_summary_label, top_panel_hit, top_panel_scroll_hit, upsert_workspace_for_folder,
-        TaskbarLayoutPreset,
+        SplitResizeAxis, TaskbarLayoutPreset, WindowTransition, WindowTransitionKind,
     };
     use crate::canvas::config::{MINIMAP_BG, MINIMAP_HEIGHT, MINIMAP_PADDING, MINIMAP_WIDTH};
     use crate::canvas::minimap;
     use crate::canvas::viewport::Viewport;
     use crate::orchestration::AgentProvider;
     use crate::panel::CanvasPanel;
-    use crate::state::Workspace;
+    use crate::state::{SnapSlot, Workspace};
     use crate::terminal::panel::{TerminalPanel, PANEL_BG};
 
     #[test]
@@ -2071,6 +2267,110 @@ mod tests {
         assert_eq!(snap.top(), desktop.top());
         assert!((snap.width() - desktop.width() * 0.5).abs() < 0.001);
         assert!((snap.height() - desktop.height() * 0.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn snap_slot_for_pointer_maps_top_edge_to_maximize() {
+        let desktop = Rect::from_min_max(pos2(16.0, 16.0), pos2(1016.0, 716.0));
+
+        let slot = desktop_snap_slot_for_pointer(pos2(420.0, 18.0), desktop);
+
+        assert_eq!(slot, Some(SnapSlot::Maximized));
+    }
+
+    #[test]
+    fn snap_slot_for_pointer_maps_bottom_left_corner() {
+        let desktop = Rect::from_min_max(pos2(16.0, 16.0), pos2(1016.0, 716.0));
+
+        let slot = desktop_snap_slot_for_pointer(pos2(18.0, 714.0), desktop);
+
+        assert_eq!(slot, Some(SnapSlot::BottomLeft));
+    }
+
+    #[test]
+    fn snap_slot_for_pointer_recognizes_top_left_without_touching_exact_corner() {
+        let desktop = Rect::from_min_max(pos2(16.0, 16.0), pos2(1016.0, 716.0));
+
+        let slot = desktop_snap_slot_for_pointer(pos2(220.0, 28.0), desktop);
+
+        assert_eq!(slot, Some(SnapSlot::TopLeft));
+    }
+
+    #[test]
+    fn snap_slot_for_pointer_recognizes_top_right_from_right_band() {
+        let desktop = Rect::from_min_max(pos2(16.0, 16.0), pos2(1016.0, 716.0));
+
+        let slot = desktop_snap_slot_for_pointer(pos2(1008.0, 150.0), desktop);
+
+        assert_eq!(slot, Some(SnapSlot::TopRight));
+    }
+
+    #[test]
+    fn split_resize_hit_detects_vertical_sash_between_two_halves() {
+        let mut workspace = Workspace::new("Desktop", None);
+        let left = TerminalPanel::new(pos2(0.0, 0.0), vec2(400.0, 300.0), Color32::WHITE, 0);
+        let left_id = left.id;
+        let right = TerminalPanel::new(pos2(0.0, 0.0), vec2(400.0, 300.0), Color32::LIGHT_BLUE, 1);
+        let right_id = right.id;
+        workspace.add_restored_terminal(left);
+        workspace.add_restored_terminal(right);
+        let desktop = Rect::from_min_max(pos2(0.0, 0.0), pos2(1200.0, 800.0));
+        workspace.snap_panel(left_id, SnapSlot::LeftHalf, desktop);
+        workspace.snap_panel(right_id, SnapSlot::RightHalf, desktop);
+
+        let hit = split_resize_hit(&workspace, pos2(600.0, 300.0)).expect("split hit");
+
+        assert_eq!(hit.axis, SplitResizeAxis::Vertical);
+        assert_eq!(hit.boundary, 600.0);
+    }
+
+    #[test]
+    fn split_resize_hit_detects_horizontal_sash_between_top_and_bottom() {
+        let mut workspace = Workspace::new("Desktop", None);
+        let top = TerminalPanel::new(pos2(0.0, 0.0), vec2(400.0, 300.0), Color32::WHITE, 0);
+        let top_id = top.id;
+        let bottom =
+            TerminalPanel::new(pos2(0.0, 0.0), vec2(400.0, 300.0), Color32::LIGHT_BLUE, 1);
+        let bottom_id = bottom.id;
+        workspace.add_restored_terminal(top);
+        workspace.add_restored_terminal(bottom);
+        let desktop = Rect::from_min_max(pos2(0.0, 0.0), pos2(1200.0, 800.0));
+        workspace.snap_panel(top_id, SnapSlot::TopHalf, desktop);
+        workspace.snap_panel(bottom_id, SnapSlot::BottomHalf, desktop);
+
+        let hit = split_resize_hit(&workspace, pos2(700.0, 400.0)).expect("split hit");
+
+        assert_eq!(hit.axis, SplitResizeAxis::Horizontal);
+        assert_eq!(hit.boundary, 400.0);
+    }
+
+    #[test]
+    fn window_transition_progress_is_clamped() {
+        let transition = WindowTransition {
+            kind: WindowTransitionKind::Minimizing,
+            from_rect: Rect::from_min_size(pos2(0.0, 0.0), vec2(100.0, 80.0)),
+            to_rect: Rect::from_min_size(pos2(40.0, 20.0), vec2(30.0, 20.0)),
+            started_at: 10.0,
+            duration: 0.14,
+        };
+
+        assert_eq!(transition.progress(9.0), 0.0);
+        assert_eq!(transition.progress(10.14), 1.0);
+        assert!(transition.finished(10.2));
+    }
+
+    #[test]
+    fn window_transition_rect_interpolates_between_endpoints() {
+        let transition = WindowTransition {
+            kind: WindowTransitionKind::Restoring,
+            from_rect: Rect::from_min_size(pos2(0.0, 0.0), vec2(40.0, 24.0)),
+            to_rect: Rect::from_min_size(pos2(200.0, 120.0), vec2(480.0, 320.0)),
+            started_at: 0.0,
+            duration: 0.14,
+        };
+
+        assert_eq!(transition.current_rect(0.0), transition.from_rect);
+        assert_eq!(transition.current_rect(0.14), transition.to_rect);
     }
 
     #[test]

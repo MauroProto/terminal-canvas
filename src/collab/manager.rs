@@ -10,7 +10,7 @@ use uuid::Uuid;
 use super::auth::hash_passphrase;
 use super::models::{
     ControlGrant, ControlRequest, ControlRevoke, GuestConnectionState, GuestId, GuestPresence,
-    GuestTerminalInput, InviteCode, JoinRequest, SessionRole, ShareSessionId,
+    GuestTerminalInput, InviteCode, JoinRequest, ParticipantId, SessionRole, ShareSessionId,
     SharedWorkspaceSnapshot, TerminalControlState, TerminalInputEvent, TrustedDevice,
 };
 use super::protocol::{
@@ -92,7 +92,6 @@ struct HostSessionContext {
 struct GuestSessionContext {
     session_id: ShareSessionId,
     guest_id: GuestId,
-    guest_token: String,
     session_secret: String,
     display_name: String,
     next_message_seq: u64,
@@ -109,6 +108,7 @@ pub struct CollabManager {
     guest_view: GuestWorkspaceView,
     remote_inputs: Vec<GuestTerminalInput>,
     remote_input_senders: Vec<GuestId>,
+    received_message_seq: HashMap<ParticipantId, u64>,
     last_error: Option<String>,
 }
 
@@ -137,6 +137,7 @@ impl CollabManager {
             guest_view: GuestWorkspaceView::default(),
             remote_inputs: Vec::new(),
             remote_input_senders: Vec::new(),
+            received_message_seq: HashMap::new(),
             last_error: None,
         }
     }
@@ -310,10 +311,7 @@ impl CollabManager {
         {
             anyhow::bail!("Invite expired. Pedile al host que rote el invite.");
         }
-        let invite_secret = invite
-            .invite_secret
-            .clone()
-            .unwrap_or_else(|| invite.session_secret.clone());
+        let invite_secret = required_invite_secret(&invite)?;
         let response: JoinShareSessionResponse = json_post(
             &format!(
                 "{}/v1/share-sessions/{}/join",
@@ -341,7 +339,6 @@ impl CollabManager {
         self.guest = Some(GuestSessionContext {
             session_id: invite.session_id,
             guest_id: response.guest_id,
-            guest_token: response.guest_token,
             session_secret: invite.session_secret,
             display_name,
             next_message_seq: 1,
@@ -354,6 +351,7 @@ impl CollabManager {
         };
         self.mode = CollabMode::Guest;
         self.broker_url = invite.broker_url;
+        self.received_message_seq.clear();
         Ok(())
     }
 
@@ -385,6 +383,7 @@ impl CollabManager {
         self.guest_view = GuestWorkspaceView::default();
         self.remote_inputs.clear();
         self.remote_input_senders.clear();
+        self.received_message_seq.clear();
         self.last_error = None;
     }
 
@@ -841,6 +840,10 @@ impl CollabManager {
                 return;
             }
         };
+        if let Err(err) = self.validate_message_sequence(envelope.sender_id, envelope.message_seq) {
+            self.last_error = Some(err);
+            return;
+        }
 
         match payload {
             SessionPayload::WorkspaceSnapshot { snapshot } => {
@@ -917,6 +920,27 @@ impl CollabManager {
                 self.transport.send(TransportCommand::SendBinary(bytes));
             }
         }
+    }
+
+    fn validate_message_sequence(
+        &mut self,
+        sender_id: ParticipantId,
+        message_seq: u64,
+    ) -> Result<(), String> {
+        let expected = self
+            .received_message_seq
+            .get(&sender_id)
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(1);
+        if message_seq != expected {
+            return Err(format!(
+                "Invalid message sequence for {:?}: expected {}, got {}",
+                sender_id, expected, message_seq
+            ));
+        }
+        self.received_message_seq.insert(sender_id, message_seq);
+        Ok(())
     }
 }
 
@@ -1001,6 +1025,13 @@ fn random_secret() -> String {
     base64::engine::general_purpose::STANDARD_NO_PAD.encode(secret)
 }
 
+fn required_invite_secret(invite: &InviteCode) -> anyhow::Result<String> {
+    invite
+        .invite_secret
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("Invite code missing invite secret"))
+}
+
 fn default_invite_expires_at() -> DateTime<Utc> {
     Utc::now() + ChronoDuration::hours(DEFAULT_INVITE_TTL_HOURS)
 }
@@ -1017,6 +1048,7 @@ fn snapshots_equivalent(left: &SharedWorkspaceSnapshot, right: &SharedWorkspaceS
 mod tests {
     use super::*;
     use crate::collab::models::JoinDecision;
+    use crate::collab::models::ParticipantId;
     use chrono::{Duration, TimeZone};
 
     fn sample_snapshot(timestamp_offset_secs: i64) -> SharedWorkspaceSnapshot {
@@ -1049,7 +1081,6 @@ mod tests {
         manager.guest = Some(GuestSessionContext {
             session_id: ShareSessionId(Uuid::new_v4()),
             guest_id,
-            guest_token: "token".to_owned(),
             session_secret: "secret".to_owned(),
             display_name: "Guest".to_owned(),
             next_message_seq: 1,
@@ -1079,7 +1110,6 @@ mod tests {
         manager.guest = Some(GuestSessionContext {
             session_id: ShareSessionId(Uuid::new_v4()),
             guest_id,
-            guest_token: "token".to_owned(),
             session_secret: "secret".to_owned(),
             display_name: "Guest".to_owned(),
             next_message_seq: 1,
@@ -1110,5 +1140,60 @@ mod tests {
         let err =
             normalize_share_url("http://mi-host.example.com:443").expect_err("http should fail");
         assert!(err.to_string().contains("https://"));
+    }
+
+    #[test]
+    fn join_requires_explicit_invite_secret() {
+        let invite = InviteCode {
+            broker_url: "https://127.0.0.1:8787".to_owned(),
+            session_id: ShareSessionId(Uuid::new_v4()),
+            session_secret: random_secret(),
+            invite_secret: None,
+            expires_at: None,
+            requires_passphrase: false,
+            tls_cert_pem: None,
+        };
+
+        let err = required_invite_secret(&invite).expect_err("missing invite secret should fail");
+        assert!(err.to_string().contains("invite secret"));
+    }
+
+    #[test]
+    fn guest_rejects_replayed_binary_message_sequence() {
+        let secret = random_secret();
+        let mut manager = CollabManager::new();
+        manager.mode = CollabMode::Guest;
+        manager.session_state = CollabSessionState::Live;
+        manager.guest = Some(GuestSessionContext {
+            session_id: ShareSessionId(Uuid::new_v4()),
+            guest_id: GuestId(Uuid::new_v4()),
+            session_secret: secret.clone(),
+            display_name: "Guest".to_owned(),
+            next_message_seq: 1,
+        });
+
+        let payload = SessionPayload::WorkspaceSnapshot {
+            snapshot: sample_snapshot(0),
+        };
+        let envelope = encode_envelope(
+            manager.guest.as_ref().unwrap().session_id,
+            ParticipantId::Host,
+            1,
+            &secret,
+            &payload,
+        )
+        .unwrap();
+        let binary = rmp_serde::to_vec_named(&envelope).unwrap();
+
+        manager.handle_binary_message(&binary);
+        assert!(manager.guest_view.snapshot.is_some());
+        assert!(manager.last_error.is_none());
+
+        manager.handle_binary_message(&binary);
+        assert!(manager
+            .last_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("sequence"));
     }
 }

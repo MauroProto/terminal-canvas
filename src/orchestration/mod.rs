@@ -1,4 +1,6 @@
+mod git;
 mod manager;
+mod matching;
 
 #[allow(unused_imports)]
 pub use manager::{

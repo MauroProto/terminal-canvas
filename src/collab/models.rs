@@ -5,6 +5,38 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ShareSessionId(pub Uuid);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum PanelShareScope {
+    Private,
+    #[default]
+    VisibleOnly,
+    VisibleAndHistory,
+    Controllable,
+}
+
+impl PanelShareScope {
+    pub fn allows_visible_text(self) -> bool {
+        !matches!(self, Self::Private)
+    }
+
+    pub fn allows_history(self) -> bool {
+        matches!(self, Self::VisibleAndHistory | Self::Controllable)
+    }
+
+    pub fn allows_control(self) -> bool {
+        matches!(self, Self::Controllable)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Private => "Private",
+            Self::VisibleOnly => "Visible",
+            Self::VisibleAndHistory => "History",
+            Self::Controllable => "Control",
+        }
+    }
+}
+
 impl Default for ShareSessionId {
     fn default() -> Self {
         Self(Uuid::nil())
@@ -99,6 +131,8 @@ pub struct SharedPanelSnapshot {
     #[serde(default)]
     pub preview_label: String,
     #[serde(default)]
+    pub share_scope: PanelShareScope,
+    #[serde(default)]
     pub visible_text: String,
     #[serde(default)]
     pub history_text: String,
@@ -167,15 +201,6 @@ pub struct SerializableModifiers {
     pub alt: bool,
     pub shift: bool,
     pub command: bool,
-}
-
-impl SerializableModifiers {
-    pub const NONE: Self = Self {
-        ctrl: false,
-        alt: false,
-        shift: false,
-        command: false,
-    };
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

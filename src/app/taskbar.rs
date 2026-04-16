@@ -1,4 +1,6 @@
 use super::*;
+use crate::state::SnapSlot;
+use crate::terminal::panel::{normalize_snapped_rect, snap_slot_rect};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum TaskbarLayoutPreset {
@@ -210,6 +212,9 @@ pub(super) fn apply_taskbar_layout_to_workspace(
     let target_rects = desktop_taskbar_layout_rects(preset, visible_indices.len(), desktop_rect);
     for ((_, index), rect) in visible_indices.into_iter().zip(target_rects) {
         let panel = &mut workspace.panels[index];
+        panel.set_placement(crate::state::PanelPlacement::Floating);
+        panel.set_restore_placement(None);
+        panel.set_restore_bounds(Some(rect));
         panel.apply_resize(rect);
         panel.set_drag_virtual_pos(None);
         panel.set_resize_virtual_rect(None);
@@ -250,57 +255,62 @@ pub(super) fn clamp_rect_to_desktop(rect: Rect, desktop_rect: Rect) -> Rect {
     Rect::from_min_size(min, vec2(width, height))
 }
 
-pub(super) fn desktop_snap_rect_for_pointer(pointer: Pos2, desktop_rect: Rect) -> Option<Rect> {
-    let edge = DESKTOP_SNAP_EDGE
-        .min(desktop_rect.width() * 0.2)
-        .min(desktop_rect.height() * 0.2);
-    let near_left = pointer.x <= desktop_rect.left() + edge;
-    let near_right = pointer.x >= desktop_rect.right() - edge;
-    let near_top = pointer.y <= desktop_rect.top() + edge;
-    let near_bottom = pointer.y >= desktop_rect.bottom() - edge;
-    let half_width = desktop_rect.width() * 0.5;
-    let half_height = desktop_rect.height() * 0.5;
+pub(super) fn desktop_snap_slot_for_pointer(pointer: Pos2, desktop_rect: Rect) -> Option<SnapSlot> {
+    let horizontal_band = DESKTOP_SNAP_EDGE
+        .max(64.0)
+        .min(desktop_rect.width() * 0.22);
+    let vertical_band = DESKTOP_SNAP_EDGE
+        .max(64.0)
+        .min(desktop_rect.height() * 0.22);
+    let near_left = pointer.x <= desktop_rect.left() + horizontal_band;
+    let near_right = pointer.x >= desktop_rect.right() - horizontal_band;
+    let near_top = pointer.y <= desktop_rect.top() + vertical_band;
+    let near_bottom = pointer.y >= desktop_rect.bottom() - vertical_band;
+    let left_third = desktop_rect.left() + desktop_rect.width() / 3.0;
+    let right_third = desktop_rect.right() - desktop_rect.width() / 3.0;
+    let top_third = desktop_rect.top() + desktop_rect.height() / 3.0;
+    let bottom_third = desktop_rect.bottom() - desktop_rect.height() / 3.0;
 
-    if near_top && near_left {
-        Some(Rect::from_min_size(
-            desktop_rect.min,
-            vec2(half_width, half_height),
-        ))
-    } else if near_top && near_right {
-        Some(Rect::from_min_size(
-            pos2(desktop_rect.center().x, desktop_rect.top()),
-            vec2(half_width, half_height),
-        ))
-    } else if near_bottom && near_left {
-        Some(Rect::from_min_size(
-            pos2(desktop_rect.left(), desktop_rect.center().y),
-            vec2(half_width, half_height),
-        ))
-    } else if near_bottom && near_right {
-        Some(Rect::from_min_size(
-            desktop_rect.center(),
-            vec2(half_width, half_height),
-        ))
-    } else if near_top {
-        Some(desktop_rect)
-    } else if near_left {
-        Some(Rect::from_min_size(
-            desktop_rect.min,
-            vec2(half_width, desktop_rect.height()),
-        ))
-    } else if near_right {
-        Some(Rect::from_min_size(
-            pos2(desktop_rect.center().x, desktop_rect.top()),
-            vec2(half_width, desktop_rect.height()),
-        ))
+    if near_top {
+        if pointer.x <= left_third {
+            Some(SnapSlot::TopLeft)
+        } else if pointer.x >= right_third {
+            Some(SnapSlot::TopRight)
+        } else {
+            Some(SnapSlot::Maximized)
+        }
     } else if near_bottom {
-        Some(Rect::from_min_size(
-            pos2(desktop_rect.left(), desktop_rect.center().y),
-            vec2(desktop_rect.width(), half_height),
-        ))
+        if pointer.x <= left_third {
+            Some(SnapSlot::BottomLeft)
+        } else if pointer.x >= right_third {
+            Some(SnapSlot::BottomRight)
+        } else {
+            Some(SnapSlot::BottomHalf)
+        }
+    } else if near_left {
+        if pointer.y <= top_third {
+            Some(SnapSlot::TopLeft)
+        } else if pointer.y >= bottom_third {
+            Some(SnapSlot::BottomLeft)
+        } else {
+            Some(SnapSlot::LeftHalf)
+        }
+    } else if near_right {
+        if pointer.y <= top_third {
+            Some(SnapSlot::TopRight)
+        } else if pointer.y >= bottom_third {
+            Some(SnapSlot::BottomRight)
+        } else {
+            Some(SnapSlot::RightHalf)
+        }
     } else {
         None
     }
+}
+
+pub(super) fn desktop_snap_rect_for_pointer(pointer: Pos2, desktop_rect: Rect) -> Option<Rect> {
+    desktop_snap_slot_for_pointer(pointer, desktop_rect)
+        .map(|slot| snap_slot_rect(slot, desktop_rect))
 }
 
 pub(super) fn clamp_workspace_panels_to_desktop(workspace: &mut Workspace, desktop_rect: Rect) {
@@ -308,8 +318,20 @@ pub(super) fn clamp_workspace_panels_to_desktop(workspace: &mut Workspace, deskt
         if panel.minimized() {
             continue;
         }
-        let clamped = clamp_rect_to_desktop(panel.rect(), desktop_rect);
-        panel.apply_resize(clamped);
+        match panel.placement() {
+            crate::state::PanelPlacement::Floating => {
+                let clamped = clamp_rect_to_desktop(panel.rect(), desktop_rect);
+                panel.apply_resize(clamped);
+                panel.set_restore_bounds(Some(clamped));
+            }
+            crate::state::PanelPlacement::Snapped(slot) => {
+                let normalized = normalize_snapped_rect(*slot, panel.rect(), desktop_rect);
+                panel.apply_resize(normalized);
+            }
+            crate::state::PanelPlacement::Maximized => {
+                panel.apply_resize(desktop_rect);
+            }
+        }
     }
 }
 

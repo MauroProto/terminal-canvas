@@ -98,21 +98,6 @@ impl TerminalGridCache {
             cursor,
         });
     }
-
-    pub fn clear(&mut self) {
-        self.key = None;
-        self.shapes.clear();
-        self.state = None;
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CursorShape {
-    Block,
-    Beam,
-    Underline,
-    HollowBlock,
-    Hidden,
 }
 
 pub fn blink_phase_visible(time: f64) -> bool {
@@ -122,12 +107,6 @@ pub fn blink_phase_visible(time: f64) -> bool {
 
 pub fn cursor_visible(focused: bool, streaming_output: bool, time: f64) -> bool {
     focused && !streaming_output && blink_phase_visible(time)
-}
-
-pub fn measure_cell(ctx: &egui::Context, font_size: f32) -> (f32, f32) {
-    let font_id = FontId::monospace(font_size);
-    let galley = ctx.fonts(|fonts| fonts.layout_no_wrap("M".into(), font_id, Color32::WHITE));
-    (galley.size().x, galley.size().y)
 }
 
 pub fn compute_grid_size(content_width: f32, content_height: f32) -> (u16, u16) {

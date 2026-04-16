@@ -5,7 +5,6 @@ use crate::sidebar::workspace_list::draw_workspace_tree;
 use crate::state::Workspace;
 use crate::update::{UpdateState, UpdateStatus};
 
-pub mod terminal_list;
 pub mod workspace_list;
 
 pub const SIDEBAR_BG: Color32 = Color32::from_rgb(23, 23, 23);
@@ -15,7 +14,6 @@ pub const ACTIVE_TAB_BG: Color32 = Color32::from_rgb(63, 63, 70);
 pub const TEXT_PRIMARY: Color32 = Color32::WHITE;
 pub const TEXT_SECONDARY: Color32 = Color32::from_rgb(163, 163, 163);
 pub const TEXT_MUTED: Color32 = Color32::from_rgb(115, 115, 115);
-pub const HOVER_BG: Color32 = Color32::from_rgba_premultiplied(39, 39, 42, 120);
 pub const ITEM_BG: Color32 = Color32::from_rgb(39, 39, 42);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,7 +34,6 @@ pub enum SidebarResponse {
     FocusPanel(uuid::Uuid),
     SpawnTerminal(usize),
     RenamePanel(uuid::Uuid),
-    ClosePanel(uuid::Uuid),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -4,7 +4,7 @@
 
 **Goal:** Re-architect the app so it can support many projects and many parallel terminals on moderate hardware without changing the product vision, visual language, or desktop-native stack.
 
-**Architecture:** Split the current design into a headless runtime layer and a thinner UI layer. The runtime becomes the owner of PTYs, session state, and scheduling; the UI becomes a consumer of snapshots plus an emitter of intents. This keeps the canvas UX while making repaint rate, terminal quality tiers, persistence, and future features manageable under load.
+**Architecture:** Split the current design into a headless runtime layer and a thinner UI layer. The runtime becomes the owner of PTYs, session state, and scheduling; the UI becomes a consumer of snapshots plus an emitter of intents. This keeps the desktop/workspace UX while making repaint rate, terminal quality tiers, persistence, and future features manageable under load.
 
 **Tech Stack:** Rust 2021, eframe/egui, portable-pty, alacritty_terminal, serde/serde_json, anyhow, log
 

@@ -1,10 +1,15 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+use super::git::{create_git_worktree, git_repo_root, inspect_git_state};
+use super::matching::{
+    event_matches_filters, inbox_matches_query, session_matches_query, task_matches_filters,
+    task_matches_query,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum AgentProvider {
@@ -93,6 +98,7 @@ impl AgentStatus {
         }
     }
 
+    #[allow(dead_code)]
     pub fn is_attention(self) -> bool {
         matches!(
             self,
@@ -100,6 +106,7 @@ impl AgentStatus {
         )
     }
 
+    #[allow(dead_code)]
     pub fn is_active(self) -> bool {
         matches!(
             self,
@@ -121,6 +128,7 @@ pub enum TaskState {
 }
 
 impl TaskState {
+    #[allow(dead_code)]
     pub fn label(self) -> &'static str {
         match self {
             Self::Draft => "Draft",
@@ -133,6 +141,7 @@ impl TaskState {
         }
     }
 
+    #[allow(dead_code)]
     pub fn is_active(self) -> bool {
         matches!(
             self,
@@ -282,6 +291,7 @@ pub enum SceneTemplateKind {
 }
 
 impl SceneTemplateKind {
+    #[allow(dead_code)]
     pub fn label(self) -> &'static str {
         match self {
             Self::Bugfix => "Bugfix",
@@ -292,6 +302,7 @@ impl SceneTemplateKind {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SceneTemplate {
     pub kind: SceneTemplateKind,
@@ -332,6 +343,7 @@ pub struct AgentLaunchRequest {
     pub worktree_mode: WorktreeMode,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct AgentLaunchPlan {
     pub task_id: Option<Uuid>,
@@ -364,6 +376,7 @@ pub struct PanelRuntimeObservation {
     pub minimized: bool,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct SessionListItem {
     pub workspace_id: Uuid,
@@ -384,6 +397,7 @@ pub struct SessionListItem {
     pub changed_files: usize,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct PanelOverlay {
     pub provider: AgentProvider,
@@ -416,22 +430,27 @@ impl Orchestrator {
         self.state.clone()
     }
 
+    #[allow(dead_code)]
     pub fn tasks(&self) -> &[TaskCard] {
         &self.state.tasks
     }
 
+    #[allow(dead_code)]
     pub fn sessions(&self) -> &[AgentSessionMeta] {
         &self.state.sessions
     }
 
+    #[allow(dead_code)]
     pub fn inbox(&self) -> &[InboxEvent] {
         &self.state.inbox
     }
 
+    #[allow(dead_code)]
     pub fn scene_template(&self) -> Option<SceneTemplateKind> {
         self.state.scene_template
     }
 
+    #[allow(dead_code)]
     pub fn task_snapshot(&self, task_id: Uuid) -> Option<TaskCard> {
         self.state
             .tasks
@@ -440,6 +459,7 @@ impl Orchestrator {
             .cloned()
     }
 
+    #[allow(dead_code)]
     pub fn session_panel_id(&self, session_id: Uuid) -> Option<Uuid> {
         self.state
             .sessions
@@ -448,6 +468,7 @@ impl Orchestrator {
             .panel_id
     }
 
+    #[allow(dead_code)]
     pub fn session_meta(&self, session_id: Uuid) -> Option<&AgentSessionMeta> {
         self.state
             .sessions
@@ -455,10 +476,12 @@ impl Orchestrator {
             .find(|session| session.session_id == session_id)
     }
 
+    #[allow(dead_code)]
     pub fn set_scene_template(&mut self, template: Option<SceneTemplateKind>) {
         self.state.scene_template = template;
     }
 
+    #[allow(dead_code)]
     pub fn apply_scene_template(&mut self, workspace_id: Uuid, template: SceneTemplateKind) {
         self.state.scene_template = Some(template);
         for (title, provider) in scene_template_defaults(template) {
@@ -590,9 +613,14 @@ impl Orchestrator {
 
         let (cwd, worktree_path, branch, shared_repo_mode) = if worktree_requested {
             if let Some(root) = repo_root.as_deref().and_then(git_repo_root) {
-                let branch = format!("canvas/{}/{}-{}", request.provider.slug(), slug, short_id);
+                let branch = format!(
+                    "workspace/{}/{}-{}",
+                    request.provider.slug(),
+                    slug,
+                    short_id
+                );
                 let worktree_path = root
-                    .join(".canvas")
+                    .join(".terminalcanvas")
                     .join("worktrees")
                     .join(format!("{slug}-{short_id}"));
                 create_git_worktree(&root, &worktree_path, &branch)?;
@@ -689,6 +717,7 @@ impl Orchestrator {
         }
     }
 
+    #[allow(dead_code)]
     pub fn mark_task_state(&mut self, task_id: Uuid, state: TaskState) {
         if let Some(task) = self.state.tasks.iter_mut().find(|task| task.id == task_id) {
             task.state = state;
@@ -697,6 +726,7 @@ impl Orchestrator {
         self.sync_task_states_from_dependencies();
     }
 
+    #[allow(dead_code)]
     pub fn dependency_targets(&self, workspace_id: Uuid, task_id: Uuid) -> Vec<TaskCard> {
         let mut tasks = self
             .state
@@ -709,6 +739,7 @@ impl Orchestrator {
         tasks
     }
 
+    #[allow(dead_code)]
     pub fn task_dependency_summary(&self, task_id: Uuid) -> Vec<String> {
         let mut labels = self
             .state
@@ -732,6 +763,7 @@ impl Orchestrator {
         labels
     }
 
+    #[allow(dead_code)]
     pub fn first_dependency(&self, task_id: Uuid) -> Option<(DependencyKind, Uuid)> {
         self.state
             .dependencies
@@ -740,6 +772,7 @@ impl Orchestrator {
             .map(|edge| (edge.kind, edge.to_task))
     }
 
+    #[allow(dead_code)]
     pub fn set_task_dependency(&mut self, from_task: Uuid, to_task: Uuid, kind: DependencyKind) {
         if from_task == to_task {
             return;
@@ -759,6 +792,7 @@ impl Orchestrator {
         self.sync_task_states_from_dependencies();
     }
 
+    #[allow(dead_code)]
     pub fn clear_task_dependencies(&mut self, task_id: Uuid) {
         self.state
             .dependencies
@@ -766,6 +800,7 @@ impl Orchestrator {
         self.sync_task_states_from_dependencies();
     }
 
+    #[allow(dead_code)]
     pub fn duplicate_session_request(
         &self,
         session_id: Uuid,
@@ -860,6 +895,7 @@ impl Orchestrator {
         self.sync_task_states_from_dependencies();
     }
 
+    #[allow(dead_code)]
     pub fn mark_inbox_resolved(&mut self, event_id: Uuid) {
         if let Some(event) = self
             .state
@@ -871,6 +907,7 @@ impl Orchestrator {
         }
     }
 
+    #[allow(dead_code)]
     pub fn archive_inbox_event(&mut self, event_id: Uuid) {
         if let Some(event) = self
             .state
@@ -907,6 +944,7 @@ impl Orchestrator {
         })
     }
 
+    #[allow(dead_code)]
     pub fn session_items(
         &self,
         search_query: &str,
@@ -968,6 +1006,7 @@ impl Orchestrator {
         items
     }
 
+    #[allow(dead_code)]
     pub fn task_for_session(&self, session_id: Uuid) -> Option<&TaskCard> {
         let task_id = self
             .state
@@ -978,6 +1017,7 @@ impl Orchestrator {
         self.state.tasks.iter().find(|task| task.id == task_id)
     }
 
+    #[allow(dead_code)]
     pub fn tasks_filtered(
         &self,
         workspace_id: Option<Uuid>,
@@ -1007,6 +1047,7 @@ impl Orchestrator {
         tasks
     }
 
+    #[allow(dead_code)]
     pub fn inbox_filtered(
         &self,
         search_query: &str,
@@ -1479,138 +1520,6 @@ fn shell_single_quote(input: &str) -> String {
     format!("'{}'", input.replace('\'', "'\"'\"'"))
 }
 
-fn session_matches_query(
-    orchestrator: &Orchestrator,
-    session: &AgentSessionMeta,
-    query: &str,
-) -> bool {
-    let query = query.trim().to_ascii_lowercase();
-    if query.is_empty() {
-        return true;
-    }
-    let mut haystacks = vec![
-        session.label.to_ascii_lowercase(),
-        session.provider.label().to_ascii_lowercase(),
-        session.status.label().to_ascii_lowercase(),
-    ];
-    if let Some(branch) = &session.branch {
-        haystacks.push(branch.to_ascii_lowercase());
-    }
-    if let Some(task) = session.task_id.and_then(|task_id| {
-        orchestrator
-            .state
-            .tasks
-            .iter()
-            .find(|task| task.id == task_id)
-    }) {
-        haystacks.push(task.title.to_ascii_lowercase());
-        haystacks.push(task.state.label().to_ascii_lowercase());
-    }
-    if let Some(error) = &session.review_summary.last_error {
-        haystacks.push(error.to_ascii_lowercase());
-    }
-    if let Some(success) = &session.review_summary.last_success {
-        haystacks.push(success.to_ascii_lowercase());
-    }
-    if let Some(summary) = &session.command_summary {
-        haystacks.push(summary.title.to_ascii_lowercase());
-        haystacks.push(summary.excerpt.to_ascii_lowercase());
-    }
-    haystacks
-        .into_iter()
-        .any(|haystack| haystack.contains(&query))
-}
-
-fn task_matches_query(orchestrator: &Orchestrator, task: &TaskCard, query: &str) -> bool {
-    let query = query.trim().to_ascii_lowercase();
-    if query.is_empty() {
-        return true;
-    }
-    if task.title.to_ascii_lowercase().contains(&query)
-        || task.brief.to_ascii_lowercase().contains(&query)
-        || task.state.label().to_ascii_lowercase().contains(&query)
-    {
-        return true;
-    }
-    task.session_ids.iter().any(|session_id| {
-        orchestrator
-            .state
-            .sessions
-            .iter()
-            .find(|session| session.session_id == *session_id)
-            .map(|session| session_matches_query(orchestrator, session, query.as_str()))
-            .unwrap_or(false)
-    })
-}
-
-fn task_matches_filters(
-    orchestrator: &Orchestrator,
-    task: &TaskCard,
-    provider_filter: Option<AgentProvider>,
-    status_filter: Option<AgentStatus>,
-) -> bool {
-    let provider_matches = provider_filter.map(|provider| {
-        task.provider_hint == Some(provider)
-            || task.session_ids.iter().any(|session_id| {
-                orchestrator
-                    .state
-                    .sessions
-                    .iter()
-                    .find(|session| session.session_id == *session_id)
-                    .map(|session| session.provider == provider)
-                    .unwrap_or(false)
-            })
-    });
-
-    let status_matches = status_filter.map(|status| {
-        task.session_ids.iter().any(|session_id| {
-            orchestrator
-                .state
-                .sessions
-                .iter()
-                .find(|session| session.session_id == *session_id)
-                .map(|session| session.status == status)
-                .unwrap_or(false)
-        })
-    });
-
-    provider_matches.unwrap_or(true) && status_matches.unwrap_or(true)
-}
-
-fn inbox_matches_query(event: &InboxEvent, query: &str) -> bool {
-    let query = query.trim().to_ascii_lowercase();
-    if query.is_empty() {
-        return true;
-    }
-    event.title.to_ascii_lowercase().contains(&query)
-        || event.summary.to_ascii_lowercase().contains(&query)
-}
-
-fn event_matches_filters(
-    orchestrator: &Orchestrator,
-    event: &InboxEvent,
-    provider_filter: Option<AgentProvider>,
-    status_filter: Option<AgentStatus>,
-) -> bool {
-    let Some(session_id) = event.session_id else {
-        return provider_filter.is_none() && status_filter.is_none();
-    };
-    let Some(session) = orchestrator
-        .state
-        .sessions
-        .iter()
-        .find(|session| session.session_id == session_id)
-    else {
-        return false;
-    };
-    provider_filter
-        .map(|provider| session.provider == provider)
-        .unwrap_or(true)
-        && status_filter
-            .map(|status| session.status == status)
-            .unwrap_or(true)
-}
-
 fn deterministic_event_id(kind: InboxEventKind, session_id: Uuid) -> Uuid {
     let kind_mask = match kind {
         InboxEventKind::ApprovalPending => 0x11u128,
@@ -1623,6 +1532,7 @@ fn deterministic_event_id(kind: InboxEventKind, session_id: Uuid) -> Uuid {
     Uuid::from_u128(session_id.as_u128() ^ kind_mask)
 }
 
+#[allow(dead_code)]
 fn scene_template_defaults(template: SceneTemplateKind) -> Vec<(&'static str, AgentProvider)> {
     match template {
         SceneTemplateKind::Bugfix => vec![
@@ -1667,99 +1577,6 @@ fn slugify(input: &str) -> String {
         .to_owned()
 }
 
-#[derive(Debug, Clone)]
-struct GitObservation {
-    repo_root: PathBuf,
-    branch: String,
-    dirty: bool,
-    changed_files: Vec<PathBuf>,
-    diff_stats: DiffStats,
-}
-
-fn inspect_git_state(path: &Path) -> Option<GitObservation> {
-    let repo_root = git_repo_root(path)?;
-    let branch = git_stdout(&repo_root, &["branch", "--show-current"])
-        .filter(|branch| !branch.is_empty())
-        .unwrap_or_else(|| "detached".to_owned());
-    let status = git_stdout(&repo_root, &["status", "--porcelain"])?;
-    let changed_files = status
-        .lines()
-        .filter_map(|line| line.get(3..).map(str::trim))
-        .filter(|line| !line.is_empty())
-        .map(PathBuf::from)
-        .collect::<Vec<_>>();
-    let dirty = !changed_files.is_empty();
-    let diff_stats = parse_diff_stats(git_stdout(&repo_root, &["diff", "--shortstat", "HEAD"]));
-    Some(GitObservation {
-        repo_root,
-        branch,
-        dirty,
-        changed_files,
-        diff_stats,
-    })
-}
-
-fn git_repo_root(path: &Path) -> Option<PathBuf> {
-    git_stdout(path, &["rev-parse", "--show-toplevel"]).map(PathBuf::from)
-}
-
-fn git_stdout(path: &Path, args: &[&str]) -> Option<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(path)
-        .args(args)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    String::from_utf8(output.stdout)
-        .ok()
-        .map(|text| text.trim().to_owned())
-}
-
-fn parse_diff_stats(raw: Option<String>) -> DiffStats {
-    let Some(raw) = raw else {
-        return DiffStats::default();
-    };
-    let mut stats = DiffStats::default();
-    for segment in raw.split(',') {
-        let segment = segment.trim();
-        if let Some(value) = segment.split_whitespace().next() {
-            if segment.contains("file changed") || segment.contains("files changed") {
-                stats.files_changed = value.parse().unwrap_or(0);
-            } else if segment.contains("insertion") {
-                stats.insertions = value.parse().unwrap_or(0);
-            } else if segment.contains("deletion") {
-                stats.deletions = value.parse().unwrap_or(0);
-            }
-        }
-    }
-    stats
-}
-
-fn create_git_worktree(repo_root: &Path, worktree_path: &Path, branch: &str) -> anyhow::Result<()> {
-    if worktree_path.exists() {
-        return Ok(());
-    }
-    if let Some(parent) = worktree_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo_root)
-        .args(["worktree", "add", "-b", branch])
-        .arg(worktree_path)
-        .output()?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "git worktree add failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    Ok(())
-}
-
 fn extract_prompt_command(visible_text: &str) -> Option<String> {
     for line in visible_text.lines().rev() {
         let line = line.trim();
@@ -1788,9 +1605,10 @@ fn extract_prompt_command(visible_text: &str) -> Option<String> {
 mod tests {
     use chrono::Utc;
 
+    use super::super::git::parse_diff_stats;
     use super::{
-        derive_status, launch_presets, parse_diff_stats, preview_label, provider_bootstrap,
-        short_uuid, slugify, AgentProvider, AgentStatus, DependencyKind, DiffStats, Orchestrator,
+        derive_status, launch_presets, preview_label, provider_bootstrap, short_uuid, slugify,
+        AgentProvider, AgentStatus, DependencyKind, DiffStats, Orchestrator,
         PanelRuntimeObservation, TaskState,
     };
 
