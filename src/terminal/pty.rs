@@ -15,7 +15,11 @@ use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, Pt
 use uuid::Uuid;
 
 use crate::runtime::SharedRuntimeScheduler;
+#[cfg(feature = "ghostty-vt")]
+use crate::terminal::backend::{runtime_backend_from_env, TerminalBackendKind};
 use crate::terminal::colors::indexed_to_egui;
+#[cfg(feature = "ghostty-vt")]
+use crate::terminal::ghostty_backend::{GhosttyRuntimeHandle, GhosttyTextSnapshot};
 use crate::terminal::input::InputMode;
 
 #[derive(Clone)]
@@ -35,6 +39,12 @@ impl EventListener for EventProxy {
     }
 }
 
+fn osc52_clipboard_enabled() -> bool {
+    std::env::var("MI_TERMINAL_ALLOW_OSC52")
+        .map(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
+}
+
 pub struct PtyHandle {
     pub term: Arc<Mutex<Term<EventProxy>>>,
     pub title: Arc<Mutex<String>>,
@@ -46,12 +56,16 @@ pub struct PtyHandle {
     window_size: Arc<Mutex<WindowSize>>,
     render_revision: Arc<AtomicU64>,
     scrollback_limit: usize,
+    #[cfg(feature = "ghostty-vt")]
+    backend_kind: TerminalBackendKind,
+    #[cfg(feature = "ghostty-vt")]
+    ghostty_runtime: Option<GhosttyRuntimeHandle>,
     master: Box<dyn MasterPty + Send>,
     killer: Box<dyn ChildKiller + Send + Sync>,
     _reader_thread: thread::JoinHandle<()>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TerminalScrollState {
     pub display_offset: usize,
     pub visible_rows: usize,
@@ -101,6 +115,27 @@ impl PtyHandle {
             &TermSize::new(cols as usize, rows as usize),
             EventProxy::new(event_tx),
         )));
+        #[cfg(feature = "ghostty-vt")]
+        let requested_backend = runtime_backend_from_env();
+        #[cfg(feature = "ghostty-vt")]
+        let ghostty_runtime = if requested_backend == TerminalBackendKind::Ghostty {
+            match GhosttyRuntimeHandle::spawn(cols, rows, scrollback_limit) {
+                Ok(runtime) => Some(runtime),
+                Err(err) => {
+                    log::warn!("failed to start ghostty backend, falling back to alacritty: {err}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        #[cfg(feature = "ghostty-vt")]
+        let backend_kind =
+            if requested_backend == TerminalBackendKind::Ghostty && ghostty_runtime.is_some() {
+                TerminalBackendKind::Ghostty
+            } else {
+                TerminalBackendKind::Alacritty
+            };
 
         let title_for_reader = Arc::clone(&title);
         let alive_for_reader = Arc::clone(&alive);
@@ -109,6 +144,8 @@ impl PtyHandle {
         let writer_for_thread = Arc::clone(&writer_for_reader);
         let output_for_reader = Arc::clone(&last_output_at);
         let term_for_reader = Arc::clone(&term);
+        #[cfg(feature = "ghostty-vt")]
+        let ghostty_for_reader = ghostty_runtime.clone();
         let window_size_for_reader = Arc::clone(&window_size);
         let render_revision_for_reader = Arc::clone(&render_revision);
         let scheduler_for_reader = Arc::clone(&scheduler);
@@ -127,6 +164,10 @@ impl PtyHandle {
                     Ok(read) => {
                         if let Ok(mut term) = term_for_reader.lock() {
                             processor.advance(&mut *term, &buf[..read]);
+                        }
+                        #[cfg(feature = "ghostty-vt")]
+                        if let Some(ghostty) = &ghostty_for_reader {
+                            ghostty.feed(&buf[..read]);
                         }
                         render_revision_for_reader.fetch_add(1, Ordering::Relaxed);
                         *output_for_reader.lock().unwrap() = Instant::now();
@@ -176,6 +217,10 @@ impl PtyHandle {
             window_size,
             render_revision,
             scrollback_limit,
+            #[cfg(feature = "ghostty-vt")]
+            backend_kind,
+            #[cfg(feature = "ghostty-vt")]
+            ghostty_runtime,
             master: pair.master,
             killer,
             _reader_thread: reader_thread,
@@ -197,6 +242,10 @@ impl PtyHandle {
         };
         if let Ok(mut term) = self.term.lock() {
             term.resize(TermSize::new(cols as usize, rows as usize));
+        }
+        #[cfg(feature = "ghostty-vt")]
+        if let Some(ghostty) = &self.ghostty_runtime {
+            ghostty.resize(cols, rows);
         }
         self.mark_render_dirty();
     }
@@ -220,9 +269,29 @@ impl PtyHandle {
         }
     }
 
+    #[cfg(feature = "ghostty-vt")]
+    pub fn backend_kind(&self) -> TerminalBackendKind {
+        self.backend_kind
+    }
+
+    #[cfg(feature = "ghostty-vt")]
+    pub fn ghostty_snapshot(&self) -> Option<Arc<GhosttyTextSnapshot>> {
+        self.ghostty_runtime.as_ref()?.snapshot()
+    }
+
     pub fn scroll_display(&self, scroll: Scroll) {
         if let Ok(mut term) = self.term.lock() {
             term.scroll_display(scroll);
+        }
+        #[cfg(feature = "ghostty-vt")]
+        if let Some(ghostty) = &self.ghostty_runtime {
+            match scroll {
+                Scroll::Delta(delta) => ghostty.scroll_delta(delta),
+                Scroll::PageUp => ghostty.scroll_delta(10),
+                Scroll::PageDown => ghostty.scroll_delta(-10),
+                Scroll::Top => ghostty.scroll_to_display_offset(usize::MAX),
+                Scroll::Bottom => ghostty.scroll_to_display_offset(0),
+            }
         }
         self.mark_render_dirty();
     }
@@ -256,6 +325,10 @@ impl PtyHandle {
     }
 
     pub fn scroll_state(&self) -> Option<TerminalScrollState> {
+        #[cfg(feature = "ghostty-vt")]
+        if let Some(snapshot) = self.ghostty_snapshot() {
+            return Some(snapshot.scroll_state);
+        }
         let term = self.term.try_lock().ok()?;
         Some(TerminalScrollState {
             display_offset: term.grid().display_offset(),
@@ -272,6 +345,10 @@ impl PtyHandle {
             if delta != 0 {
                 term.scroll_display(Scroll::Delta(delta));
             }
+        }
+        #[cfg(feature = "ghostty-vt")]
+        if let Some(ghostty) = &self.ghostty_runtime {
+            ghostty.scroll_to_display_offset(target);
         }
         self.mark_render_dirty();
     }
@@ -331,16 +408,20 @@ fn drain_terminal_events(
                 }
             }
             Event::ClipboardStore(_, text) => {
-                if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                    let _ = clipboard.set_text(text);
+                if osc52_clipboard_enabled() {
+                    if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                        let _ = clipboard.set_text(text);
+                    }
                 }
             }
             Event::ClipboardLoad(_, formatter) => {
-                if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                    if let Ok(text) = clipboard.get_text() {
-                        if let Ok(mut writer) = writer.lock() {
-                            let _ = writer.write_all(formatter(&text).as_bytes());
-                            let _ = writer.flush();
+                if osc52_clipboard_enabled() {
+                    if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                        if let Ok(text) = clipboard.get_text() {
+                            if let Ok(mut writer) = writer.lock() {
+                                let _ = writer.write_all(formatter(&text).as_bytes());
+                                let _ = writer.flush();
+                            }
                         }
                     }
                 }

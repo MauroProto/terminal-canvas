@@ -375,8 +375,14 @@ impl Workspace {
         first_id: Uuid,
         second_id: Uuid,
     ) -> Option<(&mut CanvasPanel, &mut CanvasPanel)> {
-        let first_index = self.panels.iter().position(|panel| panel.id() == first_id)?;
-        let second_index = self.panels.iter().position(|panel| panel.id() == second_id)?;
+        let first_index = self
+            .panels
+            .iter()
+            .position(|panel| panel.id() == first_id)?;
+        let second_index = self
+            .panels
+            .iter()
+            .position(|panel| panel.id() == second_id)?;
         if first_index == second_index {
             return None;
         }

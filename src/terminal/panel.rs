@@ -22,6 +22,8 @@ use crate::orchestration::{AgentProvider, PanelOverlay, PanelRuntimeObservation}
 use crate::runtime::{PtyManager, RenderTier, SessionSpec, SharedPtyHandle};
 use crate::state::panel_state::{PanelPlacement, SavedPanelBounds, SnapSlot};
 use crate::state::PanelState;
+#[cfg(feature = "ghostty-vt")]
+use crate::terminal::backend::TerminalBackendKind;
 use crate::terminal::input::{
     is_paste_shortcut, key_to_bytes, paste_bytes, should_copy_selection, wheel_action, WheelAction,
 };
@@ -33,6 +35,8 @@ use crate::terminal::renderer::{
     compute_grid_size, render_terminal, render_terminal_preview, render_terminal_reduced,
     TerminalGridCache, FONT_SIZE, MIN_TEXT_RENDER_FONT_SIZE, PAD_X, PAD_Y,
 };
+#[cfg(feature = "ghostty-vt")]
+use crate::terminal::renderer::{render_ghostty_text_snapshot, GhosttyGridCache};
 use crate::terminal::scrollbar::{
     render_scrollbar, scrollbar_pointer_to_scrollback, scrollbar_thumb_height, terminal_body_rect,
     terminal_scrollbar_rect,
@@ -89,6 +93,14 @@ fn share_scope_badge_colors(scope: PanelShareScope) -> (Color32, Color32, Color3
             Color32::from_rgb(224, 248, 230),
         ),
     }
+}
+
+fn backend_badge_colors() -> (Color32, Color32, Color32) {
+    (
+        Color32::from_rgb(42, 58, 72),
+        Color32::from_rgb(96, 170, 208),
+        Color32::from_rgb(226, 246, 255),
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -160,6 +172,8 @@ pub struct TerminalPanel {
     last_activity_scan_at: f64,
     share_scope: PanelShareScope,
     render_cache: TerminalGridCache,
+    #[cfg(feature = "ghostty-vt")]
+    ghostty_render_cache: GhosttyGridCache,
     last_scrollbar_state: Option<TerminalScrollState>,
 }
 
@@ -190,6 +204,8 @@ impl TerminalPanel {
             last_activity_scan_at: 0.0,
             share_scope: PanelShareScope::VisibleOnly,
             render_cache: TerminalGridCache::default(),
+            #[cfg(feature = "ghostty-vt")]
+            ghostty_render_cache: GhosttyGridCache::default(),
             last_scrollbar_state: None,
         }
     }
@@ -256,6 +272,10 @@ impl TerminalPanel {
         self.share_scope = scope;
     }
 
+    pub fn share_scope(&self) -> PanelShareScope {
+        self.share_scope
+    }
+
     pub fn provider_hint(&self) -> Option<AgentProvider> {
         self.activity_label
             .as_deref()
@@ -274,6 +294,20 @@ impl TerminalPanel {
 
     fn with_pty<R>(&self, f: impl FnOnce(&PtyHandle) -> R) -> Option<R> {
         self.session.with_pty(f)
+    }
+
+    #[cfg(feature = "ghostty-vt")]
+    fn backend_badge_label(&self) -> Option<&'static str> {
+        self.with_pty(|pty| match pty.backend_kind() {
+            TerminalBackendKind::Ghostty => Some("Ghostty"),
+            TerminalBackendKind::Alacritty => None,
+        })
+        .flatten()
+    }
+
+    #[cfg(not(feature = "ghostty-vt"))]
+    fn backend_badge_label(&self) -> Option<&'static str> {
+        None
     }
 
     pub fn apply_resize(&mut self, rect: Rect) {
@@ -790,7 +824,7 @@ impl TerminalPanel {
                 if let Some(pointer) = body_response.interact_pointer_pos() {
                     self.begin_selection(
                         pointer,
-                        body_rect,
+                        content_rect,
                         canvas_rect,
                         zoom,
                         SelectionType::Simple,
@@ -799,7 +833,7 @@ impl TerminalPanel {
             }
             if body_response.dragged() {
                 if let Some(pointer) = body_response.interact_pointer_pos() {
-                    self.update_selection(pointer, body_rect, canvas_rect, zoom);
+                    self.update_selection(pointer, content_rect, canvas_rect, zoom);
                 }
             }
         } else {
@@ -915,11 +949,10 @@ impl TerminalPanel {
             let badge_width =
                 ((badge_text.len() as f32 * 7.2 + 18.0) * chrome_zoom).clamp(52.0, 96.0);
             let badge_height = (20.0 * chrome_zoom).clamp(16.0, 20.0);
+            let badge_gap = (8.0 * chrome_zoom).clamp(5.0, 8.0);
+            let mut right_edge = title_rect.right() - (14.0 * chrome_zoom).clamp(8.0, 14.0);
             let badge_rect = Rect::from_center_size(
-                pos2(
-                    title_rect.right() - (14.0 * chrome_zoom).clamp(8.0, 14.0) - badge_width * 0.5,
-                    title_rect.center().y,
-                ),
+                pos2(right_edge - badge_width * 0.5, title_rect.center().y),
                 vec2(badge_width, badge_height),
             );
             let (fill, stroke, text) = share_scope_badge_colors(self.share_scope);
@@ -932,6 +965,32 @@ impl TerminalPanel {
                 FontId::proportional((11.0 * chrome_zoom).clamp(7.0, 11.0)),
                 text,
             );
+
+            right_edge = badge_rect.left() - badge_gap;
+            if title_rect.width() >= 330.0 {
+                if let Some(backend_text) = self.backend_badge_label() {
+                    let backend_width =
+                        ((backend_text.len() as f32 * 7.4 + 18.0) * chrome_zoom).clamp(58.0, 92.0);
+                    let backend_rect = Rect::from_center_size(
+                        pos2(right_edge - backend_width * 0.5, title_rect.center().y),
+                        vec2(backend_width, badge_height),
+                    );
+                    let (fill, stroke, text) = backend_badge_colors();
+                    chrome_painter.rect_filled(backend_rect, badge_height * 0.5, fill);
+                    chrome_painter.rect_stroke(
+                        backend_rect,
+                        badge_height * 0.5,
+                        Stroke::new(1.0, stroke),
+                    );
+                    chrome_painter.text(
+                        backend_rect.center(),
+                        Align2::CENTER_CENTER,
+                        backend_text,
+                        FontId::proportional((11.0 * chrome_zoom).clamp(7.0, 11.0)),
+                        text,
+                    );
+                }
+            }
         }
         let content_clip_rect = content_rect.intersect(canvas_rect);
         let content_painter = painter.with_clip_rect(content_clip_rect);
@@ -969,7 +1028,41 @@ impl TerminalPanel {
             if let Ok(pty) = handle.lock() {
                 let scan_activity = should_refresh_activity_label(self.last_activity_scan_at, now);
                 let mut scanned_activity_label = None;
-                if matches!(render_tier, RenderTier::Full | RenderTier::ReducedLive) {
+                #[cfg(feature = "ghostty-vt")]
+                let mut rendered_ghostty = false;
+                #[cfg(feature = "ghostty-vt")]
+                if matches!(render_tier, RenderTier::Full | RenderTier::ReducedLive)
+                    && pty.backend_kind() == TerminalBackendKind::Ghostty
+                {
+                    if let Some(snapshot) = pty.ghostty_snapshot() {
+                        scrollbar_state = Some(snapshot.scroll_state);
+                        if scan_activity {
+                            let visible_text = snapshot.rows.join("\n");
+                            scanned_activity_label = Some(infer_activity_label(
+                                &title_snapshot,
+                                &shell_title_snapshot,
+                                &visible_text,
+                            ));
+                        }
+                        interaction.cache_hit = render_ghostty_text_snapshot(
+                            &content_painter,
+                            content_rect,
+                            &snapshot,
+                            self.focused,
+                            now,
+                            zoom,
+                            content_rounding,
+                            Some(&mut self.ghostty_render_cache),
+                        );
+                        rendered_ghostty = true;
+                    }
+                }
+                #[cfg(not(feature = "ghostty-vt"))]
+                let rendered_ghostty = false;
+
+                if !rendered_ghostty
+                    && matches!(render_tier, RenderTier::Full | RenderTier::ReducedLive)
+                {
                     if let Ok(mut term) = pty.term.try_lock() {
                         term.is_focused = self.focused;
                         scrollbar_state = Some(TerminalScrollState {
@@ -1030,7 +1123,7 @@ impl TerminalPanel {
                             Some(preview_label.as_str()),
                         );
                     }
-                } else {
+                } else if !rendered_ghostty {
                     if !matches!(render_tier, RenderTier::Hidden) {
                         let preview_label = overlay
                             .map(|overlay| overlay.preview_label.clone())
@@ -1824,9 +1917,9 @@ fn render_tier_for_panel(
     content_rect: Rect,
     zoom: f32,
     lod: PanelLod,
-    _fast_path_render: bool,
-    _focused: bool,
-    _streaming: bool,
+    fast_path_render: bool,
+    focused: bool,
+    streaming: bool,
 ) -> RenderTier {
     let previewable = content_rect.width() >= 24.0 && content_rect.height() >= 18.0;
     if !previewable {
@@ -1834,6 +1927,12 @@ fn render_tier_for_panel(
     }
     if matches!(lod, PanelLod::Minimal) || !should_render_terminal_contents(content_rect, zoom) {
         return RenderTier::Preview;
+    }
+    if focused {
+        return RenderTier::Full;
+    }
+    if fast_path_render || streaming {
+        return RenderTier::ReducedLive;
     }
     RenderTier::Full
 }
@@ -2261,7 +2360,27 @@ mod tests {
 
         assert_eq!(
             render_tier_for_panel(content_rect, 1.0, PanelLod::Compact, false, false, true),
+            RenderTier::ReducedLive
+        );
+    }
+
+    #[test]
+    fn background_idle_panels_keep_full_cached_render_when_visible() {
+        let content_rect = egui::Rect::from_min_size(pos2(0.0, 42.0), vec2(200.0, 120.0));
+
+        assert_eq!(
+            render_tier_for_panel(content_rect, 1.0, PanelLod::Compact, false, false, false),
             RenderTier::Full
+        );
+    }
+
+    #[test]
+    fn drag_fast_path_uses_reduced_live_without_falling_to_preview() {
+        let content_rect = egui::Rect::from_min_size(pos2(0.0, 42.0), vec2(200.0, 120.0));
+
+        assert_eq!(
+            render_tier_for_panel(content_rect, 1.0, PanelLod::Compact, true, false, false),
+            RenderTier::ReducedLive
         );
     }
 

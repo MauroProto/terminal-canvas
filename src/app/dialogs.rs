@@ -290,14 +290,21 @@ impl TerminalApp {
                                     ui.add_space(10.0);
                                     ui.label("Control requests");
                                     for request in pending_controls {
-                                        let panel_title = self
+                                        let panel_info = self
                                             .shared_workspace()
                                             .and_then(|workspace| workspace.panel(request.terminal_id))
-                                            .map(|panel| panel.title().to_owned())
-                                            .unwrap_or_else(|| "Terminal".to_owned());
+                                            .map(|panel| {
+                                                (panel.title().to_owned(), panel.share_scope())
+                                            });
+                                        let (panel_title, share_scope) = panel_info
+                                            .unwrap_or_else(|| {
+                                                ("Terminal".to_owned(), PanelShareScope::Private)
+                                            });
                                         ui.horizontal(|ui| {
                                             ui.label(format!("{} -> {}", request.display_name, panel_title));
-                                            if ui.button("Grant").clicked() {
+                                            if !share_scope.allows_control() {
+                                                ui.label("Not controllable");
+                                            } else if ui.button("Grant").clicked() {
                                                 self.collab.grant_control(
                                                     request.terminal_id,
                                                     request.guest_id,

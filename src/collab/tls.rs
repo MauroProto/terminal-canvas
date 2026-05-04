@@ -37,11 +37,13 @@ pub fn generate_tls_material(subject_alt_names: Vec<String>) -> anyhow::Result<T
 
 pub fn http_client(tls_cert_pem: Option<&str>) -> anyhow::Result<Client> {
     ensure_crypto_provider();
-    let mut builder = Client::builder().timeout(Duration::from_secs(HTTP_TIMEOUT_SECS));
+    let mut builder = Client::builder()
+        .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
+        .https_only(true);
     if let Some(cert_pem) = tls_cert_pem {
         let cert = Certificate::from_pem(cert_pem.as_bytes())
             .context("failed to parse pinned TLS certificate")?;
-        builder = builder.add_root_certificate(cert).https_only(true);
+        builder = builder.add_root_certificate(cert);
     }
     builder.build().context("failed to build HTTP client")
 }

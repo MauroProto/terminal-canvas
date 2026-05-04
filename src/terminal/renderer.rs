@@ -7,6 +7,10 @@ use alacritty_terminal::vte::ansi::{
 use egui::{pos2, vec2, Align2, Color32, FontId, Rect, Rounding, Shape, Stroke};
 
 use crate::terminal::colors::{brighten, dim_color, indexed_to_egui};
+#[cfg(feature = "ghostty-vt")]
+use crate::terminal::ghostty_backend::{
+    GhosttyCellSnapshot, GhosttyCursorShape, GhosttyRgb, GhosttyTextSnapshot,
+};
 use crate::terminal::pty::EventProxy;
 
 pub const FONT_SIZE: f32 = 15.0;
@@ -180,6 +184,338 @@ fn reduced_row_stride(content_rect: Rect, zoom: f32) -> usize {
         13..=28 => 2,
         _ => 3,
     }
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[derive(Clone, Default)]
+pub struct GhosttyGridCache {
+    key: Option<GridCacheKey>,
+    shapes: Vec<Shape>,
+    background_fill: Option<Color32>,
+}
+
+#[cfg(feature = "ghostty-vt")]
+impl GhosttyGridCache {
+    pub fn matches(&self, key: GridCacheKey) -> bool {
+        self.key == Some(key)
+    }
+
+    pub fn store(&mut self, key: GridCacheKey, shapes: Vec<Shape>, background_fill: Color32) {
+        self.key = Some(key);
+        self.shapes = shapes;
+        self.background_fill = Some(background_fill);
+    }
+}
+
+#[cfg(feature = "ghostty-vt")]
+pub fn render_ghostty_text_snapshot(
+    painter: &egui::Painter,
+    content_rect: Rect,
+    snapshot: &GhosttyTextSnapshot,
+    focused: bool,
+    time: f64,
+    zoom: f32,
+    background_rounding: Rounding,
+    mut cache: Option<&mut GhosttyGridCache>,
+) -> bool {
+    if content_rect.width() <= 0.0 || content_rect.height() <= 0.0 {
+        return false;
+    }
+
+    let metrics = scaled_metrics(zoom);
+    let background = ghostty_color(snapshot.default_colors.background);
+    let foreground = ghostty_color(snapshot.default_colors.foreground);
+    let cache_key = GridCacheKey::new(content_rect, zoom, snapshot.revision, 1);
+
+    if let Some(cache) = cache.as_deref_mut() {
+        if cache.matches(cache_key) {
+            painter.rect_filled(
+                content_rect,
+                background_rounding,
+                cache.background_fill.unwrap_or(background),
+            );
+            painter.extend(cache.shapes.iter().cloned());
+            if focused {
+                draw_ghostty_cursor(painter, content_rect, snapshot, metrics, time);
+            }
+            return true;
+        }
+    }
+
+    painter.rect_filled(content_rect, background_rounding, background);
+    let shapes = build_ghostty_shapes(
+        painter.ctx(),
+        content_rect,
+        snapshot,
+        metrics,
+        foreground,
+        background,
+    );
+    painter.extend(shapes.iter().cloned());
+    if let Some(cache) = cache.as_deref_mut() {
+        cache.store(cache_key, shapes, background);
+    }
+
+    if focused {
+        draw_ghostty_cursor(painter, content_rect, snapshot, metrics, time);
+    }
+
+    false
+}
+
+#[cfg(feature = "ghostty-vt")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GhosttyRunStyle {
+    foreground: Color32,
+    underline: bool,
+    strikethrough: bool,
+}
+
+#[cfg(feature = "ghostty-vt")]
+fn build_ghostty_shapes(
+    ctx: &egui::Context,
+    content_rect: Rect,
+    snapshot: &GhosttyTextSnapshot,
+    metrics: RenderMetrics,
+    default_foreground: Color32,
+    default_background: Color32,
+) -> Vec<Shape> {
+    let mut background_shapes = Vec::new();
+    let mut foreground_shapes = Vec::new();
+    let max_rows = ((content_rect.height() - metrics.pad_y * 2.0) / metrics.cell_height)
+        .ceil()
+        .max(0.0) as usize;
+
+    ctx.fonts(|fonts| {
+        for (row_index, row) in snapshot.styled_rows.iter().take(max_rows).enumerate() {
+            build_ghostty_row_shapes(
+                fonts,
+                content_rect,
+                row_index,
+                row,
+                metrics,
+                default_foreground,
+                default_background,
+                &mut background_shapes,
+                &mut foreground_shapes,
+            );
+        }
+    });
+
+    background_shapes.extend(foreground_shapes);
+    background_shapes
+}
+
+#[cfg(feature = "ghostty-vt")]
+fn build_ghostty_row_shapes(
+    fonts: &egui::epaint::text::Fonts,
+    content_rect: Rect,
+    row_index: usize,
+    row: &[GhosttyCellSnapshot],
+    metrics: RenderMetrics,
+    default_foreground: Color32,
+    default_background: Color32,
+    background_shapes: &mut Vec<Shape>,
+    foreground_shapes: &mut Vec<Shape>,
+) {
+    let mut run_start = 0;
+    let mut run_text = String::new();
+    let mut run_style = None;
+
+    for (col_index, cell) in row.iter().enumerate() {
+        let (style, background) = ghostty_cell_style(cell, default_foreground, default_background);
+        if background != default_background {
+            let rect = Rect::from_min_size(
+                pos2(
+                    content_rect.left() + metrics.pad_x + col_index as f32 * metrics.cell_width,
+                    content_rect.top() + metrics.pad_y + row_index as f32 * metrics.cell_height,
+                ),
+                vec2(metrics.cell_width, metrics.cell_height),
+            );
+            background_shapes.push(Shape::rect_filled(rect, 0.0, background));
+        }
+
+        if cell.text.is_empty() {
+            flush_ghostty_run(
+                fonts,
+                foreground_shapes,
+                content_rect,
+                row_index,
+                run_start,
+                &mut run_text,
+                run_style,
+                metrics,
+            );
+            run_style = None;
+            continue;
+        }
+
+        if run_style == Some(style) {
+            run_text.push_str(&cell.text);
+        } else {
+            flush_ghostty_run(
+                fonts,
+                foreground_shapes,
+                content_rect,
+                row_index,
+                run_start,
+                &mut run_text,
+                run_style,
+                metrics,
+            );
+            run_start = col_index;
+            run_style = Some(style);
+            run_text.push_str(&cell.text);
+        }
+    }
+
+    flush_ghostty_run(
+        fonts,
+        foreground_shapes,
+        content_rect,
+        row_index,
+        run_start,
+        &mut run_text,
+        run_style,
+        metrics,
+    );
+}
+
+#[cfg(feature = "ghostty-vt")]
+fn ghostty_cell_style(
+    cell: &GhosttyCellSnapshot,
+    default_foreground: Color32,
+    default_background: Color32,
+) -> (GhosttyRunStyle, Color32) {
+    let mut foreground = cell.foreground.map_or(default_foreground, ghostty_color);
+    let mut background = cell.background.map_or(default_background, ghostty_color);
+
+    if cell.inverse {
+        std::mem::swap(&mut foreground, &mut background);
+    }
+    if cell.bold {
+        foreground = brighten(foreground);
+    }
+
+    (
+        GhosttyRunStyle {
+            foreground,
+            underline: cell.underline,
+            strikethrough: cell.strikethrough,
+        },
+        background,
+    )
+}
+
+#[cfg(feature = "ghostty-vt")]
+fn flush_ghostty_run(
+    fonts: &egui::epaint::text::Fonts,
+    foreground_shapes: &mut Vec<Shape>,
+    content_rect: Rect,
+    row_index: usize,
+    start_col: usize,
+    run_text: &mut String,
+    style: Option<GhosttyRunStyle>,
+    metrics: RenderMetrics,
+) {
+    let Some(style) = style else {
+        run_text.clear();
+        return;
+    };
+    if run_text.is_empty() {
+        return;
+    }
+
+    let text_pos = pos2(
+        content_rect.left() + metrics.pad_x + start_col as f32 * metrics.cell_width,
+        content_rect.top() + metrics.pad_y + row_index as f32 * metrics.cell_height,
+    );
+    foreground_shapes.push(Shape::text(
+        fonts,
+        text_pos,
+        Align2::LEFT_TOP,
+        run_text.clone(),
+        FontId::monospace(metrics.font_size),
+        style.foreground,
+    ));
+
+    let width = run_text.chars().count() as f32 * metrics.cell_width;
+    if style.underline {
+        let y = text_pos.y + metrics.cell_height * 0.86;
+        foreground_shapes.push(Shape::line_segment(
+            [pos2(text_pos.x, y), pos2(text_pos.x + width, y)],
+            Stroke::new((metrics.zoom * 1.0).max(1.0), style.foreground),
+        ));
+    }
+    if style.strikethrough {
+        let y = text_pos.y + metrics.cell_height * 0.52;
+        foreground_shapes.push(Shape::line_segment(
+            [pos2(text_pos.x, y), pos2(text_pos.x + width, y)],
+            Stroke::new((metrics.zoom * 1.0).max(1.0), style.foreground),
+        ));
+    }
+
+    run_text.clear();
+}
+
+#[cfg(feature = "ghostty-vt")]
+fn draw_ghostty_cursor(
+    painter: &egui::Painter,
+    content_rect: Rect,
+    snapshot: &GhosttyTextSnapshot,
+    metrics: RenderMetrics,
+    time: f64,
+) {
+    let Some(cursor) = snapshot.cursor else {
+        return;
+    };
+    if !cursor.visible || (cursor.blinking && !blink_phase_visible(time)) {
+        return;
+    }
+
+    let color = cursor.color.map_or(CURSOR_COLOR, ghostty_color);
+    let rect = Rect::from_min_size(
+        pos2(
+            content_rect.left() + metrics.pad_x + cursor.x as f32 * metrics.cell_width,
+            content_rect.top() + metrics.pad_y + cursor.y as f32 * metrics.cell_height,
+        ),
+        vec2(metrics.cell_width, metrics.cell_height),
+    );
+
+    match cursor.style {
+        GhosttyCursorShape::Bar => {
+            painter.rect_filled(
+                Rect::from_min_size(rect.min, vec2((2.0 * metrics.zoom).max(1.0), rect.height())),
+                0.0,
+                color,
+            );
+        }
+        GhosttyCursorShape::Block => {
+            painter.rect_filled(
+                rect,
+                0.0,
+                Color32::from_rgba_premultiplied(color.r(), color.g(), color.b(), 150),
+            );
+        }
+        GhosttyCursorShape::Underline => {
+            painter.rect_filled(
+                Rect::from_min_size(
+                    pos2(rect.left(), rect.bottom() - (2.0 * metrics.zoom).max(1.0)),
+                    vec2(rect.width(), (2.0 * metrics.zoom).max(1.0)),
+                ),
+                0.0,
+                color,
+            );
+        }
+        GhosttyCursorShape::BlockHollow => {
+            painter.rect_stroke(rect, 0.0, Stroke::new((1.0 * metrics.zoom).max(1.0), color));
+        }
+    }
+}
+
+#[cfg(feature = "ghostty-vt")]
+fn ghostty_color(color: GhosttyRgb) -> Color32 {
+    Color32::from_rgb(color.r, color.g, color.b)
 }
 
 fn render_terminal_with_row_stride(
@@ -818,12 +1154,22 @@ mod tests {
     use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
     use egui::{pos2, vec2, CentralPanel, RawInput, Rect, Rounding};
 
+    #[cfg(feature = "ghostty-vt")]
+    use crate::terminal::ghostty_backend::{
+        GhosttyCellSnapshot, GhosttyDefaultColors, GhosttyDirtyState, GhosttyRgb,
+        GhosttyTextSnapshot,
+    };
     use crate::terminal::pty::EventProxy;
+    #[cfg(feature = "ghostty-vt")]
+    use crate::terminal::pty::TerminalScrollState;
 
     use super::{
         blink_phase_visible, cursor_visible, render_terminal, render_terminal_reduced,
         terminal_background_color, GridCacheKey, TerminalGridCache,
     };
+
+    #[cfg(feature = "ghostty-vt")]
+    use super::{render_ghostty_text_snapshot, GhosttyGridCache};
 
     #[test]
     fn unfocused_cursor_is_hidden() {
@@ -1000,6 +1346,54 @@ mod tests {
         assert!(second_hit);
     }
 
+    #[cfg(feature = "ghostty-vt")]
+    #[test]
+    fn ghostty_render_cache_hits_on_unchanged_revision() {
+        let ctx = egui::Context::default();
+        let raw_input = RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(320.0, 240.0))),
+            ..Default::default()
+        };
+        let content_rect = Rect::from_min_size(pos2(20.0, 20.0), vec2(220.0, 120.0));
+        let snapshot = sample_ghostty_snapshot(7);
+        let mut cache = GhosttyGridCache::default();
+        let mut first_hit = true;
+        let mut second_hit = false;
+
+        let _ = ctx.run(raw_input.clone(), |ctx| {
+            CentralPanel::default().show(ctx, |ui| {
+                first_hit = render_ghostty_text_snapshot(
+                    ui.painter(),
+                    content_rect,
+                    &snapshot,
+                    true,
+                    0.0,
+                    1.0,
+                    Rounding::ZERO,
+                    Some(&mut cache),
+                );
+            });
+        });
+
+        let _ = ctx.run(raw_input, |ctx| {
+            CentralPanel::default().show(ctx, |ui| {
+                second_hit = render_ghostty_text_snapshot(
+                    ui.painter(),
+                    content_rect,
+                    &snapshot,
+                    true,
+                    0.0,
+                    1.0,
+                    Rounding::ZERO,
+                    Some(&mut cache),
+                );
+            });
+        });
+
+        assert!(!first_hit);
+        assert!(second_hit);
+    }
+
     fn sample_term(text: &str) -> Term<EventProxy> {
         let (event_tx, _event_rx) = mpsc::channel();
         let mut term = Term::new(
@@ -1010,6 +1404,71 @@ mod tests {
         let mut processor = Processor::<StdSyncHandler>::new();
         processor.advance(&mut term, text.as_bytes());
         term
+    }
+
+    #[cfg(feature = "ghostty-vt")]
+    fn sample_ghostty_snapshot(revision: u64) -> GhosttyTextSnapshot {
+        GhosttyTextSnapshot {
+            cols: 24,
+            rows: vec!["hello ghostty".to_owned()],
+            styled_rows: vec![vec![
+                GhosttyCellSnapshot {
+                    text: "hello".to_owned(),
+                    foreground: None,
+                    background: None,
+                    bold: false,
+                    italic: false,
+                    underline: false,
+                    strikethrough: false,
+                    inverse: false,
+                },
+                GhosttyCellSnapshot {
+                    text: " ".to_owned(),
+                    foreground: None,
+                    background: None,
+                    bold: false,
+                    italic: false,
+                    underline: false,
+                    strikethrough: false,
+                    inverse: false,
+                },
+                GhosttyCellSnapshot {
+                    text: "ghostty".to_owned(),
+                    foreground: Some(GhosttyRgb {
+                        r: 220,
+                        g: 238,
+                        b: 255,
+                    }),
+                    background: None,
+                    bold: false,
+                    italic: false,
+                    underline: false,
+                    strikethrough: false,
+                    inverse: false,
+                },
+            ]],
+            default_colors: GhosttyDefaultColors {
+                foreground: GhosttyRgb {
+                    r: 232,
+                    g: 232,
+                    b: 234,
+                },
+                background: GhosttyRgb {
+                    r: 30,
+                    g: 30,
+                    b: 30,
+                },
+                cursor: None,
+            },
+            cursor: None,
+            scroll_state: TerminalScrollState {
+                display_offset: 0,
+                visible_rows: 1,
+                history_size: 0,
+            },
+            dirty: GhosttyDirtyState::Full,
+            revision,
+        }
     }
 
     fn distinct_text_rows(shapes: &[egui::epaint::ClippedShape]) -> usize {

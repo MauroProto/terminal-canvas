@@ -256,9 +256,7 @@ pub(super) fn clamp_rect_to_desktop(rect: Rect, desktop_rect: Rect) -> Rect {
 }
 
 pub(super) fn desktop_snap_slot_for_pointer(pointer: Pos2, desktop_rect: Rect) -> Option<SnapSlot> {
-    let horizontal_band = DESKTOP_SNAP_EDGE
-        .max(64.0)
-        .min(desktop_rect.width() * 0.22);
+    let horizontal_band = DESKTOP_SNAP_EDGE.max(64.0).min(desktop_rect.width() * 0.22);
     let vertical_band = DESKTOP_SNAP_EDGE
         .max(64.0)
         .min(desktop_rect.height() * 0.22);

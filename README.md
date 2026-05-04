@@ -18,6 +18,7 @@ Native desktop workspace for terminals and coding agents.
 - Rust
 - `eframe` / `egui` / `wgpu`
 - `alacritty_terminal`
+- optional experimental `libghostty-vt` backend probe
 - `portable-pty`
 - `axum` / WebSocket / Rustls
 
@@ -66,3 +67,24 @@ Typical verification command:
 ```bash
 cargo test --quiet
 ```
+
+Optional Ghostty VT backend spike:
+
+```bash
+PATH=/opt/homebrew/opt/zig@0.15/bin:$PATH \
+MACOSX_DEPLOYMENT_TARGET=13.0 \
+RUSTFLAGS='-C link-arg=-Wl,-ld_classic' \
+cargo test --features ghostty-vt ghostty_probe --quiet
+```
+
+To run the app with the experimental Ghostty VT path:
+
+```bash
+PATH=/opt/homebrew/opt/zig@0.15/bin:$PATH \
+MACOSX_DEPLOYMENT_TARGET=13.0 \
+RUSTFLAGS='-C link-arg=-Wl,-ld_classic' \
+MI_TERMINAL_BACKEND=ghostty \
+cargo run --features ghostty-vt --bin mi-terminal
+```
+
+This is not the production backend yet. It uses Ghostty's VT core for parsing/render snapshots while the stable default backend remains `alacritty_terminal`.

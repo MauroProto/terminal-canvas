@@ -150,9 +150,21 @@ pub(super) fn split_resize_hit(workspace: &Workspace, pointer: Pos2) -> Option<S
             {
                 let (leading_index, leading_rect, trailing_index, trailing_rect, boundary) =
                     if left_rect.center().x <= right_rect.center().x {
-                        (*left_index, *left_rect, *right_index, *right_rect, left_rect.right())
+                        (
+                            *left_index,
+                            *left_rect,
+                            *right_index,
+                            *right_rect,
+                            left_rect.right(),
+                        )
                     } else {
-                        (*right_index, *right_rect, *left_index, *left_rect, right_rect.right())
+                        (
+                            *right_index,
+                            *right_rect,
+                            *left_index,
+                            *left_rect,
+                            right_rect.right(),
+                        )
                     };
                 let top = leading_rect.top().max(trailing_rect.top());
                 let bottom = leading_rect.bottom().min(trailing_rect.bottom());
@@ -178,9 +190,21 @@ pub(super) fn split_resize_hit(workspace: &Workspace, pointer: Pos2) -> Option<S
             {
                 let (leading_index, leading_rect, trailing_index, trailing_rect, boundary) =
                     if left_rect.center().y <= right_rect.center().y {
-                        (*left_index, *left_rect, *right_index, *right_rect, left_rect.bottom())
+                        (
+                            *left_index,
+                            *left_rect,
+                            *right_index,
+                            *right_rect,
+                            left_rect.bottom(),
+                        )
                     } else {
-                        (*right_index, *right_rect, *left_index, *left_rect, right_rect.bottom())
+                        (
+                            *right_index,
+                            *right_rect,
+                            *left_index,
+                            *left_rect,
+                            right_rect.bottom(),
+                        )
                     };
                 let left = leading_rect.left().max(trailing_rect.left());
                 let right = leading_rect.right().min(trailing_rect.right());

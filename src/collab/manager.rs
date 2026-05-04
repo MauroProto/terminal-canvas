@@ -311,6 +311,7 @@ impl CollabManager {
         {
             anyhow::bail!("Invite expired. Pedile al host que rote el invite.");
         }
+        validate_invite_broker_transport(&invite)?;
         let invite_secret = required_invite_secret(&invite)?;
         let response: JoinShareSessionResponse = json_post(
             &format!(
@@ -950,9 +951,12 @@ fn broker_ws_url(
     token: &str,
     role: SessionRole,
 ) -> anyhow::Result<String> {
-    let mut url = broker_url
-        .replace("https://", "wss://")
-        .replace("http://", "ws://");
+    let trimmed = broker_url.trim().trim_end_matches('/');
+    let parsed = Url::parse(trimmed)?;
+    if parsed.scheme() != "https" {
+        anyhow::bail!("Trusted Live requires https:// broker URLs");
+    }
+    let mut url = trimmed.replacen("https://", "wss://", 1);
     url.push_str(&format!(
         "/v1/share-sessions/{}/stream?token={}&role={}",
         session_id.0,
@@ -963,6 +967,26 @@ fn broker_ws_url(
         }
     ));
     Ok(url)
+}
+
+fn validate_invite_broker_transport(invite: &InviteCode) -> anyhow::Result<()> {
+    let parsed = Url::parse(invite.broker_url.trim())?;
+    if parsed.scheme() != "https" {
+        anyhow::bail!("Invite broker URL must use https://");
+    }
+    if parsed.host_str().is_none() {
+        anyhow::bail!("Invite broker URL missing host");
+    }
+    if invite
+        .tls_cert_pem
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or_default()
+        .is_empty()
+    {
+        anyhow::bail!("Invite missing pinned TLS certificate");
+    }
+    Ok(())
 }
 
 fn normalize_share_url(raw: &str) -> anyhow::Result<String> {
@@ -1156,6 +1180,53 @@ mod tests {
 
         let err = required_invite_secret(&invite).expect_err("missing invite secret should fail");
         assert!(err.to_string().contains("invite secret"));
+    }
+
+    #[test]
+    fn join_rejects_insecure_invite_broker_url() {
+        let invite = InviteCode {
+            broker_url: "http://127.0.0.1:8787".to_owned(),
+            session_id: ShareSessionId(Uuid::new_v4()),
+            session_secret: random_secret(),
+            invite_secret: Some("invite-secret".to_owned()),
+            expires_at: None,
+            requires_passphrase: false,
+            tls_cert_pem: None,
+        };
+
+        let err =
+            validate_invite_broker_transport(&invite).expect_err("http invite broker should fail");
+        assert!(err.to_string().contains("https://"));
+    }
+
+    #[test]
+    fn join_requires_pinned_invite_certificate() {
+        let invite = InviteCode {
+            broker_url: "https://127.0.0.1:8787".to_owned(),
+            session_id: ShareSessionId(Uuid::new_v4()),
+            session_secret: random_secret(),
+            invite_secret: Some("invite-secret".to_owned()),
+            expires_at: None,
+            requires_passphrase: false,
+            tls_cert_pem: None,
+        };
+
+        let err =
+            validate_invite_broker_transport(&invite).expect_err("missing pinned cert should fail");
+        assert!(err.to_string().contains("certificate"));
+    }
+
+    #[test]
+    fn broker_ws_url_rejects_plaintext_broker_url() {
+        let err = broker_ws_url(
+            "http://127.0.0.1:8787",
+            ShareSessionId(Uuid::new_v4()),
+            "token",
+            SessionRole::Guest,
+        )
+        .expect_err("plain websocket broker should fail");
+
+        assert!(err.to_string().contains("https://"));
     }
 
     #[test]

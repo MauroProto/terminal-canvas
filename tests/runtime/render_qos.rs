@@ -1,8 +1,13 @@
 mod terminal {
     #![allow(dead_code)]
 
+    #[path = "../../../src/terminal/backend.rs"]
+    pub mod backend;
     #[path = "../../../src/terminal/colors.rs"]
     pub mod colors;
+    #[cfg(feature = "ghostty-vt")]
+    #[path = "../../../src/terminal/ghostty_backend.rs"]
+    pub mod ghostty_backend;
     #[path = "../../../src/terminal/input.rs"]
     pub mod input;
     #[path = "../../../src/terminal/pty.rs"]

@@ -129,12 +129,20 @@ impl SessionController {
     }
 
     pub fn sync_grid_size(&mut self, cols: u16, rows: u16, defer_resize: bool) {
-        self.last_cols = cols.max(1);
-        self.last_rows = rows.max(1);
+        let next_cols = cols.max(1);
+        let next_rows = rows.max(1);
+        let resize_needed =
+            attached_grid_resize_needed(self.last_cols, self.last_rows, next_cols, next_rows);
+        self.last_cols = next_cols;
+        self.last_rows = next_rows;
         if defer_resize {
             return;
         }
-        if !self.is_attached() && !self.ensure_attached() {
+        if !self.is_attached() {
+            let _ = self.ensure_attached();
+            return;
+        }
+        if !resize_needed {
             return;
         }
         let _ = self.with_pty_mut(|pty| pty.resize(self.last_cols, self.last_rows));
@@ -219,6 +227,26 @@ impl SessionController {
         let manager = self.pty_manager.as_ref()?;
         let session_id = self.session_id?;
         manager.lock().ok()?.handle(session_id)
+    }
+}
+
+fn attached_grid_resize_needed(last_cols: u16, last_rows: u16, cols: u16, rows: u16) -> bool {
+    last_cols.max(1) != cols.max(1) || last_rows.max(1) != rows.max(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::attached_grid_resize_needed;
+
+    #[test]
+    fn unchanged_attached_grid_does_not_need_resize() {
+        assert!(!attached_grid_resize_needed(120, 32, 120, 32));
+    }
+
+    #[test]
+    fn changed_attached_grid_needs_resize() {
+        assert!(attached_grid_resize_needed(120, 32, 121, 32));
+        assert!(attached_grid_resize_needed(120, 32, 120, 33));
     }
 }
 

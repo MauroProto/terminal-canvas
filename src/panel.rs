@@ -96,6 +96,12 @@ impl WorkspacePanel {
         }
     }
 
+    pub fn share_scope(&self) -> PanelShareScope {
+        match self {
+            Self::Terminal(panel) => panel.share_scope(),
+        }
+    }
+
     pub fn set_focused(&mut self, focused: bool) {
         match self {
             Self::Terminal(panel) => panel.focused = focused,

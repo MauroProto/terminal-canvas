@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const RELEASES_URL: &str = "https://api.github.com/repos/owner/repo/releases/latest";
 const REQUEST_TIMEOUT: u64 = 15;
-const FOCUSED_REPAINT_WINDOW: Duration = Duration::from_millis(16);
+const FOCUSED_REPAINT_WINDOW: Duration = Duration::from_millis(80);
 
 #[derive(Debug, Clone)]
 pub struct RepaintPolicy {
@@ -81,7 +81,7 @@ impl RepaintPolicy {
 
     fn current_window(&self) -> Duration {
         if self.focused_runtime_event {
-            self.batch_window.min(FOCUSED_REPAINT_WINDOW)
+            FOCUSED_REPAINT_WINDOW
         } else {
             self.batch_window
         }

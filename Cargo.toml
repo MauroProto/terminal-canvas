@@ -5,6 +5,10 @@ edition = "2021"
 description = "A native desktop terminal and agent workspace manager, GPU-accelerated, cross-platform"
 license = "MIT"
 
+[features]
+default = []
+ghostty-vt = ["dep:libghostty-vt"]
+
 [[bin]]
 name = "mi-terminal"
 path = "src/main.rs"
@@ -41,6 +45,7 @@ path = "tests/runtime/load_20_terminals.rs"
 eframe = { version = "0.30", features = ["wgpu"] }
 egui = "0.30"
 alacritty_terminal = "0.25.1"
+libghostty-vt = { version = "0.1.1", optional = true }
 portable-pty = "0.9"
 axum = { version = "0.7", features = ["ws", "json"] }
 axum-server = { version = "0.7", features = ["tls-rustls"] }

@@ -37,5 +37,8 @@ fn repaint_policy_keeps_focused_terminal_responsive() {
 
     policy.note_focused_runtime_event();
     assert!(!policy.should_repaint_now_at(now + Duration::from_millis(8)));
-    assert!(policy.should_repaint_now_at(now + Duration::from_millis(18)));
+    assert!(!policy.should_repaint_now_at(now + Duration::from_millis(18)));
+    assert!(!policy.should_repaint_now_at(now + Duration::from_millis(34)));
+    assert!(!policy.should_repaint_now_at(now + Duration::from_millis(55)));
+    assert!(policy.should_repaint_now_at(now + Duration::from_millis(85)));
 }

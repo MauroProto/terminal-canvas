@@ -11,6 +11,8 @@ use super::matching::{
     task_matches_query,
 };
 
+const GIT_INSPECT_INTERVAL_SECS: i64 = 8;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum AgentProvider {
     ClaudeCode,
@@ -413,6 +415,7 @@ pub struct PanelOverlay {
 #[derive(Debug, Default)]
 pub struct Orchestrator {
     state: OrchestrationState,
+    last_git_inspect_at: HashMap<Uuid, DateTime<Utc>>,
 }
 
 impl Orchestrator {
@@ -423,6 +426,7 @@ impl Orchestrator {
     pub fn from_saved(state: Option<OrchestrationState>) -> Self {
         Self {
             state: state.unwrap_or_default(),
+            last_git_inspect_at: HashMap::new(),
         }
     }
 
@@ -858,10 +862,15 @@ impl Orchestrator {
                 &observation.visible_text,
                 session.review_summary.last_error.as_deref(),
             );
-            let should_inspect_git = observation.attached
-                && !observation.minimized
-                && session.cwd.is_some()
-                && (session.provider != AgentProvider::Unknown || session.task_id.is_some());
+            let should_inspect_git = should_inspect_git_for_session(
+                session,
+                observation,
+                now,
+                self.last_git_inspect_at.get(&session.session_id).copied(),
+            );
+            if should_inspect_git {
+                self.last_git_inspect_at.insert(session.session_id, now);
+            }
             let git = should_inspect_git
                 .then(|| session.cwd.as_deref().and_then(inspect_git_state))
                 .flatten();
@@ -1442,6 +1451,28 @@ fn apply_output_summaries(session: &mut AgentSessionMeta, visible_text: &str) {
     }
 }
 
+fn should_inspect_git_for_session(
+    session: &AgentSessionMeta,
+    observation: &PanelRuntimeObservation,
+    now: DateTime<Utc>,
+    last_inspect_at: Option<DateTime<Utc>>,
+) -> bool {
+    if !observation.attached || observation.minimized || session.cwd.is_none() {
+        return false;
+    }
+
+    let explicitly_orchestrated = session.task_id.is_some()
+        || session.worktree_path.is_some()
+        || session.startup_command.is_some();
+    if !explicitly_orchestrated {
+        return false;
+    }
+
+    last_inspect_at
+        .map(|last| now.signed_duration_since(last).num_seconds() >= GIT_INSPECT_INTERVAL_SECS)
+        .unwrap_or(true)
+}
+
 fn preview_label(provider: AgentProvider, task_title: Option<&str>, status: AgentStatus) -> String {
     if let Some(task_title) = task_title.filter(|task_title| !task_title.trim().is_empty()) {
         format!("{} · {}", provider.label(), truncate_text(task_title, 18))
@@ -1603,13 +1634,16 @@ fn extract_prompt_command(visible_text: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use chrono::Utc;
 
     use super::super::git::parse_diff_stats;
     use super::{
-        derive_status, launch_presets, preview_label, provider_bootstrap, short_uuid, slugify,
-        AgentProvider, AgentStatus, DependencyKind, DiffStats, Orchestrator,
-        PanelRuntimeObservation, TaskState,
+        derive_status, launch_presets, preview_label, provider_bootstrap, short_uuid,
+        should_inspect_git_for_session, slugify, AgentLaunchRequest, AgentProvider, AgentStatus,
+        DependencyKind, DiffStats, Orchestrator, PanelRuntimeObservation, TaskState, WorktreeMode,
+        GIT_INSPECT_INTERVAL_SECS,
     };
 
     #[test]
@@ -1751,6 +1785,104 @@ mod tests {
             session.last_activity_at.date_naive(),
             Utc::now().date_naive()
         );
+    }
+
+    #[test]
+    fn git_inspection_skips_heuristic_generic_panel_sessions() {
+        let mut orchestrator = Orchestrator::new();
+        let workspace_id = uuid::Uuid::new_v4();
+        let panel_id = uuid::Uuid::new_v4();
+        let session_id = orchestrator.ensure_panel_session(
+            workspace_id,
+            Some(PathBuf::from("/tmp")),
+            panel_id,
+            Some(uuid::Uuid::new_v4()),
+            "claude",
+        );
+        let session = orchestrator
+            .state
+            .sessions
+            .iter()
+            .find(|session| session.session_id == session_id)
+            .unwrap();
+        let observation = PanelRuntimeObservation {
+            panel_id,
+            runtime_session_id: Some(uuid::Uuid::new_v4()),
+            workspace_id,
+            title: "claude".to_owned(),
+            visible_text: "mauro % claude".to_owned(),
+            alive: true,
+            recent_output: true,
+            attached: true,
+            minimized: false,
+        };
+
+        assert!(!should_inspect_git_for_session(
+            session,
+            &observation,
+            Utc::now(),
+            None,
+        ));
+    }
+
+    #[test]
+    fn git_inspection_requires_explicit_agent_and_throttle_window() {
+        let mut orchestrator = Orchestrator::new();
+        let workspace_id = uuid::Uuid::new_v4();
+        let task_id = orchestrator.create_task(
+            workspace_id,
+            "Build feature",
+            "",
+            Some(AgentProvider::ClaudeCode),
+        );
+        let plan = orchestrator
+            .prepare_launch(AgentLaunchRequest {
+                workspace_id,
+                task_id: Some(task_id),
+                base_cwd: Some(PathBuf::from("/tmp")),
+                provider: AgentProvider::ClaudeCode,
+                task_title: "Build feature".to_owned(),
+                brief: String::new(),
+                worktree_mode: WorktreeMode::SharedRepo,
+            })
+            .unwrap();
+        let session = orchestrator
+            .state
+            .sessions
+            .iter()
+            .find(|session| session.session_id == plan.session_id)
+            .unwrap();
+        let observation = PanelRuntimeObservation {
+            panel_id: uuid::Uuid::new_v4(),
+            runtime_session_id: Some(uuid::Uuid::new_v4()),
+            workspace_id,
+            title: "Claude Code".to_owned(),
+            visible_text: "Running".to_owned(),
+            alive: true,
+            recent_output: true,
+            attached: true,
+            minimized: false,
+        };
+        let now = Utc::now();
+
+        assert!(should_inspect_git_for_session(
+            session,
+            &observation,
+            now,
+            None,
+        ));
+        assert!(!should_inspect_git_for_session(
+            session,
+            &observation,
+            now,
+            Some(now),
+        ));
+        assert!(should_inspect_git_for_session(
+            session,
+            &observation,
+            now,
+            Some(now - chrono::Duration::seconds(GIT_INSPECT_INTERVAL_SECS + 1)),
+        ));
     }
 
     #[test]

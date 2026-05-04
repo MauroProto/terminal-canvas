@@ -4,7 +4,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, Query, State};
+use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
@@ -124,7 +124,7 @@ impl EmbeddedCollabServer {
                         .expect("build rustls config for embedded collab server");
                 if let Err(err) = from_tcp_rustls(listener, tls_config)
                     .handle(handle_for_thread)
-                    .serve(router.into_make_service())
+                    .serve(router.into_make_service_with_connect_info::<SocketAddr>())
                     .await
                 {
                     log::error!("embedded collab server stopped with error: {err}");
@@ -171,9 +171,16 @@ fn build_router(state: AppState) -> Router {
 }
 
 async fn create_share_session(
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
     Json(body): Json<CreateShareSessionRequest>,
 ) -> Result<Json<CreateShareSessionResponse>, (StatusCode, String)> {
+    if !peer_addr.ip().is_loopback() {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Session creation is restricted to the local host".to_owned(),
+        ));
+    }
     let session_id = ShareSessionId(Uuid::new_v4());
     let host_token = random_token();
     let session = SessionRecord {
