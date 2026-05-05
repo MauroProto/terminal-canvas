@@ -2183,7 +2183,10 @@ mod tests {
         panel.shell_label = shell_label();
         panel.session.set_last_grid_size_for_tests(80, 24);
 
-        assert_eq!(panel.window_title(720.0), "mauro — -zsh — 80×24");
+        assert_eq!(
+            panel.window_title(720.0),
+            format!("mauro — {} — 80×24", shell_label())
+        );
     }
 
     #[test]
