@@ -187,6 +187,7 @@ impl SessionController {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     pub fn set_last_grid_size_for_tests(&mut self, cols: u16, rows: u16) {
         self.last_cols = cols.max(1);
         self.last_rows = rows.max(1);
@@ -234,6 +235,20 @@ fn attached_grid_resize_needed(last_cols: u16, last_rows: u16, cols: u16, rows: 
     last_cols.max(1) != cols.max(1) || last_rows.max(1) != rows.max(1)
 }
 
+pub fn session_spec(
+    title: String,
+    cwd: Option<PathBuf>,
+    startup_command: Option<String>,
+    startup_input: Option<String>,
+) -> SessionSpec {
+    SessionSpec {
+        title,
+        cwd,
+        startup_command,
+        startup_input,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::attached_grid_resize_needed;
@@ -247,19 +262,5 @@ mod tests {
     fn changed_attached_grid_needs_resize() {
         assert!(attached_grid_resize_needed(120, 32, 121, 32));
         assert!(attached_grid_resize_needed(120, 32, 120, 33));
-    }
-}
-
-pub fn session_spec(
-    title: String,
-    cwd: Option<PathBuf>,
-    startup_command: Option<String>,
-    startup_input: Option<String>,
-) -> SessionSpec {
-    SessionSpec {
-        title,
-        cwd,
-        startup_command,
-        startup_input,
     }
 }

@@ -2,6 +2,7 @@ use egui::{pos2, vec2, Align2, Area, Color32, FontId, Frame, Id, Key, Order, Ric
 
 use crate::command_palette::commands::{Command, CommandEntry, COMMANDS};
 use crate::command_palette::fuzzy::fuzzy_score;
+use crate::theme::colors as palette;
 
 pub mod commands;
 pub mod fuzzy;
@@ -48,8 +49,8 @@ impl CommandPalette {
         let mut command = None;
         area.show(ctx, |ui| {
             Frame::default()
-                .fill(Color32::from_rgb(24, 24, 28))
-                .stroke(egui::Stroke::new(1.0, Color32::from_rgb(55, 55, 65)))
+                .fill(palette::SURFACE)
+                .stroke(egui::Stroke::new(1.0, palette::LINE))
                 .rounding(10.0)
                 .inner_margin(egui::Margin::same(10.0))
                 .show(ui, |ui: &mut egui::Ui| {
@@ -94,11 +95,8 @@ impl CommandPalette {
                         let (rect, response) =
                             ui.allocate_exact_size(vec2(width - 20.0, 32.0), egui::Sense::click());
                         if selected {
-                            ui.painter().rect_filled(
-                                rect.shrink(2.0),
-                                6.0,
-                                Color32::from_rgb(45, 45, 62),
-                            );
+                            ui.painter()
+                                .rect_filled(rect.shrink(2.0), 6.0, palette::HOVER);
                         }
                         ui.painter().text(
                             rect.left_center() + vec2(12.0, 0.0),
@@ -112,17 +110,14 @@ impl CommandPalette {
                             Align2::RIGHT_CENTER,
                             entry.shortcut,
                             FontId::monospace(10.5),
-                            Color32::from_rgb(163, 163, 163),
+                            palette::TEXT,
                         );
                         if response.clicked() {
                             command = Some(entry.command);
                         }
                     }
                     if entries.is_empty() {
-                        ui.label(
-                            RichText::new("No commands match")
-                                .color(Color32::from_rgb(163, 163, 163)),
-                        );
+                        ui.label(RichText::new("No commands match").color(palette::TEXT));
                     }
                 });
         });

@@ -1,28 +1,127 @@
 use super::*;
-use crate::state::SnapSlot;
-use crate::terminal::panel::{normalize_snapped_rect, snap_slot_rect};
+use crate::state::{PanelPlacement, SnapSlot};
+use crate::terminal::panel::snap_slot_rect;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum TaskbarLayoutPreset {
-    SideBySide,
-    Stacked,
-    Grid,
-    Cascade,
-}
+const MAX_VISIBLE_PANELS: usize = 4;
+pub(super) const SPLIT_MIN: f32 = 0.18;
+pub(super) const SPLIT_MAX: f32 = 0.82;
 
-impl TaskbarLayoutPreset {
-    pub(super) fn label(self) -> &'static str {
-        match self {
-            Self::SideBySide => "Lado a lado",
-            Self::Stacked => "Arriba y abajo",
-            Self::Grid => "Grilla",
-            Self::Cascade => "Cascada",
-        }
+pub(super) fn auto_layout_slots(visible_count: usize) -> Vec<SnapSlot> {
+    match visible_count {
+        0 => Vec::new(),
+        1 => vec![SnapSlot::Maximized],
+        2 => vec![SnapSlot::LeftHalf, SnapSlot::RightHalf],
+        3 => vec![
+            SnapSlot::LeftHalf,
+            SnapSlot::TopRight,
+            SnapSlot::BottomRight,
+        ],
+        _ => vec![
+            SnapSlot::TopLeft,
+            SnapSlot::TopRight,
+            SnapSlot::BottomLeft,
+            SnapSlot::BottomRight,
+        ],
     }
 }
 
-pub(super) fn taskbar_summary_label(total: usize, minimized: usize) -> String {
-    format!("{total} abiertas · {minimized} minimizadas")
+pub(super) fn slot_rect_with_splits(
+    slot: SnapSlot,
+    desktop_rect: Rect,
+    split_x: f32,
+    split_y: f32,
+) -> Rect {
+    let split_x = split_x.clamp(SPLIT_MIN, SPLIT_MAX);
+    let split_y = split_y.clamp(SPLIT_MIN, SPLIT_MAX);
+    let mid_x = desktop_rect.left() + desktop_rect.width() * split_x;
+    let mid_y = desktop_rect.top() + desktop_rect.height() * split_y;
+    match slot {
+        SnapSlot::Maximized => desktop_rect,
+        SnapSlot::LeftHalf => {
+            Rect::from_min_max(desktop_rect.min, egui::pos2(mid_x, desktop_rect.bottom()))
+        }
+        SnapSlot::RightHalf => {
+            Rect::from_min_max(egui::pos2(mid_x, desktop_rect.top()), desktop_rect.max)
+        }
+        SnapSlot::TopHalf => {
+            Rect::from_min_max(desktop_rect.min, egui::pos2(desktop_rect.right(), mid_y))
+        }
+        SnapSlot::BottomHalf => {
+            Rect::from_min_max(egui::pos2(desktop_rect.left(), mid_y), desktop_rect.max)
+        }
+        SnapSlot::TopLeft => Rect::from_min_max(desktop_rect.min, egui::pos2(mid_x, mid_y)),
+        SnapSlot::TopRight => Rect::from_min_max(
+            egui::pos2(mid_x, desktop_rect.top()),
+            egui::pos2(desktop_rect.right(), mid_y),
+        ),
+        SnapSlot::BottomLeft => Rect::from_min_max(
+            egui::pos2(desktop_rect.left(), mid_y),
+            egui::pos2(mid_x, desktop_rect.bottom()),
+        ),
+        SnapSlot::BottomRight => Rect::from_min_max(egui::pos2(mid_x, mid_y), desktop_rect.max),
+    }
+}
+
+pub(super) fn auto_tile_workspace(workspace: &mut Workspace, desktop_rect: Rect) {
+    let visible_count = workspace
+        .panels
+        .iter()
+        .filter(|panel| !panel.minimized())
+        .count();
+
+    let signature = (
+        visible_count,
+        [
+            desktop_rect.min.x.round() as i32,
+            desktop_rect.min.y.round() as i32,
+            desktop_rect.max.x.round() as i32,
+            desktop_rect.max.y.round() as i32,
+        ],
+        (workspace.split_x * 1000.0).round() as i32,
+        (workspace.split_y * 1000.0).round() as i32,
+    );
+    if workspace.last_auto_tile_signature == Some(signature) {
+        return;
+    }
+
+    if visible_count > MAX_VISIBLE_PANELS {
+        let mut by_z: Vec<(usize, u32)> = workspace
+            .panels
+            .iter()
+            .enumerate()
+            .filter(|(_, panel)| !panel.minimized())
+            .map(|(idx, panel)| (idx, panel.z_index()))
+            .collect();
+        by_z.sort_by_key(|(_, z)| *z);
+        for (idx, _) in by_z.iter().take(visible_count - MAX_VISIBLE_PANELS) {
+            workspace.panels[*idx].set_minimized(true);
+        }
+    }
+
+    let mut visible: Vec<(u32, usize)> = workspace
+        .panels
+        .iter()
+        .enumerate()
+        .filter(|(_, panel)| !panel.minimized())
+        .map(|(idx, panel)| (panel.z_index(), idx))
+        .collect();
+    visible.sort_by_key(|(z, _)| *z);
+
+    let slots = auto_layout_slots(visible.len());
+    let split_x = workspace.split_x;
+    let split_y = workspace.split_y;
+    for ((_, idx), slot) in visible.iter().zip(slots.iter()) {
+        let panel = &mut workspace.panels[*idx];
+        let rect = slot_rect_with_splits(*slot, desktop_rect, split_x, split_y);
+        panel.set_placement(PanelPlacement::Snapped(*slot));
+        panel.set_restore_placement(None);
+        panel.set_restore_bounds(Some(rect));
+        panel.apply_resize(rect);
+        panel.set_drag_virtual_pos(None);
+        panel.set_resize_virtual_rect(None);
+    }
+
+    workspace.last_auto_tile_signature = Some(signature);
 }
 
 pub(super) fn taskbar_provider_label(
@@ -36,81 +135,6 @@ pub(super) fn taskbar_provider_label(
         .unwrap_or(AgentProvider::Unknown)
 }
 
-pub(super) fn taskbar_button_colors(
-    provider: AgentProvider,
-    focused: bool,
-    minimized: bool,
-) -> (Color32, Color32, Color32) {
-    let (focused_fill, idle_fill, minimized_fill, focused_stroke, idle_stroke, text, dim_text) =
-        match provider {
-            AgentProvider::CodexCli => (
-                Color32::from_rgb(38, 82, 156),
-                Color32::from_rgb(24, 56, 108),
-                Color32::from_rgb(18, 38, 74),
-                Color32::from_rgb(126, 184, 255),
-                Color32::from_rgb(90, 142, 220),
-                Color32::from_rgb(232, 242, 255),
-                Color32::from_rgb(174, 198, 230),
-            ),
-            AgentProvider::ClaudeCode => (
-                Color32::from_rgb(136, 82, 28),
-                Color32::from_rgb(94, 54, 18),
-                Color32::from_rgb(66, 38, 14),
-                Color32::from_rgb(255, 182, 92),
-                Color32::from_rgb(222, 142, 62),
-                Color32::from_rgb(255, 238, 216),
-                Color32::from_rgb(226, 196, 160),
-            ),
-            AgentProvider::OpenCode => (
-                Color32::from_rgb(78, 78, 84),
-                Color32::from_rgb(52, 52, 58),
-                Color32::from_rgb(36, 36, 42),
-                Color32::from_rgb(164, 164, 172),
-                Color32::from_rgb(124, 124, 132),
-                Color32::from_rgb(236, 236, 240),
-                Color32::from_rgb(182, 182, 188),
-            ),
-            AgentProvider::GeminiCli => (
-                Color32::from_rgb(24, 108, 96),
-                Color32::from_rgb(18, 76, 68),
-                Color32::from_rgb(14, 56, 50),
-                Color32::from_rgb(108, 224, 198),
-                Color32::from_rgb(78, 182, 160),
-                Color32::from_rgb(224, 248, 242),
-                Color32::from_rgb(170, 210, 202),
-            ),
-            AgentProvider::Aider => (
-                Color32::from_rgb(106, 56, 136),
-                Color32::from_rgb(74, 38, 98),
-                Color32::from_rgb(52, 30, 70),
-                Color32::from_rgb(214, 152, 255),
-                Color32::from_rgb(174, 118, 220),
-                Color32::from_rgb(246, 232, 255),
-                Color32::from_rgb(208, 186, 228),
-            ),
-            AgentProvider::Unknown => (
-                Color32::from_rgb(52, 52, 62),
-                Color32::from_rgb(34, 34, 40),
-                Color32::from_rgb(28, 28, 34),
-                Color32::from_rgb(98, 98, 112),
-                Color32::from_rgb(56, 56, 66),
-                Color32::from_rgb(214, 214, 220),
-                Color32::from_rgb(164, 164, 172),
-            ),
-        };
-
-    let fill = if focused {
-        focused_fill
-    } else if minimized {
-        minimized_fill
-    } else {
-        idle_fill
-    };
-    let stroke = if focused { focused_stroke } else { idle_stroke };
-    let text_color = if minimized { dim_text } else { text };
-    (fill, stroke, text_color)
-}
-
 pub(super) fn taskbar_provider_accent(provider: AgentProvider) -> Color32 {
     match provider {
         AgentProvider::CodexCli => Color32::from_rgb(120, 190, 255),
@@ -119,105 +143,6 @@ pub(super) fn taskbar_provider_accent(provider: AgentProvider) -> Color32 {
         AgentProvider::GeminiCli => Color32::from_rgb(96, 230, 196),
         AgentProvider::Aider => Color32::from_rgb(214, 152, 255),
         AgentProvider::Unknown => Color32::from_rgb(108, 108, 116),
-    }
-}
-
-pub(super) fn desktop_taskbar_layout_rects(
-    preset: TaskbarLayoutPreset,
-    count: usize,
-    desktop_rect: Rect,
-) -> Vec<Rect> {
-    match preset {
-        TaskbarLayoutPreset::SideBySide => tiled_layout_rects(count, desktop_rect, count.max(1), 1),
-        TaskbarLayoutPreset::Stacked => tiled_layout_rects(count, desktop_rect, 1, count.max(1)),
-        TaskbarLayoutPreset::Grid => {
-            let cols = ((count as f32).sqrt().ceil() as usize).max(1);
-            let rows = count.div_ceil(cols).max(1);
-            tiled_layout_rects(count, desktop_rect, cols, rows)
-        }
-        TaskbarLayoutPreset::Cascade => cascaded_layout_rects(count, desktop_rect),
-    }
-}
-
-fn tiled_layout_rects(count: usize, desktop_rect: Rect, cols: usize, rows: usize) -> Vec<Rect> {
-    if count == 0 {
-        return Vec::new();
-    }
-
-    let mut rects = Vec::with_capacity(count);
-    for index in 0..count {
-        let col = index % cols;
-        let row = index / cols;
-        let left = desktop_rect.left() + desktop_rect.width() * (col as f32 / cols as f32);
-        let right = if col + 1 == cols {
-            desktop_rect.right()
-        } else {
-            desktop_rect.left() + desktop_rect.width() * ((col + 1) as f32 / cols as f32)
-        };
-        let top = desktop_rect.top() + desktop_rect.height() * (row as f32 / rows as f32);
-        let bottom = if row + 1 == rows {
-            desktop_rect.bottom()
-        } else {
-            desktop_rect.top() + desktop_rect.height() * ((row + 1) as f32 / rows as f32)
-        };
-        rects.push(Rect::from_min_max(pos2(left, top), pos2(right, bottom)));
-    }
-    rects
-}
-
-fn cascaded_layout_rects(count: usize, desktop_rect: Rect) -> Vec<Rect> {
-    if count == 0 {
-        return Vec::new();
-    }
-
-    let width = (desktop_rect.width() * 0.82).clamp(
-        crate::terminal::panel::MIN_WIDTH.min(desktop_rect.width()),
-        desktop_rect.width(),
-    );
-    let height = (desktop_rect.height() * 0.82).clamp(
-        crate::terminal::panel::MIN_HEIGHT.min(desktop_rect.height()),
-        desktop_rect.height(),
-    );
-    let max_offset_x = (desktop_rect.width() - width).max(0.0);
-    let max_offset_y = (desktop_rect.height() - height).max(0.0);
-    let divisor = count.saturating_sub(1).max(1) as f32;
-    let step_x = (max_offset_x / divisor).min(36.0);
-    let step_y = (max_offset_y / divisor).min(30.0);
-
-    (0..count)
-        .map(|index| {
-            let min = pos2(
-                (desktop_rect.left() + step_x * index as f32).min(desktop_rect.right() - width),
-                (desktop_rect.top() + step_y * index as f32).min(desktop_rect.bottom() - height),
-            );
-            Rect::from_min_size(min, vec2(width, height))
-        })
-        .collect()
-}
-
-pub(super) fn apply_taskbar_layout_to_workspace(
-    workspace: &mut Workspace,
-    preset: TaskbarLayoutPreset,
-    desktop_rect: Rect,
-) {
-    let mut visible_indices: Vec<_> = workspace
-        .panels
-        .iter()
-        .enumerate()
-        .filter(|(_, panel)| !panel.minimized())
-        .map(|(index, panel)| (panel.z_index(), index))
-        .collect();
-    visible_indices.sort_by_key(|(z, _)| *z);
-
-    let target_rects = desktop_taskbar_layout_rects(preset, visible_indices.len(), desktop_rect);
-    for ((_, index), rect) in visible_indices.into_iter().zip(target_rects) {
-        let panel = &mut workspace.panels[index];
-        panel.set_placement(crate::state::PanelPlacement::Floating);
-        panel.set_restore_placement(None);
-        panel.set_restore_bounds(Some(rect));
-        panel.apply_resize(rect);
-        panel.set_drag_virtual_pos(None);
-        panel.set_resize_virtual_rect(None);
     }
 }
 
@@ -306,31 +231,45 @@ pub(super) fn desktop_snap_slot_for_pointer(pointer: Pos2, desktop_rect: Rect) -
     }
 }
 
+pub(super) fn desktop_required_snap_slot_for_pointer(
+    pointer: Pos2,
+    desktop_rect: Rect,
+    fallback: SnapSlot,
+) -> SnapSlot {
+    if let Some(slot) = desktop_snap_slot_for_pointer(pointer, desktop_rect) {
+        return slot;
+    }
+
+    let width = desktop_rect.width().max(1.0);
+    let height = desktop_rect.height().max(1.0);
+    let x = ((pointer.x - desktop_rect.left()) / width).clamp(0.0, 1.0);
+    let y = ((pointer.y - desktop_rect.top()) / height).clamp(0.0, 1.0);
+    let left = x < 0.33;
+    let right = x > 0.67;
+    let top = y < 0.33;
+    let bottom = y > 0.67;
+
+    match (left, right, top, bottom) {
+        (true, _, true, _) => SnapSlot::TopLeft,
+        (true, _, _, true) => SnapSlot::BottomLeft,
+        (true, _, _, _) => SnapSlot::LeftHalf,
+        (_, true, true, _) => SnapSlot::TopRight,
+        (_, true, _, true) => SnapSlot::BottomRight,
+        (_, true, _, _) => SnapSlot::RightHalf,
+        (_, _, true, _) => SnapSlot::TopHalf,
+        (_, _, _, true) => SnapSlot::BottomHalf,
+        _ => fallback,
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn desktop_snap_rect_for_pointer(pointer: Pos2, desktop_rect: Rect) -> Option<Rect> {
     desktop_snap_slot_for_pointer(pointer, desktop_rect)
         .map(|slot| snap_slot_rect(slot, desktop_rect))
 }
 
 pub(super) fn clamp_workspace_panels_to_desktop(workspace: &mut Workspace, desktop_rect: Rect) {
-    for panel in &mut workspace.panels {
-        if panel.minimized() {
-            continue;
-        }
-        match panel.placement() {
-            crate::state::PanelPlacement::Floating => {
-                let clamped = clamp_rect_to_desktop(panel.rect(), desktop_rect);
-                panel.apply_resize(clamped);
-                panel.set_restore_bounds(Some(clamped));
-            }
-            crate::state::PanelPlacement::Snapped(slot) => {
-                let normalized = normalize_snapped_rect(*slot, panel.rect(), desktop_rect);
-                panel.apply_resize(normalized);
-            }
-            crate::state::PanelPlacement::Maximized => {
-                panel.apply_resize(desktop_rect);
-            }
-        }
-    }
+    auto_tile_workspace(workspace, desktop_rect);
 }
 
 pub(super) fn truncate_taskbar_title(title: &str) -> String {
@@ -346,5 +285,181 @@ pub(super) fn truncate_taskbar_title(title: &str) -> String {
                 .take(MAX_CHARS.saturating_sub(1))
                 .collect::<String>()
         )
+    }
+}
+
+impl TerminalApp {
+    /// Barra inferior de ventanas: un botón por panel (con títulos
+    /// desambiguados) y restauración animada desde el botón.
+    pub(super) fn show_taskbar(&mut self, ctx: &egui::Context) {
+        if !matches!(self.collab.mode(), CollabMode::Guest) {
+            let mut requested_panel = None;
+            let panel_count = self.ws().panels.len();
+            let mut taskbar_button_rects = HashMap::with_capacity(panel_count);
+            // Stable creation order so clicks don't reshuffle items by z-index.
+            let taskbar_panels: Vec<_> = self
+                .ws()
+                .panels
+                .iter()
+                .map(|panel| {
+                    let provider = taskbar_provider_label(
+                        self.orchestrator
+                            .panel_overlay(panel.id())
+                            .map(|overlay| overlay.provider),
+                        panel.provider_hint(),
+                        panel.title(),
+                    );
+                    (
+                        panel.id(),
+                        panel.title().to_owned(),
+                        panel.minimized(),
+                        panel.focused(),
+                        provider,
+                    )
+                })
+                .collect();
+
+            // Disambiguate duplicate titles: append " N" to repeated entries so
+            // the user can tell them apart in the bottom selector.
+            let mut title_counts: HashMap<String, usize> = HashMap::with_capacity(panel_count);
+            for (_, title, ..) in &taskbar_panels {
+                if let Some(c) = title_counts.get_mut(title.as_str()) {
+                    *c += 1;
+                } else {
+                    title_counts.insert(title.clone(), 1);
+                }
+            }
+            let mut title_seen: HashMap<String, usize> = HashMap::with_capacity(panel_count);
+            let taskbar_panels: Vec<_> = taskbar_panels
+                .into_iter()
+                .map(|(id, title, minimized, focused, provider)| {
+                    let total = title_counts.get(&title).copied().unwrap_or(1);
+                    let display = if total > 1 {
+                        let n = if let Some(n) = title_seen.get_mut(title.as_str()) {
+                            *n += 1;
+                            *n
+                        } else {
+                            title_seen.insert(title.clone(), 1);
+                            1
+                        };
+                        format!("{title} {n}")
+                    } else {
+                        title
+                    };
+                    (id, display, minimized, focused, provider)
+                })
+                .collect();
+            TopBottomPanel::bottom("window-taskbar")
+                .resizable(false)
+                .exact_height(34.0)
+                .frame(
+                    egui::Frame::none()
+                        .fill(palette::INK)
+                        .inner_margin(egui::Margin::symmetric(14.0, 6.0)),
+                )
+                .show_separator_line(false)
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.style_mut().spacing.item_spacing.x = 6.0;
+                        for (panel_id, title, minimized, focused, provider) in &taskbar_panels {
+                            let truncated = truncate_taskbar_title(title);
+                            let font = egui::FontId::proportional(11.5);
+                            let text_w = ui.fonts(|f| {
+                                f.layout_no_wrap(truncated.clone(), font.clone(), palette::TEXT)
+                                    .size()
+                                    .x
+                            });
+                            let dot_size = 7.0;
+                            let dot_pad = 8.0;
+                            let pad_x = 10.0;
+                            let item_w = text_w + dot_size + dot_pad + pad_x * 2.0;
+                            let (rect, response) = ui.allocate_exact_size(
+                                egui::vec2(item_w, 26.0),
+                                egui::Sense::click(),
+                            );
+                            let dot_x = rect.left() + pad_x + dot_size * 0.5;
+                            let text_x = rect.left() + pad_x + dot_size + dot_pad;
+                            if response.hovered() && !*focused {
+                                ui.painter().rect_filled(rect, 4.0, palette::RAISED);
+                            }
+                            let accent = taskbar_provider_accent(*provider);
+                            let dot_color = if *minimized {
+                                accent.linear_multiply(0.55)
+                            } else {
+                                accent
+                            };
+                            ui.painter().circle_filled(
+                                egui::pos2(dot_x, rect.center().y),
+                                dot_size * 0.5,
+                                dot_color,
+                            );
+                            let text_color = if *focused {
+                                palette::TEXT_STRONG
+                            } else if *minimized {
+                                palette::DIM
+                            } else if response.hovered() {
+                                palette::TEXT_STRONG
+                            } else {
+                                palette::TEXT
+                            };
+                            ui.painter().text(
+                                egui::pos2(text_x, rect.center().y),
+                                egui::Align2::LEFT_CENTER,
+                                &truncated,
+                                font,
+                                text_color,
+                            );
+                            if *focused {
+                                let underline_y = rect.bottom() - 3.0;
+                                ui.painter().line_segment(
+                                    [
+                                        egui::pos2(text_x, underline_y),
+                                        egui::pos2(text_x + text_w, underline_y),
+                                    ],
+                                    Stroke::new(1.0, palette::TEXT_STRONG),
+                                );
+                            }
+                            taskbar_button_rects.insert(*panel_id, rect);
+                            if response.clicked() {
+                                requested_panel = Some(*panel_id);
+                            }
+                        }
+                    });
+                });
+            self.taskbar_button_rects = taskbar_button_rects;
+            self.layout_menu_open = false;
+            if let Some(panel_id) = requested_panel {
+                if self
+                    .ws()
+                    .panel(panel_id)
+                    .map(|panel| panel.minimized())
+                    .unwrap_or(false)
+                {
+                    if let (Some(canvas_rect), Some(button_rect)) = (
+                        Some(ctx.available_rect()),
+                        self.taskbar_button_rects.get(&panel_id).copied(),
+                    ) {
+                        let desktop_rect = desktop_canvas_rect(canvas_rect);
+                        self.ws_mut()
+                            .restore_panel_with_desktop(panel_id, desktop_rect);
+                        if let Some(panel) = self.ws().panel(panel_id) {
+                            let target_rect = self.panel_screen_rect(panel.rect(), canvas_rect);
+                            let now = ctx.input(|i| i.time);
+                            self.start_window_transition(
+                                panel_id,
+                                WindowTransitionKind::Restoring,
+                                button_rect,
+                                target_rect,
+                                now,
+                            );
+                        }
+                    } else {
+                        self.focus_panel_across_workspaces(panel_id, Some(ctx.available_rect()));
+                    }
+                } else {
+                    self.focus_panel_across_workspaces(panel_id, Some(ctx.available_rect()));
+                }
+            }
+        }
     }
 }

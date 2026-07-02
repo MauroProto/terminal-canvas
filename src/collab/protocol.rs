@@ -225,7 +225,7 @@ pub fn encode_envelope(
     let cipher = XChaCha20Poly1305::new_from_slice(&key_bytes)
         .map_err(|_| ProtocolError::InvalidKeyLength)?;
     let mut nonce_bytes = [0u8; 24];
-    rand::thread_rng().fill_bytes(&mut nonce_bytes);
+    rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
     let nonce = XNonce::from_slice(&nonce_bytes);
     let encoded_payload =
         rmp_serde::to_vec_named(payload).map_err(|_| ProtocolError::EncodeFailed)?;
@@ -279,7 +279,7 @@ mod tests {
 
     fn session_secret() -> String {
         let mut key = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut key);
+        rand::rngs::OsRng.fill_bytes(&mut key);
         base64::engine::general_purpose::STANDARD_NO_PAD.encode(key)
     }
 

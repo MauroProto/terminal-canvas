@@ -5,7 +5,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::git::{create_git_worktree, git_repo_root, inspect_git_state};
+use super::git::{
+    create_git_worktree, git_repo_root, GitInspector, WorktreeCreateJob, WorktreeCreator,
+};
 use super::matching::{
     event_matches_filters, inbox_matches_query, session_matches_query, task_matches_filters,
     task_matches_query,
@@ -59,7 +61,8 @@ impl AgentProvider {
     }
 
     pub fn detect(text: &str) -> Option<Self> {
-        let normalized = text.trim().to_ascii_lowercase();
+        use crate::utils::ascii_icontains;
+        let normalized = text.trim();
         [
             ("openclaude", Self::OpenCode),
             ("opencode", Self::OpenCode),
@@ -71,7 +74,7 @@ impl AgentProvider {
             ("aider", Self::Aider),
         ]
         .into_iter()
-        .find_map(|(needle, provider)| normalized.contains(needle).then_some(provider))
+        .find_map(|(needle, provider)| ascii_icontains(normalized, needle).then_some(provider))
     }
 }
 
@@ -348,6 +351,7 @@ pub struct AgentLaunchRequest {
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct AgentLaunchPlan {
+    pub workspace_id: Uuid,
     pub task_id: Option<Uuid>,
     pub session_id: Uuid,
     pub panel_title: String,
@@ -357,6 +361,21 @@ pub struct AgentLaunchPlan {
     pub branch: Option<String>,
     pub worktree_path: Option<PathBuf>,
     pub shared_repo_mode: bool,
+}
+
+/// Resultado inmediato de `prepare_launch`: el panel puede crearse ya, o hay
+/// que esperar a que el worker termine el worktree.
+#[derive(Debug)]
+pub enum LaunchPreparation {
+    Ready(Box<AgentLaunchPlan>),
+    PendingWorktree { session_id: Uuid },
+}
+
+/// Desenlace de un lanzamiento que quedó esperando su worktree.
+#[derive(Debug)]
+pub enum LaunchOutcome {
+    Ready(Box<AgentLaunchPlan>),
+    Failed { session_id: Uuid, error: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -416,6 +435,11 @@ pub struct PanelOverlay {
 pub struct Orchestrator {
     state: OrchestrationState,
     last_git_inspect_at: HashMap<Uuid, DateTime<Utc>>,
+    git_inspector: GitInspector,
+    worktree_creator: WorktreeCreator,
+    // Planes cuyo worktree se está creando en el worker; el panel se spawnea
+    // cuando poll_ready_launches entrega el plan.
+    pending_launches: HashMap<Uuid, AgentLaunchPlan>,
 }
 
 impl Orchestrator {
@@ -427,6 +451,9 @@ impl Orchestrator {
         Self {
             state: state.unwrap_or_default(),
             last_git_inspect_at: HashMap::new(),
+            git_inspector: GitInspector::default(),
+            worktree_creator: WorktreeCreator::default(),
+            pending_launches: HashMap::new(),
         }
     }
 
@@ -585,12 +612,14 @@ impl Orchestrator {
                 .map(|id| !removed_sessions.contains(&id))
                 .unwrap_or(true)
         });
+        self.last_git_inspect_at
+            .retain(|session_id, _| !removed_sessions.contains(session_id));
     }
 
     pub fn prepare_launch(
         &mut self,
         request: AgentLaunchRequest,
-    ) -> anyhow::Result<AgentLaunchPlan> {
+    ) -> anyhow::Result<LaunchPreparation> {
         let task_title = if request.task_title.trim().is_empty() {
             request.provider.label().to_owned()
         } else {
@@ -615,6 +644,7 @@ impl Orchestrator {
             .or_else(|| base_cwd.clone());
         let worktree_requested = matches!(request.worktree_mode, WorktreeMode::Auto);
 
+        let mut pending_worktree = None;
         let (cwd, worktree_path, branch, shared_repo_mode) = if worktree_requested {
             if let Some(root) = repo_root.as_deref().and_then(git_repo_root) {
                 let branch = format!(
@@ -627,7 +657,21 @@ impl Orchestrator {
                     .join(".terminalcanvas")
                     .join("worktrees")
                     .join(format!("{slug}-{short_id}"));
-                create_git_worktree(&root, &worktree_path, &branch)?;
+                // `git worktree add` puede tardar segundos en repos grandes:
+                // va al worker y el panel se crea cuando el worktree existe.
+                match self.worktree_creator.request(WorktreeCreateJob {
+                    session_id,
+                    repo_root: root,
+                    worktree_path: worktree_path.clone(),
+                    branch: branch.clone(),
+                }) {
+                    Ok(()) => pending_worktree = Some(session_id),
+                    Err(job) => {
+                        // Sin worker (fallo patológico de spawn): creación
+                        // síncrona antes que dejar el lanzamiento colgado.
+                        create_git_worktree(&job.repo_root, &job.worktree_path, &job.branch)?;
+                    }
+                }
                 (
                     Some(worktree_path.clone()),
                     Some(worktree_path),
@@ -689,7 +733,8 @@ impl Orchestrator {
             }
         }
 
-        Ok(AgentLaunchPlan {
+        let plan = AgentLaunchPlan {
+            workspace_id: request.workspace_id,
             task_id,
             session_id,
             panel_title: label,
@@ -699,7 +744,55 @@ impl Orchestrator {
             branch,
             worktree_path,
             shared_repo_mode,
-        })
+        };
+        if pending_worktree.is_some() {
+            self.pending_launches.insert(session_id, plan);
+            Ok(LaunchPreparation::PendingWorktree { session_id })
+        } else {
+            Ok(LaunchPreparation::Ready(Box::new(plan)))
+        }
+    }
+
+    /// Drena los worktrees terminados: entrega los planes listos para spawnear
+    /// y limpia sesión/tarea de los que fallaron.
+    pub fn poll_ready_launches(&mut self) -> Vec<LaunchOutcome> {
+        let mut outcomes = Vec::new();
+        for result in self.worktree_creator.poll() {
+            let Some(plan) = self.pending_launches.remove(&result.session_id) else {
+                continue;
+            };
+            match result.error {
+                None => outcomes.push(LaunchOutcome::Ready(Box::new(plan))),
+                Some(error) => {
+                    self.discard_failed_launch(&plan);
+                    outcomes.push(LaunchOutcome::Failed {
+                        session_id: result.session_id,
+                        error,
+                    });
+                }
+            }
+        }
+        outcomes
+    }
+
+    pub fn has_pending_launches(&self) -> bool {
+        !self.pending_launches.is_empty()
+    }
+
+    fn discard_failed_launch(&mut self, plan: &AgentLaunchPlan) {
+        self.state
+            .sessions
+            .retain(|session| session.session_id != plan.session_id);
+        if let Some(task_id) = plan.task_id {
+            if let Some(task) = self.state.tasks.iter_mut().find(|task| task.id == task_id) {
+                task.session_ids
+                    .retain(|session_id| *session_id != plan.session_id);
+                if task.session_ids.is_empty() {
+                    task.state = TaskState::Draft;
+                }
+                task.updated_at = Utc::now();
+            }
+        }
     }
 
     pub fn bind_launch_to_panel(
@@ -833,6 +926,7 @@ impl Orchestrator {
 
     pub fn apply_observations(&mut self, observations: Vec<PanelRuntimeObservation>) {
         let now = Utc::now();
+        self.merge_finished_git_inspections();
         let observations_by_panel = observations
             .into_iter()
             .map(|observation| (observation.panel_id, observation))
@@ -849,11 +943,9 @@ impl Orchestrator {
             session.runtime_session_id = observation.runtime_session_id;
             session.last_activity_at = now;
             if session.provider == AgentProvider::Unknown {
-                session.provider = AgentProvider::detect(&format!(
-                    "{}\n{}",
-                    observation.title, observation.visible_text
-                ))
-                .unwrap_or(AgentProvider::Unknown);
+                session.provider = AgentProvider::detect(&observation.title)
+                    .or_else(|| AgentProvider::detect(&observation.visible_text))
+                    .unwrap_or(AgentProvider::Unknown);
             }
             session.command_summary = summarize_command_output(&observation.visible_text);
             session.status = derive_status(
@@ -870,16 +962,9 @@ impl Orchestrator {
             );
             if should_inspect_git {
                 self.last_git_inspect_at.insert(session.session_id, now);
-            }
-            let git = should_inspect_git
-                .then(|| session.cwd.as_deref().and_then(inspect_git_state))
-                .flatten();
-            if let Some(git) = git {
-                session.repo_root = Some(git.repo_root.clone());
-                session.branch = Some(git.branch.clone());
-                session.dirty = git.dirty;
-                session.review_summary.changed_files = git.changed_files;
-                session.review_summary.diff_stats = git.diff_stats;
+                if let Some(cwd) = session.cwd.clone() {
+                    self.git_inspector.request(session.session_id, cwd);
+                }
             }
             apply_output_summaries(session, &observation.visible_text);
             if let Some(task_id) = session.task_id {
@@ -902,6 +987,27 @@ impl Orchestrator {
         self.refresh_inbox();
         self.refresh_conflict_risk();
         self.sync_task_states_from_dependencies();
+    }
+
+    fn merge_finished_git_inspections(&mut self) {
+        for result in self.git_inspector.poll() {
+            let Some(git) = result.observation else {
+                continue;
+            };
+            let Some(session) = self
+                .state
+                .sessions
+                .iter_mut()
+                .find(|session| session.session_id == result.session_id)
+            else {
+                continue;
+            };
+            session.repo_root = Some(git.repo_root);
+            session.branch = Some(git.branch);
+            session.dirty = git.dirty;
+            session.review_summary.changed_files = git.changed_files;
+            session.review_summary.diff_stats = git.diff_stats;
+        }
     }
 
     #[allow(dead_code)]
@@ -941,15 +1047,17 @@ impl Orchestrator {
                 .find(|task| task.id == task_id)
                 .map(|task| task.title.clone())
         });
+        let preview_label_value =
+            preview_label(session.provider, task_title.as_deref(), session.status);
         Some(PanelOverlay {
             provider: session.provider,
-            task_title: task_title.clone(),
+            task_title,
             status: session.status,
             branch: session.branch.clone(),
             dirty: session.dirty,
             shared_repo_mode: session.shared_repo_mode,
             conflict_risk: session.conflict_risk,
-            preview_label: preview_label(session.provider, task_title.as_deref(), session.status),
+            preview_label: preview_label_value,
         })
     }
 
@@ -1215,19 +1323,20 @@ impl Orchestrator {
             }
         }
 
-        let previous_resolution = self
+        let previous_state = self
             .state
             .inbox
             .iter()
-            .map(|event| (event.id, (event.resolved, event.archived)))
+            .map(|event| (event.id, (event.resolved, event.archived, event.created_at)))
             .collect::<HashMap<_, _>>();
 
         self.state.inbox = desired
             .into_values()
             .map(|mut event| {
-                if let Some((resolved, archived)) = previous_resolution.get(&event.id) {
+                if let Some((resolved, archived, created_at)) = previous_state.get(&event.id) {
                     event.resolved = *resolved;
                     event.archived = *archived;
+                    event.created_at = *created_at;
                 }
                 event
             })
@@ -1303,7 +1412,13 @@ impl Orchestrator {
             };
             by_id.insert(event_id, event);
         }
-        self.state.inbox = by_id.into_values().collect();
+        let mut inbox = by_id.into_values().collect::<Vec<_>>();
+        inbox.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        self.state.inbox = inbox;
     }
 
     fn sync_task_states_from_dependencies(&mut self) {
@@ -1356,7 +1471,7 @@ fn derive_status(
     visible_text: &str,
     last_error: Option<&str>,
 ) -> AgentStatus {
-    let text = visible_text.to_ascii_lowercase();
+    use crate::utils::ascii_icontains;
     let has_error = last_error.is_some()
         || [
             "error",
@@ -1367,7 +1482,7 @@ fn derive_status(
             "command failed",
         ]
         .into_iter()
-        .any(|needle| text.contains(needle));
+        .any(|needle| ascii_icontains(visible_text, needle));
     let waiting_approval = [
         "approve",
         "approval",
@@ -1375,7 +1490,7 @@ fn derive_status(
         "waiting for approval",
     ]
     .into_iter()
-    .any(|needle| text.contains(needle));
+    .any(|needle| ascii_icontains(visible_text, needle));
     let needs_input = [
         "press enter",
         "continue?",
@@ -1384,7 +1499,7 @@ fn derive_status(
         "[y/n]",
     ]
     .into_iter()
-    .any(|needle| text.contains(needle));
+    .any(|needle| ascii_icontains(visible_text, needle));
     let ready_for_review = [
         "ready for review",
         "review ready",
@@ -1392,7 +1507,7 @@ fn derive_status(
         "done. changed files",
     ]
     .into_iter()
-    .any(|needle| text.contains(needle));
+    .any(|needle| ascii_icontains(visible_text, needle));
 
     if waiting_approval {
         AgentStatus::WaitingApproval
@@ -1412,25 +1527,25 @@ fn derive_status(
 }
 
 fn summarize_command_output(visible_text: &str) -> Option<CommandSummary> {
-    let lines = visible_text
+    use crate::utils::ascii_icontains;
+    let last_line = visible_text
         .lines()
         .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>();
-    let excerpt = lines.last()?.to_owned();
-    let title = extract_prompt_command(visible_text).unwrap_or_else(|| excerpt.to_owned());
-    let failed = excerpt.to_ascii_lowercase().contains("error")
-        || excerpt.to_ascii_lowercase().contains("failed");
+        .rfind(|line| !line.is_empty())?;
+    let title = extract_prompt_command(visible_text).unwrap_or_else(|| last_line.to_owned());
+    let failed = ascii_icontains(last_line, "error") || ascii_icontains(last_line, "failed");
     Some(CommandSummary {
         title,
-        excerpt: excerpt.to_owned(),
+        excerpt: last_line.to_owned(),
         failed,
     })
 }
 
 fn apply_output_summaries(session: &mut AgentSessionMeta, visible_text: &str) {
-    let text = visible_text.to_ascii_lowercase();
-    if text.contains("tests passed") || text.contains("all checks passed") {
+    use crate::utils::ascii_icontains;
+    if ascii_icontains(visible_text, "tests passed")
+        || ascii_icontains(visible_text, "all checks passed")
+    {
         session.review_summary.last_success = Some("Tests passed".to_owned());
         session.review_summary.tests = vec![TestStatus {
             label: "Suite".to_owned(),
@@ -1440,10 +1555,7 @@ fn apply_output_summaries(session: &mut AgentSessionMeta, visible_text: &str) {
     if let Some(error_line) = visible_text
         .lines()
         .rev()
-        .find(|line| {
-            let line = line.to_ascii_lowercase();
-            line.contains("error") || line.contains("failed")
-        })
+        .find(|line| ascii_icontains(line, "error") || ascii_icontains(line, "failed"))
         .map(str::trim)
         .filter(|line| !line.is_empty())
     {
@@ -1642,8 +1754,8 @@ mod tests {
     use super::{
         derive_status, launch_presets, preview_label, provider_bootstrap, short_uuid,
         should_inspect_git_for_session, slugify, AgentLaunchRequest, AgentProvider, AgentStatus,
-        DependencyKind, DiffStats, Orchestrator, PanelRuntimeObservation, TaskState, WorktreeMode,
-        GIT_INSPECT_INTERVAL_SECS,
+        DependencyKind, DiffStats, LaunchPreparation, Orchestrator, PanelRuntimeObservation,
+        TaskState, WorktreeMode, GIT_INSPECT_INTERVAL_SECS,
     };
 
     #[test]
@@ -1835,7 +1947,7 @@ mod tests {
             "",
             Some(AgentProvider::ClaudeCode),
         );
-        let plan = orchestrator
+        let preparation = orchestrator
             .prepare_launch(AgentLaunchRequest {
                 workspace_id,
                 task_id: Some(task_id),
@@ -1846,6 +1958,9 @@ mod tests {
                 worktree_mode: WorktreeMode::SharedRepo,
             })
             .unwrap();
+        let LaunchPreparation::Ready(plan) = preparation else {
+            panic!("shared repo launches must be ready immediately");
+        };
         let session = orchestrator
             .state
             .sessions

@@ -4,13 +4,13 @@ pub const ZOOM_MIN: f32 = 0.125;
 pub const ZOOM_MAX: f32 = 4.0;
 pub const ZOOM_KEYBOARD_FACTOR: f32 = 1.15;
 pub const GRID_SPACING: f32 = 40.0;
-pub const GRID_COLOR: Color32 = Color32::from_rgb(30, 30, 30);
+pub const GRID_COLOR: Color32 = Color32::from_rgb(18, 18, 18);
 pub const SNAP_THRESHOLD: f32 = 8.0;
 pub const MINIMAP_WIDTH: f32 = 200.0;
 pub const MINIMAP_HEIGHT: f32 = 150.0;
 pub const MINIMAP_PADDING: f32 = 10.0;
-pub const MINIMAP_BG: Color32 = Color32::from_rgba_premultiplied(15, 15, 15, 200);
-pub const MINIMAP_VIEWPORT_BORDER: Color32 = Color32::from_rgb(100, 100, 100);
+pub const MINIMAP_BG: Color32 = Color32::from_rgba_premultiplied(10, 10, 10, 200);
+pub const MINIMAP_VIEWPORT_BORDER: Color32 = Color32::from_rgb(110, 110, 110);
 pub const DEFAULT_PANEL_WIDTH: f32 = 760.0;
 pub const DEFAULT_PANEL_HEIGHT: f32 = 460.0;
 pub const LEGACY_DEFAULT_PANEL_WIDTH: f32 = 1904.0;
@@ -20,8 +20,8 @@ pub const PREVIOUS_DEFAULT_PANEL_HEIGHT: f32 = 620.0;
 pub const CURRENT_OLD_PANEL_WIDTH: f32 = 900.0;
 pub const CURRENT_OLD_PANEL_HEIGHT: f32 = 520.0;
 pub const PANEL_GAP: f32 = 30.0;
-pub const CANVAS_BG: Color32 = Color32::from_rgb(10, 10, 10);
-pub const SNAP_GUIDE_COLOR: Color32 = Color32::from_rgba_premultiplied(100, 160, 255, 150);
+pub const CANVAS_BG: Color32 = Color32::from_rgb(0, 0, 0);
+pub const SNAP_GUIDE_COLOR: Color32 = Color32::from_rgba_premultiplied(244, 244, 244, 130);
 
 pub fn normalize_panel_size(size: Vec2) -> Vec2 {
     let is_legacy_default = (size.x - LEGACY_DEFAULT_PANEL_WIDTH).abs() < 0.1

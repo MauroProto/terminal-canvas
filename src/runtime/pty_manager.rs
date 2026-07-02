@@ -381,20 +381,18 @@ impl PtyManager {
             let Some(handle) = session.handle.as_ref() else {
                 continue;
             };
-            let ready = handle
-                .lock()
-                .ok()
-                .map(|handle| pending.is_ready(handle.render_revision()))
-                .unwrap_or(false);
-            if !ready {
+            // Hold a single lock across the readiness check and the write so
+            // the handle cannot change state between the two.
+            let Ok(handle) = handle.lock() else {
+                continue;
+            };
+            if !pending.is_ready(handle.render_revision()) {
                 continue;
             }
             let Some(pending) = session.pending_startup_input.take() else {
                 continue;
             };
-            if let Ok(handle) = handle.lock() {
-                handle.write_all(format!("{}\n", pending.input).as_bytes());
-            }
+            handle.write_all(format!("{}\n", pending.input).as_bytes());
         }
     }
 }

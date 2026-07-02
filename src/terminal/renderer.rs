@@ -19,7 +19,7 @@ pub const PAD_X: f32 = 10.0;
 pub const PAD_Y: f32 = 6.0;
 pub const CELL_WIDTH_FACTOR: f32 = 0.6;
 pub const CELL_HEIGHT_FACTOR: f32 = 1.25;
-pub const CURSOR_COLOR: Color32 = Color32::from_rgb(196, 223, 255);
+pub const CURSOR_COLOR: Color32 = Color32::from_rgb(244, 244, 244);
 pub const BLINK_ON_MS: f64 = 600.0;
 pub const BLINK_OFF_MS: f64 = 400.0;
 pub const BLINK_CYCLE: f64 = BLINK_ON_MS + BLINK_OFF_MS;
@@ -35,7 +35,7 @@ struct RenderMetrics {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct GridCacheKey {
+pub struct GridCacheKey {
     rect_min_x_bits: u32,
     rect_min_y_bits: u32,
     rect_width_bits: u32,
@@ -280,11 +280,12 @@ fn build_ghostty_shapes(
     default_foreground: Color32,
     default_background: Color32,
 ) -> Vec<Shape> {
-    let mut background_shapes = Vec::new();
-    let mut foreground_shapes = Vec::new();
     let max_rows = ((content_rect.height() - metrics.pad_y * 2.0) / metrics.cell_height)
         .ceil()
         .max(0.0) as usize;
+    let estimated_cells = max_rows * snapshot.styled_rows.first().map_or(0, |row| row.len());
+    let mut background_shapes = Vec::with_capacity(estimated_cells.max(64));
+    let mut foreground_shapes = Vec::with_capacity(estimated_cells.max(64));
 
     ctx.fonts(|fonts| {
         for (row_index, row) in snapshot.styled_rows.iter().take(max_rows).enumerate() {
@@ -518,6 +519,7 @@ fn ghostty_color(color: GhosttyRgb) -> Color32 {
     Color32::from_rgb(color.r, color.g, color.b)
 }
 
+#[allow(clippy::needless_option_as_deref)]
 fn render_terminal_with_row_stride(
     painter: &egui::Painter,
     content_rect: Rect,
@@ -590,8 +592,8 @@ fn build_grid_shapes(
     let base_x = content_rect.left() + metrics.pad_x;
     let base_y = content_rect.top() + metrics.pad_y;
 
-    let mut background_shapes = Vec::new();
-    let mut foreground_shapes = Vec::new();
+    let mut background_shapes = Vec::with_capacity(cells.len() / 2);
+    let mut foreground_shapes = Vec::with_capacity(cells.len() / 2);
     let mut current_run: Option<(Color32, f32, f32, f32)> = None;
 
     for indexed in &cells {
@@ -639,7 +641,7 @@ fn build_grid_shapes(
     ctx.fonts(|fonts| {
         let mut push_text = |foreground_shapes: &mut Vec<Shape>,
                              pos: egui::Pos2,
-                             text: String,
+                             text: &str,
                              fg: Color32,
                              italic_offset: f32| {
             if metrics.font_size < MIN_TEXT_RENDER_FONT_SIZE || text.is_empty() {
@@ -704,8 +706,9 @@ fn build_full_foreground_shapes(
     row_stride: usize,
     background_shapes: &mut Vec<Shape>,
     foreground_shapes: &mut Vec<Shape>,
-    push_text: &mut impl FnMut(&mut Vec<Shape>, egui::Pos2, String, Color32, f32),
+    push_text: &mut impl FnMut(&mut Vec<Shape>, egui::Pos2, &str, Color32, f32),
 ) {
+    let mut char_buf = [0u8; 4];
     for indexed in cells {
         let Some(point) = point_to_viewport(display_offset, indexed.point) else {
             continue;
@@ -729,7 +732,7 @@ fn build_full_foreground_shapes(
                 background_shapes.push(Shape::rect_filled(
                     rect,
                     0.0,
-                    Color32::from_rgba_premultiplied(80, 130, 200, 80),
+                    Color32::from_rgba_premultiplied(208, 208, 208, 80),
                 ));
             }
         }
@@ -747,13 +750,8 @@ fn build_full_foreground_shapes(
         if cell.flags.contains(Flags::HIDDEN) {
             continue;
         }
-        push_text(
-            foreground_shapes,
-            text_pos,
-            ch.to_string(),
-            fg,
-            italic_offset,
-        );
+        let encoded = ch.encode_utf8(&mut char_buf);
+        push_text(foreground_shapes, text_pos, encoded, fg, italic_offset);
 
         draw_decoration_shapes(foreground_shapes, text_pos, metrics, cell.flags, fg);
     }
@@ -772,7 +770,7 @@ fn build_reduced_foreground_shapes(
     row_stride: usize,
     background_shapes: &mut Vec<Shape>,
     foreground_shapes: &mut Vec<Shape>,
-    push_text: &mut impl FnMut(&mut Vec<Shape>, egui::Pos2, String, Color32, f32),
+    push_text: &mut impl FnMut(&mut Vec<Shape>, egui::Pos2, &str, Color32, f32),
 ) {
     #[derive(Default)]
     struct TextRun {
@@ -787,13 +785,12 @@ fn build_reduced_foreground_shapes(
     let mut run = TextRun::default();
     let mut flush_run = |run: &mut TextRun, foreground_shapes: &mut Vec<Shape>| {
         if run.text.is_empty() {
-            run.text.clear();
             return;
         }
         push_text(
             foreground_shapes,
             pos2(run.x, run.y),
-            run.text.clone(),
+            &run.text,
             run.fg,
             run.italic_offset,
         );
@@ -820,7 +817,7 @@ fn build_reduced_foreground_shapes(
                 background_shapes.push(Shape::rect_filled(
                     Rect::from_min_size(text_pos, vec2(metrics.cell_width, metrics.cell_height)),
                     0.0,
-                    Color32::from_rgba_premultiplied(80, 130, 200, 80),
+                    Color32::from_rgba_premultiplied(208, 208, 208, 80),
                 ));
             }
         }
@@ -971,12 +968,12 @@ pub fn render_terminal_preview(
         painter.rect_filled(
             badge_rect,
             badge_height * 0.5,
-            Color32::from_rgba_premultiplied(18, 20, 28, 210),
+            Color32::from_rgba_premultiplied(10, 10, 10, 210),
         );
         painter.rect_stroke(
             badge_rect,
             badge_height * 0.5,
-            Stroke::new(1.0, Color32::from_rgba_premultiplied(110, 118, 150, 120)),
+            Stroke::new(1.0, Color32::from_rgba_premultiplied(110, 110, 110, 120)),
         );
         painter.text(
             badge_rect.center(),
@@ -1044,9 +1041,9 @@ fn draw_cursor(
 
 fn preview_color(focused: bool, alpha: u8) -> Color32 {
     let base = if focused {
-        Color32::from_rgb(225, 228, 235)
+        Color32::from_rgb(244, 244, 244)
     } else {
-        Color32::from_rgb(155, 160, 170)
+        Color32::from_rgb(110, 110, 110)
     };
     Color32::from_rgba_premultiplied(base.r(), base.g(), base.b(), alpha)
 }
@@ -1114,9 +1111,9 @@ fn named_color(name: NamedColor, colors: &Colors) -> Color32 {
     }
 
     match name {
-        NamedColor::Foreground | NamedColor::BrightForeground => Color32::from_rgb(232, 232, 234),
+        NamedColor::Foreground | NamedColor::BrightForeground => Color32::from_rgb(244, 244, 244),
         NamedColor::Background | NamedColor::DimForeground | NamedColor::DimBlack => {
-            Color32::from_rgb(30, 30, 30)
+            Color32::from_rgb(0, 0, 0)
         }
         NamedColor::Cursor => CURSOR_COLOR,
         NamedColor::Black => indexed_to_egui(0),

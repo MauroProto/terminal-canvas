@@ -1,3 +1,12 @@
+mod activity;
+mod chrome;
+#[cfg(test)]
+mod tests;
+
+use activity::*;
+use chrome::*;
+pub use chrome::{normalize_snapped_rect, snap_slot_rect};
+
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -13,7 +22,7 @@ use alacritty_terminal::term::{point_to_viewport, viewport_to_point, Term};
 
 use crate::canvas::config::normalize_panel_size;
 use crate::canvas::config::SNAP_THRESHOLD;
-use crate::canvas::snap::{snap_drag, snap_resize, SnapGuide};
+use crate::canvas::snap::{snap_resize, SnapGuide};
 use crate::canvas::viewport::Viewport;
 use crate::collab::{
     PanelShareScope, SerializableModifiers, SharedPanelSnapshot, TerminalInputEvent,
@@ -38,70 +47,41 @@ use crate::terminal::renderer::{
 #[cfg(feature = "ghostty-vt")]
 use crate::terminal::renderer::{render_ghostty_text_snapshot, GhosttyGridCache};
 use crate::terminal::scrollbar::{
-    render_scrollbar, scrollbar_pointer_to_scrollback, scrollbar_thumb_height, terminal_body_rect,
+    scrollbar_pointer_to_scrollback, scrollbar_thumb_height, terminal_body_rect,
     terminal_scrollbar_rect,
 };
 use crate::terminal::session_controller::{session_spec, SessionController};
 use crate::utils::platform::default_shell;
 
-pub const TITLE_BAR_HEIGHT: f32 = 42.0;
-pub const BORDER_RADIUS: f32 = 16.0;
+pub const TITLE_BAR_HEIGHT: f32 = 28.0;
+pub const BORDER_RADIUS: f32 = 0.0;
 pub const MIN_WIDTH: f32 = 260.0;
 pub const MIN_HEIGHT: f32 = 180.0;
+#[allow(dead_code)]
 pub const RESIZE_GRIP_SIZE: f32 = 32.0;
 pub const RESIZE_HIT_THICKNESS: f32 = 12.0;
+#[allow(dead_code)]
 pub const RESIZE_CORNER_SIZE: f32 = 28.0;
-pub const PANEL_BG: Color32 = Color32::from_rgb(30, 30, 30);
-pub const TITLE_BG: Color32 = Color32::from_rgb(38, 38, 58);
-pub const BORDER_DEFAULT: Color32 = Color32::from_rgb(72, 72, 84);
-pub const BORDER_FOCUS: Color32 = Color32::from_rgb(110, 110, 124);
-pub const FG: Color32 = Color32::from_rgb(232, 232, 234);
-pub const DIM_FG: Color32 = Color32::from_rgb(146, 146, 152);
-pub const MAC_RED: Color32 = Color32::from_rgb(255, 95, 87);
-pub const MAC_YELLOW: Color32 = Color32::from_rgb(254, 188, 46);
-pub const MAC_GREEN: Color32 = Color32::from_rgb(40, 200, 64);
+pub const PANEL_BG: Color32 = Color32::from_rgb(18, 18, 18);
+pub const TITLE_BG: Color32 = Color32::from_rgb(26, 26, 26);
+pub const BORDER_DEFAULT: Color32 = Color32::from_rgb(56, 56, 56);
+pub const BORDER_FOCUS: Color32 = Color32::from_rgb(110, 110, 110);
+pub const FG: Color32 = Color32::from_rgb(244, 244, 244);
+pub const DIM_FG: Color32 = Color32::from_rgb(110, 110, 110);
+pub const MAC_RED: Color32 = Color32::from_rgb(244, 244, 244);
+pub const MAC_YELLOW: Color32 = Color32::from_rgb(170, 170, 170);
+pub const MAC_GREEN: Color32 = Color32::from_rgb(208, 208, 208);
 pub const CHROME_ZOOM_MAX: f32 = 1.0;
 pub const MIN_CONTROL_STRIP_WIDTH: f32 = 72.0;
 pub const MIN_TITLE_TEXT_WIDTH: f32 = 132.0;
+#[allow(dead_code)]
 pub const MIN_RESIZE_GRIP_WIDTH: f32 = 150.0;
+#[allow(dead_code)]
 pub const MIN_RESIZE_GRIP_HEIGHT: f32 = 110.0;
 pub const MIN_TERMINAL_RENDER_ZOOM: f32 = MIN_TEXT_RENDER_FONT_SIZE / FONT_SIZE;
 pub const MIN_TERMINAL_RENDER_WIDTH: f32 = 40.0;
 pub const MIN_TERMINAL_RENDER_HEIGHT: f32 = 28.0;
 const STREAMING_OUTPUT_WINDOW: Duration = Duration::from_millis(350);
-
-fn share_scope_badge_colors(scope: PanelShareScope) -> (Color32, Color32, Color32) {
-    match scope {
-        PanelShareScope::Private => (
-            Color32::from_rgb(70, 42, 46),
-            Color32::from_rgb(176, 92, 102),
-            Color32::from_rgb(248, 212, 218),
-        ),
-        PanelShareScope::VisibleOnly => (
-            Color32::from_rgb(48, 56, 78),
-            Color32::from_rgb(104, 138, 212),
-            Color32::from_rgb(222, 232, 255),
-        ),
-        PanelShareScope::VisibleAndHistory => (
-            Color32::from_rgb(68, 58, 34),
-            Color32::from_rgb(188, 164, 92),
-            Color32::from_rgb(248, 238, 204),
-        ),
-        PanelShareScope::Controllable => (
-            Color32::from_rgb(42, 72, 48),
-            Color32::from_rgb(98, 186, 122),
-            Color32::from_rgb(224, 248, 230),
-        ),
-    }
-}
-
-fn backend_badge_colors() -> (Color32, Color32, Color32) {
-    (
-        Color32::from_rgb(42, 58, 72),
-        Color32::from_rgb(96, 170, 208),
-        Color32::from_rgb(226, 246, 255),
-    )
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResizeHandle {
@@ -121,21 +101,8 @@ pub enum PanelHitArea {
     MinimizeButton,
     TitleBar,
     Body,
+    #[allow(dead_code)]
     Resize(ResizeHandle),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PanelLod {
-    Full,
-    Compact,
-    Minimal,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct PanelRoundings {
-    panel: Rounding,
-    title: Rounding,
-    body: Rounding,
 }
 
 #[derive(Default)]
@@ -158,7 +125,9 @@ pub struct TerminalPanel {
     pub size: Vec2,
     pub color: Color32,
     pub z_index: u32,
-    pub focused: bool,
+    // Privado a propósito: el foco lo administra el Workspace (dueño de la
+    // invariante "a lo sumo un panel enfocado") vía set_focused.
+    focused: bool,
     minimized: bool,
     placement: PanelPlacement,
     restore_placement: Option<PanelPlacement>,
@@ -296,20 +265,6 @@ impl TerminalPanel {
         self.session.with_pty(f)
     }
 
-    #[cfg(feature = "ghostty-vt")]
-    fn backend_badge_label(&self) -> Option<&'static str> {
-        self.with_pty(|pty| match pty.backend_kind() {
-            TerminalBackendKind::Ghostty => Some("Ghostty"),
-            TerminalBackendKind::Alacritty => None,
-        })
-        .flatten()
-    }
-
-    #[cfg(not(feature = "ghostty-vt"))]
-    fn backend_badge_label(&self) -> Option<&'static str> {
-        None
-    }
-
     pub fn apply_resize(&mut self, rect: Rect) {
         self.position = rect.min;
         self.size = rect.size();
@@ -341,6 +296,16 @@ impl TerminalPanel {
             )),
             share_scope: self.share_scope,
         }
+    }
+
+    pub fn focused(&self) -> bool {
+        self.focused
+    }
+
+    /// Único punto de escritura del foco desde afuera del panel. Lo llama el
+    /// Workspace, que mantiene la invariante de foco único; no usar directo.
+    pub(crate) fn set_focused(&mut self, focused: bool) {
+        self.focused = focused;
     }
 
     pub fn minimized(&self) -> bool {
@@ -453,11 +418,7 @@ impl TerminalPanel {
                 if let Ok(term) = pty.term.try_lock() {
                     visible_text = visible_text_snapshot(&term, 16, 180);
                 }
-                pty.last_output_at
-                    .try_lock()
-                    .ok()
-                    .map(|last_output_at| last_output_at.elapsed() <= Duration::from_secs(4))
-                    .unwrap_or(false)
+                pty.output_elapsed() <= Duration::from_secs(4)
             })
             .unwrap_or(false);
 
@@ -708,15 +669,9 @@ impl TerminalPanel {
             return Some(PanelHitArea::MinimizeButton);
         }
 
-        for handle in ResizeHandle::ALL {
-            if handle
-                .hit_rect(screen_rect)
-                .intersect(canvas_rect)
-                .contains(pos)
-            {
-                return Some(PanelHitArea::Resize(handle));
-            }
-        }
+        // Resize from corners/edges is intentionally disabled: panels are
+        // always auto-tiled into one of the fixed slots, never freely resized.
+        let _ = ResizeHandle::ALL;
 
         if title_drag_hit_rect(screen_rect, title_rect)
             .intersect(canvas_rect)
@@ -741,26 +696,6 @@ impl TerminalPanel {
         }
 
         Some(PanelHitArea::Body)
-    }
-
-    pub fn drag_to(
-        &mut self,
-        origin: Pos2,
-        pointer_delta: Vec2,
-        zoom: f32,
-        other_panels: &[Rect],
-    ) -> Vec<SnapGuide> {
-        let new_virtual = drag_target_from_origin(origin, pointer_delta, zoom);
-        let snapped = snap_drag(
-            Rect::from_min_size(new_virtual, self.size),
-            other_panels,
-            SNAP_THRESHOLD,
-        );
-        self.position = pos2(
-            new_virtual.x + snapped.delta.x,
-            new_virtual.y + snapped.delta.y,
-        );
-        snapped.guides
     }
 
     pub fn resize_to(
@@ -883,7 +818,7 @@ impl TerminalPanel {
         }
 
         let border_color = if ui.ctx().input(|i| i.time) < self.bell_flash_until {
-            Color32::from_rgb(255, 200, 80)
+            Color32::from_rgb(255, 255, 255)
         } else if self.focused {
             BORDER_FOCUS
         } else {
@@ -944,68 +879,24 @@ impl TerminalPanel {
                 if self.is_alive() { FG } else { DIM_FG },
             );
         }
-        if matches!(lod, PanelLod::Full | PanelLod::Compact) && title_rect.width() >= 220.0 {
-            let badge_text = self.share_scope.label();
-            let badge_width =
-                ((badge_text.len() as f32 * 7.2 + 18.0) * chrome_zoom).clamp(52.0, 96.0);
-            let badge_height = (20.0 * chrome_zoom).clamp(16.0, 20.0);
-            let badge_gap = (8.0 * chrome_zoom).clamp(5.0, 8.0);
-            let mut right_edge = title_rect.right() - (14.0 * chrome_zoom).clamp(8.0, 14.0);
-            let badge_rect = Rect::from_center_size(
-                pos2(right_edge - badge_width * 0.5, title_rect.center().y),
-                vec2(badge_width, badge_height),
-            );
-            let (fill, stroke, text) = share_scope_badge_colors(self.share_scope);
-            chrome_painter.rect_filled(badge_rect, badge_height * 0.5, fill);
-            chrome_painter.rect_stroke(badge_rect, badge_height * 0.5, Stroke::new(1.0, stroke));
-            chrome_painter.text(
-                badge_rect.center(),
-                Align2::CENTER_CENTER,
-                badge_text,
-                FontId::proportional((11.0 * chrome_zoom).clamp(7.0, 11.0)),
-                text,
-            );
-
-            right_edge = badge_rect.left() - badge_gap;
-            if title_rect.width() >= 330.0 {
-                if let Some(backend_text) = self.backend_badge_label() {
-                    let backend_width =
-                        ((backend_text.len() as f32 * 7.4 + 18.0) * chrome_zoom).clamp(58.0, 92.0);
-                    let backend_rect = Rect::from_center_size(
-                        pos2(right_edge - backend_width * 0.5, title_rect.center().y),
-                        vec2(backend_width, badge_height),
-                    );
-                    let (fill, stroke, text) = backend_badge_colors();
-                    chrome_painter.rect_filled(backend_rect, badge_height * 0.5, fill);
-                    chrome_painter.rect_stroke(
-                        backend_rect,
-                        badge_height * 0.5,
-                        Stroke::new(1.0, stroke),
-                    );
-                    chrome_painter.text(
-                        backend_rect.center(),
-                        Align2::CENTER_CENTER,
-                        backend_text,
-                        FontId::proportional((11.0 * chrome_zoom).clamp(7.0, 11.0)),
-                        text,
-                    );
-                }
-            }
-        }
+        // Share-scope and backend badges removed: they don't aid the user
+        // and clutter the minimal header.
         let content_clip_rect = content_rect.intersect(canvas_rect);
         let content_painter = painter.with_clip_rect(content_clip_rect);
         let content_rounding = roundings.body;
         let now = ui.ctx().input(|i| i.time);
-        let title_snapshot = self.title.clone();
-        let shell_title_snapshot = self.shell_title.clone();
-        let fallback_preview_title = if let Some(overlay) = overlay {
-            overlay.preview_label.clone()
+        let title_snapshot: &str = &self.title;
+        let shell_title_snapshot: &str = &self.shell_title;
+        let fallback_preview_title: &str = if let Some(overlay) = overlay {
+            &overlay.preview_label
         } else if is_generic_terminal_name(&self.title) {
-            self.cwd_label.clone()
+            &self.cwd_label
         } else {
-            self.title.clone()
+            &self.title
         };
-        let mut activity_label = self.activity_label.clone();
+        // Only allocate a new activity_label when an actual scan updates it.
+        // Most frames don't scan, so we read self.activity_label by borrow.
+        let mut updated_activity_label: Option<Option<String>> = None;
         let mut activity_label_scan_at = None;
         let mut scrollbar_state = self.last_scrollbar_state;
         let render_tier = render_tier_for_panel(
@@ -1039,8 +930,8 @@ impl TerminalPanel {
                         if scan_activity {
                             let visible_text = snapshot.rows.join("\n");
                             scanned_activity_label = Some(infer_activity_label(
-                                &title_snapshot,
-                                &shell_title_snapshot,
+                                title_snapshot,
+                                shell_title_snapshot,
                                 &visible_text,
                             ));
                         }
@@ -1072,8 +963,8 @@ impl TerminalPanel {
                         });
                         if scan_activity {
                             scanned_activity_label = Some(infer_activity_label_from_term(
-                                &title_snapshot,
-                                &shell_title_snapshot,
+                                title_snapshot,
+                                shell_title_snapshot,
                                 &term,
                             ));
                         }
@@ -1111,8 +1002,8 @@ impl TerminalPanel {
                             .map(|overlay| overlay.preview_label.clone())
                             .unwrap_or_else(|| {
                                 preview_label_text(
-                                    activity_label.as_deref(),
-                                    &fallback_preview_title,
+                                    self.activity_label.as_deref(),
+                                    fallback_preview_title,
                                 )
                             });
                         render_terminal_preview(
@@ -1123,36 +1014,34 @@ impl TerminalPanel {
                             Some(preview_label.as_str()),
                         );
                     }
-                } else if !rendered_ghostty {
-                    if !matches!(render_tier, RenderTier::Hidden) {
-                        let preview_label = overlay
-                            .map(|overlay| overlay.preview_label.clone())
-                            .unwrap_or_else(|| {
-                                preview_label_text(
-                                    activity_label.as_deref(),
-                                    &fallback_preview_title,
-                                )
-                            });
-                        render_terminal_preview(
-                            &content_painter,
-                            content_rect,
-                            self.focused,
-                            zoom,
-                            Some(preview_label.as_str()),
-                        );
-                    }
+                } else if !rendered_ghostty && !matches!(render_tier, RenderTier::Hidden) {
+                    let preview_label = overlay
+                        .map(|overlay| overlay.preview_label.clone())
+                        .unwrap_or_else(|| {
+                            preview_label_text(
+                                self.activity_label.as_deref(),
+                                fallback_preview_title,
+                            )
+                        });
+                    render_terminal_preview(
+                        &content_painter,
+                        content_rect,
+                        self.focused,
+                        zoom,
+                        Some(preview_label.as_str()),
+                    );
                 }
                 if let Some(detected_label) = scanned_activity_label.take() {
-                    activity_label = detected_label.or_else(|| {
-                        infer_activity_label(&title_snapshot, &shell_title_snapshot, "")
-                    });
+                    updated_activity_label = Some(detected_label.or_else(|| {
+                        infer_activity_label(title_snapshot, shell_title_snapshot, "")
+                    }));
                     activity_label_scan_at = Some(now);
                 }
             } else {
                 let preview_label = overlay
                     .map(|overlay| overlay.preview_label.clone())
                     .unwrap_or_else(|| {
-                        preview_label_text(activity_label.as_deref(), &fallback_preview_title)
+                        preview_label_text(self.activity_label.as_deref(), fallback_preview_title)
                     });
                 render_terminal_preview(
                     &content_painter,
@@ -1169,30 +1058,18 @@ impl TerminalPanel {
                 Align2::LEFT_TOP,
                 error,
                 FontId::monospace(FONT_SIZE),
-                Color32::from_rgb(239, 68, 68),
+                Color32::from_rgb(244, 244, 244),
             );
         }
-        self.activity_label = activity_label;
+        if let Some(new) = updated_activity_label {
+            self.activity_label = new;
+        }
         if let Some(scanned_at) = activity_label_scan_at {
             self.last_activity_scan_at = scanned_at;
         }
         self.last_scrollbar_state = scrollbar_state;
 
-        if let Some(scroll_state) = scrollbar_state {
-            render_scrollbar(
-                &chrome_painter,
-                scrollbar_rect.intersect(canvas_rect),
-                scroll_state.display_offset,
-                scroll_state.visible_rows,
-                scroll_state.history_size,
-                self.focused
-                    || scrollbar_response
-                        .as_ref()
-                        .is_some_and(|response| response.hovered()),
-            );
-        }
-
-        chrome_painter.rect_stroke(stroke_rect, panel_rounding, Stroke::new(1.0, border_color));
+        chrome_painter.rect_stroke(stroke_rect, panel_rounding, Stroke::new(0.75, border_color));
         if matches!(lod, PanelLod::Full) {
             chrome_painter.line_segment(
                 [
@@ -1203,21 +1080,9 @@ impl TerminalPanel {
             );
         }
 
-        let grip_color = Color32::from_rgba_premultiplied(180, 180, 188, 110);
-        let resize_rect = resize_handle_rect(screen_rect);
-        if matches!(lod, PanelLod::Full) && should_draw_resize_grip(screen_rect) {
-            let grip_painter =
-                painter.with_clip_rect(screen_rect.shrink(1.0).intersect(canvas_rect));
-            for offset in [0.0, 5.0, 10.0] {
-                grip_painter.line_segment(
-                    [
-                        resize_rect.right_bottom() - vec2(18.0 - offset, 6.0),
-                        resize_rect.right_bottom() - vec2(6.0, 18.0 - offset),
-                    ],
-                    Stroke::new(1.0, grip_color),
-                );
-            }
-        }
+        // Resize grip removido: las terminales solo viven en los slots fijos
+        // del auto-tile, no se redimensionan manualmente desde la esquina.
+        let _ = lod;
 
         interaction
     }
@@ -1310,21 +1175,14 @@ impl TerminalPanel {
     }
 
     fn window_title(&self, screen_width: f32) -> String {
-        let (cols, rows) = self.session.last_grid_size();
-        if screen_width < 340.0 {
-            return format!("{}×{}", cols, rows);
-        }
-        if screen_width < 520.0 {
-            return format!("{} — {}×{}", self.title, cols, rows);
-        }
+        let _ = screen_width;
         if let Some(custom_title) = &self.custom_title {
-            format!("{} — {}×{}", custom_title, cols, rows)
-        } else {
-            format!(
-                "{} — {} — {}×{}",
-                self.cwd_label, self.shell_label, cols, rows
-            )
+            return custom_title.clone();
         }
+        if !self.title.is_empty() && self.title != "Terminal" {
+            return self.title.clone();
+        }
+        self.shell_label.clone()
     }
 
     fn begin_selection(
@@ -1430,1173 +1288,5 @@ impl TerminalPanel {
 impl Drop for TerminalPanel {
     fn drop(&mut self) {
         self.close_runtime_session();
-    }
-}
-
-impl ResizeHandle {
-    const ALL: [Self; 8] = [
-        Self::TopLeft,
-        Self::TopRight,
-        Self::BottomLeft,
-        Self::BottomRight,
-        Self::Left,
-        Self::Right,
-        Self::Top,
-        Self::Bottom,
-    ];
-
-    fn resizes_left(self) -> bool {
-        matches!(self, Self::Left | Self::TopLeft | Self::BottomLeft)
-    }
-
-    fn resizes_right(self) -> bool {
-        matches!(self, Self::Right | Self::TopRight | Self::BottomRight)
-    }
-
-    fn resizes_top(self) -> bool {
-        matches!(self, Self::Top | Self::TopLeft | Self::TopRight)
-    }
-
-    fn resizes_bottom(self) -> bool {
-        matches!(self, Self::Bottom | Self::BottomLeft | Self::BottomRight)
-    }
-
-    fn hit_rect(self, screen_rect: Rect) -> Rect {
-        match self {
-            Self::TopLeft => Rect::from_min_max(
-                screen_rect.min,
-                screen_rect.min + vec2(RESIZE_CORNER_SIZE, RESIZE_CORNER_SIZE),
-            ),
-            Self::TopRight => Rect::from_min_max(
-                pos2(screen_rect.right() - RESIZE_CORNER_SIZE, screen_rect.top()),
-                pos2(screen_rect.right(), screen_rect.top() + RESIZE_CORNER_SIZE),
-            ),
-            Self::BottomLeft => Rect::from_min_max(
-                pos2(
-                    screen_rect.left(),
-                    screen_rect.bottom() - RESIZE_CORNER_SIZE,
-                ),
-                pos2(
-                    screen_rect.left() + RESIZE_CORNER_SIZE,
-                    screen_rect.bottom(),
-                ),
-            ),
-            Self::BottomRight => Rect::from_min_max(
-                screen_rect.right_bottom() - vec2(RESIZE_CORNER_SIZE, RESIZE_CORNER_SIZE),
-                screen_rect.right_bottom(),
-            ),
-            Self::Left => Rect::from_min_max(
-                pos2(screen_rect.left(), screen_rect.top() + RESIZE_CORNER_SIZE),
-                pos2(
-                    screen_rect.left() + RESIZE_HIT_THICKNESS,
-                    screen_rect.bottom() - RESIZE_CORNER_SIZE,
-                ),
-            ),
-            Self::Right => Rect::from_min_max(
-                pos2(
-                    screen_rect.right() - RESIZE_HIT_THICKNESS,
-                    screen_rect.top() + RESIZE_CORNER_SIZE,
-                ),
-                pos2(
-                    screen_rect.right(),
-                    screen_rect.bottom() - RESIZE_CORNER_SIZE,
-                ),
-            ),
-            Self::Top => Rect::from_min_max(
-                pos2(screen_rect.left() + RESIZE_CORNER_SIZE, screen_rect.top()),
-                pos2(
-                    screen_rect.right() - RESIZE_CORNER_SIZE,
-                    screen_rect.top() + RESIZE_HIT_THICKNESS,
-                ),
-            ),
-            Self::Bottom => Rect::from_min_max(
-                pos2(
-                    screen_rect.left() + RESIZE_CORNER_SIZE,
-                    screen_rect.bottom() - RESIZE_HIT_THICKNESS,
-                ),
-                pos2(
-                    screen_rect.right() - RESIZE_CORNER_SIZE,
-                    screen_rect.bottom(),
-                ),
-            ),
-        }
-    }
-
-    fn apply_delta(self, rect: Rect, delta: Vec2) -> Rect {
-        let mut min = rect.min;
-        let mut max = rect.max;
-
-        if self.resizes_left() {
-            min.x = (min.x + delta.x).min(max.x - MIN_WIDTH);
-        }
-        if self.resizes_right() {
-            max.x = (max.x + delta.x).max(min.x + MIN_WIDTH);
-        }
-        if self.resizes_top() {
-            min.y = (min.y + delta.y).min(max.y - MIN_HEIGHT);
-        }
-        if self.resizes_bottom() {
-            max.y = (max.y + delta.y).max(min.y + MIN_HEIGHT);
-        }
-
-        Rect::from_min_max(min, max)
-    }
-
-    fn apply_snap_delta(self, rect: Rect, delta: Vec2) -> Rect {
-        let mut min = rect.min;
-        let mut max = rect.max;
-
-        if self.resizes_left() {
-            min.x += delta.x;
-        } else if self.resizes_right() {
-            max.x += delta.x;
-        }
-
-        if self.resizes_top() {
-            min.y += delta.y;
-        } else if self.resizes_bottom() {
-            max.y += delta.y;
-        }
-
-        Rect::from_min_max(min, max)
-    }
-}
-
-fn close_rect(title_rect: Rect) -> Rect {
-    let chrome_zoom = chrome_zoom_from_title_rect(title_rect);
-    Rect::from_center_size(
-        pos2(
-            title_rect.left() + 26.0 * chrome_zoom,
-            title_rect.center().y,
-        ),
-        vec2(18.0, 18.0) * chrome_zoom,
-    )
-}
-
-fn minimize_rect(title_rect: Rect) -> Rect {
-    let chrome_zoom = chrome_zoom_from_title_rect(title_rect);
-    Rect::from_center_size(
-        pos2(
-            title_rect.left() + 46.0 * chrome_zoom,
-            title_rect.center().y,
-        ),
-        vec2(18.0, 18.0) * chrome_zoom,
-    )
-}
-
-fn resize_handle_rect(screen_rect: Rect) -> Rect {
-    Rect::from_min_size(
-        screen_rect.right_bottom() - vec2(RESIZE_GRIP_SIZE, RESIZE_GRIP_SIZE),
-        vec2(RESIZE_GRIP_SIZE, RESIZE_GRIP_SIZE),
-    )
-}
-
-fn title_drag_hit_rect(screen_rect: Rect, title_rect: Rect) -> Rect {
-    const MIN_TITLE_DRAG_HIT_HEIGHT: f32 = 18.0;
-    const MIN_TITLE_DRAG_HIT_WIDTH: f32 = 28.0;
-
-    let controls_inset = if should_draw_window_controls(screen_rect, title_rect) {
-        (90.0 * chrome_zoom_from_title_rect(title_rect)).clamp(42.0, 90.0)
-    } else {
-        10.0
-    };
-    let right = screen_rect.right() - RESIZE_HIT_THICKNESS;
-    let left = (screen_rect.left() + controls_inset)
-        .min(right - MIN_TITLE_DRAG_HIT_WIDTH)
-        .max(screen_rect.left() + RESIZE_HIT_THICKNESS);
-    let bottom = (title_rect.top() + title_rect.height().max(MIN_TITLE_DRAG_HIT_HEIGHT))
-        .min(screen_rect.bottom() - RESIZE_HIT_THICKNESS)
-        .max(title_rect.top() + 1.0);
-
-    Rect::from_min_max(pos2(left, title_rect.top()), pos2(right, bottom))
-}
-
-fn drag_target_from_origin(origin: Pos2, drag_delta: Vec2, zoom: f32) -> Pos2 {
-    origin + drag_delta / zoom.max(0.01)
-}
-
-fn resize_target_from_origin(
-    handle: ResizeHandle,
-    origin: Rect,
-    drag_delta: Vec2,
-    zoom: f32,
-) -> Rect {
-    handle.apply_delta(origin, drag_delta / zoom.max(0.01))
-}
-
-fn chrome_zoom(zoom: f32) -> f32 {
-    zoom.clamp(0.0, CHROME_ZOOM_MAX)
-}
-
-fn title_bar_height(zoom: f32) -> f32 {
-    TITLE_BAR_HEIGHT * chrome_zoom(zoom)
-}
-
-fn chrome_zoom_from_title_rect(title_rect: Rect) -> f32 {
-    (title_rect.height() / TITLE_BAR_HEIGHT).clamp(0.0, CHROME_ZOOM_MAX)
-}
-
-fn panel_corner_radius(screen_rect: Rect) -> f32 {
-    BORDER_RADIUS
-        .min(screen_rect.width() * 0.18)
-        .min(screen_rect.height() * 0.18)
-        .max(2.0)
-}
-
-fn panel_roundings(screen_rect: Rect, title_rect: Rect, body_rect: Rect) -> PanelRoundings {
-    let base_radius = panel_corner_radius(screen_rect);
-    let top_radius = base_radius
-        .min(title_rect.width() * 0.5)
-        .min(title_rect.height() * 0.5)
-        .max(0.0);
-    let bottom_radius = base_radius
-        .min(body_rect.width() * 0.5)
-        .min(body_rect.height() * 0.5)
-        .max(0.0);
-
-    PanelRoundings {
-        panel: Rounding {
-            nw: top_radius,
-            ne: top_radius,
-            sw: bottom_radius,
-            se: bottom_radius,
-        },
-        title: Rounding {
-            nw: top_radius,
-            ne: top_radius,
-            sw: 0.0,
-            se: 0.0,
-        },
-        body: Rounding {
-            nw: 0.0,
-            ne: 0.0,
-            sw: bottom_radius,
-            se: bottom_radius,
-        },
-    }
-}
-
-fn max_panel_corner_radius(roundings: PanelRoundings) -> f32 {
-    roundings
-        .panel
-        .nw
-        .max(roundings.panel.ne)
-        .max(roundings.panel.sw)
-        .max(roundings.panel.se)
-}
-
-fn panel_lod(screen_rect: Rect, title_rect: Rect) -> PanelLod {
-    if screen_rect.width() < 96.0 || screen_rect.height() < 64.0 || title_rect.height() < 8.0 {
-        PanelLod::Minimal
-    } else if screen_rect.width() < 220.0
-        || screen_rect.height() < 120.0
-        || title_rect.height() < 14.0
-    {
-        PanelLod::Compact
-    } else {
-        PanelLod::Full
-    }
-}
-
-fn should_draw_window_controls(screen_rect: Rect, title_rect: Rect) -> bool {
-    screen_rect.width() >= MIN_CONTROL_STRIP_WIDTH && title_rect.height() >= 8.0
-}
-
-fn should_draw_title_text(screen_rect: Rect, title_rect: Rect) -> bool {
-    screen_rect.width() >= MIN_TITLE_TEXT_WIDTH && title_rect.height() >= 10.0
-}
-
-fn should_draw_resize_grip(screen_rect: Rect) -> bool {
-    screen_rect.width() >= MIN_RESIZE_GRIP_WIDTH && screen_rect.height() >= MIN_RESIZE_GRIP_HEIGHT
-}
-
-fn should_render_terminal_contents(content_rect: Rect, zoom: f32) -> bool {
-    zoom >= MIN_TERMINAL_RENDER_ZOOM
-        && content_rect.width() >= MIN_TERMINAL_RENDER_WIDTH
-        && content_rect.height() >= MIN_TERMINAL_RENDER_HEIGHT
-}
-
-fn rect_to_saved_bounds(rect: Rect) -> SavedPanelBounds {
-    SavedPanelBounds::new([rect.min.x, rect.min.y], [rect.width(), rect.height()])
-}
-
-fn saved_bounds_to_rect(bounds: SavedPanelBounds) -> Rect {
-    Rect::from_min_size(
-        pos2(bounds.position[0], bounds.position[1]),
-        vec2(bounds.size[0], bounds.size[1]),
-    )
-}
-
-pub fn snap_slot_rect(slot: SnapSlot, desktop_rect: Rect) -> Rect {
-    let half_width = desktop_rect.width() * 0.5;
-    let half_height = desktop_rect.height() * 0.5;
-
-    match slot {
-        SnapSlot::LeftHalf => {
-            Rect::from_min_size(desktop_rect.min, vec2(half_width, desktop_rect.height()))
-        }
-        SnapSlot::RightHalf => Rect::from_min_size(
-            pos2(desktop_rect.center().x, desktop_rect.top()),
-            vec2(half_width, desktop_rect.height()),
-        ),
-        SnapSlot::TopHalf => {
-            Rect::from_min_size(desktop_rect.min, vec2(desktop_rect.width(), half_height))
-        }
-        SnapSlot::BottomHalf => Rect::from_min_size(
-            pos2(desktop_rect.left(), desktop_rect.center().y),
-            vec2(desktop_rect.width(), half_height),
-        ),
-        SnapSlot::TopLeft => Rect::from_min_size(desktop_rect.min, vec2(half_width, half_height)),
-        SnapSlot::TopRight => Rect::from_min_size(
-            pos2(desktop_rect.center().x, desktop_rect.top()),
-            vec2(half_width, half_height),
-        ),
-        SnapSlot::BottomLeft => Rect::from_min_size(
-            pos2(desktop_rect.left(), desktop_rect.center().y),
-            vec2(half_width, half_height),
-        ),
-        SnapSlot::BottomRight => {
-            Rect::from_min_size(desktop_rect.center(), vec2(half_width, half_height))
-        }
-        SnapSlot::Maximized => desktop_rect,
-    }
-}
-
-pub fn normalize_snapped_rect(slot: SnapSlot, rect: Rect, desktop_rect: Rect) -> Rect {
-    let min_width = MIN_WIDTH.min(desktop_rect.width());
-    let min_height = MIN_HEIGHT.min(desktop_rect.height());
-
-    match slot {
-        SnapSlot::LeftHalf => {
-            let width = rect.width().clamp(min_width, desktop_rect.width());
-            Rect::from_min_max(
-                desktop_rect.min,
-                pos2(
-                    (desktop_rect.left() + width).min(desktop_rect.right()),
-                    desktop_rect.bottom(),
-                ),
-            )
-        }
-        SnapSlot::RightHalf => {
-            let width = rect.width().clamp(min_width, desktop_rect.width());
-            Rect::from_min_max(
-                pos2(
-                    (desktop_rect.right() - width).max(desktop_rect.left()),
-                    desktop_rect.top(),
-                ),
-                desktop_rect.max,
-            )
-        }
-        SnapSlot::TopHalf => {
-            let height = rect.height().clamp(min_height, desktop_rect.height());
-            Rect::from_min_max(
-                desktop_rect.min,
-                pos2(
-                    desktop_rect.right(),
-                    (desktop_rect.top() + height).min(desktop_rect.bottom()),
-                ),
-            )
-        }
-        SnapSlot::BottomHalf => {
-            let height = rect.height().clamp(min_height, desktop_rect.height());
-            Rect::from_min_max(
-                pos2(
-                    desktop_rect.left(),
-                    (desktop_rect.bottom() - height).max(desktop_rect.top()),
-                ),
-                desktop_rect.max,
-            )
-        }
-        SnapSlot::TopLeft => {
-            let width = rect.width().clamp(min_width, desktop_rect.width());
-            let height = rect.height().clamp(min_height, desktop_rect.height());
-            Rect::from_min_max(
-                desktop_rect.min,
-                pos2(
-                    (desktop_rect.left() + width).min(desktop_rect.right()),
-                    (desktop_rect.top() + height).min(desktop_rect.bottom()),
-                ),
-            )
-        }
-        SnapSlot::TopRight => {
-            let width = rect.width().clamp(min_width, desktop_rect.width());
-            let height = rect.height().clamp(min_height, desktop_rect.height());
-            Rect::from_min_max(
-                pos2(
-                    (desktop_rect.right() - width).max(desktop_rect.left()),
-                    desktop_rect.top(),
-                ),
-                pos2(
-                    desktop_rect.right(),
-                    (desktop_rect.top() + height).min(desktop_rect.bottom()),
-                ),
-            )
-        }
-        SnapSlot::BottomLeft => {
-            let width = rect.width().clamp(min_width, desktop_rect.width());
-            let height = rect.height().clamp(min_height, desktop_rect.height());
-            Rect::from_min_max(
-                pos2(
-                    desktop_rect.left(),
-                    (desktop_rect.bottom() - height).max(desktop_rect.top()),
-                ),
-                pos2(
-                    (desktop_rect.left() + width).min(desktop_rect.right()),
-                    desktop_rect.bottom(),
-                ),
-            )
-        }
-        SnapSlot::BottomRight => {
-            let width = rect.width().clamp(min_width, desktop_rect.width());
-            let height = rect.height().clamp(min_height, desktop_rect.height());
-            Rect::from_min_max(
-                pos2(
-                    (desktop_rect.right() - width).max(desktop_rect.left()),
-                    (desktop_rect.bottom() - height).max(desktop_rect.top()),
-                ),
-                desktop_rect.max,
-            )
-        }
-        SnapSlot::Maximized => desktop_rect,
-    }
-}
-
-#[cfg(test)]
-fn should_render_live_terminal(
-    content_rect: Rect,
-    zoom: f32,
-    lod: PanelLod,
-    fast_path_render: bool,
-) -> bool {
-    matches!(
-        render_tier_for_panel(content_rect, zoom, lod, fast_path_render, false, false),
-        RenderTier::Full | RenderTier::ReducedLive
-    )
-}
-
-fn should_defer_terminal_resize(fast_path_render: bool, resize_virtual_rect: Option<Rect>) -> bool {
-    fast_path_render && resize_virtual_rect.is_some()
-}
-
-fn body_behaves_like_title_bar(lod: PanelLod) -> bool {
-    !matches!(lod, PanelLod::Full)
-}
-
-fn terminal_mouse_cell_from_pointer(
-    content_rect: Rect,
-    pointer: Pos2,
-    zoom: f32,
-) -> Option<(usize, usize)> {
-    let metrics = grid_metrics(zoom);
-    let rect = Rect::from_min_max(
-        Pos2::new(
-            content_rect.left() + PAD_X * zoom.max(0.01),
-            content_rect.top() + PAD_Y * zoom.max(0.01),
-        ),
-        content_rect.right_bottom(),
-    );
-    let point = grid_point_from_position(rect, pointer, &metrics, u16::MAX, u16::MAX)?;
-    Some((point.column, point.line))
-}
-
-fn should_refresh_activity_label(last_scan_at: f64, time: f64) -> bool {
-    (time - last_scan_at) >= 0.45
-}
-
-fn egui_modifiers(modifiers: SerializableModifiers) -> egui::Modifiers {
-    egui::Modifiers {
-        alt: modifiers.alt,
-        ctrl: modifiers.ctrl,
-        shift: modifiers.shift,
-        mac_cmd: modifiers.command,
-        command: modifiers.command,
-    }
-}
-
-fn render_tier_for_panel(
-    content_rect: Rect,
-    zoom: f32,
-    lod: PanelLod,
-    fast_path_render: bool,
-    focused: bool,
-    streaming: bool,
-) -> RenderTier {
-    let previewable = content_rect.width() >= 24.0 && content_rect.height() >= 18.0;
-    if !previewable {
-        return RenderTier::Hidden;
-    }
-    if matches!(lod, PanelLod::Minimal) || !should_render_terminal_contents(content_rect, zoom) {
-        return RenderTier::Preview;
-    }
-    if focused {
-        return RenderTier::Full;
-    }
-    if fast_path_render || streaming {
-        return RenderTier::ReducedLive;
-    }
-    RenderTier::Full
-}
-
-fn is_streaming_output(pty: &PtyHandle) -> bool {
-    pty.last_output_at
-        .try_lock()
-        .ok()
-        .map(|last_output_at| last_output_at.elapsed() <= STREAMING_OUTPUT_WINDOW)
-        .unwrap_or(false)
-}
-
-fn infer_activity_label_from_term(
-    display_title: &str,
-    shell_title: &str,
-    term: &Term<crate::terminal::pty::EventProxy>,
-) -> Option<String> {
-    let visible_text = visible_text_snapshot(term, 10, 120);
-    infer_activity_label(display_title, shell_title, &visible_text)
-}
-
-fn visible_text_snapshot(
-    term: &Term<crate::terminal::pty::EventProxy>,
-    max_lines: usize,
-    max_cols: usize,
-) -> String {
-    let content = term.renderable_content();
-    let display_offset = content.display_offset;
-    let mut last_row = None;
-    let mut current_line = String::new();
-    let mut lines = Vec::new();
-
-    for indexed in content.display_iter {
-        let Some(point) = point_to_viewport(display_offset, indexed.point) else {
-            continue;
-        };
-        if last_row != Some(point.line) {
-            if !current_line.trim().is_empty() {
-                lines.push(current_line.trim_end().to_owned());
-            }
-            current_line.clear();
-            last_row = Some(point.line);
-        }
-
-        if current_line.chars().count() >= max_cols {
-            continue;
-        }
-
-        let ch = indexed.cell.c;
-        if ch == '\0' || indexed.cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
-            continue;
-        }
-
-        current_line.push(if ch.is_control() { ' ' } else { ch });
-    }
-
-    if !current_line.trim().is_empty() {
-        lines.push(current_line.trim_end().to_owned());
-    }
-
-    let mut tail = lines
-        .into_iter()
-        .rev()
-        .filter(|line| !line.trim().is_empty())
-        .take(max_lines)
-        .collect::<Vec<_>>();
-    tail.reverse();
-    tail.join("\n")
-}
-
-fn infer_activity_label(
-    display_title: &str,
-    shell_title: &str,
-    visible_text: &str,
-) -> Option<String> {
-    if let Some(command) = extract_prompt_command(visible_text) {
-        if let Some(label) = map_command_to_activity(&command) {
-            return Some(label.to_owned());
-        }
-    }
-
-    for source in [visible_text, shell_title, display_title] {
-        if let Some(label) = detect_activity_keyword(source) {
-            return Some(label.to_owned());
-        }
-    }
-
-    None
-}
-
-fn preview_label_text(activity_label: Option<&str>, fallback_title: &str) -> String {
-    if let Some(activity_label) = activity_label
-        .map(str::trim)
-        .filter(|label| !label.is_empty())
-    {
-        activity_label.to_owned()
-    } else {
-        sanitize_preview_title(fallback_title).unwrap_or_else(|| "Terminal".to_owned())
-    }
-}
-
-fn sanitize_preview_title(title: &str) -> Option<String> {
-    let trimmed = title.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_owned())
-    }
-}
-
-fn detect_activity_keyword(source: &str) -> Option<&'static str> {
-    let source = source.to_ascii_lowercase();
-    let source = source.trim();
-
-    [
-        ("openclaude", "OpenClaude"),
-        ("claude code", "Claude Code"),
-        ("claude-code", "Claude Code"),
-        (" codex", "Codex"),
-        ("codex ", "Codex"),
-        ("aider", "Aider"),
-        ("cursor", "Cursor"),
-        ("gemini", "Gemini"),
-        ("chatgpt", "ChatGPT"),
-        ("claude", "Claude Code"),
-    ]
-    .into_iter()
-    .find_map(|(needle, label)| source.contains(needle).then_some(label))
-}
-
-fn extract_prompt_command(visible_text: &str) -> Option<String> {
-    for line in visible_text.lines().rev() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        for marker in [" % ", " $ ", "> "] {
-            if let Some(index) = line.rfind(marker) {
-                let tail = line[index + marker.len()..].trim();
-                if tail.is_empty() {
-                    continue;
-                }
-                let command = tail
-                    .split_whitespace()
-                    .next()
-                    .map(|part| part.trim_matches(|ch: char| matches!(ch, '"' | '\'' | '`')))
-                    .filter(|part| !part.is_empty())?;
-                return Some(command.to_owned());
-            }
-        }
-    }
-
-    None
-}
-
-fn map_command_to_activity(command: &str) -> Option<&'static str> {
-    let command = command.to_ascii_lowercase();
-    let command = command.trim();
-
-    match command {
-        "openclaude" => Some("OpenClaude"),
-        "claude" | "claude-code" => Some("Claude Code"),
-        "codex" => Some("Codex"),
-        "aider" => Some("Aider"),
-        "cursor" | "cursor-agent" => Some("Cursor"),
-        "gemini" => Some("Gemini"),
-        "chatgpt" => Some("ChatGPT"),
-        _ => None,
-    }
-}
-
-fn is_generic_terminal_name(title: &str) -> bool {
-    matches!(
-        title.trim().to_ascii_lowercase().as_str(),
-        "" | "terminal" | "shell"
-    )
-}
-
-fn body_input_rect(body_rect: Rect) -> Rect {
-    body_rect.shrink2(vec2(RESIZE_HIT_THICKNESS, RESIZE_HIT_THICKNESS))
-}
-
-fn shell_label() -> String {
-    let shell = default_shell();
-    let shell_name = Path::new(&shell)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("shell");
-    format!("-{}", shell_name)
-}
-
-fn cwd_label(cwd: Option<&Path>) -> String {
-    cwd.and_then(|path| path.file_name())
-        .and_then(|name| name.to_str())
-        .filter(|name| !name.is_empty())
-        .unwrap_or("Terminal")
-        .to_owned()
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::app::gesture_pointer_pos;
-    use crate::canvas::viewport::Viewport;
-    use crate::collab::PanelShareScope;
-    use crate::runtime::RenderTier;
-    use crate::terminal::input::{
-        alt_screen_scroll_sequence, mouse_scroll_button, mouse_scroll_sgr_sequence,
-        scroll_lines_from_input_delta, scrollback_delta_from_input,
-    };
-    use crate::terminal::layout::{grid_point_from_position, GridMetrics};
-    use crate::terminal::scrollbar::{
-        scrollbar_pointer_to_scrollback, scrollbar_thumb_height, terminal_scrollbar_rect,
-    };
-    use egui::{pos2, vec2, Color32};
-
-    use super::{
-        chrome_zoom, close_rect, drag_target_from_origin, infer_activity_label, minimize_rect,
-        panel_corner_radius, panel_lod, panel_roundings, preview_label_text, render_tier_for_panel,
-        resize_target_from_origin, shell_label, should_defer_terminal_resize,
-        should_draw_resize_grip, should_draw_title_text, should_draw_window_controls,
-        should_render_live_terminal, should_render_terminal_contents,
-        terminal_mouse_cell_from_pointer, title_bar_height, title_drag_hit_rect, PanelHitArea,
-        PanelLod, ResizeHandle, TerminalPanel, BORDER_RADIUS, MIN_HEIGHT, MIN_WIDTH,
-        TITLE_BAR_HEIGHT,
-    };
-    #[test]
-    fn custom_title_survives_shell_title_updates() {
-        let mut panel = TerminalPanel::new(pos2(0.0, 0.0), vec2(400.0, 300.0), Color32::WHITE, 0);
-        panel.rename_title("Deploy".to_owned());
-        panel.apply_shell_title("bash".to_owned());
-
-        assert_eq!(panel.title, "Deploy");
-    }
-
-    #[test]
-    fn empty_custom_title_falls_back_to_shell_title() {
-        let mut panel = TerminalPanel::new(pos2(0.0, 0.0), vec2(400.0, 300.0), Color32::WHITE, 0);
-        panel.apply_shell_title("zsh".to_owned());
-        panel.rename_title("   ".to_owned());
-
-        assert_eq!(panel.title, "zsh");
-    }
-
-    #[test]
-    fn default_window_title_uses_shell_and_grid_size() {
-        let mut panel = TerminalPanel::new(pos2(0.0, 0.0), vec2(400.0, 300.0), Color32::WHITE, 0);
-        panel.cwd_label = "mauro".to_owned();
-        panel.shell_label = shell_label();
-        panel.session.set_last_grid_size_for_tests(80, 24);
-
-        assert_eq!(
-            panel.window_title(720.0),
-            format!("mauro — {} — 80×24", shell_label())
-        );
-    }
-
-    #[test]
-    fn close_button_is_on_left_like_macos() {
-        let title_rect = egui::Rect::from_min_size(pos2(100.0, 50.0), vec2(500.0, 42.0));
-        let close = close_rect(title_rect);
-
-        assert!(close.center().x < title_rect.center().x);
-        assert!((close.center().x - 126.0).abs() < 0.001);
-    }
-
-    #[test]
-    fn minimize_button_sits_to_right_of_close_button() {
-        let title_rect = egui::Rect::from_min_size(pos2(100.0, 50.0), vec2(500.0, 42.0));
-        let close = close_rect(title_rect);
-        let minimize = minimize_rect(title_rect);
-
-        assert!(minimize.center().x > close.center().x);
-    }
-
-    #[test]
-    fn drag_target_uses_original_position_instead_of_accumulating() {
-        let origin = pos2(50.0, 60.0);
-        let after_small_drag = drag_target_from_origin(origin, vec2(10.0, 0.0), 1.0);
-        let after_larger_drag = drag_target_from_origin(origin, vec2(15.0, 0.0), 1.0);
-
-        assert_eq!(after_small_drag, pos2(60.0, 60.0));
-        assert_eq!(after_larger_drag, pos2(65.0, 60.0));
-    }
-
-    #[test]
-    fn resize_target_uses_original_rect_instead_of_accumulating() {
-        let origin = egui::Rect::from_min_size(pos2(50.0, 60.0), vec2(400.0, 300.0));
-        let after_small_drag =
-            resize_target_from_origin(ResizeHandle::BottomRight, origin, vec2(10.0, 0.0), 1.0);
-        let after_larger_drag =
-            resize_target_from_origin(ResizeHandle::BottomRight, origin, vec2(15.0, 0.0), 1.0);
-
-        assert_eq!(after_small_drag.size(), vec2(410.0, 300.0));
-        assert_eq!(after_larger_drag.size(), vec2(415.0, 300.0));
-    }
-
-    #[test]
-    fn resize_respects_new_smaller_minimum_size() {
-        let origin = egui::Rect::from_min_size(pos2(50.0, 60.0), vec2(320.0, 220.0));
-        let resized =
-            resize_target_from_origin(ResizeHandle::BottomRight, origin, vec2(-500.0, -500.0), 1.0);
-
-        assert_eq!(resized.size(), vec2(MIN_WIDTH, MIN_HEIGHT));
-    }
-
-    #[test]
-    fn narrow_windows_use_compact_title() {
-        let mut panel = TerminalPanel::new(pos2(0.0, 0.0), vec2(400.0, 300.0), Color32::WHITE, 0);
-        panel.session.set_last_grid_size_for_tests(42, 25);
-
-        assert_eq!(panel.window_title(420.0), "Terminal — 42×25");
-    }
-
-    #[test]
-    fn chrome_zoom_is_capped_at_normal_size() {
-        assert_eq!(chrome_zoom(0.5), 0.5);
-        assert_eq!(chrome_zoom(1.0), 1.0);
-        assert_eq!(chrome_zoom(2.5), 1.0);
-    }
-
-    #[test]
-    fn title_bar_height_shrinks_when_zooming_out_but_not_when_zooming_in() {
-        assert!((title_bar_height(0.5) - TITLE_BAR_HEIGHT * 0.5).abs() < 0.001);
-        assert!((title_bar_height(1.0) - TITLE_BAR_HEIGHT).abs() < 0.001);
-        assert!((title_bar_height(3.0) - TITLE_BAR_HEIGHT).abs() < 0.001);
-    }
-
-    #[test]
-    fn tiny_panels_hide_header_details_and_terminal_text() {
-        let screen_rect = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(120.0, 70.0));
-        let title_rect = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(120.0, 12.0));
-        let content_rect = egui::Rect::from_min_size(pos2(0.0, 12.0), vec2(120.0, 58.0));
-
-        assert!(matches!(
-            panel_lod(screen_rect, title_rect),
-            PanelLod::Compact
-        ));
-        assert!(should_draw_window_controls(screen_rect, title_rect));
-        assert!(!should_draw_title_text(screen_rect, title_rect));
-        assert!(!should_draw_resize_grip(screen_rect));
-        assert!(should_render_terminal_contents(content_rect, 0.24));
-        assert!(!should_render_terminal_contents(content_rect, 0.22));
-        assert!(should_render_terminal_contents(content_rect, 0.3));
-        assert!(!should_render_terminal_contents(content_rect, 0.05));
-    }
-
-    #[test]
-    fn large_panels_keep_full_ui_details() {
-        let screen_rect = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(420.0, 260.0));
-        let title_rect = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(420.0, 42.0));
-        let content_rect = egui::Rect::from_min_size(pos2(0.0, 42.0), vec2(420.0, 218.0));
-
-        assert!(should_draw_window_controls(screen_rect, title_rect));
-        assert!(should_draw_title_text(screen_rect, title_rect));
-        assert!(should_draw_resize_grip(screen_rect));
-        assert!(should_render_terminal_contents(content_rect, 1.0));
-    }
-
-    #[test]
-    fn microscopic_panels_switch_to_minimal_lod_and_reduce_corner_radius() {
-        let screen_rect = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(80.0, 52.0));
-        let title_rect = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(80.0, 7.0));
-
-        assert!(matches!(
-            panel_lod(screen_rect, title_rect),
-            PanelLod::Minimal
-        ));
-        assert!(panel_corner_radius(screen_rect) < BORDER_RADIUS);
-    }
-
-    #[test]
-    fn zoomed_out_panel_roundings_fit_visible_header_and_body() {
-        let screen_rect = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(84.0, 34.0));
-        let title_rect = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(84.0, 5.0));
-        let body_rect = egui::Rect::from_min_max(pos2(0.0, 5.0), pos2(84.0, 34.0));
-
-        let roundings = panel_roundings(screen_rect, title_rect, body_rect);
-
-        assert!(roundings.panel.nw <= title_rect.height() * 0.5);
-        assert!(roundings.panel.ne <= title_rect.height() * 0.5);
-        assert!(roundings.panel.sw <= body_rect.height() * 0.5);
-        assert!(roundings.panel.se <= body_rect.height() * 0.5);
-        assert_eq!(roundings.title.nw, roundings.panel.nw);
-        assert_eq!(roundings.body.sw, roundings.panel.sw);
-    }
-
-    #[test]
-    fn fast_path_keeps_background_panels_live() {
-        let content_rect = egui::Rect::from_min_size(pos2(0.0, 42.0), vec2(420.0, 218.0));
-
-        assert!(should_render_live_terminal(
-            content_rect,
-            1.0,
-            PanelLod::Full,
-            false
-        ));
-        assert!(should_render_live_terminal(
-            content_rect,
-            1.0,
-            PanelLod::Full,
-            true
-        ));
-    }
-
-    #[test]
-    fn focused_panels_get_full_render_tier() {
-        let content_rect = egui::Rect::from_min_size(pos2(0.0, 42.0), vec2(420.0, 218.0));
-
-        assert_eq!(
-            render_tier_for_panel(content_rect, 1.0, PanelLod::Full, false, true, false),
-            RenderTier::Full
-        );
-    }
-
-    #[test]
-    fn fast_path_still_keeps_focused_panels_live() {
-        let content_rect = egui::Rect::from_min_size(pos2(0.0, 42.0), vec2(420.0, 218.0));
-
-        assert_eq!(
-            render_tier_for_panel(content_rect, 1.0, PanelLod::Full, true, true, false),
-            RenderTier::Full
-        );
-    }
-
-    #[test]
-    fn background_streaming_panels_stay_live_when_renderable() {
-        let content_rect = egui::Rect::from_min_size(pos2(0.0, 42.0), vec2(200.0, 120.0));
-
-        assert_eq!(
-            render_tier_for_panel(content_rect, 1.0, PanelLod::Compact, false, false, true),
-            RenderTier::ReducedLive
-        );
-    }
-
-    #[test]
-    fn background_idle_panels_keep_full_cached_render_when_visible() {
-        let content_rect = egui::Rect::from_min_size(pos2(0.0, 42.0), vec2(200.0, 120.0));
-
-        assert_eq!(
-            render_tier_for_panel(content_rect, 1.0, PanelLod::Compact, false, false, false),
-            RenderTier::Full
-        );
-    }
-
-    #[test]
-    fn drag_fast_path_uses_reduced_live_without_falling_to_preview() {
-        let content_rect = egui::Rect::from_min_size(pos2(0.0, 42.0), vec2(200.0, 120.0));
-
-        assert_eq!(
-            render_tier_for_panel(content_rect, 1.0, PanelLod::Compact, true, false, false),
-            RenderTier::ReducedLive
-        );
-    }
-
-    #[test]
-    fn minimal_panels_keep_preview_badge_visible() {
-        let content_rect = egui::Rect::from_min_size(pos2(0.0, 7.0), vec2(84.0, 44.0));
-
-        assert_eq!(
-            render_tier_for_panel(content_rect, 0.18, PanelLod::Minimal, false, false, false),
-            RenderTier::Preview
-        );
-    }
-
-    #[test]
-    fn fast_path_only_defers_resize_during_active_resize_gesture() {
-        let rect = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(320.0, 220.0));
-
-        assert!(should_defer_terminal_resize(true, Some(rect)));
-        assert!(!should_defer_terminal_resize(true, None));
-        assert!(!should_defer_terminal_resize(false, Some(rect)));
-    }
-
-    #[test]
-    fn intelligent_preview_detects_claude_code_from_prompt_command() {
-        let label = infer_activity_label("Terminal", "Terminal", "(base) mauro@Mac ~ % claude");
-
-        assert_eq!(label.as_deref(), Some("Claude Code"));
-    }
-
-    #[test]
-    fn intelligent_preview_prefers_openclaude_over_generic_claude() {
-        let label = infer_activity_label("Claude", "Terminal", "running openclaude in this panel");
-
-        assert_eq!(label.as_deref(), Some("OpenClaude"));
-    }
-
-    #[test]
-    fn preview_label_falls_back_to_clean_title_when_no_agent_is_detected() {
-        let label = preview_label_text(None, "Deploy API");
-
-        assert_eq!(label, "Deploy API");
-    }
-
-    #[test]
-    fn mac_native_upward_input_scroll_moves_toward_recent_output() {
-        assert_eq!(scroll_lines_from_input_delta(-48.0), 2);
-        #[cfg(target_os = "macos")]
-        {
-            assert_eq!(scrollback_delta_from_input(-48.0), -2);
-            assert_eq!(alt_screen_scroll_sequence(-1.0), b"\x1b[B");
-            assert_eq!(mouse_scroll_button(-1.0), 65);
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            assert_eq!(scrollback_delta_from_input(-48.0), 2);
-            assert_eq!(alt_screen_scroll_sequence(-1.0), b"\x1b[A");
-            assert_eq!(mouse_scroll_button(-1.0), 64);
-        }
-    }
-
-    #[test]
-    fn mac_native_downward_input_scroll_moves_toward_history() {
-        assert_eq!(scroll_lines_from_input_delta(48.0), 2);
-        #[cfg(target_os = "macos")]
-        {
-            assert_eq!(scrollback_delta_from_input(48.0), 2);
-            assert_eq!(alt_screen_scroll_sequence(1.0), b"\x1b[A");
-            assert_eq!(mouse_scroll_button(1.0), 64);
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            assert_eq!(scrollback_delta_from_input(48.0), -2);
-            assert_eq!(alt_screen_scroll_sequence(1.0), b"\x1b[B");
-            assert_eq!(mouse_scroll_button(1.0), 65);
-        }
-    }
-
-    #[test]
-    fn mouse_mode_scroll_reports_pointer_cell_instead_of_fixed_origin() {
-        let content_rect = egui::Rect::from_min_size(pos2(10.0, 20.0), vec2(400.0, 240.0));
-        let pointer = pos2(10.0 + 7.2 * 5.4, 20.0 + 14.4 * 3.2);
-
-        let (column, row) = terminal_mouse_cell_from_pointer(content_rect, pointer, 1.0).unwrap();
-        let seq = mouse_scroll_sgr_sequence(64, column, row);
-
-        assert_eq!((column, row), (3, 2));
-        assert_eq!(seq, b"\x1b[<64;4;3M".to_vec());
-    }
-
-    #[test]
-    fn grid_point_from_position_clamps_to_visible_terminal_bounds() {
-        let rect = egui::Rect::from_min_size(pos2(100.0, 80.0), vec2(80.0, 48.0));
-        let metrics = GridMetrics {
-            char_width: 8.0,
-            line_height: 16.0,
-        };
-
-        let point =
-            grid_point_from_position(rect, pos2(179.0, 127.0), &metrics, 3, 10).expect("point");
-
-        assert_eq!(point.line, 2);
-        assert_eq!(point.column, 9);
-    }
-
-    #[test]
-    fn tiny_title_bar_keeps_a_real_drag_hit_area() {
-        let screen_rect = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(90.0, 52.0));
-        let title_rect = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(90.0, 4.0));
-        let hit_rect = title_drag_hit_rect(screen_rect, title_rect);
-
-        assert!(hit_rect.height() >= 16.0);
-        assert!(hit_rect.width() > 20.0);
-    }
-
-    #[test]
-    fn gesture_pointer_uses_latest_pointer_position_when_available() {
-        let pointer = gesture_pointer_pos(
-            Some(pos2(120.0, 80.0)),
-            Some(pos2(100.0, 70.0)),
-            Some(pos2(90.0, 60.0)),
-        );
-
-        assert_eq!(pointer, Some(pos2(120.0, 80.0)));
-    }
-
-    #[test]
-    fn compact_panels_drag_from_the_body_instead_of_terminal_selection() {
-        let panel = TerminalPanel::new(pos2(0.0, 0.0), vec2(400.0, 300.0), Color32::WHITE, 0);
-        let viewport = Viewport {
-            pan: egui::Vec2::ZERO,
-            zoom: 0.2,
-        };
-        let canvas_rect = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0));
-        let hit = panel.hit_test(pos2(40.0, 34.0), &viewport, canvas_rect);
-
-        assert!(matches!(hit, Some(PanelHitArea::TitleBar)));
-    }
-
-    #[test]
-    fn hit_test_detects_minimize_button() {
-        let panel = TerminalPanel::new(pos2(0.0, 0.0), vec2(400.0, 300.0), Color32::WHITE, 0);
-        let viewport = Viewport::default();
-        let canvas_rect = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0));
-        let title_rect = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(400.0, 42.0));
-        let hit = panel.hit_test(minimize_rect(title_rect).center(), &viewport, canvas_rect);
-
-        assert_eq!(hit, Some(PanelHitArea::MinimizeButton));
-    }
-
-    #[test]
-    fn resize_hit_areas_are_slightly_more_generous() {
-        let screen_rect = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(420.0, 260.0));
-
-        assert!(ResizeHandle::Right.hit_rect(screen_rect).width() >= 12.0);
-        assert!(ResizeHandle::Bottom.hit_rect(screen_rect).height() >= 12.0);
-        assert!(ResizeHandle::BottomRight.hit_rect(screen_rect).width() >= 28.0);
-        assert!(ResizeHandle::BottomRight.hit_rect(screen_rect).height() >= 28.0);
-    }
-
-    #[test]
-    fn scrollbar_thumb_height_stays_within_track_bounds() {
-        assert!((scrollbar_thumb_height(12.0, 50, 0) - 12.0).abs() <= f32::EPSILON);
-
-        let thumb_height = scrollbar_thumb_height(120.0, 24, 240);
-        assert!(thumb_height >= 18.0);
-        assert!(thumb_height <= 120.0);
-    }
-
-    #[test]
-    fn scrollbar_pointer_maps_to_expected_scrollback_extremes() {
-        let track_rect = egui::Rect::from_min_size(pos2(10.0, 20.0), vec2(12.0, 100.0));
-        let thumb_height = 20.0;
-
-        assert_eq!(
-            scrollbar_pointer_to_scrollback(
-                pos2(16.0, track_rect.max.y),
-                track_rect,
-                thumb_height,
-                200
-            ),
-            0
-        );
-        assert_eq!(
-            scrollbar_pointer_to_scrollback(
-                pos2(16.0, track_rect.min.y),
-                track_rect,
-                thumb_height,
-                200
-            ),
-            200
-        );
-    }
-
-    #[test]
-    fn scroll_hit_target_includes_scrollbar_track() {
-        let panel = TerminalPanel::new(pos2(0.0, 0.0), vec2(400.0, 300.0), Color32::WHITE, 0);
-        let viewport = Viewport::default();
-        let canvas_rect = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0));
-        let body_rect = egui::Rect::from_min_max(pos2(0.0, 42.0), pos2(400.0, 300.0));
-        let pointer = terminal_scrollbar_rect(body_rect).center();
-
-        assert!(panel.scroll_hit_test(pointer, &viewport, canvas_rect));
-    }
-
-    #[test]
-    fn shared_snapshot_reports_private_scope() {
-        let mut panel = TerminalPanel::new(pos2(0.0, 0.0), vec2(400.0, 300.0), Color32::WHITE, 0);
-        panel.set_share_scope(PanelShareScope::Private);
-
-        let snapshot = panel.shared_snapshot();
-
-        assert_eq!(snapshot.share_scope, PanelShareScope::Private);
-        assert!(snapshot.visible_text.is_empty());
-        assert!(snapshot.history_text.is_empty());
     }
 }

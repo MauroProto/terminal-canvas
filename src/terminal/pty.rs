@@ -1,9 +1,11 @@
 use std::io::{Read, Write};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+use arc_swap::ArcSwap;
 
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::grid::{Dimensions, Scroll};
@@ -11,7 +13,7 @@ use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::term::{Config as TermConfig, Term, TermMode};
 use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
 use anyhow::Context as _;
-use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
+use portable_pty::{native_pty_system, Child, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use uuid::Uuid;
 
 use crate::runtime::SharedRuntimeScheduler;
@@ -45,14 +47,24 @@ fn osc52_clipboard_enabled() -> bool {
         .unwrap_or(false)
 }
 
+fn pty_clock_epoch() -> Instant {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    *EPOCH.get_or_init(Instant::now)
+}
+
+fn pty_clock_now_ms() -> i64 {
+    Instant::now()
+        .saturating_duration_since(pty_clock_epoch())
+        .as_millis() as i64
+}
+
 pub struct PtyHandle {
     pub term: Arc<Mutex<Term<EventProxy>>>,
-    pub title: Arc<Mutex<String>>,
+    title: Arc<ArcSwap<String>>,
     pub alive: Arc<AtomicBool>,
     pub bell_fired: Arc<AtomicBool>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
-    pub last_input_at: Arc<Mutex<Instant>>,
-    pub last_output_at: Arc<Mutex<Instant>>,
+    last_output_at: Arc<AtomicI64>,
     window_size: Arc<Mutex<WindowSize>>,
     render_revision: Arc<AtomicU64>,
     scrollback_limit: usize,
@@ -62,6 +74,7 @@ pub struct PtyHandle {
     ghostty_runtime: Option<GhosttyRuntimeHandle>,
     master: Box<dyn MasterPty + Send>,
     killer: Box<dyn ChildKiller + Send + Sync>,
+    child: Option<Box<dyn Child + Send + Sync>>,
     _reader_thread: thread::JoinHandle<()>,
 }
 
@@ -95,11 +108,10 @@ impl PtyHandle {
         let mut reader = pair.master.try_clone_reader().context("clone PTY reader")?;
         let writer = pair.master.take_writer().context("take PTY writer")?;
 
-        let title = Arc::new(Mutex::new("Terminal".to_owned()));
+        let title = Arc::new(ArcSwap::from_pointee("Terminal".to_owned()));
         let alive = Arc::new(AtomicBool::new(true));
         let bell_fired = Arc::new(AtomicBool::new(false));
-        let last_input_at = Arc::new(Mutex::new(Instant::now()));
-        let last_output_at = Arc::new(Mutex::new(Instant::now()));
+        let last_output_at = Arc::new(AtomicI64::new(pty_clock_now_ms()));
         let window_size = Arc::new(Mutex::new(WindowSize {
             num_lines: rows,
             num_cols: cols,
@@ -150,49 +162,49 @@ impl PtyHandle {
         let render_revision_for_reader = Arc::clone(&render_revision);
         let scheduler_for_reader = Arc::clone(&scheduler);
         let reader_thread = thread::spawn(move || {
-            let mut buf = [0_u8; 4096];
-            let mut processor = Processor::<StdSyncHandler>::new();
-            loop {
-                match reader.read(&mut buf) {
-                    Ok(0) => {
-                        alive_for_reader.store(false, Ordering::Relaxed);
-                        if let Ok(mut scheduler) = scheduler_for_reader.lock() {
-                            scheduler.record_exit(session_id);
+            // The parser processes untrusted terminal output; if it ever
+            // panics, contain the damage to this session instead of taking
+            // down the whole app, and leave the session marked as exited.
+            let loop_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut buf = vec![0_u8; 65_536];
+                let mut processor = Processor::<StdSyncHandler>::new();
+                loop {
+                    match reader.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(read) => {
+                            if let Ok(mut term) = term_for_reader.lock() {
+                                processor.advance(&mut *term, &buf[..read]);
+                            }
+                            #[cfg(feature = "ghostty-vt")]
+                            if let Some(ghostty) = &ghostty_for_reader {
+                                ghostty.feed(&buf[..read]);
+                            }
+                            render_revision_for_reader.fetch_add(1, Ordering::Relaxed);
+                            output_for_reader.store(pty_clock_now_ms(), Ordering::Relaxed);
+                            if let Ok(mut scheduler) = scheduler_for_reader.lock() {
+                                scheduler.record_output(session_id);
+                            }
+                            drain_terminal_events(
+                                &event_rx,
+                                &writer_for_thread,
+                                &title_for_reader,
+                                &alive_for_reader,
+                                &bell_for_reader,
+                                &window_size_for_reader,
+                                &scheduler_for_reader,
+                                session_id,
+                            );
                         }
-                        break;
-                    }
-                    Ok(read) => {
-                        if let Ok(mut term) = term_for_reader.lock() {
-                            processor.advance(&mut *term, &buf[..read]);
-                        }
-                        #[cfg(feature = "ghostty-vt")]
-                        if let Some(ghostty) = &ghostty_for_reader {
-                            ghostty.feed(&buf[..read]);
-                        }
-                        render_revision_for_reader.fetch_add(1, Ordering::Relaxed);
-                        *output_for_reader.lock().unwrap() = Instant::now();
-                        if let Ok(mut scheduler) = scheduler_for_reader.lock() {
-                            scheduler.record_output(session_id);
-                        }
-                        drain_terminal_events(
-                            &event_rx,
-                            &writer_for_thread,
-                            &title_for_reader,
-                            &alive_for_reader,
-                            &bell_for_reader,
-                            &window_size_for_reader,
-                            &scheduler_for_reader,
-                            session_id,
-                        );
-                    }
-                    Err(_) => {
-                        alive_for_reader.store(false, Ordering::Relaxed);
-                        if let Ok(mut scheduler) = scheduler_for_reader.lock() {
-                            scheduler.record_exit(session_id);
-                        }
-                        break;
+                        Err(_) => break,
                     }
                 }
+            }));
+            if loop_result.is_err() {
+                log::error!("PTY reader thread for session {session_id} panicked");
+            }
+            alive_for_reader.store(false, Ordering::Relaxed);
+            if let Ok(mut scheduler) = scheduler_for_reader.lock() {
+                scheduler.record_exit(session_id);
             }
             drain_terminal_events(
                 &event_rx,
@@ -212,7 +224,6 @@ impl PtyHandle {
             alive,
             bell_fired,
             writer: writer_for_reader,
-            last_input_at,
             last_output_at,
             window_size,
             render_revision,
@@ -223,6 +234,7 @@ impl PtyHandle {
             ghostty_runtime,
             master: pair.master,
             killer,
+            child: Some(child),
             _reader_thread: reader_thread,
         })
     }
@@ -234,12 +246,14 @@ impl PtyHandle {
             pixel_width: 0,
             pixel_height: 0,
         });
-        *self.window_size.lock().unwrap() = WindowSize {
-            num_lines: rows,
-            num_cols: cols,
-            cell_width: 0,
-            cell_height: 0,
-        };
+        if let Ok(mut window_size) = self.window_size.lock() {
+            *window_size = WindowSize {
+                num_lines: rows,
+                num_cols: cols,
+                cell_width: 0,
+                cell_height: 0,
+            };
+        }
         if let Ok(mut term) = self.term.lock() {
             term.resize(TermSize::new(cols as usize, rows as usize));
         }
@@ -254,13 +268,21 @@ impl PtyHandle {
         if let Ok(mut writer) = self.writer.lock() {
             if writer.write_all(bytes).is_ok() {
                 let _ = writer.flush();
-                *self.last_input_at.lock().unwrap() = Instant::now();
             }
         }
     }
 
+    pub fn output_elapsed(&self) -> Duration {
+        let last = self.last_output_at.load(Ordering::Relaxed);
+        let delta = pty_clock_now_ms().saturating_sub(last).max(0) as u64;
+        Duration::from_millis(delta)
+    }
+
     pub fn input_mode(&self) -> InputMode {
-        let mode = self.term.lock().unwrap().mode().to_owned();
+        let Ok(term) = self.term.lock() else {
+            return InputMode::default();
+        };
+        let mode = term.mode().to_owned();
         InputMode {
             app_cursor: mode.contains(TermMode::APP_CURSOR),
             bracketed_paste: mode.contains(TermMode::BRACKETED_PASTE),
@@ -297,7 +319,7 @@ impl PtyHandle {
     }
 
     pub fn selected_text(&self) -> Option<String> {
-        self.term.lock().unwrap().selection_to_string()
+        self.term.lock().ok()?.selection_to_string()
     }
 
     pub fn with_term<R>(&self, f: impl FnOnce(&mut Term<EventProxy>) -> R) -> Option<R> {
@@ -306,7 +328,7 @@ impl PtyHandle {
     }
 
     pub fn title_snapshot(&self) -> Option<String> {
-        self.title.try_lock().ok().map(|title| title.clone())
+        Some((*self.title.load_full()).clone())
     }
 
     pub fn clear_selection(&self) {
@@ -380,13 +402,14 @@ fn shell_command(cwd: Option<&Path>) -> CommandBuilder {
 fn drain_terminal_events(
     event_rx: &mpsc::Receiver<Event>,
     writer: &Arc<Mutex<Box<dyn Write + Send>>>,
-    title: &Arc<Mutex<String>>,
+    title: &Arc<ArcSwap<String>>,
     alive: &Arc<AtomicBool>,
     bell_fired: &Arc<AtomicBool>,
     window_size: &Arc<Mutex<WindowSize>>,
     scheduler: &SharedRuntimeScheduler,
     session_id: Uuid,
 ) {
+    let mut sched_flags = SchedulerEventFlags::default();
     while let Ok(event) = event_rx.try_recv() {
         match event {
             Event::PtyWrite(text) => {
@@ -396,16 +419,12 @@ fn drain_terminal_events(
                 }
             }
             Event::Title(new_title) => {
-                *title.lock().unwrap() = new_title;
-                if let Ok(mut scheduler) = scheduler.lock() {
-                    scheduler.record_title_changed(session_id);
-                }
+                title.store(Arc::new(new_title));
+                sched_flags.title_changed = true;
             }
             Event::ResetTitle => {
-                *title.lock().unwrap() = "Terminal".to_owned();
-                if let Ok(mut scheduler) = scheduler.lock() {
-                    scheduler.record_title_changed(session_id);
-                }
+                title.store(Arc::new("Terminal".to_owned()));
+                sched_flags.title_changed = true;
             }
             Event::ClipboardStore(_, text) => {
                 if osc52_clipboard_enabled() {
@@ -441,29 +460,76 @@ fn drain_terminal_events(
                 }
             }
             Event::TextAreaSizeRequest(formatter) => {
-                let size = *window_size.lock().unwrap();
-                if let Ok(mut writer) = writer.lock() {
-                    let _ = writer.write_all(formatter(size).as_bytes());
-                    let _ = writer.flush();
+                if let Ok(size) = window_size.lock().map(|guard| *guard) {
+                    if let Ok(mut writer) = writer.lock() {
+                        let _ = writer.write_all(formatter(size).as_bytes());
+                        let _ = writer.flush();
+                    }
                 }
             }
             Event::Bell => {
                 bell_fired.store(true, Ordering::Relaxed);
-                if let Ok(mut scheduler) = scheduler.lock() {
-                    scheduler.record_bell(session_id);
-                }
+                sched_flags.bell = true;
             }
             Event::Exit | Event::ChildExit(_) => {
                 alive.store(false, Ordering::Relaxed);
-                if let Ok(mut scheduler) = scheduler.lock() {
-                    scheduler.record_exit(session_id);
-                }
+                sched_flags.exited = true;
             }
             Event::Wakeup | Event::MouseCursorDirty | Event::CursorBlinkingChange => {
-                if let Ok(mut scheduler) = scheduler.lock() {
-                    scheduler.record_render(session_id);
-                }
+                sched_flags.render = true;
             }
+        }
+    }
+
+    if sched_flags.has_any() {
+        if let Ok(mut scheduler) = scheduler.lock() {
+            sched_flags.apply(&mut scheduler, session_id);
+        }
+    }
+}
+
+#[derive(Default)]
+struct SchedulerEventFlags {
+    title_changed: bool,
+    bell: bool,
+    exited: bool,
+    render: bool,
+}
+
+impl SchedulerEventFlags {
+    fn has_any(&self) -> bool {
+        self.title_changed || self.bell || self.exited || self.render
+    }
+
+    fn apply(&self, scheduler: &mut crate::runtime::RuntimeScheduler, session_id: Uuid) {
+        if self.title_changed {
+            scheduler.record_title_changed(session_id);
+        }
+        if self.bell {
+            scheduler.record_bell(session_id);
+        }
+        if self.exited {
+            scheduler.record_exit(session_id);
+        }
+        if self.render {
+            scheduler.record_render(session_id);
+        }
+    }
+}
+
+impl Drop for PtyHandle {
+    fn drop(&mut self) {
+        self.alive.store(false, Ordering::Relaxed);
+        let _ = self.killer.kill();
+        // Reap the child off-thread: without a wait() every closed terminal
+        // leaves a zombie process, and long sessions with many terminals
+        // eventually exhaust the process table.
+        if let Some(mut child) = self.child.take() {
+            let _ = thread::Builder::new()
+                .name("pty-reaper".to_owned())
+                .spawn(move || {
+                    let _ = child.wait();
+                });
         }
     }
 }
@@ -501,12 +567,5 @@ mod tests {
         assert_eq!(command.get_env("TERM"), Some("xterm-256color".as_ref()));
         assert_eq!(command.get_env("COLORTERM"), Some("truecolor".as_ref()));
         assert_eq!(command.get_env("MI_TERMINAL"), Some("1".as_ref()));
-    }
-}
-
-impl Drop for PtyHandle {
-    fn drop(&mut self) {
-        self.alive.store(false, Ordering::Relaxed);
-        let _ = self.killer.kill();
     }
 }

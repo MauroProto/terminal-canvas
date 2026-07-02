@@ -6,7 +6,7 @@ mod matching;
 pub use manager::{
     launch_presets, AgentLaunchPlan, AgentLaunchRequest, AgentProvider, AgentSessionMeta,
     AgentStatus, CommandSummary, DependencyEdge, DependencyKind, DiffStats, InboxEvent,
-    InboxEventKind, OrchestrationState, Orchestrator, PanelOverlay, PanelRuntimeObservation,
-    ReviewSummary, SceneTemplate, SceneTemplateKind, SessionListItem, TaskCard, TaskState,
-    TestStatus, WorktreeMode,
+    InboxEventKind, LaunchOutcome, LaunchPreparation, OrchestrationState, Orchestrator,
+    PanelOverlay, PanelRuntimeObservation, ReviewSummary, SceneTemplate, SceneTemplateKind,
+    SessionListItem, TaskCard, TaskState, TestStatus, WorktreeMode,
 };

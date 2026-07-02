@@ -73,6 +73,17 @@ pub fn runtime_backend_from_env() -> TerminalBackendKind {
     }
 }
 
+#[cfg(not(feature = "ghostty-vt"))]
+fn ghostty_status() -> TerminalBackendStatus {
+    TerminalBackendStatus {
+        kind: TerminalBackendKind::Ghostty,
+        available: false,
+        reason: "build without ghostty-vt feature".to_owned(),
+        requires_single_thread_actor: true,
+        production_default: false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::TerminalBackendKind;
@@ -114,16 +125,5 @@ mod tests {
         unsafe {
             std::env::remove_var("MI_TERMINAL_BACKEND");
         }
-    }
-}
-
-#[cfg(not(feature = "ghostty-vt"))]
-fn ghostty_status() -> TerminalBackendStatus {
-    TerminalBackendStatus {
-        kind: TerminalBackendKind::Ghostty,
-        available: false,
-        reason: "build without ghostty-vt feature".to_owned(),
-        requires_single_thread_actor: true,
-        production_default: false,
     }
 }

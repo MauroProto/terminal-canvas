@@ -1,4 +1,6 @@
 pub(crate) mod auth;
+pub mod broker;
+mod http_worker;
 mod manager;
 mod models;
 mod protocol;

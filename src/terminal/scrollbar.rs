@@ -1,4 +1,4 @@
-use egui::{pos2, vec2, Color32, Painter, Pos2, Rect, Stroke};
+use egui::{pos2, vec2, Pos2, Rect};
 
 pub const SCROLLBAR_WIDTH: f32 = 12.0;
 pub const SCROLLBAR_GAP: f32 = 8.0;
@@ -31,24 +31,6 @@ pub fn scrollbar_thumb_height(
     (track_height * (visible_rows / total_rows)).clamp(SCROLLBAR_MIN_THUMB_HEIGHT, track_height)
 }
 
-pub fn scrollbar_thumb_rect(
-    track_rect: Rect,
-    thumb_height: f32,
-    scrollback: usize,
-    scrollback_limit: usize,
-) -> Rect {
-    let max_scrollback = scrollback_limit.max(1) as f32;
-    let scroll_ratio =
-        (scrollback.min(scrollback_limit.max(1)) as f32 / max_scrollback).clamp(0.0, 1.0);
-    let travel = (track_rect.height() - thumb_height).max(0.0);
-    let thumb_top = track_rect.max.y - thumb_height - (travel * scroll_ratio);
-
-    Rect::from_min_size(
-        pos2(track_rect.min.x + 1.0, thumb_top),
-        vec2((track_rect.width() - 2.0).max(4.0), thumb_height),
-    )
-}
-
 pub fn scrollbar_pointer_to_scrollback(
     pointer_position: Pos2,
     track_rect: Rect,
@@ -60,34 +42,4 @@ pub fn scrollbar_pointer_to_scrollback(
     let relative = (track_rect.max.y - thumb_height - clamped_y).clamp(0.0, travel);
     let ratio = (relative / travel).clamp(0.0, 1.0);
     (ratio * scrollback_limit.max(1) as f32).round() as usize
-}
-
-pub fn render_scrollbar(
-    painter: &Painter,
-    rect: Rect,
-    scrollback: usize,
-    visible_rows: usize,
-    scrollback_limit: usize,
-    highlighted: bool,
-) {
-    let track_fill = if highlighted {
-        Color32::from_rgba_premultiplied(48, 48, 56, 220)
-    } else {
-        Color32::from_rgba_premultiplied(42, 42, 48, 180)
-    };
-    painter.rect_filled(rect, rect.width() * 0.5, track_fill);
-    painter.rect_stroke(
-        rect,
-        rect.width() * 0.5,
-        Stroke::new(1.0, Color32::from_rgba_premultiplied(94, 94, 104, 170)),
-    );
-
-    let thumb_height = scrollbar_thumb_height(rect.height(), visible_rows, scrollback_limit);
-    let thumb_rect = scrollbar_thumb_rect(rect, thumb_height, scrollback, scrollback_limit);
-    let thumb_fill = if highlighted || scrollback > 0 {
-        Color32::from_rgba_premultiplied(126, 138, 170, 220)
-    } else {
-        Color32::from_rgba_premultiplied(108, 108, 118, 150)
-    };
-    painter.rect_filled(thumb_rect, thumb_rect.width() * 0.5, thumb_fill);
 }

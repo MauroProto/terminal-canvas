@@ -1,15 +1,16 @@
 use egui::{pos2, vec2, Align2, Color32, FontId, Rect, Stroke};
 
 use crate::canvas::viewport::Viewport;
+use crate::theme::colors as palette;
 
 use super::{CollabSessionState, GuestId, SharedWorkspaceSnapshot};
 
-const PANEL_BG: Color32 = Color32::from_rgb(30, 30, 30);
-const TITLE_BG: Color32 = Color32::from_rgb(42, 44, 52);
-const BORDER: Color32 = Color32::from_rgb(95, 97, 110);
-const FG: Color32 = Color32::from_rgb(220, 220, 220);
-const MUTED: Color32 = Color32::from_rgb(150, 150, 150);
-const ACCENT: Color32 = Color32::from_rgb(116, 147, 255);
+const PANEL_BG: Color32 = palette::SURFACE;
+const TITLE_BG: Color32 = palette::RAISED;
+const BORDER: Color32 = palette::LINE;
+const FG: Color32 = palette::TEXT;
+const MUTED: Color32 = palette::DIM;
+const ACCENT: Color32 = palette::TEXT_STRONG;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RemotePanelAction {
@@ -30,7 +31,9 @@ pub fn draw_remote_workspace(
     let painter = ui.painter().with_clip_rect(canvas_rect);
     let mut action = None;
 
-    let mut panels = snapshot.panels.clone();
+    // Sort references instead of cloning: panel snapshots carry the full
+    // history text, so cloning them every frame is expensive.
+    let mut panels: Vec<_> = snapshot.panels.iter().collect();
     panels.sort_by_key(|panel| panel.z_index);
 
     for panel in panels {
@@ -158,7 +161,7 @@ pub fn draw_remote_workspace(
             painter.rect_filled(
                 cta_rect,
                 13.0,
-                Color32::from_rgba_premultiplied(22, 24, 34, 220),
+                Color32::from_rgba_premultiplied(10, 10, 10, 220),
             );
             painter.rect_stroke(cta_rect, 13.0, Stroke::new(1.0, ACCENT));
             painter.text(

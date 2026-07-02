@@ -1,19 +1,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod app;
-mod canvas;
-mod collab;
-mod command_palette;
-mod orchestration;
-mod panel;
-mod runtime;
-mod shortcuts;
-mod sidebar;
-mod state;
-mod terminal;
-mod theme;
-mod update;
-mod utils;
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+use mi_terminal::{app, collab, terminal, utils};
 
 use std::sync::Arc;
 use std::{backtrace::Backtrace, fmt::Write as _, fs, io::Write as _, path::Path, path::PathBuf};

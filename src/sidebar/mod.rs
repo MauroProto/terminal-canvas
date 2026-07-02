@@ -1,20 +1,24 @@
-use egui::{Align2, Color32, FontId, RichText, ScrollArea, Sense, Stroke, Ui};
+use egui::{Align2, FontId, RichText, ScrollArea, Sense, Stroke, Ui};
 
 use crate::collab::{CollabMode, CollabSessionState};
 use crate::sidebar::workspace_list::draw_workspace_tree;
 use crate::state::Workspace;
-use crate::update::{UpdateState, UpdateStatus};
+use crate::theme::colors::{DIM, FOCUS, INK, LINE, RAISED, SURFACE, TEXT, TEXT_STRONG};
+use crate::update::UpdateState;
 
 pub mod workspace_list;
 
-pub const SIDEBAR_BG: Color32 = Color32::from_rgb(23, 23, 23);
-pub const SIDEBAR_BORDER: Color32 = Color32::from_rgb(38, 38, 38);
-pub const INPUT_BG: Color32 = Color32::from_rgb(39, 39, 42);
-pub const ACTIVE_TAB_BG: Color32 = Color32::from_rgb(63, 63, 70);
-pub const TEXT_PRIMARY: Color32 = Color32::WHITE;
-pub const TEXT_SECONDARY: Color32 = Color32::from_rgb(163, 163, 163);
-pub const TEXT_MUTED: Color32 = Color32::from_rgb(115, 115, 115);
-pub const ITEM_BG: Color32 = Color32::from_rgb(39, 39, 42);
+pub const SIDEBAR_BG: egui::Color32 = INK;
+pub const SIDEBAR_BORDER: egui::Color32 = LINE;
+#[allow(dead_code)]
+pub const INPUT_BG: egui::Color32 = SURFACE;
+#[allow(dead_code)]
+pub const ACTIVE_TAB_BG: egui::Color32 = FOCUS;
+pub const TEXT_PRIMARY: egui::Color32 = TEXT_STRONG;
+pub const TEXT_SECONDARY: egui::Color32 = TEXT;
+pub const TEXT_MUTED: egui::Color32 = DIM;
+#[allow(dead_code)]
+pub const ITEM_BG: egui::Color32 = RAISED;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SidebarTab {
@@ -87,7 +91,7 @@ impl Sidebar {
     pub fn show(
         &mut self,
         ui: &mut Ui,
-        brand_texture: Option<&egui::TextureHandle>,
+        _brand_texture: Option<&egui::TextureHandle>,
         workspaces: &[Workspace],
         active_ws: usize,
         update_state: &UpdateState,
@@ -97,77 +101,40 @@ impl Sidebar {
         let mut responses = Vec::new();
 
         ui.visuals_mut().widgets.noninteractive.bg_fill = SIDEBAR_BG;
-        ui.painter().rect_filled(ui.max_rect(), 0.0, SIDEBAR_BG);
+        let area = ui.max_rect();
+        ui.painter().rect_filled(area, 0.0, SIDEBAR_BG);
+        let divider_color = egui::Color32::from_rgb(72, 72, 72);
+        let divider_width = 1.5;
+        ui.painter().rect_filled(
+            egui::Rect::from_min_max(
+                egui::pos2(area.right() - divider_width, area.top()),
+                egui::pos2(area.right(), area.bottom()),
+            ),
+            0.0,
+            divider_color,
+        );
 
-        ui.horizontal(|ui| {
-            if let Some(texture) = brand_texture {
-                ui.add(
-                    egui::Image::new(texture)
-                        .max_size(egui::vec2(16.0, 16.0))
-                        .tint(TEXT_SECONDARY),
-                );
-            }
-            ui.label(
-                RichText::new("My Terminal")
-                    .color(TEXT_PRIMARY)
-                    .size(13.0)
-                    .strong(),
-            );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                match &update_state.status {
-                    UpdateStatus::Available => {
-                        ui.label(
-                            RichText::new("Update")
-                                .color(Color32::from_rgb(90, 180, 90))
-                                .size(11.0),
-                        );
-                    }
-                    UpdateStatus::Downloading => {
-                        ui.label(
-                            RichText::new("Downloading...")
-                                .color(Color32::from_rgb(200, 160, 60))
-                                .size(11.0),
-                        );
-                    }
-                    UpdateStatus::Ready => {
-                        ui.label(
-                            RichText::new("Ready")
-                                .color(Color32::from_rgb(90, 180, 90))
-                                .size(11.0),
-                        );
-                    }
-                    _ => {
-                        ui.label(
-                            RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
-                                .color(TEXT_MUTED)
-                                .size(11.0),
-                        );
-                    }
-                }
-            });
-        });
-
+        let _ = update_state;
         ui.add_space(8.0);
         responses.extend(self.show_tabs(ui));
         ui.add_space(8.0);
 
-        ScrollArea::vertical().show(ui, |ui| match self.active_tab {
-            SidebarTab::Workspaces => {
-                responses.extend(draw_workspace_tree(ui, workspaces, active_ws));
-            }
-            SidebarTab::Online => {
-                responses.extend(self.show_online_panel(ui, collab_mode, collab_state));
-            }
+        ui.scope(|ui| {
+            // Ocultamos el thumb del scrollbar (la "barrita blanca") manteniendo
+            // el track. El usuario sigue pudiendo scrollear con rueda/trackpad.
+            let visuals = ui.visuals_mut();
+            visuals.widgets.inactive.bg_fill = egui::Color32::TRANSPARENT;
+            visuals.widgets.hovered.bg_fill = egui::Color32::TRANSPARENT;
+            visuals.widgets.active.bg_fill = egui::Color32::TRANSPARENT;
+            ScrollArea::vertical().show(ui, |ui| match self.active_tab {
+                SidebarTab::Workspaces => {
+                    responses.extend(draw_workspace_tree(ui, workspaces, active_ws));
+                }
+                SidebarTab::Online => {
+                    responses.extend(self.show_online_panel(ui, collab_mode, collab_state));
+                }
+            });
         });
-
-        ui.add_space(10.0);
-        ui.painter().text(
-            ui.max_rect().center_bottom() - egui::vec2(0.0, 8.0),
-            Align2::CENTER_BOTTOM,
-            "Ctrl+Shift+O folder · Ctrl+Shift+T terminal · Ctrl+B sidebar",
-            FontId::proportional(9.5),
-            TEXT_MUTED,
-        );
 
         responses
     }
@@ -175,57 +142,67 @@ impl Sidebar {
     fn show_tabs(&mut self, ui: &mut Ui) -> Vec<SidebarResponse> {
         let responses = Vec::new();
         let total = ui.available_width();
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(total, 34.0), Sense::hover());
-        ui.painter().rect_filled(rect, 8.0, INPUT_BG);
+        let row_height = 28.0;
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(total, row_height), Sense::hover());
 
-        let half = rect.width() * 0.5;
-        let workspaces =
-            egui::Rect::from_min_max(rect.min, egui::pos2(rect.left() + half, rect.bottom()));
-        let online = egui::Rect::from_min_max(egui::pos2(rect.left() + half, rect.top()), rect.max);
-        let active_rect = match self.active_tab {
-            SidebarTab::Workspaces => workspaces.shrink(2.0),
-            SidebarTab::Online => online.shrink(2.0),
+        let label_pad_left = 12.0;
+        let item_gap = 18.0;
+
+        let entries = [
+            (
+                SidebarTab::Workspaces,
+                "Workspaces",
+                "sidebar-tab-workspaces",
+            ),
+            (SidebarTab::Online, "Online", "sidebar-tab-online"),
+        ];
+
+        let painter = ui.painter().clone();
+        let font = FontId::proportional(11.5);
+
+        // Pre-medir cada label para construir hit-rects ajustados al texto.
+        let measure = |text: &str| -> f32 {
+            ui.fonts(|fonts| {
+                fonts
+                    .layout_no_wrap(text.to_owned(), font.clone(), TEXT_PRIMARY)
+                    .size()
+                    .x
+            })
         };
-        ui.painter().rect_filled(active_rect, 6.0, ACTIVE_TAB_BG);
-        ui.painter().line_segment(
-            [
-                egui::pos2(rect.left() + half, rect.top() + 6.0),
-                egui::pos2(rect.left() + half, rect.bottom() - 6.0),
-            ],
-            Stroke::new(1.0, SIDEBAR_BORDER),
-        );
 
-        if ui
-            .interact(
-                workspaces,
-                ui.id().with("sidebar-tab-workspaces"),
-                Sense::click(),
-            )
-            .clicked()
-        {
-            self.active_tab = SidebarTab::Workspaces;
+        let mut cursor_x = rect.left() + label_pad_left;
+        for (tab, label, id_seed) in entries {
+            let text_width = measure(label);
+            let hit_rect = egui::Rect::from_min_size(
+                egui::pos2(cursor_x - 6.0, rect.top()),
+                egui::vec2(text_width + 12.0, row_height),
+            );
+            let response = ui.interact(hit_rect, ui.id().with(id_seed), Sense::click());
+            if response.clicked() {
+                self.active_tab = tab;
+            }
+            let active = self.active_tab == tab;
+            let color = if active {
+                TEXT_PRIMARY
+            } else if response.hovered() {
+                TEXT
+            } else {
+                TEXT_MUTED
+            };
+            let baseline = egui::pos2(cursor_x, rect.center().y);
+            painter.text(baseline, Align2::LEFT_CENTER, label, font.clone(), color);
+            if active {
+                let underline_y = rect.bottom() - 4.0;
+                painter.line_segment(
+                    [
+                        egui::pos2(cursor_x, underline_y),
+                        egui::pos2(cursor_x + text_width, underline_y),
+                    ],
+                    Stroke::new(1.5, TEXT_PRIMARY),
+                );
+            }
+            cursor_x += text_width + item_gap;
         }
-        if ui
-            .interact(online, ui.id().with("sidebar-tab-online"), Sense::click())
-            .clicked()
-        {
-            self.active_tab = SidebarTab::Online;
-        }
-
-        ui.painter().text(
-            workspaces.center(),
-            Align2::CENTER_CENTER,
-            "Workspaces",
-            FontId::proportional(11.5),
-            TEXT_PRIMARY,
-        );
-        ui.painter().text(
-            online.center(),
-            Align2::CENTER_CENTER,
-            "Online",
-            FontId::proportional(11.5),
-            TEXT_PRIMARY,
-        );
 
         responses
     }
@@ -238,94 +215,105 @@ impl Sidebar {
     ) -> Vec<SidebarResponse> {
         let mut responses = Vec::new();
         let controls = sidebar_collab_controls(collab_mode, collab_state);
-        let status_color = match collab_state {
-            CollabSessionState::NotSharing | CollabSessionState::Ended => TEXT_MUTED,
-            CollabSessionState::Starting | CollabSessionState::Disconnected => {
-                Color32::from_rgb(245, 158, 11)
-            }
-            CollabSessionState::Live => Color32::from_rgb(74, 222, 128),
-        };
+        let status_alive = matches!(collab_state, CollabSessionState::Live);
         let description = match collab_mode {
-            CollabMode::Inactive => "Comparte este workspace o unite a una sesion existente.",
-            CollabMode::Host => "Esta maquina esta compartiendo el workspace actual.",
-            CollabMode::Guest => "Estas dentro de una sesion remota como invitado.",
+            CollabMode::Inactive => "Compartí este workspace o unite a una sesión existente.",
+            CollabMode::Host => "Esta máquina está compartiendo el workspace actual.",
+            CollabMode::Guest => "Estás dentro de una sesión remota como invitado.",
         };
 
-        egui::Frame::default()
-            .fill(INPUT_BG)
-            .stroke(Stroke::new(1.0, SIDEBAR_BORDER))
-            .rounding(10.0)
-            .inner_margin(egui::Margin::same(12.0))
-            .show(ui, |ui| {
+        ui.add_space(4.0);
+        ui.scope(|ui| {
+            ui.style_mut().spacing.item_spacing.x = 6.0;
+            ui.horizontal(|ui| {
+                ui.add_space(14.0);
+                let dot_color = if status_alive {
+                    TEXT_PRIMARY
+                } else {
+                    TEXT_MUTED
+                };
+                let (dot_rect, _) = ui.allocate_exact_size(egui::vec2(6.0, 6.0), Sense::hover());
+                ui.painter()
+                    .circle_filled(dot_rect.center(), 3.0, dot_color);
                 ui.label(
-                    RichText::new("Online")
-                        .size(14.0)
-                        .strong()
-                        .color(TEXT_PRIMARY),
+                    RichText::new(controls.state_label)
+                        .size(11.0)
+                        .color(if status_alive { TEXT_PRIMARY } else { TEXT }),
                 );
-                ui.add_space(4.0);
-                ui.label(RichText::new(description).size(11.0).color(TEXT_SECONDARY));
-                ui.add_space(12.0);
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Estado").size(10.5).color(TEXT_MUTED));
-                    ui.add_space(6.0);
-                    ui.label(
-                        RichText::new(controls.state_label)
-                            .size(10.5)
-                            .strong()
-                            .color(status_color),
-                    );
-                });
-                ui.add_space(12.0);
-                ui.horizontal(|ui| {
-                    if ui
-                        .add_sized(
-                            [88.0, 30.0],
-                            egui::Button::new(
-                                RichText::new(controls.primary_label)
-                                    .size(11.0)
-                                    .color(TEXT_PRIMARY),
-                            )
-                            .fill(ACTIVE_TAB_BG)
-                            .stroke(Stroke::new(1.0, SIDEBAR_BORDER))
-                            .rounding(8.0),
-                        )
-                        .clicked()
-                    {
-                        responses.push(match collab_mode {
-                            CollabMode::Inactive => SidebarResponse::OpenShareWorkspace,
-                            CollabMode::Host | CollabMode::Guest => {
-                                SidebarResponse::OpenCollabSession
-                            }
-                        });
-                    }
-
-                    if let Some(label) = controls.secondary_label {
-                        if ui
-                            .add_sized(
-                                [88.0, 30.0],
-                                egui::Button::new(
-                                    RichText::new(label).size(11.0).color(TEXT_PRIMARY),
-                                )
-                                .fill(ACTIVE_TAB_BG)
-                                .stroke(Stroke::new(1.0, SIDEBAR_BORDER))
-                                .rounding(8.0),
-                            )
-                            .clicked()
-                        {
-                            responses.push(match collab_mode {
-                                CollabMode::Inactive => SidebarResponse::OpenJoinSession,
-                                CollabMode::Host | CollabMode::Guest => {
-                                    SidebarResponse::StopCollabSession
-                                }
-                            });
-                        }
-                    }
-                });
             });
+        });
+
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            ui.add_space(14.0);
+            ui.style_mut().spacing.item_spacing.x = 0.0;
+            let avail = (ui.available_width() - 14.0).max(120.0);
+            let primary = render_text_link(ui, controls.primary_label, avail * 0.5, true);
+            if primary {
+                responses.push(match collab_mode {
+                    CollabMode::Inactive => SidebarResponse::OpenShareWorkspace,
+                    CollabMode::Host | CollabMode::Guest => SidebarResponse::OpenCollabSession,
+                });
+            }
+            if let Some(label) = controls.secondary_label {
+                let secondary = render_text_link(ui, label, avail * 0.5, false);
+                if secondary {
+                    responses.push(match collab_mode {
+                        CollabMode::Inactive => SidebarResponse::OpenJoinSession,
+                        CollabMode::Host | CollabMode::Guest => SidebarResponse::StopCollabSession,
+                    });
+                }
+            }
+        });
+
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            ui.add_space(14.0);
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+            ui.label(RichText::new(description).size(10.5).color(TEXT_MUTED));
+        });
 
         responses
     }
+}
+
+fn render_text_link(ui: &mut Ui, label: &str, slot_width: f32, primary: bool) -> bool {
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(slot_width.max(60.0), 26.0), Sense::click());
+    let color = if primary {
+        if response.hovered() {
+            TEXT_PRIMARY
+        } else {
+            TEXT
+        }
+    } else if response.hovered() {
+        TEXT
+    } else {
+        TEXT_MUTED
+    };
+    ui.painter().text(
+        egui::pos2(rect.left(), rect.center().y),
+        Align2::LEFT_CENTER,
+        label,
+        FontId::proportional(11.5),
+        color,
+    );
+    if response.hovered() {
+        let underline_y = rect.bottom() - 6.0;
+        let text_w = ui.fonts(|f| {
+            f.layout_no_wrap(label.to_owned(), FontId::proportional(11.5), color)
+                .size()
+                .x
+        });
+        ui.painter().line_segment(
+            [
+                egui::pos2(rect.left(), underline_y),
+                egui::pos2(rect.left() + text_w, underline_y),
+            ],
+            Stroke::new(1.0, color),
+        );
+    }
+    response.clicked()
 }
 
 #[cfg(test)]

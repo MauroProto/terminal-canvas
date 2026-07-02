@@ -43,6 +43,18 @@ pub fn hash_passphrase(passphrase: &str) -> anyhow::Result<String> {
     Ok(hash.to_string())
 }
 
+/// Compares two secrets without short-circuiting so the comparison time does
+/// not leak how many leading characters matched.
+pub fn constant_time_str_eq(a: &str, b: &str) -> bool {
+    let a = a.as_bytes();
+    let b = b.as_bytes();
+    let mut diff = a.len() ^ b.len();
+    for i in 0..a.len().min(b.len()) {
+        diff |= usize::from(a[i] ^ b[i]);
+    }
+    diff == 0
+}
+
 pub fn verify_passphrase(hash: &str, passphrase: &str) -> anyhow::Result<bool> {
     let parsed = PasswordHash::new(hash)
         .map_err(|err| anyhow::anyhow!("failed to parse passphrase hash: {err}"))?;
@@ -53,11 +65,22 @@ pub fn verify_passphrase(hash: &str, passphrase: &str) -> anyhow::Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{hash_passphrase, normalize_optional_passphrase, verify_passphrase};
+    use super::{
+        constant_time_str_eq, hash_passphrase, normalize_optional_passphrase, verify_passphrase,
+    };
 
     #[test]
     fn empty_passphrase_normalizes_to_none() {
         assert_eq!(normalize_optional_passphrase("   "), None);
+    }
+
+    #[test]
+    fn constant_time_eq_matches_string_equality() {
+        assert!(constant_time_str_eq("secret", "secret"));
+        assert!(!constant_time_str_eq("secret", "secreT"));
+        assert!(!constant_time_str_eq("secret", "secret-longer"));
+        assert!(!constant_time_str_eq("secret", ""));
+        assert!(constant_time_str_eq("", ""));
     }
 
     #[test]

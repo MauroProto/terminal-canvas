@@ -80,7 +80,7 @@ impl WorkspacePanel {
 
     pub fn focused(&self) -> bool {
         match self {
-            Self::Terminal(panel) => panel.focused,
+            Self::Terminal(panel) => panel.focused(),
         }
     }
 
@@ -104,7 +104,7 @@ impl WorkspacePanel {
 
     pub fn set_focused(&mut self, focused: bool) {
         match self {
-            Self::Terminal(panel) => panel.focused = focused,
+            Self::Terminal(panel) => panel.set_focused(focused),
         }
     }
 
@@ -253,18 +253,6 @@ impl WorkspacePanel {
     ) -> Option<PanelHitArea> {
         match self {
             Self::Terminal(panel) => panel.hit_test(pos, viewport, canvas_rect),
-        }
-    }
-
-    pub fn drag_to(
-        &mut self,
-        origin: Pos2,
-        pointer_delta: Vec2,
-        zoom: f32,
-        other_panels: &[Rect],
-    ) -> Vec<crate::canvas::snap::SnapGuide> {
-        match self {
-            Self::Terminal(panel) => panel.drag_to(origin, pointer_delta, zoom, other_panels),
         }
     }
 

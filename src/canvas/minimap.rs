@@ -65,19 +65,19 @@ pub fn show(
     painter.rect_filled(
         reset_rect,
         11.0,
-        Color32::from_rgba_premultiplied(18, 18, 22, 220),
+        Color32::from_rgba_premultiplied(10, 10, 10, 220),
     );
     painter.rect_stroke(
         reset_rect,
         11.0,
-        Stroke::new(1.0, Color32::from_rgb(65, 65, 78)),
+        Stroke::new(1.0, Color32::from_rgb(56, 56, 56)),
     );
     painter.text(
         reset_rect.center(),
         Align2::CENTER_CENTER,
         "Show All",
         FontId::proportional(11.5),
-        Color32::from_rgb(205, 205, 214),
+        Color32::from_rgb(208, 208, 208),
     );
 
     let mut bounds = viewport.visible_canvas_rect(canvas_rect);
@@ -138,14 +138,14 @@ pub fn show(
         Align2::CENTER_CENTER,
         "×",
         FontId::proportional(13.0),
-        Color32::from_rgb(180, 180, 180),
+        Color32::from_rgb(208, 208, 208),
     );
     painter.text(
         rect.center_bottom() - vec2(0.0, 6.0),
         Align2::CENTER_BOTTOM,
         format!("{:.0}%", viewport.zoom * 100.0),
         FontId::proportional(11.0),
-        Color32::from_rgb(163, 163, 163),
+        Color32::from_rgb(110, 110, 110),
     );
 
     if response.clicked() || response.dragged() {

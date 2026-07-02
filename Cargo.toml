@@ -41,6 +41,10 @@ path = "tests/runtime/repaint_policy.rs"
 name = "runtime_load_20_terminals"
 path = "tests/runtime/load_20_terminals.rs"
 
+[[test]]
+name = "runtime_perf_scenarios"
+path = "tests/runtime/perf_scenarios.rs"
+
 [dependencies]
 eframe = { version = "0.30", features = ["wgpu"] }
 egui = "0.30"
@@ -59,7 +63,6 @@ chrono = { version = "0.4", features = ["serde"] }
 directories = "5"
 arboard = "3"
 rfd = "0.15"
-minreq = { version = "2", features = ["https-native"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
 futures-util = "0.3"
@@ -76,6 +79,8 @@ log = "0.4"
 env_logger = "0.11"
 rustls = "0.23"
 rustls-pemfile = "2"
+mimalloc = { version = "0.1", default-features = false }
+arc-swap = "1"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
@@ -84,6 +89,9 @@ tokio-tungstenite = "0.24"
 [profile.dev]
 opt-level = 1
 
+# panic = "unwind" (default) on purpose: with "abort", a panic in ANY worker
+# thread (PTY reader, collab server, transport) kills the whole app instantly.
+# With unwind, worker threads can catch panics and degrade gracefully.
 [profile.release]
 opt-level = 3
 lto = true
@@ -93,3 +101,6 @@ strip = true
 [profile.dist]
 inherits = "release"
 lto = "thin"
+
+[lints.clippy]
+too_many_arguments = "allow"

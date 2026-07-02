@@ -27,6 +27,7 @@ impl PanelShareScope {
         matches!(self, Self::Controllable)
     }
 
+    #[allow(dead_code)]
     pub fn label(self) -> &'static str {
         match self {
             Self::Private => "Private",

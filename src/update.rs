@@ -141,14 +141,19 @@ impl UpdateChecker {
                     ..UpdateState::default()
                 },
             };
-            *state_clone.lock().unwrap() = next;
+            if let Ok(mut state) = state_clone.lock() {
+                *state = next;
+            }
             ctx.request_repaint();
         });
         Self { state }
     }
 
     pub fn snapshot(&self) -> UpdateState {
-        self.state.lock().unwrap().clone()
+        self.state
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
     }
 }
 
@@ -166,21 +171,31 @@ pub fn version_newer(latest: &str, current: &str) -> bool {
     parse(latest) > parse(current)
 }
 
+fn http_client() -> Result<reqwest::blocking::Client, String> {
+    reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(REQUEST_TIMEOUT))
+        .user_agent("mi-terminal")
+        .https_only(true)
+        .build()
+        .map_err(|e| format!("HTTP client build failed: {e}"))
+}
+
 pub fn check_latest_release() -> Result<UpdateState, String> {
-    let resp = minreq::get(RELEASES_URL)
-        .with_header("User-Agent", "mi-terminal")
-        .with_header("Accept", "application/vnd.github+json")
-        .with_timeout(REQUEST_TIMEOUT)
+    let resp = http_client()?
+        .get(RELEASES_URL)
+        .header("Accept", "application/vnd.github+json")
         .send()
         .map_err(|e| format!("HTTP request failed: {e}"))?;
 
-    if resp.status_code != 200 {
-        return Err(format!("GitHub API returned {}", resp.status_code));
+    if resp.status() != reqwest::StatusCode::OK {
+        return Err(format!("GitHub API returned {}", resp.status().as_u16()));
     }
 
+    let body = resp
+        .text()
+        .map_err(|e| format!("Failed to read response body: {e}"))?;
     let json: serde_json::Value =
-        serde_json::from_str(resp.as_str().map_err(|e| format!("UTF-8 error: {e}"))?)
-            .map_err(|e| format!("JSON parse failed: {e}"))?;
+        serde_json::from_str(&body).map_err(|e| format!("JSON parse failed: {e}"))?;
 
     let tag = json
         .get("tag_name")
@@ -263,17 +278,13 @@ pub fn verify_checksum(file_path: &Path, expected_hash: &str) -> bool {
 }
 
 pub fn download_checksum(url: &str) -> Option<String> {
-    let resp = minreq::get(url)
-        .with_header("User-Agent", "mi-terminal")
-        .with_timeout(REQUEST_TIMEOUT)
-        .send()
-        .ok()?;
+    let resp = http_client().ok()?.get(url).send().ok()?;
 
-    if resp.status_code != 200 {
+    if resp.status() != reqwest::StatusCode::OK {
         return None;
     }
 
-    let text = resp.as_str().ok()?.trim().to_owned();
+    let text = resp.text().ok()?.trim().to_owned();
     let hash = text.split_whitespace().next()?;
     if hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit()) {
         Some(hash.to_lowercase())

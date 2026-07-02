@@ -5,7 +5,7 @@ use egui::{pos2, Color32, Pos2, Rect, Vec2};
 use uuid::Uuid;
 
 use crate::canvas::config::{
-    normalize_panel_size, DEFAULT_PANEL_HEIGHT, DEFAULT_PANEL_WIDTH, PANEL_GAP,
+    normalize_panel_size, DEFAULT_PANEL_HEIGHT, DEFAULT_PANEL_WIDTH, PANEL_GAP, ZOOM_MAX, ZOOM_MIN,
 };
 use crate::collab::{SharedPanelSnapshot, TerminalInputEvent};
 use crate::orchestration::PanelRuntimeObservation;
@@ -17,14 +17,14 @@ use crate::state::{PanelPlacement, SnapSlot};
 use crate::terminal::panel::TerminalPanel;
 
 const PANEL_COLORS: &[Color32] = &[
-    Color32::from_rgb(90, 130, 200),
-    Color32::from_rgb(200, 90, 90),
-    Color32::from_rgb(90, 180, 90),
-    Color32::from_rgb(200, 160, 60),
-    Color32::from_rgb(150, 90, 200),
-    Color32::from_rgb(200, 120, 160),
-    Color32::from_rgb(80, 170, 200),
-    Color32::from_rgb(180, 180, 80),
+    Color32::from_rgb(232, 232, 232),
+    Color32::from_rgb(200, 200, 200),
+    Color32::from_rgb(168, 168, 168),
+    Color32::from_rgb(140, 140, 140),
+    Color32::from_rgb(112, 112, 112),
+    Color32::from_rgb(86, 86, 86),
+    Color32::from_rgb(180, 180, 180),
+    Color32::from_rgb(64, 64, 64),
 ];
 
 pub struct Workspace {
@@ -38,6 +38,9 @@ pub struct Workspace {
     pub next_z: u32,
     pub next_color: usize,
     pty_manager: Arc<Mutex<PtyManager>>,
+    pub last_auto_tile_signature: Option<(usize, [i32; 4], i32, i32)>,
+    pub split_x: f32,
+    pub split_y: f32,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -72,6 +75,9 @@ impl Workspace {
             next_z: 0,
             next_color: 0,
             pty_manager: Arc::new(Mutex::new(PtyManager::new())),
+            last_auto_tile_signature: None,
+            split_x: 0.5,
+            split_y: 0.5,
         }
     }
 
@@ -88,7 +94,10 @@ impl Workspace {
             desktop,
             legacy_canvas,
         } = saved;
-        let workspace_id = Uuid::parse_str(&id).unwrap_or_else(|_| Uuid::new_v4());
+        let workspace_id = Uuid::parse_str(&id).unwrap_or_else(|err| {
+            log::warn!("Invalid saved workspace id {id:?} ({err}); generating a new one");
+            Uuid::new_v4()
+        });
         let pty_manager = Arc::new(Mutex::new(PtyManager::new()));
         let mut panels = Vec::new();
         for panel in saved_panels {
@@ -105,11 +114,17 @@ impl Workspace {
             cwd: cwd.clone(),
             folder_path_label: cwd.as_deref().map(workspace_path_label),
             panels,
-            viewport_pan: egui::vec2(legacy_canvas.viewport_pan[0], legacy_canvas.viewport_pan[1]),
-            viewport_zoom: legacy_canvas.viewport_zoom,
+            viewport_pan: egui::vec2(
+                sanitize_viewport_coord(legacy_canvas.viewport_pan[0]),
+                sanitize_viewport_coord(legacy_canvas.viewport_pan[1]),
+            ),
+            viewport_zoom: sanitize_viewport_zoom(legacy_canvas.viewport_zoom),
             next_z: desktop.next_z,
             next_color: desktop.next_color,
             pty_manager,
+            last_auto_tile_signature: None,
+            split_x: 0.5,
+            split_y: 0.5,
         };
         if workspace
             .panels
@@ -145,11 +160,31 @@ impl Workspace {
             .panel_id
     }
 
+    pub fn can_spawn_terminal(&self) -> bool {
+        const MAX_TERMINALS: usize = 4;
+        self.panels.len() < MAX_TERMINALS
+    }
+
     pub fn spawn_terminal_with_request(
         &mut self,
-        _ctx: &egui::Context,
+        ctx: &egui::Context,
         request: TerminalSpawnRequest,
     ) -> SpawnedTerminal {
+        if !self.can_spawn_terminal() {
+            if let Some(focused) = self.focused_panel() {
+                return SpawnedTerminal {
+                    panel_id: focused.id(),
+                    runtime_session_id: None,
+                };
+            }
+            if let Some(first) = self.panels.first() {
+                return SpawnedTerminal {
+                    panel_id: first.id(),
+                    runtime_session_id: None,
+                };
+            }
+        }
+        let _ = ctx;
         let size = normalize_panel_size(egui::vec2(DEFAULT_PANEL_WIDTH, DEFAULT_PANEL_HEIGHT));
         let position = self.find_free_position(size);
         let color = PANEL_COLORS[self.next_color % PANEL_COLORS.len()];
@@ -161,7 +196,8 @@ impl Workspace {
         {
             panel.rename_title(title);
         }
-        panel.focused = true;
+        // El foco lo asigna bring_to_front al final; escribirlo acá dejaría
+        // dos paneles enfocados hasta esa llamada.
         let cwd = request.cwd.as_deref().or(self.cwd.as_deref());
         panel.attach_session_with_spec(
             Arc::clone(&self.pty_manager),
@@ -190,6 +226,9 @@ impl Workspace {
         self.panels.push(CanvasPanel::Terminal(panel));
     }
 
+    /// El Workspace es el dueño de la invariante "a lo sumo un panel
+    /// enfocado": todo cambio de foco pasa por este método, por
+    /// focus_topmost_visible_panel o por unfocus_all.
     pub fn bring_to_front(&mut self, panel_id: Uuid) {
         if self
             .panels
@@ -358,10 +397,12 @@ impl Workspace {
             .unwrap_or(false)
     }
 
+    #[allow(dead_code)]
     pub fn panel_count(&self) -> usize {
         self.panels.len()
     }
 
+    #[allow(dead_code)]
     pub fn minimized_panel_count(&self) -> usize {
         self.panels.iter().filter(|panel| panel.minimized()).count()
     }
@@ -489,6 +530,24 @@ impl Workspace {
         for (index, panel) in self.panels.iter_mut().enumerate() {
             panel.set_focused(Some(index) == target);
         }
+    }
+}
+
+/// Saved state comes from disk and may be corrupted or hand-edited; a zoom of
+/// zero (or NaN) would poison every screen/canvas conversion with NaN.
+fn sanitize_viewport_zoom(zoom: f32) -> f32 {
+    if zoom.is_finite() {
+        zoom.clamp(ZOOM_MIN, ZOOM_MAX)
+    } else {
+        1.0
+    }
+}
+
+fn sanitize_viewport_coord(value: f32) -> f32 {
+    if value.is_finite() {
+        value
+    } else {
+        0.0
     }
 }
 
@@ -767,7 +826,7 @@ mod tests {
             0,
         );
         let panel_id = panel.id;
-        panel.focused = true;
+        panel.set_focused(true);
         workspace.add_restored_terminal(panel);
         let desktop = Rect::from_min_max(pos2(0.0, 0.0), pos2(1280.0, 720.0));
 

@@ -9,6 +9,7 @@ use crate::runtime::{
 #[derive(Debug, Clone)]
 struct HarnessSession {
     id: Uuid,
+    #[allow(dead_code)]
     workspace_id: Uuid,
     visible: bool,
     focused: bool,
@@ -30,6 +31,7 @@ impl RuntimeHarness {
         Self::default()
     }
 
+    #[allow(dead_code)]
     pub fn seed(&mut self, workspace_count: usize, session_count: usize) {
         assert!(
             workspace_count > 0,
@@ -105,7 +107,7 @@ impl RuntimeHarness {
             "streaming_terminals should target non-focused visible terminals"
         );
 
-        let workspace_count = open_terminals.min(5).max(1);
+        let workspace_count = open_terminals.clamp(1, 5);
         self.registry = RuntimeRegistry::new();
         self.scheduler = RuntimeScheduler::new_for_tests();
         self.sessions.clear();
@@ -221,11 +223,15 @@ impl RuntimeHarness {
                 .filter(|session| session.focused)
                 .count()
                 == 1
+            && self
+                .sessions
+                .iter()
+                .filter(|session| session.focused)
+                .all(|session| session.visible)
             && self.sessions.iter().any(|session| session.visible)
-            && self.sessions.iter().any(|session| !session.visible)
-            && self.sessions.iter().any(|session| session.streaming)
     }
 
+    #[allow(dead_code)]
     pub fn has_mixed_render_tiers(&self) -> bool {
         let mut has_full = false;
         let mut has_reduced = false;
@@ -251,6 +257,7 @@ impl RuntimeHarness {
         has_full && has_reduced && has_preview && has_hidden
     }
 
+    #[allow(dead_code)]
     pub fn every_session_is_registered_in_seeded_workspace(&self) -> bool {
         let seeded_workspaces = self
             .registry

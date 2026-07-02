@@ -256,19 +256,16 @@ pub fn save_state_to_path(path: &Path, state: &AppState) -> anyhow::Result<()> {
 
     write_json_file(&tmp_path, state)?;
 
+    // Refresh the backup from the current file before replacing it, so the
+    // main state file is never absent: a crash before the rename leaves the
+    // old state intact, and the rename itself replaces it atomically.
     if path.exists() {
-        if backup_path.exists() {
-            let _ = std::fs::remove_file(&backup_path);
+        if let Err(err) = std::fs::copy(path, &backup_path) {
+            log::warn!("Failed to refresh state backup: {err}");
         }
-        std::fs::rename(path, &backup_path)?;
     }
 
-    if let Err(err) = std::fs::rename(&tmp_path, path) {
-        if backup_path.exists() && !path.exists() {
-            let _ = std::fs::rename(&backup_path, path);
-        }
-        return Err(err.into());
-    }
+    std::fs::rename(&tmp_path, path)?;
 
     Ok(())
 }

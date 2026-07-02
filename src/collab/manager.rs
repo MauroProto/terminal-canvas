@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use base64::Engine;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -7,7 +8,10 @@ use rand::RngCore;
 use url::Url;
 use uuid::Uuid;
 
+use std::thread;
+
 use super::auth::hash_passphrase;
+use super::http_worker::{CollabHttpJob, CollabHttpOp, CollabHttpWorker};
 use super::models::{
     ControlGrant, ControlRequest, ControlRevoke, GuestConnectionState, GuestId, GuestPresence,
     GuestTerminalInput, InviteCode, JoinRequest, ParticipantId, SessionRole, ShareSessionId,
@@ -63,7 +67,9 @@ pub enum CollabEvent {
 
 #[derive(Debug, Clone, Default)]
 pub struct GuestWorkspaceView {
-    pub snapshot: Option<SharedWorkspaceSnapshot>,
+    // Arc so per-frame consumers can take a cheap handle instead of deep
+    // cloning the full remote workspace (panel history included).
+    pub snapshot: Option<Arc<SharedWorkspaceSnapshot>>,
     pub focused_panel: Option<Uuid>,
     pub my_guest_id: Option<GuestId>,
     pub scroll_offsets: HashMap<Uuid, usize>,
@@ -110,6 +116,11 @@ pub struct CollabManager {
     remote_input_senders: Vec<GuestId>,
     received_message_seq: HashMap<ParticipantId, u64>,
     last_error: Option<String>,
+    http_worker: CollabHttpWorker,
+    // Sube en cada stop_session: los resultados HTTP en vuelo de la sesión
+    // anterior se descartan al llegar.
+    http_generation: u64,
+    join_pending: bool,
 }
 
 impl Default for CollabManager {
@@ -139,6 +150,9 @@ impl CollabManager {
             remote_input_senders: Vec::new(),
             received_message_seq: HashMap::new(),
             last_error: None,
+            http_worker: CollabHttpWorker::default(),
+            http_generation: 0,
+            join_pending: false,
         }
     }
 
@@ -167,9 +181,7 @@ impl CollabManager {
     }
 
     pub fn invite_expires_at(&self) -> Option<DateTime<Utc>> {
-        self.host
-            .as_ref()
-            .and_then(|host| host.invite_expires_at.clone())
+        self.host.as_ref().and_then(|host| host.invite_expires_at)
     }
 
     pub fn last_error(&self) -> Option<&str> {
@@ -246,7 +258,7 @@ impl CollabManager {
             &CreateShareSessionRequest {
                 session_secret: session_secret.clone(),
                 invite_secret: invite_secret.clone(),
-                invite_expires_at: invite_expires_at.clone(),
+                invite_expires_at,
                 passphrase_hash,
                 trusted_devices,
             },
@@ -257,7 +269,7 @@ impl CollabManager {
             session_id: response.session_id,
             session_secret: session_secret.clone(),
             invite_secret: Some(invite_secret.clone()),
-            expires_at: invite_expires_at.clone(),
+            expires_at: invite_expires_at,
             requires_passphrase: session_passphrase.is_some(),
             tls_cert_pem: Some(tls_material.cert_pem.clone()),
         })?;
@@ -302,7 +314,6 @@ impl CollabManager {
         device_id: String,
     ) -> anyhow::Result<()> {
         self.stop_session();
-        self.session_state = CollabSessionState::Starting;
         let invite = decode_invite_code(invite_code)?;
         if invite
             .expires_at
@@ -313,74 +324,89 @@ impl CollabManager {
         }
         validate_invite_broker_transport(&invite)?;
         let invite_secret = required_invite_secret(&invite)?;
-        let response: JoinShareSessionResponse = json_post(
-            &format!(
+        let body = serde_json::to_value(&JoinShareSessionRequest {
+            display_name: display_name.clone(),
+            invite_secret,
+            device_id,
+            passphrase: session_passphrase,
+        })?;
+        // El POST va al broker remoto: se resuelve en el worker HTTP y el
+        // resto del alta ocurre en apply_http_outcomes cuando llega.
+        self.session_state = CollabSessionState::Starting;
+        self.join_pending = true;
+        self.http_worker.request(CollabHttpJob {
+            url: format!(
                 "{}/v1/share-sessions/{}/join",
                 invite.broker_url.trim_end_matches('/'),
                 invite.session_id.0
             ),
-            &JoinShareSessionRequest {
-                display_name: display_name.clone(),
-                invite_secret,
-                device_id,
-                passphrase: session_passphrase,
-            },
-            invite.tls_cert_pem.as_deref(),
-        )?;
-        let websocket_url = broker_ws_url(
-            &invite.broker_url,
-            invite.session_id,
-            &response.guest_token,
-            SessionRole::Guest,
-        )?;
-        self.transport.send(TransportCommand::Connect {
-            websocket_url,
+            body,
             tls_cert_pem: invite.tls_cert_pem.clone(),
+            generation: self.http_generation,
+            op: CollabHttpOp::JoinSession {
+                invite,
+                display_name,
+            },
         });
-        self.guest = Some(GuestSessionContext {
-            session_id: invite.session_id,
-            guest_id: response.guest_id,
-            session_secret: invite.session_secret,
-            display_name,
-            next_message_seq: 1,
-        });
-        self.guest_view = GuestWorkspaceView {
-            snapshot: None,
-            focused_panel: None,
-            my_guest_id: Some(response.guest_id),
-            scroll_offsets: HashMap::new(),
-        };
-        self.mode = CollabMode::Guest;
-        self.broker_url = invite.broker_url;
-        self.received_message_seq.clear();
         Ok(())
     }
 
+    /// Hay un join encolado cuyo resultado todavía no llegó del worker HTTP.
+    pub fn join_in_flight(&self) -> bool {
+        self.join_pending
+    }
+
     pub fn stop_session(&mut self) {
-        if let Some(host) = &self.host {
-            let _ = json_post::<_, serde_json::Value>(
-                &format!(
+        // Los resultados HTTP en vuelo pertenecen a la sesión que se cierra.
+        self.http_generation = self.http_generation.wrapping_add(1);
+        self.join_pending = false;
+        let server = self.embedded_server.take();
+        let end_request = self.host.as_ref().map(|host| {
+            (
+                format!(
                     "{}/v1/share-sessions/{}/end",
-                    self.embedded_server
+                    server
                         .as_ref()
-                        .map(|server| server.local_api_url())
-                        .unwrap_or(self.broker_url.trim_end_matches('/')),
+                        .map(|server| server.local_api_url().to_owned())
+                        .unwrap_or_else(|| self.broker_url.trim_end_matches('/').to_owned()),
                     host.session_id.0
                 ),
-                &EndShareSessionRequest {
+                EndShareSessionRequest {
                     host_token: host.host_token.clone(),
                 },
-                Some(host.tls_cert_pem.as_str()),
-            );
+                host.tls_cert_pem.clone(),
+            )
+        });
+        if end_request.is_some() || server.is_some() {
+            // El aviso de cierre puede esperar red y server.stop() joinea el
+            // hilo del servidor (hasta ~1s): ambos fuera del hilo de UI. Si
+            // el POST no llega, el broker limpia la sesión por grace period.
+            let spawned = thread::Builder::new()
+                .name("collab-stop".to_owned())
+                .spawn(move || {
+                    if let Some((url, body, tls_cert_pem)) = end_request {
+                        if let Err(err) = json_post::<_, serde_json::Value>(
+                            &url,
+                            &body,
+                            Some(tls_cert_pem.as_str()),
+                        ) {
+                            log::warn!("Failed to end share session on broker: {err}");
+                        }
+                    }
+                    if let Some(mut server) = server {
+                        let _ = server.stop();
+                    }
+                });
+            if let Err(err) = spawned {
+                // El closure se descarta y el Drop del server lo detiene acá.
+                log::warn!("failed to spawn collab-stop thread: {err}");
+            }
         }
         self.transport.send(TransportCommand::Close);
         self.mode = CollabMode::Inactive;
         self.session_state = CollabSessionState::NotSharing;
         self.host = None;
         self.guest = None;
-        if let Some(mut server) = self.embedded_server.take() {
-            let _ = server.stop();
-        }
         self.guest_view = GuestWorkspaceView::default();
         self.remote_inputs.clear();
         self.remote_input_senders.clear();
@@ -388,86 +414,102 @@ impl CollabManager {
         self.last_error = None;
     }
 
-    pub fn approve_join(&mut self, guest_id: GuestId) -> anyhow::Result<()> {
-        let Some(host) = &mut self.host else {
-            return Ok(());
-        };
-        let _: serde_json::Value = json_post(
-            &format!(
-                "{}/v1/share-sessions/{}/approve",
-                self.embedded_server
-                    .as_ref()
-                    .map(|server| server.local_api_url())
-                    .unwrap_or(self.broker_url.trim_end_matches('/')),
-                host.session_id.0
-            ),
-            &JoinDecisionRequest {
-                host_token: host.host_token.clone(),
-                guest_id,
-            },
-            Some(host.tls_cert_pem.as_str()),
-        )?;
-        host.pending_joins.retain(|join| join.guest_id != guest_id);
-        Ok(())
+    pub fn approve_join(&mut self, guest_id: GuestId) {
+        self.send_join_decision(guest_id, true);
     }
 
-    pub fn rotate_invite(&mut self) -> anyhow::Result<()> {
+    pub fn deny_join(&mut self, guest_id: GuestId) {
+        self.send_join_decision(guest_id, false);
+    }
+
+    fn send_join_decision(&mut self, guest_id: GuestId, approve: bool) {
+        let base = self.broker_api_base();
+        let generation = self.http_generation;
         let Some(host) = &mut self.host else {
-            return Ok(());
+            return;
+        };
+        // Se saca de pending_joins de una para respuesta inmediata en la UI;
+        // si el POST falla, apply_http_outcomes lo repone.
+        let removed_request = host
+            .pending_joins
+            .iter()
+            .position(|join| join.guest_id == guest_id)
+            .map(|index| host.pending_joins.remove(index));
+        let body = match serde_json::to_value(&JoinDecisionRequest {
+            host_token: host.host_token.clone(),
+            guest_id,
+        }) {
+            Ok(body) => body,
+            Err(err) => {
+                self.last_error = Some(err.to_string());
+                return;
+            }
+        };
+        let action = if approve { "approve" } else { "deny" };
+        let op = if approve {
+            CollabHttpOp::ApproveJoin {
+                guest_id,
+                removed_request,
+            }
+        } else {
+            CollabHttpOp::DenyJoin {
+                guest_id,
+                removed_request,
+            }
+        };
+        self.http_worker.request(CollabHttpJob {
+            url: format!(
+                "{}/v1/share-sessions/{}/{}",
+                base, host.session_id.0, action
+            ),
+            body,
+            tls_cert_pem: Some(host.tls_cert_pem.clone()),
+            generation,
+            op,
+        });
+    }
+
+    fn broker_api_base(&self) -> String {
+        self.embedded_server
+            .as_ref()
+            .map(|server| server.local_api_url().to_owned())
+            .unwrap_or_else(|| self.broker_url.trim_end_matches('/').to_owned())
+    }
+
+    pub fn rotate_invite(&mut self) {
+        let base = self.broker_api_base();
+        let generation = self.http_generation;
+        let Some(host) = &self.host else {
+            return;
         };
         let invite_secret = random_secret();
         let invite_expires_at = Some(default_invite_expires_at());
-        let _: serde_json::Value = json_post(
-            &format!(
-                "{}/v1/share-sessions/{}/rotate-invite",
-                self.embedded_server
-                    .as_ref()
-                    .map(|server| server.local_api_url())
-                    .unwrap_or(self.broker_url.trim_end_matches('/')),
-                host.session_id.0
-            ),
-            &RotateInviteRequest {
-                host_token: host.host_token.clone(),
-                invite_secret: invite_secret.clone(),
-                invite_expires_at: invite_expires_at.clone(),
-            },
-            Some(host.tls_cert_pem.as_str()),
-        )?;
-        host.invite_secret = invite_secret.clone();
-        host.invite_expires_at = invite_expires_at.clone();
-        host.invite_code = encode_invite_code(&InviteCode {
-            broker_url: self.broker_url.clone(),
-            session_id: host.session_id,
-            session_secret: host.session_secret.clone(),
-            invite_secret: Some(invite_secret),
-            expires_at: invite_expires_at,
-            requires_passphrase: host.requires_passphrase,
-            tls_cert_pem: Some(host.tls_cert_pem.clone()),
-        })?;
-        Ok(())
-    }
-
-    pub fn deny_join(&mut self, guest_id: GuestId) -> anyhow::Result<()> {
-        let Some(host) = &mut self.host else {
-            return Ok(());
+        let body = match serde_json::to_value(&RotateInviteRequest {
+            host_token: host.host_token.clone(),
+            invite_secret: invite_secret.clone(),
+            invite_expires_at,
+        }) {
+            Ok(body) => body,
+            Err(err) => {
+                self.last_error = Some(err.to_string());
+                return;
+            }
         };
-        let _: serde_json::Value = json_post(
-            &format!(
-                "{}/v1/share-sessions/{}/deny",
-                self.embedded_server
-                    .as_ref()
-                    .map(|server| server.local_api_url())
-                    .unwrap_or(self.broker_url.trim_end_matches('/')),
-                host.session_id.0
+        // El invite local recién cambia cuando el broker confirma la
+        // rotación; mientras tanto el código viejo sigue siendo el válido.
+        self.http_worker.request(CollabHttpJob {
+            url: format!(
+                "{}/v1/share-sessions/{}/rotate-invite",
+                base, host.session_id.0
             ),
-            &JoinDecisionRequest {
-                host_token: host.host_token.clone(),
-                guest_id,
+            body,
+            tls_cert_pem: Some(host.tls_cert_pem.clone()),
+            generation,
+            op: CollabHttpOp::RotateInvite {
+                invite_secret,
+                invite_expires_at,
             },
-            Some(host.tls_cert_pem.as_str()),
-        )?;
-        host.pending_joins.retain(|join| join.guest_id != guest_id);
-        Ok(())
+        });
     }
 
     pub fn publish_snapshot(&mut self, mut snapshot: SharedWorkspaceSnapshot) {
@@ -714,7 +756,130 @@ impl CollabManager {
         }
     }
 
+    fn apply_http_outcomes(&mut self) {
+        for outcome in self.http_worker.poll() {
+            if outcome.generation != self.http_generation {
+                // Resultado de una sesión que ya se cerró.
+                continue;
+            }
+            match outcome.op {
+                CollabHttpOp::ApproveJoin {
+                    guest_id,
+                    removed_request,
+                } => {
+                    if let Err(err) = outcome.result {
+                        log::warn!("approve join failed: {err}");
+                        self.last_error = Some(format!("No se pudo aprobar el acceso: {err}"));
+                        self.restore_pending_join(guest_id, removed_request);
+                    }
+                }
+                CollabHttpOp::DenyJoin {
+                    guest_id,
+                    removed_request,
+                } => {
+                    if let Err(err) = outcome.result {
+                        log::warn!("deny join failed: {err}");
+                        self.last_error = Some(format!("No se pudo rechazar el acceso: {err}"));
+                        self.restore_pending_join(guest_id, removed_request);
+                    }
+                }
+                CollabHttpOp::RotateInvite {
+                    invite_secret,
+                    invite_expires_at,
+                } => match outcome.result {
+                    Ok(_) => {
+                        let broker_url = self.broker_url.clone();
+                        if let Some(host) = &mut self.host {
+                            host.invite_secret = invite_secret.clone();
+                            host.invite_expires_at = invite_expires_at;
+                            match encode_invite_code(&InviteCode {
+                                broker_url,
+                                session_id: host.session_id,
+                                session_secret: host.session_secret.clone(),
+                                invite_secret: Some(invite_secret),
+                                expires_at: invite_expires_at,
+                                requires_passphrase: host.requires_passphrase,
+                                tls_cert_pem: Some(host.tls_cert_pem.clone()),
+                            }) {
+                                Ok(code) => host.invite_code = code,
+                                Err(err) => self.last_error = Some(err.to_string()),
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        log::warn!("rotate invite failed: {err}");
+                        self.last_error = Some(format!("No se pudo rotar el invite: {err}"));
+                    }
+                },
+                CollabHttpOp::JoinSession {
+                    invite,
+                    display_name,
+                } => {
+                    self.join_pending = false;
+                    let completed = outcome
+                        .result
+                        .and_then(|value| {
+                            Ok(serde_json::from_value::<JoinShareSessionResponse>(value)?)
+                        })
+                        .and_then(|response| {
+                            let websocket_url = broker_ws_url(
+                                &invite.broker_url,
+                                invite.session_id,
+                                &response.guest_token,
+                                SessionRole::Guest,
+                            )?;
+                            Ok((response, websocket_url))
+                        });
+                    match completed {
+                        Ok((response, websocket_url)) => {
+                            self.transport.send(TransportCommand::Connect {
+                                websocket_url,
+                                tls_cert_pem: invite.tls_cert_pem.clone(),
+                            });
+                            self.guest = Some(GuestSessionContext {
+                                session_id: invite.session_id,
+                                guest_id: response.guest_id,
+                                session_secret: invite.session_secret,
+                                display_name,
+                                next_message_seq: 1,
+                            });
+                            self.guest_view = GuestWorkspaceView {
+                                snapshot: None,
+                                focused_panel: None,
+                                my_guest_id: Some(response.guest_id),
+                                scroll_offsets: HashMap::new(),
+                            };
+                            self.mode = CollabMode::Guest;
+                            self.broker_url = invite.broker_url;
+                            self.received_message_seq.clear();
+                        }
+                        Err(err) => {
+                            self.session_state = CollabSessionState::NotSharing;
+                            self.last_error = Some(err.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn restore_pending_join(&mut self, guest_id: GuestId, removed_request: Option<JoinRequest>) {
+        let Some(host) = &mut self.host else {
+            return;
+        };
+        if let Some(request) = removed_request {
+            if !host
+                .pending_joins
+                .iter()
+                .any(|join| join.guest_id == guest_id)
+            {
+                host.pending_joins.push(request);
+            }
+        }
+    }
+
     fn handle_transport_events(&mut self) {
+        self.apply_http_outcomes();
         for event in self.transport.drain_events() {
             match event {
                 super::transport::TransportEvent::Connected => {
@@ -794,7 +959,7 @@ impl CollabManager {
                     }
                 }
                 if let Some(snapshot) = &mut self.guest_view.snapshot {
-                    snapshot.guests = guests;
+                    Arc::make_mut(snapshot).guests = guests;
                 }
             }
             BrokerControlMessage::HostDisconnected => {
@@ -820,6 +985,14 @@ impl CollabManager {
     }
 
     fn handle_binary_message(&mut self, binary: &[u8]) {
+        const MAX_ENVELOPE_BYTES: usize = 16 * 1024 * 1024;
+        if binary.len() > MAX_ENVELOPE_BYTES {
+            log::warn!(
+                "Dropping oversized collab envelope ({} bytes)",
+                binary.len()
+            );
+            return;
+        }
         let envelope: CollabEnvelope = match rmp_serde::from_slice(binary) {
             Ok(envelope) => envelope,
             Err(err) => {
@@ -848,7 +1021,15 @@ impl CollabManager {
 
         match payload {
             SessionPayload::WorkspaceSnapshot { snapshot } => {
-                self.guest_view.snapshot = Some(snapshot);
+                // Drop scroll offsets for panels the host no longer shares so
+                // the map does not grow across long sessions.
+                self.guest_view.scroll_offsets.retain(|panel_id, _| {
+                    snapshot
+                        .panels
+                        .iter()
+                        .any(|panel| panel.panel_id == *panel_id)
+                });
+                self.guest_view.snapshot = Some(Arc::new(snapshot));
             }
             SessionPayload::ControlRequest { request } => {
                 self.note_control_request(request);
@@ -878,6 +1059,7 @@ impl CollabManager {
 
     fn update_remote_control(&mut self, terminal_id: Uuid, controller: Option<GuestId>) {
         if let Some(snapshot) = &mut self.guest_view.snapshot {
+            let snapshot = Arc::make_mut(snapshot);
             for panel in &mut snapshot.panels {
                 if panel.panel_id == terminal_id {
                     panel.controller = controller;
@@ -1045,7 +1227,7 @@ fn certificate_subject_names(reachable_url: &str, bind_addr: SocketAddr) -> Vec<
 
 fn random_secret() -> String {
     let mut secret = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut secret);
+    rand::rngs::OsRng.fill_bytes(&mut secret);
     base64::engine::general_purpose::STANDARD_NO_PAD.encode(secret)
 }
 
