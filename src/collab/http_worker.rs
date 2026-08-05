@@ -27,6 +27,9 @@ pub(super) enum CollabHttpOp {
     RotateInvite {
         invite_secret: String,
         invite_expires_at: Option<DateTime<Utc>>,
+        /// Nueva clave de tráfico: se aplica recién cuando el broker confirma
+        /// la rotación (junto con el aviso de rekey a los invitados).
+        new_session_secret: String,
     },
     JoinSession {
         invite: InviteCode,
@@ -127,6 +130,7 @@ mod tests {
             op: CollabHttpOp::RotateInvite {
                 invite_secret: "secret".to_owned(),
                 invite_expires_at: None,
+                new_session_secret: "new-secret".to_owned(),
             },
         });
 

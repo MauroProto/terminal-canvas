@@ -98,11 +98,27 @@ pub enum BrokerControlMessage {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SessionPayload {
-    WorkspaceSnapshot { snapshot: SharedWorkspaceSnapshot },
-    ControlRequest { request: ControlRequest },
-    ControlGrant { grant: ControlGrant },
-    ControlRevoke { revoke: ControlRevoke },
-    GuestInput { input: GuestTerminalInput },
+    WorkspaceSnapshot {
+        snapshot: SharedWorkspaceSnapshot,
+    },
+    ControlRequest {
+        request: ControlRequest,
+    },
+    ControlGrant {
+        grant: ControlGrant,
+    },
+    ControlRevoke {
+        revoke: ControlRevoke,
+    },
+    GuestInput {
+        input: GuestTerminalInput,
+    },
+    /// El host rotó la clave de tráfico: se envía cifrada con la clave
+    /// VIEJA para que los invitados conectados puedan descifrarla y
+    /// cambiar de clave sin reconectarse.
+    SessionRekeyed {
+        new_session_secret: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

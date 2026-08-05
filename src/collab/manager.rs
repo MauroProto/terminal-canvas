@@ -81,6 +81,9 @@ struct HostSessionContext {
     workspace_id: Uuid,
     host_token: String,
     session_secret: String,
+    /// Clave de tráfico anterior (post-rotación): permite descifrar mensajes
+    /// de invitados que aún no procesaron el rekey.
+    previous_session_secret: Option<String>,
     invite_secret: String,
     invite_expires_at: Option<DateTime<Utc>>,
     requires_passphrase: bool,
@@ -99,6 +102,8 @@ struct GuestSessionContext {
     session_id: ShareSessionId,
     guest_id: GuestId,
     session_secret: String,
+    /// Clave anterior tras un rekey del host (gracia de descifrado).
+    previous_session_secret: Option<String>,
     display_name: String,
     next_message_seq: u64,
 }
@@ -290,6 +295,7 @@ impl CollabManager {
             workspace_id,
             host_token: response.host_token,
             session_secret,
+            previous_session_secret: None,
             invite_secret,
             invite_expires_at,
             requires_passphrase: session_passphrase.is_some(),
@@ -483,6 +489,10 @@ impl CollabManager {
             return;
         };
         let invite_secret = random_secret();
+        // Rotar el invite también rota la clave de tráfico: un invite viejo
+        // filtrado no debe poder descifrar el tráfico nuevo. El rekey se
+        // aplica cuando el broker confirma (ver `CollabHttpOp::RotateInvite`).
+        let new_session_secret = random_secret();
         let invite_expires_at = Some(default_invite_expires_at());
         let body = match serde_json::to_value(&RotateInviteRequest {
             host_token: host.host_token.clone(),
@@ -508,6 +518,7 @@ impl CollabManager {
             op: CollabHttpOp::RotateInvite {
                 invite_secret,
                 invite_expires_at,
+                new_session_secret,
             },
         });
     }
@@ -546,6 +557,22 @@ impl CollabManager {
             if let Ok(bytes) = rmp_serde::to_vec_named(&envelope) {
                 self.transport.send(TransportCommand::SendBinary(bytes));
             }
+        }
+    }
+
+    /// Avisa a los invitados de la nueva clave de tráfico (cifrado con la
+    /// clave vieja, que aún comparten) y recién después cambia la propia.
+    /// La clave vieja queda como `previous_session_secret` para descifrar
+    /// mensajes en vuelo durante la transición.
+    fn send_session_rekeyed(&mut self, new_session_secret: &str) {
+        self.send_host_payload(SessionPayload::SessionRekeyed {
+            new_session_secret: new_session_secret.to_owned(),
+        });
+        if let Some(host) = &mut self.host {
+            host.previous_session_secret = Some(std::mem::replace(
+                &mut host.session_secret,
+                new_session_secret.to_owned(),
+            ));
         }
     }
 
@@ -786,9 +813,13 @@ impl CollabManager {
                 CollabHttpOp::RotateInvite {
                     invite_secret,
                     invite_expires_at,
+                    new_session_secret,
                 } => match outcome.result {
                     Ok(_) => {
                         let broker_url = self.broker_url.clone();
+                        // Rekey: avisar a los invitados con la clave vieja y
+                        // recién cambiar la clave de tráfico.
+                        self.send_session_rekeyed(&new_session_secret);
                         if let Some(host) = &mut self.host {
                             host.invite_secret = invite_secret.clone();
                             host.invite_expires_at = invite_expires_at;
@@ -840,6 +871,7 @@ impl CollabManager {
                                 session_id: invite.session_id,
                                 guest_id: response.guest_id,
                                 session_secret: invite.session_secret,
+                                previous_session_secret: None,
                                 display_name,
                                 next_message_seq: 1,
                             });
@@ -1000,19 +1032,27 @@ impl CollabManager {
                 return;
             }
         };
-        let secret = if let Some(host) = &self.host {
-            host.session_secret.as_str()
+        let (secret, previous_secret) = if let Some(host) = &self.host {
+            (
+                host.session_secret.clone(),
+                host.previous_session_secret.clone(),
+            )
         } else if let Some(guest) = &self.guest {
-            guest.session_secret.as_str()
+            (
+                guest.session_secret.clone(),
+                guest.previous_session_secret.clone(),
+            )
         } else {
             return;
         };
-        let payload = match decode_envelope(&envelope, secret) {
-            Ok(payload) => payload,
-            Err(err) => {
-                self.last_error = Some(err.to_string());
-                return;
-            }
+        // Tras un rekey, los mensajes en vuelo pueden venir cifrados con la
+        // clave anterior: se prueba la vigente y luego la previa.
+        let payload = decode_envelope(&envelope, &secret).ok().or_else(|| {
+            previous_secret.and_then(|previous| decode_envelope(&envelope, &previous).ok())
+        });
+        let Some(payload) = payload else {
+            self.last_error = Some("Failed to decode collab envelope".to_owned());
+            return;
         };
         if let Err(err) = self.validate_message_sequence(envelope.sender_id, envelope.message_seq) {
             self.last_error = Some(err);
@@ -1052,6 +1092,15 @@ impl CollabManager {
                 if let super::models::ParticipantId::Guest(guest_id) = envelope.sender_id {
                     self.remote_inputs.push(input);
                     self.remote_input_senders.push(guest_id);
+                }
+            }
+            SessionPayload::SessionRekeyed { new_session_secret } => {
+                // Solo el invitado recibe el aviso de rekey del host.
+                if let Some(guest) = &mut self.guest {
+                    guest.previous_session_secret = Some(std::mem::replace(
+                        &mut guest.session_secret,
+                        new_session_secret,
+                    ));
                 }
             }
         }
@@ -1288,6 +1337,7 @@ mod tests {
             session_id: ShareSessionId(Uuid::new_v4()),
             guest_id,
             session_secret: "secret".to_owned(),
+            previous_session_secret: None,
             display_name: "Guest".to_owned(),
             next_message_seq: 1,
         });
@@ -1317,6 +1367,7 @@ mod tests {
             session_id: ShareSessionId(Uuid::new_v4()),
             guest_id,
             session_secret: "secret".to_owned(),
+            previous_session_secret: None,
             display_name: "Guest".to_owned(),
             next_message_seq: 1,
         });
@@ -1421,6 +1472,7 @@ mod tests {
             session_id: ShareSessionId(Uuid::new_v4()),
             guest_id: GuestId(Uuid::new_v4()),
             session_secret: secret.clone(),
+            previous_session_secret: None,
             display_name: "Guest".to_owned(),
             next_message_seq: 1,
         });
@@ -1448,5 +1500,143 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .contains("sequence"));
+    }
+
+    #[test]
+    fn guest_switches_traffic_key_on_session_rekeyed() {
+        let old_secret = random_secret();
+        let new_secret = random_secret();
+        let mut manager = CollabManager::new();
+        manager.mode = CollabMode::Guest;
+        manager.session_state = CollabSessionState::Live;
+        manager.guest = Some(GuestSessionContext {
+            session_id: ShareSessionId(Uuid::new_v4()),
+            guest_id: GuestId(Uuid::new_v4()),
+            session_secret: old_secret.clone(),
+            previous_session_secret: None,
+            display_name: "Guest".to_owned(),
+            next_message_seq: 1,
+        });
+
+        // El aviso de rekey llega cifrado con la clave vieja.
+        let rekey = SessionPayload::SessionRekeyed {
+            new_session_secret: new_secret.clone(),
+        };
+        let envelope = encode_envelope(
+            manager.guest.as_ref().unwrap().session_id,
+            ParticipantId::Host,
+            1,
+            &old_secret,
+            &rekey,
+        )
+        .unwrap();
+        manager.handle_binary_message(&rmp_serde::to_vec_named(&envelope).unwrap());
+
+        let guest = manager.guest.as_ref().unwrap();
+        assert_eq!(guest.session_secret, new_secret);
+        assert_eq!(
+            guest.previous_session_secret.as_deref(),
+            Some(old_secret.as_str())
+        );
+
+        // Y el siguiente snapshot ya viene con la clave nueva.
+        let snapshot = SessionPayload::WorkspaceSnapshot {
+            snapshot: sample_snapshot(0),
+        };
+        let envelope = encode_envelope(
+            manager.guest.as_ref().unwrap().session_id,
+            ParticipantId::Host,
+            2,
+            &new_secret,
+            &snapshot,
+        )
+        .unwrap();
+        manager.handle_binary_message(&rmp_serde::to_vec_named(&envelope).unwrap());
+        assert!(manager.guest_view.snapshot.is_some());
+        assert!(manager.last_error.is_none());
+    }
+
+    #[test]
+    fn guest_decodes_in_flight_message_with_previous_key_after_rekey() {
+        let old_secret = random_secret();
+        let new_secret = random_secret();
+        let mut manager = CollabManager::new();
+        manager.mode = CollabMode::Guest;
+        manager.session_state = CollabSessionState::Live;
+        manager.guest = Some(GuestSessionContext {
+            session_id: ShareSessionId(Uuid::new_v4()),
+            guest_id: GuestId(Uuid::new_v4()),
+            session_secret: new_secret.clone(),
+            previous_session_secret: Some(old_secret.clone()),
+            display_name: "Guest".to_owned(),
+            next_message_seq: 1,
+        });
+
+        // Mensaje en vuelo cifrado con la clave vieja: se descifra por la
+        // ventana de gracia.
+        let snapshot = SessionPayload::WorkspaceSnapshot {
+            snapshot: sample_snapshot(0),
+        };
+        let envelope = encode_envelope(
+            manager.guest.as_ref().unwrap().session_id,
+            ParticipantId::Host,
+            1,
+            &old_secret,
+            &snapshot,
+        )
+        .unwrap();
+        manager.handle_binary_message(&rmp_serde::to_vec_named(&envelope).unwrap());
+
+        assert!(manager.guest_view.snapshot.is_some());
+        assert!(manager.last_error.is_none());
+    }
+
+    #[test]
+    fn host_rekey_keeps_previous_key_for_grace_decoding() {
+        let old_secret = random_secret();
+        let new_secret = random_secret();
+        let mut manager = CollabManager::new();
+        manager.mode = CollabMode::Host;
+        manager.session_state = CollabSessionState::Live;
+        let guest_id = GuestId(Uuid::new_v4());
+        manager.host = Some(HostSessionContext {
+            session_id: ShareSessionId(Uuid::new_v4()),
+            workspace_id: Uuid::new_v4(),
+            host_token: "token".to_owned(),
+            session_secret: new_secret.clone(),
+            previous_session_secret: Some(old_secret.clone()),
+            invite_secret: "invite".to_owned(),
+            invite_expires_at: None,
+            requires_passphrase: false,
+            tls_cert_pem: String::new(),
+            invite_code: String::new(),
+            guests: HashMap::new(),
+            pending_joins: Vec::new(),
+            pending_control_requests: Vec::new(),
+            terminal_controls: HashMap::new(),
+            last_snapshot: None,
+            next_message_seq: 1,
+        });
+
+        // Input de invitado en vuelo cifrado con la clave vieja.
+        let payload = SessionPayload::GuestInput {
+            input: crate::collab::models::GuestTerminalInput {
+                terminal_id: Uuid::new_v4(),
+                events: Vec::new(),
+            },
+        };
+        let envelope = encode_envelope(
+            manager.host.as_ref().unwrap().session_id,
+            ParticipantId::Guest(guest_id),
+            1,
+            &old_secret,
+            &payload,
+        )
+        .unwrap();
+        manager.handle_binary_message(&rmp_serde::to_vec_named(&envelope).unwrap());
+
+        assert!(manager.last_error.is_none());
+        let events = manager.drain_events();
+        assert_eq!(events.len(), 1);
     }
 }
