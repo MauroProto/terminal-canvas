@@ -6,7 +6,7 @@ mod matching;
 #[allow(unused_imports)]
 pub use code_diff::{
     list_git_worktrees, parse_unified_diff, remove_git_worktree, DiffLine, DiffLineKind,
-    DiffLoader, FileDiff, RepoDiff, WorktreeInfo,
+    DiffLoader, FileDiff, RepoDiff, WorktreeInfo, WorktreeJob, WorktreeOps,
 };
 #[allow(unused_imports)]
 pub use manager::{

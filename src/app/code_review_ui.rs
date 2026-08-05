@@ -7,9 +7,7 @@ use std::path::{Path, PathBuf};
 use egui::{pos2, vec2, Align2, Color32, FontId, RichText, ScrollArea, Sense, Stroke};
 use uuid::Uuid;
 
-use crate::orchestration::{
-    list_git_worktrees, remove_git_worktree, DiffLine, DiffLineKind, FileDiff, WorktreeInfo,
-};
+use crate::orchestration::{DiffLine, DiffLineKind, FileDiff, WorktreeInfo, WorktreeJob};
 use crate::theme::colors as palette;
 
 use super::TerminalApp;
@@ -116,7 +114,10 @@ impl TerminalApp {
                     state.files = diff.files;
                     state.selected = 0;
                     state.failed = false;
-                    state.worktrees = list_git_worktrees(&state.repo_root);
+                    // Listar lanza un subproceso git: va al worker para no
+                    // gastar milisegundos del frame.
+                    let repo_root = state.repo_root.clone();
+                    self.worktree_ops.request(WorktreeJob::List { repo_root });
                 }
                 None => {
                     state.failed = true;
@@ -624,24 +625,29 @@ impl TerminalApp {
         ui.add_space(4.0);
     }
 
+    /// Pide el borrado al worker. `git worktree remove` borra un árbol de
+    /// trabajo entero y en un repo grande tarda segundos: hacerlo acá
+    /// congelaba la ventana.
     fn remove_code_review_worktree(&mut self, path: &Path) {
-        let repo_root = {
-            let Some(state) = self.code_review.as_ref() else {
-                return;
-            };
-            state.repo_root.clone()
+        let Some(state) = self.code_review.as_ref() else {
+            return;
         };
-        let result = remove_git_worktree(&repo_root, path);
-        if let Some(state) = self.code_review.as_mut() {
-            match result {
-                Ok(()) => {
-                    state.worktree_error = None;
-                    state.worktrees = list_git_worktrees(&repo_root);
-                }
-                Err(err) => {
-                    state.worktree_error = Some(err.to_string());
-                }
-            }
+        let repo_root = state.repo_root.clone();
+        self.worktree_ops.request(WorktreeJob::Remove {
+            repo_root,
+            worktree_path: path.to_path_buf(),
+        });
+    }
+
+    /// Recoge los resultados del worker de worktrees.
+    pub(super) fn poll_worktree_ops(&mut self) {
+        let outcomes = self.worktree_ops.poll();
+        let Some(state) = self.code_review.as_mut() else {
+            return;
+        };
+        for outcome in outcomes {
+            state.worktrees = outcome.worktrees;
+            state.worktree_error = outcome.error;
         }
     }
 }

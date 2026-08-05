@@ -717,4 +717,165 @@ index 1..2 100644
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn listing_worktrees_outside_a_repo_yields_nothing_without_erroring() {
+        let outcome = super::run_worktree_job(super::WorktreeJob::List {
+            repo_root: std::env::temp_dir(),
+        });
+        assert!(outcome.worktrees.is_empty());
+        assert!(outcome.error.is_none(), "listing must not report an error");
+    }
+
+    #[test]
+    fn a_failed_removal_reports_the_error_and_still_relists() {
+        // Aunque falle el borrado se re-lista: el disco pudo quedar a medias.
+        let outcome = super::run_worktree_job(super::WorktreeJob::Remove {
+            repo_root: std::env::temp_dir(),
+            worktree_path: std::env::temp_dir().join("no-existe-cbf1f0"),
+        });
+        assert!(outcome.error.is_some(), "removal outside a repo must fail");
+        assert!(outcome.worktrees.is_empty());
+    }
+
+    #[test]
+    fn worktree_ops_returns_results_through_the_worker() {
+        let mut ops = super::WorktreeOps::default();
+        ops.request(super::WorktreeJob::List {
+            repo_root: std::env::temp_dir(),
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let results = ops.poll();
+            if !results.is_empty() {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "worker timed out");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn requesting_a_removal_does_not_block_the_caller() {
+        // Regresión: antes el borrado corría inline y congelaba la ventana.
+        let mut ops = super::WorktreeOps::default();
+        let started = std::time::Instant::now();
+        ops.request(super::WorktreeJob::Remove {
+            repo_root: std::env::temp_dir(),
+            worktree_path: std::env::temp_dir().join("no-existe-cbf1f0"),
+        });
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(200),
+            "request blocked for {:?}",
+            started.elapsed()
+        );
+    }
+}
+
+/// Trabajo de worktree a ejecutar fuera del hilo de UI.
+///
+/// `git worktree remove` borra un árbol de trabajo entero: en un repo grande
+/// puede tardar segundos, y hasta ahora corría en el hilo de UI, congelando la
+/// ventana. Listar es más barato pero igual lanza un subproceso, así que
+/// también se saca del camino del frame.
+#[derive(Debug, Clone)]
+pub enum WorktreeJob {
+    List {
+        repo_root: PathBuf,
+    },
+    Remove {
+        repo_root: PathBuf,
+        worktree_path: PathBuf,
+    },
+}
+
+/// Resultado de un trabajo de worktree. Siempre trae el listado actualizado,
+/// así la UI no necesita encadenar un segundo pedido después de borrar.
+#[derive(Debug)]
+pub struct WorktreeOutcome {
+    pub worktrees: Vec<WorktreeInfo>,
+    /// Mensaje de error del borrado, si falló.
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Default)]
+pub struct WorktreeOps {
+    worker: Option<WorktreeOpsWorker>,
+}
+
+#[derive(Debug)]
+struct WorktreeOpsWorker {
+    request_tx: Sender<WorktreeJob>,
+    result_rx: Receiver<WorktreeOutcome>,
+}
+
+impl WorktreeOps {
+    pub fn request(&mut self, job: WorktreeJob) {
+        if self.worker.is_none() {
+            self.worker = spawn_worktree_ops_worker();
+        }
+        let Some(worker) = self.worker.as_ref() else {
+            return;
+        };
+        // Si el hilo murió, soltamos el worker para reintentar en el próximo
+        // pedido en vez de quedar mudos para siempre.
+        if worker.request_tx.send(job).is_err() {
+            self.worker = None;
+        }
+    }
+
+    pub fn poll(&mut self) -> Vec<WorktreeOutcome> {
+        let Some(worker) = self.worker.as_ref() else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        while let Ok(result) = worker.result_rx.try_recv() {
+            out.push(result);
+        }
+        out
+    }
+}
+
+fn spawn_worktree_ops_worker() -> Option<WorktreeOpsWorker> {
+    let (request_tx, request_rx) = std::sync::mpsc::channel::<WorktreeJob>();
+    let (result_tx, result_rx) = std::sync::mpsc::channel::<WorktreeOutcome>();
+    std::thread::Builder::new()
+        .name("worktree-ops".to_owned())
+        .spawn(move || {
+            while let Ok(job) = request_rx.recv() {
+                let outcome = run_worktree_job(job);
+                if result_tx.send(outcome).is_err() {
+                    break;
+                }
+            }
+        })
+        .ok()?;
+    Some(WorktreeOpsWorker {
+        request_tx,
+        result_rx,
+    })
+}
+
+fn run_worktree_job(job: WorktreeJob) -> WorktreeOutcome {
+    match job {
+        WorktreeJob::List { repo_root } => WorktreeOutcome {
+            worktrees: list_git_worktrees(&repo_root),
+            error: None,
+        },
+        WorktreeJob::Remove {
+            repo_root,
+            worktree_path,
+        } => {
+            let error = remove_git_worktree(&repo_root, &worktree_path)
+                .err()
+                .map(|err| err.to_string());
+            // Se re-lista siempre, incluso si el borrado falló: el estado en
+            // disco pudo cambiar parcialmente.
+            WorktreeOutcome {
+                worktrees: list_git_worktrees(&repo_root),
+                error,
+            }
+        }
+    }
 }
