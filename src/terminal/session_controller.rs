@@ -172,6 +172,20 @@ impl SessionController {
         let _ = self.with_pty(PtyHandle::clear_selection);
     }
 
+    /// Encola un prompt diferido en el PtyManager (se escribe cuando el TUI
+    /// renderice algo). Usado cuando el panel se acaba de spawnear.
+    pub fn queue_prompt(&self, text: &str) {
+        let Some(manager) = &self.pty_manager else {
+            return;
+        };
+        let Some(session_id) = self.session_id else {
+            return;
+        };
+        if let Ok(mut manager) = manager.lock() {
+            manager.queue_prompt(session_id, text);
+        }
+    }
+
     pub fn title_snapshot(&self) -> Option<String> {
         let manager = self.pty_manager.as_ref()?;
         let session_id = self.session_id?;
