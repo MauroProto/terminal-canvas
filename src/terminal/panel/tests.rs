@@ -2,10 +2,7 @@ use crate::app::gesture_pointer_pos;
 use crate::canvas::viewport::Viewport;
 use crate::collab::PanelShareScope;
 use crate::runtime::RenderTier;
-use crate::terminal::input::{
-    alt_screen_scroll_sequence, mouse_scroll_button, mouse_scroll_sgr_sequence,
-    scroll_lines_from_input_delta, scrollback_delta_from_input,
-};
+use crate::terminal::input::{mouse_scroll_sgr_sequence, ScrollAccumulator};
 use crate::terminal::layout::{grid_point_from_position, GridMetrics};
 use crate::terminal::scrollbar::{
     scrollbar_pointer_to_scrollback, scrollbar_thumb_height, terminal_scrollbar_rect,
@@ -13,12 +10,13 @@ use crate::terminal::scrollbar::{
 use egui::{pos2, vec2, Color32};
 
 use super::{
-    chrome_zoom, close_rect, infer_activity_label, minimize_rect, panel_corner_radius, panel_lod,
-    panel_roundings, preview_label_text, render_tier_for_panel, resize_target_from_origin,
-    shell_label, should_defer_terminal_resize, should_draw_resize_grip, should_draw_title_text,
-    should_draw_window_controls, should_render_live_terminal, should_render_terminal_contents,
-    terminal_mouse_cell_from_pointer, title_bar_height, title_drag_hit_rect, PanelHitArea,
-    PanelLod, ResizeHandle, TerminalPanel, BORDER_RADIUS, MIN_HEIGHT, MIN_WIDTH, TITLE_BAR_HEIGHT,
+    branch_badge_rect, chrome_zoom, close_rect, infer_activity_label, minimize_rect,
+    panel_corner_radius, panel_lod, panel_roundings, preview_label_text, render_tier_for_panel,
+    resize_target_from_origin, shell_label, should_defer_terminal_resize, should_draw_resize_grip,
+    should_draw_title_text, should_draw_window_controls, should_render_live_terminal,
+    should_render_terminal_contents, terminal_mouse_cell_from_pointer, title_bar_height,
+    title_drag_hit_rect, PanelHitArea, PanelLod, ResizeHandle, TerminalPanel, BORDER_RADIUS,
+    MIN_HEIGHT, MIN_WIDTH, TITLE_BAR_HEIGHT,
 };
 #[test]
 fn custom_title_survives_shell_title_updates() {
@@ -189,7 +187,7 @@ fn focused_panels_get_full_render_tier() {
     let content_rect = egui::Rect::from_min_size(pos2(0.0, 42.0), vec2(420.0, 218.0));
 
     assert_eq!(
-        render_tier_for_panel(content_rect, 1.0, PanelLod::Full, false, true, false),
+        render_tier_for_panel(content_rect, 1.0, PanelLod::Full, false, true),
         RenderTier::Full
     );
 }
@@ -199,18 +197,20 @@ fn fast_path_still_keeps_focused_panels_live() {
     let content_rect = egui::Rect::from_min_size(pos2(0.0, 42.0), vec2(420.0, 218.0));
 
     assert_eq!(
-        render_tier_for_panel(content_rect, 1.0, PanelLod::Full, true, true, false),
+        render_tier_for_panel(content_rect, 1.0, PanelLod::Full, true, true),
         RenderTier::Full
     );
 }
 
 #[test]
-fn background_streaming_panels_stay_live_when_renderable() {
+fn background_streaming_panels_render_every_row() {
     let content_rect = egui::Rect::from_min_size(pos2(0.0, 42.0), vec2(200.0, 120.0));
 
+    // Sin gesto activo, un panel visible renderiza completo aunque no
+    // tenga foco: saltear filas se ve como texto roto.
     assert_eq!(
-        render_tier_for_panel(content_rect, 1.0, PanelLod::Compact, false, false, true),
-        RenderTier::ReducedLive
+        render_tier_for_panel(content_rect, 1.0, PanelLod::Compact, false, false),
+        RenderTier::Full
     );
 }
 
@@ -219,7 +219,7 @@ fn background_idle_panels_keep_full_cached_render_when_visible() {
     let content_rect = egui::Rect::from_min_size(pos2(0.0, 42.0), vec2(200.0, 120.0));
 
     assert_eq!(
-        render_tier_for_panel(content_rect, 1.0, PanelLod::Compact, false, false, false),
+        render_tier_for_panel(content_rect, 1.0, PanelLod::Compact, false, false),
         RenderTier::Full
     );
 }
@@ -229,7 +229,7 @@ fn drag_fast_path_uses_reduced_live_without_falling_to_preview() {
     let content_rect = egui::Rect::from_min_size(pos2(0.0, 42.0), vec2(200.0, 120.0));
 
     assert_eq!(
-        render_tier_for_panel(content_rect, 1.0, PanelLod::Compact, true, false, false),
+        render_tier_for_panel(content_rect, 1.0, PanelLod::Compact, true, false),
         RenderTier::ReducedLive
     );
 }
@@ -239,7 +239,7 @@ fn minimal_panels_keep_preview_badge_visible() {
     let content_rect = egui::Rect::from_min_size(pos2(0.0, 7.0), vec2(84.0, 44.0));
 
     assert_eq!(
-        render_tier_for_panel(content_rect, 0.18, PanelLod::Minimal, false, false, false),
+        render_tier_for_panel(content_rect, 0.18, PanelLod::Minimal, false, false),
         RenderTier::Preview
     );
 }
@@ -276,36 +276,20 @@ fn preview_label_falls_back_to_clean_title_when_no_agent_is_detected() {
 
 #[test]
 fn mac_native_upward_input_scroll_moves_toward_recent_output() {
-    assert_eq!(scroll_lines_from_input_delta(-48.0), 2);
+    let mut accumulator = ScrollAccumulator::default();
     #[cfg(target_os = "macos")]
-    {
-        assert_eq!(scrollback_delta_from_input(-48.0), -2);
-        assert_eq!(alt_screen_scroll_sequence(-1.0), b"\x1b[B");
-        assert_eq!(mouse_scroll_button(-1.0), 65);
-    }
+    assert_eq!(accumulator.take_lines(-48.0), -2);
     #[cfg(not(target_os = "macos"))]
-    {
-        assert_eq!(scrollback_delta_from_input(-48.0), 2);
-        assert_eq!(alt_screen_scroll_sequence(-1.0), b"\x1b[A");
-        assert_eq!(mouse_scroll_button(-1.0), 64);
-    }
+    assert_eq!(accumulator.take_lines(-48.0), 2);
 }
 
 #[test]
 fn mac_native_downward_input_scroll_moves_toward_history() {
-    assert_eq!(scroll_lines_from_input_delta(48.0), 2);
+    let mut accumulator = ScrollAccumulator::default();
     #[cfg(target_os = "macos")]
-    {
-        assert_eq!(scrollback_delta_from_input(48.0), 2);
-        assert_eq!(alt_screen_scroll_sequence(1.0), b"\x1b[A");
-        assert_eq!(mouse_scroll_button(1.0), 64);
-    }
+    assert_eq!(accumulator.take_lines(48.0), 2);
     #[cfg(not(target_os = "macos"))]
-    {
-        assert_eq!(scrollback_delta_from_input(48.0), -2);
-        assert_eq!(alt_screen_scroll_sequence(1.0), b"\x1b[B");
-        assert_eq!(mouse_scroll_button(1.0), 65);
-    }
+    assert_eq!(accumulator.take_lines(48.0), -2);
 }
 
 #[test]
@@ -444,4 +428,76 @@ fn shared_snapshot_reports_private_scope() {
     assert_eq!(snapshot.share_scope, PanelShareScope::Private);
     assert!(snapshot.visible_text.is_empty());
     assert!(snapshot.history_text.is_empty());
+}
+
+fn title_bar(width: f32) -> egui::Rect {
+    egui::Rect::from_min_size(pos2(100.0, 50.0), vec2(width, 28.0))
+}
+
+#[test]
+fn branch_badge_sits_against_the_right_edge_of_the_title_bar() {
+    let bar = title_bar(400.0);
+    let badge = branch_badge_rect(bar, 150.0, vec2(90.0, 16.0)).expect("badge fits");
+    assert!(
+        badge.right() < bar.right(),
+        "badge must keep a right margin"
+    );
+    assert!(
+        badge.right() > bar.right() - 20.0,
+        "badge hugs the right edge"
+    );
+    assert_eq!(badge.width(), 90.0);
+    assert_eq!(badge.height(), 16.0);
+}
+
+#[test]
+fn branch_badge_is_vertically_centred_in_the_title_bar() {
+    let bar = title_bar(400.0);
+    let badge = branch_badge_rect(bar, 100.0, vec2(80.0, 16.0)).expect("badge fits");
+    assert!((badge.center().y - bar.center().y).abs() < 0.01);
+}
+
+#[test]
+fn branch_badge_is_dropped_when_it_would_touch_the_title_text() {
+    let bar = title_bar(400.0);
+    // Un título que llega casi al borde derecho no deja lugar al badge.
+    assert!(branch_badge_rect(bar, bar.right() - 40.0, vec2(90.0, 16.0)).is_none());
+}
+
+#[test]
+fn branch_badge_is_dropped_on_narrow_panels() {
+    let narrow = title_bar(80.0);
+    assert!(branch_badge_rect(narrow, 60.0, vec2(90.0, 16.0)).is_none());
+}
+
+#[test]
+fn branch_badge_is_dropped_when_taller_than_the_title_bar() {
+    let bar = title_bar(400.0);
+    assert!(branch_badge_rect(bar, 100.0, vec2(90.0, 40.0)).is_none());
+}
+
+#[test]
+fn branch_badge_is_dropped_for_degenerate_sizes() {
+    let bar = title_bar(400.0);
+    assert!(branch_badge_rect(bar, 100.0, vec2(0.0, 16.0)).is_none());
+    assert!(branch_badge_rect(bar, 100.0, vec2(90.0, 0.0)).is_none());
+}
+
+#[test]
+fn branch_badge_never_overlaps_the_title_for_any_title_width() {
+    let bar = title_bar(500.0);
+    let size = vec2(70.0, 16.0);
+    let mut drawn = 0usize;
+    for step in 0..100 {
+        let title_right = bar.left() + step as f32 * 5.0;
+        if let Some(badge) = branch_badge_rect(bar, title_right, size) {
+            assert!(
+                badge.left() > title_right,
+                "badge at {badge:?} overlaps title ending at {title_right}"
+            );
+            assert!(badge.right() <= bar.right());
+            drawn += 1;
+        }
+    }
+    assert!(drawn > 0, "the badge should fit for at least some widths");
 }
