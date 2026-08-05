@@ -57,7 +57,38 @@ impl TerminalApp {
     pub(super) fn refresh_orchestration(&mut self) {
         let observations = self.collect_observations();
         self.orchestrator.apply_observations(observations);
+        self.notify_agent_attention_transitions();
         self.last_orchestration_refresh = Instant::now();
+    }
+
+    /// Notifica al SO cuando una sesión de agente pasa a un estado de atención
+    /// (esperando aprobación, input, o falló). Solo en la transición, no se
+    /// repite mientras siga en el mismo estado.
+    fn notify_agent_attention_transitions(&mut self) {
+        if !crate::config::runtime_config().agent_notifications {
+            return;
+        }
+        let sessions: Vec<(
+            Uuid,
+            crate::orchestration::AgentStatus,
+            &'static str,
+            String,
+        )> = self
+            .orchestrator
+            .sessions()
+            .iter()
+            .map(|session| {
+                (
+                    session.session_id,
+                    session.status,
+                    session.provider.label(),
+                    session.label.clone(),
+                )
+            })
+            .collect();
+        for (title, body) in attention_transitions(&mut self.agent_status_seen, &sessions) {
+            crate::utils::platform::notify(&title, &body);
+        }
     }
 
     pub(super) fn maybe_refresh_orchestration(&mut self) {
@@ -193,5 +224,108 @@ impl TerminalApp {
         self.reconcile_orchestration();
         self.refresh_orchestration();
         true
+    }
+}
+
+/// Dada la historia de estados vistos y los estados actuales, devuelve
+/// `(title, body)` para cada sesión que TRANSICIONÓ a un estado de atención.
+/// Actualiza `seen` como efecto lateral. Pura y testeable (sin notificar).
+fn attention_transitions(
+    seen: &mut std::collections::HashMap<Uuid, crate::orchestration::AgentStatus>,
+    sessions: &[(
+        Uuid,
+        crate::orchestration::AgentStatus,
+        &'static str,
+        String,
+    )],
+) -> Vec<(String, String)> {
+    use crate::orchestration::AgentStatus;
+    let mut out = Vec::new();
+    for (session_id, status, provider_label, label) in sessions {
+        let previous = seen.get(session_id).copied();
+        seen.insert(*session_id, *status);
+        if previous == Some(*status) {
+            continue;
+        }
+        let attention = matches!(
+            status,
+            AgentStatus::WaitingApproval | AgentStatus::NeedsInput | AgentStatus::Failed
+        );
+        if !attention {
+            continue;
+        }
+        let title = format!("Agente: {provider_label}");
+        let body = if label.trim().is_empty() {
+            status.label().to_owned()
+        } else {
+            format!("{} — {}", label, status.label())
+        };
+        out.push((title, body));
+    }
+    out
+}
+
+#[cfg(test)]
+mod attention_tests {
+    use std::collections::HashMap;
+
+    use uuid::Uuid;
+
+    use super::attention_transitions;
+    use crate::orchestration::AgentStatus;
+
+    fn session(
+        id: Uuid,
+        status: AgentStatus,
+        label: &str,
+    ) -> (Uuid, AgentStatus, &'static str, String) {
+        (id, status, "Claude Code", label.to_owned())
+    }
+
+    #[test]
+    fn notifies_on_transition_into_attention() {
+        let mut seen = HashMap::new();
+        let id = Uuid::new_v4();
+        let notifications = attention_transitions(
+            &mut seen,
+            &[session(id, AgentStatus::WaitingApproval, "Fix bug")],
+        );
+        assert_eq!(notifications.len(), 1);
+        assert_eq!(notifications[0].0, "Agente: Claude Code");
+        assert!(notifications[0].1.contains("Fix bug"));
+    }
+
+    #[test]
+    fn does_not_repeat_while_in_same_attention_state() {
+        let mut seen = HashMap::new();
+        let id = Uuid::new_v4();
+        let first =
+            attention_transitions(&mut seen, &[session(id, AgentStatus::NeedsInput, "Task")]);
+        assert_eq!(first.len(), 1);
+        let second =
+            attention_transitions(&mut seen, &[session(id, AgentStatus::NeedsInput, "Task")]);
+        assert!(second.is_empty(), "no debe repetir en el mismo estado");
+    }
+
+    #[test]
+    fn ignores_non_attention_states() {
+        let mut seen = HashMap::new();
+        let id = Uuid::new_v4();
+        let notifications =
+            attention_transitions(&mut seen, &[session(id, AgentStatus::Running, "Task")]);
+        assert!(notifications.is_empty());
+    }
+
+    #[test]
+    fn notifies_again_on_transition_to_different_attention_state() {
+        let mut seen = HashMap::new();
+        let id = Uuid::new_v4();
+        let _ = attention_transitions(&mut seen, &[session(id, AgentStatus::WaitingApproval, "T")]);
+        let again = attention_transitions(&mut seen, &[session(id, AgentStatus::Failed, "T")]);
+        assert_eq!(
+            again.len(),
+            1,
+            "transición a otro estado de atención notifica"
+        );
     }
 }

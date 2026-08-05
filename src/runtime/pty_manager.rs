@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use uuid::Uuid;
 
+use crate::terminal::input::{agent_prompt_bytes, paste_bytes, sanitize_agent_prompt};
 use crate::terminal::pty::PtyHandle;
 
 use super::SessionSpec;
@@ -45,6 +46,9 @@ struct ManagedSession {
     handle: Option<SharedPtyHandle>,
     detached_alive: bool,
     pending_startup_input: Option<PendingStartupInput>,
+    /// Prompt interactivo (feedback del code review) diferido hasta que el
+    /// TUI renderice algo; solo se usa cuando el panel se acaba de spawnear.
+    pending_prompt: Option<PendingStartupInput>,
 }
 
 struct PendingStartupInput {
@@ -68,6 +72,7 @@ impl ManagedSession {
             handle: None,
             detached_alive: true,
             pending_startup_input: None,
+            pending_prompt: None,
         }
     }
 
@@ -308,7 +313,7 @@ impl PtyManager {
                     baseline_render_revision,
                 });
             } else if let Ok(handle) = shared_handle.lock() {
-                handle.write_all(format!("{input}\n").as_bytes());
+                write_startup_input(&handle, &input);
             }
         }
         session.handle = Some(shared_handle);
@@ -373,33 +378,97 @@ impl PtyManager {
         self.sessions.remove(&session_id).is_some()
     }
 
+    /// Encola un prompt interactivo diferido: se escribe recién cuando el
+    /// render revision avanza (el TUI renderizó algo), para no inyectar en un
+    /// agente que todavía está arrancando.
+    pub fn queue_prompt(&mut self, session_id: Uuid, text: &str) {
+        let Some(session) = self.sessions.get_mut(&session_id) else {
+            return;
+        };
+        let Some(handle) = session.handle.as_ref() else {
+            return;
+        };
+        let baseline = handle
+            .lock()
+            .ok()
+            .map(|handle| handle.render_revision())
+            .unwrap_or(0);
+        session.pending_prompt = Some(PendingStartupInput {
+            input: text.to_owned(),
+            baseline_render_revision: baseline,
+        });
+    }
+
     fn flush_pending_startup_inputs(&mut self) {
         for session in self.sessions.values_mut() {
-            let Some(pending) = session.pending_startup_input.as_ref() else {
-                continue;
-            };
-            let Some(handle) = session.handle.as_ref() else {
-                continue;
-            };
-            // Hold a single lock across the readiness check and the write so
-            // the handle cannot change state between the two.
-            let Ok(handle) = handle.lock() else {
-                continue;
-            };
-            if !pending.is_ready(handle.render_revision()) {
-                continue;
-            }
-            let Some(pending) = session.pending_startup_input.take() else {
-                continue;
-            };
-            handle.write_all(format!("{}\n", pending.input).as_bytes());
+            Self::flush_one_pending(session, true);
+            Self::flush_one_pending(session, false);
+        }
+    }
+
+    /// Flushea `pending_startup_input` (is_startup=true) o `pending_prompt`
+    /// (false) si el handle está listo. Devuelve el input escrito, si hubo.
+    fn flush_one_pending(session: &mut ManagedSession, is_startup: bool) {
+        let pending_ref = if is_startup {
+            session.pending_startup_input.as_ref()
+        } else {
+            session.pending_prompt.as_ref()
+        };
+        let Some(pending) = pending_ref else {
+            return;
+        };
+        let Some(handle) = session.handle.as_ref() else {
+            return;
+        };
+        // Hold a single lock across the readiness check and the write so
+        // the handle cannot change state between the two.
+        let Ok(handle) = handle.lock() else {
+            return;
+        };
+        if !pending.is_ready(handle.render_revision()) {
+            return;
+        }
+        let taken = if is_startup {
+            session.pending_startup_input.take()
+        } else {
+            session.pending_prompt.take()
+        };
+        let Some(pending) = taken else {
+            return;
+        };
+        if is_startup {
+            write_startup_input(&handle, &pending.input);
+        } else {
+            write_prompt_input(&handle, &pending.input);
         }
     }
 }
 
+/// Inyecta el prompt inicial en el agente (idea de orca): neutraliza bytes
+/// de escape para que el brief no pueda emitir secuencias de control, y si
+/// el TUI ya activó bracketed paste lo envía como paste atómico para que un
+/// brief multi-línea no se ejecute línea por línea.
+fn write_startup_input(handle: &PtyHandle, input: &str) {
+    let sanitized = sanitize_agent_prompt(input);
+    let mode = handle.input_mode();
+    let mut bytes = paste_bytes(&sanitized, &mode);
+    bytes.push(b'\n');
+    handle.write_all(&bytes);
+}
+
+/// Prompt interactivo (feedback): igual que el startup pero submit con `\r`
+/// (la tecla Enter real), consistente con `agent_prompt_bytes`.
+fn write_prompt_input(handle: &PtyHandle, input: &str) {
+    let bytes = agent_prompt_bytes(input, &handle.input_mode());
+    handle.write_all(&bytes);
+}
+
 #[cfg(test)]
 mod tests {
-    use super::PendingStartupInput;
+    use uuid::Uuid;
+
+    use super::{PendingStartupInput, PtyManager};
+    use crate::runtime::SessionSpec;
 
     #[test]
     fn pending_startup_input_waits_for_render_revision_to_advance() {
@@ -410,5 +479,22 @@ mod tests {
 
         assert!(!pending.is_ready(4));
         assert!(pending.is_ready(5));
+    }
+
+    #[test]
+    fn queue_prompt_on_missing_session_is_noop() {
+        let mut manager = PtyManager::new_for_tests();
+        manager.queue_prompt(Uuid::new_v4(), "hello");
+        assert_eq!(manager.attached_session_count(), 0);
+    }
+
+    #[test]
+    fn queue_prompt_on_detached_session_without_handle_is_noop() {
+        let mut manager = PtyManager::new_for_tests();
+        let session_id = manager.create_detached(SessionSpec::default());
+        // Sin handle todavía: no se puede diferir (necesita el render
+        // revision del PTY), no debe paniquear ni adjuntar.
+        manager.queue_prompt(session_id, "hello");
+        assert!(!manager.is_attached(session_id));
     }
 }

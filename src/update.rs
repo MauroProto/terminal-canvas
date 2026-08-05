@@ -12,7 +12,11 @@ use sha2::{Digest, Sha256};
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const RELEASES_URL: &str = "https://api.github.com/repos/owner/repo/releases/latest";
 const REQUEST_TIMEOUT: u64 = 15;
-const FOCUSED_REPAINT_WINDOW: Duration = Duration::from_millis(80);
+// La terminal enfocada tiene prioridad de repintado sobre el fondo: el
+// usuario percibe el throughput del stream enfocado, así que su ventana es
+// más corta (~60 fps) que la de fondo (~30 fps). Antes era al revés (80 ms
+// foco vs 33 ms fondo) y el stream enfocado se veía a ~12 fps.
+const FOCUSED_REPAINT_WINDOW: Duration = Duration::from_millis(16);
 
 #[derive(Debug, Clone)]
 pub struct RepaintPolicy {

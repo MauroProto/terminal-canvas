@@ -26,16 +26,25 @@ use crate::theme::fonts::setup_fonts;
 use crate::update::{RepaintPolicy, UpdateChecker};
 use crate::utils::platform::home_dir;
 
+mod broadcast_ui;
+mod code_highlight;
+mod code_review_ui;
 mod collab_ui;
 mod desktop;
 mod dialogs;
+mod export_action;
+mod file_viewer_ui;
 mod orchestration_ui;
 mod perf;
+mod quick_open_ui;
+mod settings_ui;
 mod taskbar;
 #[cfg(test)]
 mod tests;
+mod toast;
 mod windowing;
 
+use self::code_review_ui::CodeReviewState;
 use self::collab_ui::{
     default_guest_display_name, host_terminal_input_pending, JoinSessionDraft, ShareWorkspaceDraft,
 };
@@ -47,6 +56,7 @@ use self::desktop::{
 };
 use self::orchestration_ui::{LaunchAgentDraft, ORCHESTRATION_REFRESH_INTERVAL};
 use self::perf::FramePerfSnapshot;
+use self::quick_open_ui::QuickOpenState;
 use self::taskbar::{clamp_workspace_panels_to_desktop, desktop_canvas_rect, desktop_screen_rect};
 
 use self::windowing::{
@@ -74,6 +84,25 @@ pub struct TerminalApp {
     command_palette: CommandPalette,
     renaming_panel: Option<Uuid>,
     rename_buf: String,
+    search_open: bool,
+    search_buf: String,
+    search_panel_id: Option<Uuid>,
+    code_review: Option<CodeReviewState>,
+    diff_loader: crate::orchestration::DiffLoader,
+    quick_open: Option<QuickOpenState>,
+    quick_open_rx: Option<std::sync::mpsc::Receiver<Vec<String>>>,
+    file_viewer: Option<file_viewer_ui::FileViewerState>,
+    settings_open: bool,
+    settings_draft: Option<settings_ui::SettingsDraft>,
+    broadcast: Option<broadcast_ui::BroadcastState>,
+    file_tree: crate::sidebar::file_tree::FileTreeState,
+    /// Paneles cuyo scrollback persistido ya se reinyectó en esta corrida.
+    scrollback_restored: HashSet<Uuid>,
+    highlighter: code_highlight::Highlighter,
+    toasts: toast::Toasts,
+    /// Último estado de agente por sesión que vimos, para notificar solo en la
+    /// transición hacia un estado de atención (no repetirlo cada refresh).
+    agent_status_seen: HashMap<Uuid, crate::orchestration::AgentStatus>,
     brand_texture: Option<egui::TextureHandle>,
     sidebar: Sidebar,
     update_checker: UpdateChecker,
@@ -143,6 +172,22 @@ impl TerminalApp {
                 command_palette: CommandPalette::default(),
                 renaming_panel: None,
                 rename_buf: String::new(),
+                search_open: false,
+                search_buf: String::new(),
+                search_panel_id: None,
+                code_review: None,
+                diff_loader: crate::orchestration::DiffLoader::default(),
+                quick_open: None,
+                quick_open_rx: None,
+                file_viewer: None,
+                settings_open: false,
+                settings_draft: None,
+                broadcast: None,
+                file_tree: Default::default(),
+                scrollback_restored: HashSet::new(),
+                highlighter: code_highlight::Highlighter::new(),
+                toasts: Default::default(),
+                agent_status_seen: HashMap::new(),
                 brand_texture,
                 sidebar: Sidebar::default(),
                 update_checker,
@@ -198,6 +243,22 @@ impl TerminalApp {
                 command_palette: CommandPalette::default(),
                 renaming_panel: None,
                 rename_buf: String::new(),
+                search_open: false,
+                search_buf: String::new(),
+                search_panel_id: None,
+                code_review: None,
+                diff_loader: crate::orchestration::DiffLoader::default(),
+                quick_open: None,
+                quick_open_rx: None,
+                file_viewer: None,
+                settings_open: false,
+                settings_draft: None,
+                broadcast: None,
+                file_tree: Default::default(),
+                scrollback_restored: HashSet::new(),
+                highlighter: code_highlight::Highlighter::new(),
+                toasts: Default::default(),
+                agent_status_seen: HashMap::new(),
                 brand_texture,
                 sidebar: Sidebar::default(),
                 update_checker,
@@ -365,8 +426,6 @@ impl TerminalApp {
                 command,
                 Command::ZoomToFitAll
                     | Command::ToggleSidebar
-                    | Command::ToggleMinimap
-                    | Command::ToggleGrid
                     | Command::ZoomIn
                     | Command::ZoomOut
                     | Command::ResetZoom
@@ -398,6 +457,12 @@ impl TerminalApp {
                     self.rename_buf = panel_title;
                 }
             }
+            Command::SearchTerminal => self.open_search_bar(),
+            Command::ReviewChanges => self.open_code_review(),
+            Command::QuickOpen => self.open_quick_open(),
+            Command::OpenSettings => self.open_settings(),
+            Command::ExportScrollback => self.export_focused_scrollback(),
+            Command::BroadcastCommand => self.open_broadcast(),
             Command::SharePanelPrivate => {
                 self.set_focused_panel_share_scope(PanelShareScope::Private)
             }
@@ -414,8 +479,6 @@ impl TerminalApp {
             Command::FocusPrev => self.focus_relative(-1),
             Command::ZoomToFitAll => self.zoom_to_fit_all(canvas_rect),
             Command::ToggleSidebar => self.sidebar_visible = !self.sidebar_visible,
-            Command::ToggleMinimap => self.show_minimap = !self.show_minimap,
-            Command::ToggleGrid => self.show_grid = !self.show_grid,
             Command::ZoomIn => {
                 let center = canvas_rect.center();
                 self.viewport
@@ -535,6 +598,10 @@ impl TerminalApp {
                 SidebarResponse::FocusPanel(panel_id) => {
                     self.focus_panel_across_workspaces(panel_id, Some(ctx.available_rect()));
                 }
+                SidebarResponse::ReviewPanelChanges(panel_id) => {
+                    self.focus_panel_across_workspaces(panel_id, Some(ctx.available_rect()));
+                    self.open_code_review();
+                }
                 SidebarResponse::SpawnTerminal(index) => {
                     if let Some(workspace) = self.workspaces.get_mut(index) {
                         workspace.spawn_terminal(ctx);
@@ -562,6 +629,10 @@ impl TerminalApp {
                 SidebarResponse::StopCollabSession => {
                     self.collab.stop_session();
                 }
+                SidebarResponse::OpenSettings => self.open_settings(),
+                SidebarResponse::OpenBroadcast => self.open_broadcast(),
+                SidebarResponse::ExportScrollback => self.export_focused_scrollback(),
+                SidebarResponse::OpenFileInViewer(path) => self.open_file_viewer(path),
             }
         }
         self.reconcile_orchestration();
@@ -581,6 +652,9 @@ impl TerminalApp {
                     Ok(()) => {
                         self.persisted_state = Some(snapshot);
                         self.autosave.mark_saved(now);
+                        // El scrollback va junto al layout: si guardamos uno sin
+                        // el otro, al restaurar el historial no matchea.
+                        self.persist_scrollbacks();
                     }
                     Err(err) => {
                         log::warn!("Autosave failed: {err}");
@@ -601,6 +675,9 @@ impl TerminalApp {
         self.forward_input_to_focused_panel(ctx);
         self.show_sidebar(ctx);
         self.show_taskbar(ctx);
+        // El visor de código es un SidePanel: tiene que declararse antes del
+        // CentralPanel para que el canvas se achique en vez de quedar tapado.
+        self.show_file_viewer(ctx);
 
         CentralPanel::default()
             .frame(
@@ -630,6 +707,11 @@ impl TerminalApp {
         self.handle_collab_events();
         self.sync_window_transitions(ctx);
         self.maybe_refresh_orchestration();
+        self.poll_diff_loader();
+        self.poll_quick_open();
+        if self.code_review.as_ref().is_some_and(|state| state.loading) {
+            ctx.request_repaint_after(std::time::Duration::from_millis(80));
+        }
 
         if let Some(command) = self.handle_shortcuts(ctx) {
             let canvas_rect = ctx.available_rect();
@@ -689,6 +771,12 @@ impl TerminalApp {
     fn forward_input_to_focused_panel(&mut self, ctx: &egui::Context) {
         if !self.command_palette.open
             && self.renaming_panel.is_none()
+            && !self.search_open
+            && self.code_review.is_none()
+            && self.quick_open.is_none()
+            && self.file_viewer.is_none()
+            && !self.settings_open
+            && self.broadcast.is_none()
             && !matches!(self.collab.mode(), CollabMode::Guest)
         {
             let focused_panel_id = self.ws().focused_panel().map(|panel| panel.id());
@@ -722,6 +810,10 @@ impl TerminalApp {
                 .show_separator_line(false)
                 .show(ctx, |ui| {
                     let state = self.update_checker.snapshot();
+                    let attention = self.attention_items();
+                    // El explorador sigue la carpeta del workspace activo.
+                    let ws_root = self.workspaces[self.active_ws].cwd.clone();
+                    self.file_tree.set_root(ws_root);
                     let responses = self.sidebar.show(
                         ui,
                         self.brand_texture.as_ref(),
@@ -730,10 +822,101 @@ impl TerminalApp {
                         &state,
                         self.collab.mode(),
                         self.collab.session_state(),
+                        &attention,
+                        &mut self.file_tree,
                     );
                     self.handle_sidebar_responses(responses, ctx);
                 });
         }
+    }
+
+    /// Sesiones de agente del workspace activo que piden atención, para la
+    /// sección "Atención" del sidebar.
+    /// Guarda el scrollback de cada panel vivo de todos los workspaces y borra
+    /// los archivos de paneles que ya no existen.
+    fn persist_scrollbacks(&mut self) {
+        let Some(dir) = crate::state::scrollback_store::scrollback_dir() else {
+            return;
+        };
+        let mut live_ids = Vec::new();
+        for workspace in &self.workspaces {
+            for panel in &workspace.panels {
+                live_ids.push(panel.id());
+                // Un panel detached no tiene texto que leer; su archivo previo
+                // se conserva tal cual (es justo el historial a restaurar).
+                if let Some(text) = panel.scrollback_text() {
+                    if let Err(err) =
+                        crate::state::scrollback_store::save_scrollback(&dir, panel.id(), &text)
+                    {
+                        log::warn!("No se pudo guardar el scrollback del panel: {err}");
+                    }
+                }
+            }
+        }
+        crate::state::scrollback_store::prune_scrollback(&dir, &live_ids);
+    }
+
+    /// Reinyecta el historial guardado en los paneles que acaban de conseguir
+    /// terminal. Cada panel se restaura una sola vez por corrida.
+    fn restore_pending_scrollbacks(&mut self) {
+        if self.scrollback_restored.len() == self.total_panel_count() {
+            return;
+        }
+        let Some(dir) = crate::state::scrollback_store::scrollback_dir() else {
+            return;
+        };
+        let pending: Vec<Uuid> = self
+            .workspaces
+            .iter()
+            .flat_map(|workspace| workspace.panels.iter())
+            .filter(|panel| !self.scrollback_restored.contains(&panel.id()))
+            .map(|panel| panel.id())
+            .collect();
+
+        for panel_id in pending {
+            let Some(text) = crate::state::scrollback_store::load_scrollback(&dir, panel_id) else {
+                // Sin historial guardado: no hay nada que reintentar después.
+                self.scrollback_restored.insert(panel_id);
+                continue;
+            };
+            let restored = self
+                .workspaces
+                .iter_mut()
+                .flat_map(|workspace| workspace.panels.iter_mut())
+                .find(|panel| panel.id() == panel_id)
+                .map(|panel| panel.restore_history(&text))
+                .unwrap_or(true);
+            // Si todavía está detached, se reintenta en un frame posterior.
+            if restored {
+                self.scrollback_restored.insert(panel_id);
+            }
+        }
+    }
+
+    fn total_panel_count(&self) -> usize {
+        self.workspaces
+            .iter()
+            .map(|workspace| workspace.panels.len())
+            .sum()
+    }
+
+    fn attention_items(&self) -> Vec<crate::sidebar::AttentionItem> {
+        let workspace_id = self.ws().id;
+        self.orchestrator
+            .sessions()
+            .iter()
+            .filter(|session| session.workspace_id == workspace_id)
+            .filter(|session| session.status.is_attention())
+            .filter_map(|session| {
+                let panel_id = session.panel_id?;
+                Some(crate::sidebar::AttentionItem {
+                    panel_id,
+                    label: session.label.clone(),
+                    provider: session.provider.label(),
+                    status: session.status.label(),
+                })
+            })
+            .collect()
     }
 
     /// Escritorio host: input de puntero, sash global, gestos de ventana,
@@ -952,6 +1135,14 @@ impl TerminalApp {
         }
         self.show_launch_dialog(ctx);
         self.show_rename_dialog(ctx);
+        self.show_search_bar(ctx);
+        self.show_code_review(ctx);
+        self.show_quick_open(ctx);
+        self.restore_pending_scrollbacks();
+        self.show_settings(ctx);
+        self.show_broadcast(ctx);
+        // Los toasts van último: se dibujan por encima de cualquier overlay.
+        self.show_toasts(ctx);
         self.maybe_persist_state(ctx);
 
         if perf_snapshot.runtime_repaint {
@@ -1005,6 +1196,9 @@ impl eframe::App for TerminalApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.collab.stop_session();
         save_state(&self.snapshot_state());
+        // El autosave puede tener hasta AUTOSAVE_INTERVAL de atraso: al salir
+        // guardamos el scrollback definitivo para no perder las últimas líneas.
+        self.persist_scrollbacks();
     }
 }
 

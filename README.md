@@ -12,6 +12,76 @@ Native desktop workspace for terminals and coding agents.
 - Detached runtime sessions with lazy restore
 - Trusted live collaboration with local TLS and device approval
 - Agent/session orchestration with provider detection and Git worktree support
+- Scrollback search (regex) with match highlight and jump
+- Mouse reporting to TUIs (click/drag/motion), word/line selection
+- In-band agent status via the OSC 9999 channel, with an attention inbox in the sidebar
+- Built-in code review: unified diff viewer (changed + new files, colored, open-in-editor)
+- Send review feedback to the agent straight from the code review (bracketed-paste injection)
+- Git worktree lifecycle: list and clean up agent worktrees from the code review
+- Quick Open: async fuzzy file finder for the active workspace
+- Built-in code viewer docked to the right of the canvas: resizable panel with a line-number
+  gutter, selectable text and real syntax highlighting — TextMate grammars via `two-face`
+  (the extended set `bat` ships, 213 languages incl. TypeScript/TSX/TOML) rendered with the
+  Catppuccin Mocha theme. Highlighting runs on a worker thread (~145 ms for 2400 lines, off the
+  UI thread), one `LayoutJob` per line, and rows are virtualized
+- Clickable URLs: Cmd/Ctrl+click a link in the terminal to open it
+- OS notifications when an agent needs attention (waiting approval / input / failed)
+- New terminals inherit the focused shell's directory (OSC 7, if the shell reports it)
+- Settings dialog (`Ctrl+,`): edit font size, scrollback, bell, OSC 52, copy-on-select and
+  shell live, applied immediately and persisted to `config.toml`
+- Broadcast (`Ctrl+Shift+Enter`): send one command to many terminals at once, picking targets
+  from a list (dead panels can't be selected)
+- Export terminal output (`Ctrl+Shift+E`): dump the focused terminal's scrollback to a text
+  file in your Downloads folder
+- Git branch badge in each panel's title bar, with a dot when the repo is dirty (drawn only
+  when it fits without covering the title)
+- Toast notices confirming actions that have no other visible feedback
+- Project file explorer (sidebar "Files" tab): lazy tree of the active workspace, click a file
+  to read it in the built-in viewer, heavy directories (`.git`, `node_modules`, `target`) skipped
+- Scrollback survives restarts: each panel's history is persisted and replayed into the grid on
+  restore, so a restored panel shows its previous session instead of an empty rectangle
+
+## Configuration
+
+Open the settings dialog with `Ctrl+,` to change everything below from the UI:
+changes apply live and are written back to disk.
+
+Settings are read from `config.toml` in the platform config directory (same
+location family as the persisted layout). Missing keys fall back to defaults.
+
+```toml
+[terminal]
+font_size = 15.0        # 8..32, base terminal font size
+scrollback_lines = 10000
+allow_osc52 = false     # let terminal output write the system clipboard
+audio_bell = false      # play a sound on bell (in addition to the visual flash)
+copy_on_select = false  # auto-copy to clipboard when you select text
+agent_notifications = true  # OS notification when an agent needs attention
+# shell = "/opt/homebrew/bin/fish"   # custom shell (default: system login shell)
+```
+
+The `MI_TERMINAL_ALLOW_OSC52` environment variable still overrides `allow_osc52`.
+
+## Keyboard shortcuts
+
+| Action | Shortcut |
+| --- | --- |
+| Command palette | `Ctrl+Shift+P` |
+| New terminal | `Ctrl+Shift+T` |
+| Close terminal | `Ctrl+Shift+W` |
+| Rename terminal | `F2` |
+| Search in terminal | `Ctrl+Shift+F` |
+| Review changes (code review) | `Ctrl+Shift+D` |
+| Quick open file (opens the built-in viewer) | `Ctrl+P` |
+| Settings | `Ctrl+,` |
+| Export terminal output | `Ctrl+Shift+E` |
+| Broadcast command to terminals | `Ctrl+Shift+Enter` |
+| Launch agent | `Ctrl+Shift+A` |
+| Focus next / prev | `Ctrl+Shift+]` / `Ctrl+Shift+[` |
+| Toggle sidebar | `Ctrl+B` |
+| Toggle fullscreen | `F11` |
+
+In the terminal, double-click selects a word and triple-click selects a line.
 
 ## Stack
 

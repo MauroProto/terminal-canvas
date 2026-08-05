@@ -3,7 +3,7 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use mi_terminal::{app, collab, terminal, utils};
+use mi_terminal::{app, collab, config, terminal, utils};
 
 use std::sync::Arc;
 use std::{backtrace::Backtrace, fmt::Write as _, fs, io::Write as _, path::Path, path::PathBuf};
@@ -13,6 +13,7 @@ use anyhow::Result;
 fn main() -> Result<()> {
     env_logger::init();
     install_panic_logging();
+    install_config();
     log_terminal_backends();
     let pending_join_invite = collab::invite_code_from_launch_sources(
         std::env::args(),
@@ -53,6 +54,23 @@ fn main() -> Result<()> {
         }),
     )
     .map_err(|e| anyhow::anyhow!("eframe error: {e}"))
+}
+
+fn install_config() {
+    let config = config::load();
+    if let Some(path) = config::config_file_path() {
+        log::info!("config: {}", path.display());
+    }
+    log::info!(
+        "config efectiva: font_size={} scrollback={} osc52={} audio_bell={} shell={:?}",
+        config.font_size,
+        config.scrollback_lines,
+        config.allow_osc52,
+        config.audio_bell,
+        config.shell,
+    );
+    terminal::metrics::install_base_font_size(config.font_size);
+    config::install_runtime_config(config);
 }
 
 fn log_terminal_backends() {

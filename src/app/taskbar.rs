@@ -98,22 +98,43 @@ pub(super) fn auto_tile_workspace(workspace: &mut Workspace, desktop_rect: Rect)
         }
     }
 
-    let mut visible: Vec<(u32, usize)> = workspace
+    // Orden de creación (índice), NO z-order: asignar slots por z hacía que
+    // clickear un panel (bring_to_front) intercambiara las terminales de
+    // lugar en el siguiente re-tile (p. ej. al mover el sash).
+    let visible: Vec<usize> = workspace
         .panels
         .iter()
         .enumerate()
         .filter(|(_, panel)| !panel.minimized())
-        .map(|(idx, panel)| (panel.z_index(), idx))
+        .map(|(idx, _)| idx)
         .collect();
-    visible.sort_by_key(|(z, _)| *z);
 
+    // Asignación estable: cada panel conserva su slot actual si sigue
+    // existiendo en el layout; los demás toman los slots libres en orden.
     let slots = auto_layout_slots(visible.len());
+    let mut free_slots = slots.clone();
+    let mut pending = Vec::new();
+    let mut assignments: Vec<(usize, SnapSlot)> = Vec::new();
+    for idx in visible {
+        let placement = workspace.panels[idx].placement().clone();
+        if let PanelPlacement::Snapped(slot) = placement {
+            if let Some(pos) = free_slots.iter().position(|candidate| *candidate == slot) {
+                assignments.push((idx, free_slots.remove(pos)));
+                continue;
+            }
+        }
+        pending.push(idx);
+    }
+    for (idx, slot) in pending.into_iter().zip(free_slots) {
+        assignments.push((idx, slot));
+    }
+
     let split_x = workspace.split_x;
     let split_y = workspace.split_y;
-    for ((_, idx), slot) in visible.iter().zip(slots.iter()) {
-        let panel = &mut workspace.panels[*idx];
-        let rect = slot_rect_with_splits(*slot, desktop_rect, split_x, split_y);
-        panel.set_placement(PanelPlacement::Snapped(*slot));
+    for (idx, slot) in assignments {
+        let panel = &mut workspace.panels[idx];
+        let rect = slot_rect_with_splits(slot, desktop_rect, split_x, split_y);
+        panel.set_placement(PanelPlacement::Snapped(slot));
         panel.set_restore_placement(None);
         panel.set_restore_bounds(Some(rect));
         panel.apply_resize(rect);

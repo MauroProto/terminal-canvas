@@ -343,7 +343,7 @@ impl TerminalApp {
         &mut self,
         split_hit: Option<desktop::SplitResizeHit>,
         hovered_hit: Option<desktop::PanelHit>,
-        desktop_rect: Rect,
+        _desktop_rect: Rect,
         pointer_pos: Option<Pos2>,
     ) {
         match (split_hit, hovered_hit) {
@@ -381,36 +381,13 @@ impl TerminalApp {
                             self.panel_gesture = None;
                             let _ = drag_fallback_slot;
                         }
-                        PanelHitArea::Resize(handle) => {
-                            if let Some(origin) = self
-                                .ws_mut()
-                                .panels
-                                .iter_mut()
-                                .find(|panel| panel.id() == panel_id)
-                                .map(|panel| {
-                                    if !matches!(panel.placement(), PanelPlacement::Floating) {
-                                        let restore_rect = clamp_rect_to_desktop(
-                                            panel.current_or_restore_rect(),
-                                            desktop_rect,
-                                        );
-                                        panel.apply_resize(restore_rect);
-                                        panel.set_placement(PanelPlacement::Floating);
-                                        panel.set_restore_placement(None);
-                                        panel.set_restore_bounds(Some(restore_rect));
-                                    }
-                                    let origin = panel.rect();
-                                    panel.set_resize_virtual_rect(Some(origin));
-                                    origin
-                                })
-                            {
-                                self.panel_gesture = Some(PanelGesture {
-                                    panel_id,
-                                    pointer_origin: hit.pointer,
-                                    kind: PanelGestureKind::Resize { handle, origin },
-                                });
-                            } else {
-                                self.panel_gesture = None;
-                            }
+                        PanelHitArea::Resize(_) => {
+                            // El escritorio es tiling fijo: los tamaños se
+                            // ajustan con el sash global entre paneles. El
+                            // resize libre por borde peleaba con el auto-tile
+                            // (el panel flotaba y el próximo re-tile lo
+                            // devolvía al slot: "se movía solo").
+                            self.panel_gesture = None;
                         }
                         PanelHitArea::Body
                         | PanelHitArea::CloseButton

@@ -130,6 +130,42 @@ fn auto_layout_uses_left_right_split_for_two_panels() {
 }
 
 #[test]
+fn auto_tile_keeps_slots_stable_when_z_order_changes() {
+    let mut workspace = Workspace::new("Desktop", None);
+    for i in 0..4 {
+        let panel = TerminalPanel::new(
+            pos2(40.0 * i as f32, 40.0 * i as f32),
+            vec2(480.0, 320.0),
+            Color32::WHITE,
+            i,
+        );
+        workspace.add_restored_terminal(panel);
+    }
+    let desktop = Rect::from_min_max(pos2(0.0, 0.0), pos2(1280.0, 720.0));
+    super::taskbar::auto_tile_workspace(&mut workspace, desktop);
+    let slots_before: Vec<_> = workspace
+        .panels
+        .iter()
+        .map(|panel| panel.placement().clone())
+        .collect();
+
+    // Click en un panel del fondo (cambia el z-order) y mover el sash
+    // (invalida la firma del tile): antes esto intercambiaba las terminales
+    // de slot; ahora cada una conserva el suyo.
+    let first_id = workspace.panels[0].id();
+    workspace.bring_to_front(first_id);
+    workspace.split_x = 0.6;
+    super::taskbar::auto_tile_workspace(&mut workspace, desktop);
+
+    let slots_after: Vec<_> = workspace
+        .panels
+        .iter()
+        .map(|panel| panel.placement().clone())
+        .collect();
+    assert_eq!(slots_before, slots_after);
+}
+
+#[test]
 fn auto_layout_uses_quadrants_for_four_or_more_panels() {
     use super::taskbar::auto_layout_slots;
     let slots = auto_layout_slots(4);

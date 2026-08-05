@@ -34,10 +34,29 @@ fn repaint_policy_keeps_focused_terminal_responsive() {
     policy.note_focused_runtime_event();
     assert!(policy.should_repaint_now_at(now));
 
+    // El stream enfocado repinta más rápido que el fondo (16 ms vs 33 ms):
+    // la prioridad sigue la atención del usuario.
     policy.note_focused_runtime_event();
     assert!(!policy.should_repaint_now_at(now + Duration::from_millis(8)));
-    assert!(!policy.should_repaint_now_at(now + Duration::from_millis(18)));
-    assert!(!policy.should_repaint_now_at(now + Duration::from_millis(34)));
-    assert!(!policy.should_repaint_now_at(now + Duration::from_millis(55)));
-    assert!(policy.should_repaint_now_at(now + Duration::from_millis(85)));
+    assert!(policy.should_repaint_now_at(now + Duration::from_millis(18)));
+}
+
+#[test]
+fn repaint_policy_focused_window_is_tighter_than_background() {
+    let now = Instant::now();
+    let mut policy = RepaintPolicy::new(Duration::from_millis(33));
+
+    policy.note_runtime_event();
+    assert!(policy.should_repaint_now_at(now));
+    policy.note_runtime_event();
+    assert!(
+        !policy.should_repaint_now_at(now + Duration::from_millis(18)),
+        "el fondo todavía está dentro de su ventana de 33 ms"
+    );
+
+    policy.note_focused_runtime_event();
+    assert!(
+        policy.should_repaint_now_at(now + Duration::from_millis(18)),
+        "el foco pasa a su ventana corta en cuanto llega un evento enfocado"
+    );
 }

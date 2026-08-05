@@ -218,6 +218,127 @@ impl TerminalApp {
         }
     }
 
+    pub(super) fn open_search_bar(&mut self) {
+        if matches!(self.collab.mode(), CollabMode::Guest) {
+            return;
+        }
+        let Some((panel_id, query)) = self.ws_mut().focused_panel_mut().map(|panel| {
+            panel.search_open();
+            (panel.id(), panel.search_query().to_owned())
+        }) else {
+            return;
+        };
+        self.search_panel_id = Some(panel_id);
+        self.search_buf = query;
+        self.search_open = true;
+    }
+
+    pub(super) fn close_search_bar(&mut self) {
+        if let Some(panel_id) = self.search_panel_id {
+            if let Some(panel) = self.ws_mut().panel_mut(panel_id) {
+                panel.search_close();
+            }
+        }
+        self.search_open = false;
+        self.search_panel_id = None;
+        self.search_buf.clear();
+    }
+
+    /// Barra de búsqueda del terminal enfocado: Enter salta al próximo match,
+    /// Escape cierra. La consulta vive en el panel (sobrevive a la barra).
+    pub(super) fn show_search_bar(&mut self, ctx: &egui::Context) {
+        if !self.search_open {
+            return;
+        }
+        // La búsqueda es del panel que estaba enfocado al abrirla; si el foco
+        // cambió o el panel ya no existe, se cierra.
+        let still_valid = self
+            .search_panel_id
+            .and_then(|panel_id| self.ws().panel(panel_id))
+            .is_some_and(|panel| panel.focused());
+        if !still_valid {
+            self.close_search_bar();
+            return;
+        }
+
+        let mut find_next = false;
+        let mut close = false;
+        Area::new(Id::new("terminal-search-bar"))
+            .order(Order::Foreground)
+            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-14.0, 10.0))
+            .show(ctx, |ui| {
+                egui::Frame::default()
+                    .fill(palette::INK)
+                    .stroke(egui::Stroke::new(1.0, palette::LINE))
+                    .rounding(8.0)
+                    .inner_margin(egui::Margin::symmetric(12.0, 8.0))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.style_mut().spacing.item_spacing.x = 8.0;
+                            ui.label(egui::RichText::new("Buscar").size(11.0).color(palette::DIM));
+                            dialog_input_visuals(ui);
+                            let edit = egui::TextEdit::singleline(&mut self.search_buf)
+                                .margin(egui::Margin::symmetric(8.0, 4.0))
+                                .text_color(palette::TEXT_STRONG)
+                                .hint_text("regex o texto…")
+                                .desired_width(220.0);
+                            let response = ui.add_sized(egui::vec2(220.0, 26.0), edit);
+                            // Autofocus al abrir: si nada tiene el foco, lo
+                            // toma el input (así se puede tipear enseguida).
+                            if !response.has_focus()
+                                && ui.ctx().memory(|memory| memory.focused()).is_none()
+                            {
+                                response.request_focus();
+                            }
+                            if response.changed() {
+                                let query = self.search_buf.clone();
+                                if let Some(panel) = self.ws_mut().focused_panel_mut() {
+                                    panel.search_set_query(query);
+                                }
+                            }
+                            if response.lost_focus()
+                                && ui.input(|input| input.key_pressed(Key::Enter))
+                            {
+                                find_next = true;
+                            }
+                            if ui.input(|input| input.key_pressed(Key::Escape)) {
+                                close = true;
+                            }
+                            if dialog_inline_link(ui, "Next") {
+                                find_next = true;
+                            }
+                            if dialog_inline_link(ui, "Cerrar") {
+                                close = true;
+                            }
+                        });
+                        // Feedback de la última búsqueda.
+                        let no_results = self
+                            .ws()
+                            .focused_panel()
+                            .and_then(|panel| panel.search_found())
+                            == Some(false);
+                        if no_results {
+                            ui.add_space(2.0);
+                            ui.label(
+                                egui::RichText::new("Sin coincidencias")
+                                    .size(10.5)
+                                    .color(palette::DIM),
+                            );
+                        }
+                    });
+            });
+
+        if find_next {
+            if let Some(panel) = self.ws_mut().focused_panel_mut() {
+                panel.search_find_next();
+            }
+            ctx.request_repaint();
+        }
+        if close {
+            self.close_search_bar();
+        }
+    }
+
     pub(super) fn show_launch_dialog(&mut self, ctx: &egui::Context) {
         let Some(mut draft) = self.launch_agent.clone() else {
             return;

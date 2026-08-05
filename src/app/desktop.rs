@@ -11,6 +11,9 @@ use crate::terminal::panel::PanelHitArea;
 pub(super) struct PanelHit {
     pub(super) index: usize,
     pub(super) area: PanelHitArea,
+    // Quedó sin lector al deshabilitar el resize libre por borde; se
+    // conserva porque describe el hit completo y los gestos pueden volver.
+    #[allow(dead_code)]
     pub(super) pointer: Pos2,
 }
 
