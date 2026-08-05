@@ -4,21 +4,19 @@ use alacritty_terminal::term::{point_to_viewport, RenderableCursor, Term};
 use alacritty_terminal::vte::ansi::{
     Color as AnsiColor, CursorShape as VteCursorShape, NamedColor,
 };
-use egui::{pos2, vec2, Align2, Color32, FontId, Rect, Rounding, Shape, Stroke};
+use egui::{pos2, vec2, Align2, Color32, FontFamily, FontId, Pos2, Rect, Rounding, Shape, Stroke};
 
 use crate::terminal::colors::{brighten, dim_color, indexed_to_egui};
 #[cfg(feature = "ghostty-vt")]
 use crate::terminal::ghostty_backend::{
     GhosttyCellSnapshot, GhosttyCursorShape, GhosttyRgb, GhosttyTextSnapshot,
 };
+use crate::terminal::metrics::{
+    base_font_size, CELL_HEIGHT_FACTOR, CELL_WIDTH_FACTOR, MIN_TEXT_RENDER_FONT_SIZE, PAD_X, PAD_Y,
+};
 use crate::terminal::pty::EventProxy;
+use crate::theme::fonts::{bold_font_available, TERMINAL_BOLD_FONT};
 
-pub const FONT_SIZE: f32 = 15.0;
-pub const MIN_TEXT_RENDER_FONT_SIZE: f32 = 3.4;
-pub const PAD_X: f32 = 10.0;
-pub const PAD_Y: f32 = 6.0;
-pub const CELL_WIDTH_FACTOR: f32 = 0.6;
-pub const CELL_HEIGHT_FACTOR: f32 = 1.25;
 pub const CURSOR_COLOR: Color32 = Color32::from_rgb(244, 244, 244);
 pub const BLINK_ON_MS: f64 = 600.0;
 pub const BLINK_OFF_MS: f64 = 400.0;
@@ -34,29 +32,79 @@ struct RenderMetrics {
     zoom: f32,
 }
 
+/// Clave del cache de shapes del grid. Depende solo del TAMAÑO del rect (no
+/// de su posición): los shapes se construyen en coordenadas locales al panel
+/// y se trasladan al pintar, así el cache sobrevive drags, transiciones y
+/// re-tiling sin reconstruir galleys.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GridCacheKey {
-    rect_min_x_bits: u32,
-    rect_min_y_bits: u32,
-    rect_width_bits: u32,
-    rect_height_bits: u32,
+    width_bits: u32,
+    height_bits: u32,
     zoom_bits: u32,
     revision: u64,
     row_stride: usize,
+    atlas_generation: u64,
 }
 
 impl GridCacheKey {
-    pub(crate) fn new(rect: Rect, zoom: f32, revision: u64, row_stride: usize) -> Self {
+    pub(crate) fn new(
+        rect: Rect,
+        zoom: f32,
+        revision: u64,
+        row_stride: usize,
+        atlas_generation: u64,
+    ) -> Self {
         Self {
-            rect_min_x_bits: rect.min.x.to_bits(),
-            rect_min_y_bits: rect.min.y.to_bits(),
-            rect_width_bits: rect.width().to_bits(),
-            rect_height_bits: rect.height().to_bits(),
+            width_bits: rect.width().to_bits(),
+            height_bits: rect.height().to_bits(),
             zoom_bits: zoom.to_bits(),
             revision,
             row_stride,
+            atlas_generation,
         }
     }
+}
+
+/// Marca de agua del atlas de fuentes de egui. epaint recrea el atlas
+/// cuando pasa el 80% de llenado o cambia `pixels_per_point`; los galleys
+/// creados antes apuntan a texels que ya no contienen sus glifos, así que
+/// un `Shape::text` cacheado a través de una recreación se pinta con
+/// regiones vacías del atlas nuevo (texto "en negro"). Dentro de una
+/// generación el `fill_ratio` solo crece: una caída delata la recreación.
+#[derive(Clone, Copy)]
+struct AtlasWatermark {
+    pixels_per_point: f32,
+    fill_ratio: f32,
+    generation: u64,
+}
+
+impl AtlasWatermark {
+    fn advance(self, pixels_per_point: f32, fill_ratio: f32) -> Self {
+        let recreated = self.pixels_per_point != pixels_per_point || fill_ratio < self.fill_ratio;
+        Self {
+            pixels_per_point,
+            fill_ratio,
+            generation: self.generation + u64::from(recreated),
+        }
+    }
+}
+
+fn atlas_watermark_id() -> egui::Id {
+    egui::Id::new("terminal-font-atlas-watermark")
+}
+
+fn font_atlas_generation(ctx: &egui::Context) -> u64 {
+    let fill_ratio = ctx.fonts(|fonts| fonts.font_atlas_fill_ratio());
+    let pixels_per_point = ctx.pixels_per_point();
+    ctx.data_mut(|data| {
+        let watermark = data.get_temp_mut_or_insert_with(atlas_watermark_id(), || AtlasWatermark {
+            pixels_per_point,
+            fill_ratio,
+            generation: 0,
+        });
+        *watermark = watermark.advance(pixels_per_point, fill_ratio);
+        watermark.generation
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -114,8 +162,9 @@ pub fn cursor_visible(focused: bool, streaming_output: bool, time: f64) -> bool 
 }
 
 pub fn compute_grid_size(content_width: f32, content_height: f32) -> (u16, u16) {
-    let cell_w = FONT_SIZE * CELL_WIDTH_FACTOR;
-    let cell_h = FONT_SIZE * CELL_HEIGHT_FACTOR;
+    let font_size = base_font_size();
+    let cell_w = font_size * CELL_WIDTH_FACTOR;
+    let cell_h = font_size * CELL_HEIGHT_FACTOR;
     let cols = ((content_width - PAD_X * 2.0) / cell_w).floor().max(1.0) as u16;
     let rows = ((content_height - PAD_Y * 2.0) / cell_h).floor().max(1.0) as u16;
     (cols, rows)
@@ -208,6 +257,7 @@ impl GhosttyGridCache {
 }
 
 #[cfg(feature = "ghostty-vt")]
+#[allow(clippy::needless_option_as_deref)]
 pub fn render_ghostty_text_snapshot(
     painter: &egui::Painter,
     content_rect: Rect,
@@ -225,7 +275,13 @@ pub fn render_ghostty_text_snapshot(
     let metrics = scaled_metrics(zoom);
     let background = ghostty_color(snapshot.default_colors.background);
     let foreground = ghostty_color(snapshot.default_colors.foreground);
-    let cache_key = GridCacheKey::new(content_rect, zoom, snapshot.revision, 1);
+    let cache_key = GridCacheKey::new(
+        content_rect,
+        zoom,
+        snapshot.revision,
+        1,
+        font_atlas_generation(painter.ctx()),
+    );
 
     if let Some(cache) = cache.as_deref_mut() {
         if cache.matches(cache_key) {
@@ -234,7 +290,7 @@ pub fn render_ghostty_text_snapshot(
                 background_rounding,
                 cache.background_fill.unwrap_or(background),
             );
-            painter.extend(cache.shapes.iter().cloned());
+            extend_translated(painter, &cache.shapes, content_rect.min);
             if focused {
                 draw_ghostty_cursor(painter, content_rect, snapshot, metrics, time);
             }
@@ -243,15 +299,16 @@ pub fn render_ghostty_text_snapshot(
     }
 
     painter.rect_filled(content_rect, background_rounding, background);
+    let local_rect = Rect::from_min_size(pos2(0.0, 0.0), content_rect.size());
     let shapes = build_ghostty_shapes(
         painter.ctx(),
-        content_rect,
+        local_rect,
         snapshot,
         metrics,
         foreground,
         background,
     );
-    painter.extend(shapes.iter().cloned());
+    extend_translated(painter, &shapes, content_rect.min);
     if let Some(cache) = cache.as_deref_mut() {
         cache.store(cache_key, shapes, background);
     }
@@ -537,11 +594,17 @@ fn render_terminal_with_row_stride(
     }
 
     let metrics = scaled_metrics(zoom);
-    let cache_key = GridCacheKey::new(content_rect, zoom, revision, row_stride);
+    let cache_key = GridCacheKey::new(
+        content_rect,
+        zoom,
+        revision,
+        row_stride,
+        font_atlas_generation(painter.ctx()),
+    );
     if let Some(cache) = cache.as_deref_mut() {
         if let Some(state) = cache.state_for(cache_key) {
             painter.rect_filled(content_rect, background_rounding, state.background_fill);
-            painter.extend(cache.shapes.iter().cloned());
+            extend_translated(painter, &cache.shapes, content_rect.min);
             if cursor_visible(focused, row_stride > 1, time) {
                 draw_cursor(
                     painter,
@@ -563,8 +626,11 @@ fn render_terminal_with_row_stride(
 
     painter.rect_filled(content_rect, background_rounding, background_fill);
 
-    let shapes = build_grid_shapes(painter.ctx(), content_rect, content, metrics, row_stride);
-    painter.extend(shapes.iter().cloned());
+    // Los shapes se construyen en coordenadas locales (origen 0,0) para que
+    // el cache no dependa de la posición del panel en pantalla.
+    let local_rect = Rect::from_min_size(pos2(0.0, 0.0), content_rect.size());
+    let shapes = build_grid_shapes(painter.ctx(), local_rect, content, metrics, row_stride);
+    extend_translated(painter, &shapes, content_rect.min);
 
     if let Some(cache) = cache.as_deref_mut() {
         cache.store(cache_key, shapes, background_fill, display_offset, cursor);
@@ -575,6 +641,21 @@ fn render_terminal_with_row_stride(
     }
 
     false
+}
+
+/// Pinta shapes cacheados (construidos en coordenadas locales) trasladándolos
+/// al origen real del panel.
+fn extend_translated(painter: &egui::Painter, shapes: &[Shape], origin: Pos2) {
+    if origin.x == 0.0 && origin.y == 0.0 {
+        painter.extend(shapes.iter().cloned());
+        return;
+    }
+    let delta = origin.to_vec2();
+    painter.extend(shapes.iter().map(|shape| {
+        let mut shape = shape.clone();
+        shape.translate(delta);
+        shape
+    }));
 }
 
 fn build_grid_shapes(
@@ -643,7 +724,8 @@ fn build_grid_shapes(
                              pos: egui::Pos2,
                              text: &str,
                              fg: Color32,
-                             italic_offset: f32| {
+                             italic_offset: f32,
+                             bold: bool| {
             if metrics.font_size < MIN_TEXT_RENDER_FONT_SIZE || text.is_empty() {
                 return;
             }
@@ -652,7 +734,7 @@ fn build_grid_shapes(
                 pos + vec2(italic_offset * metrics.zoom.max(0.25), 0.0),
                 Align2::LEFT_TOP,
                 text,
-                FontId::monospace(metrics.font_size),
+                terminal_font_id(metrics.font_size, bold),
                 fg,
             ));
         };
@@ -693,6 +775,76 @@ fn build_grid_shapes(
     background_shapes
 }
 
+/// Run de texto acumulado para emitir un solo `Shape::text` por tramo de
+/// celdas contiguas con el mismo estilo, en vez de un shape por carácter
+/// (el costo dominante del renderer: miles de galleys por frame en grids
+/// grandes). Los espacios cortan el run: mantienen cada tramo anclado a su
+/// columna y evitan deriva si el avance del glifo no clava `cell_width`.
+#[derive(Default)]
+struct TextRun {
+    text: String,
+    x: f32,
+    y: f32,
+    next_x: f32,
+    fg: Color32,
+    italic_offset: f32,
+    bold: bool,
+}
+
+impl TextRun {
+    fn can_extend(&self, fg: Color32, x: f32, y: f32, italic_offset: f32, bold: bool) -> bool {
+        !self.text.is_empty()
+            && self.fg == fg
+            && self.bold == bold
+            && (self.y - y).abs() < 0.1
+            && (self.next_x - x).abs() < 0.5
+            && (self.italic_offset - italic_offset).abs() < 0.1
+    }
+
+    fn extend(&mut self, ch: char, width: f32) {
+        self.text.push(ch);
+        self.next_x += width;
+    }
+
+    fn start(
+        &mut self,
+        ch: char,
+        x: f32,
+        y: f32,
+        width: f32,
+        fg: Color32,
+        italic_offset: f32,
+        bold: bool,
+    ) {
+        self.text.clear();
+        self.text.push(ch);
+        self.x = x;
+        self.y = y;
+        self.next_x = x + width;
+        self.fg = fg;
+        self.italic_offset = italic_offset;
+        self.bold = bold;
+    }
+
+    fn flush(
+        &mut self,
+        foreground_shapes: &mut Vec<Shape>,
+        push_text: &mut impl FnMut(&mut Vec<Shape>, egui::Pos2, &str, Color32, f32, bool),
+    ) {
+        if !self.text.is_empty() {
+            push_text(
+                foreground_shapes,
+                pos2(self.x, self.y),
+                &self.text,
+                self.fg,
+                self.italic_offset,
+                self.bold,
+            );
+            self.text.clear();
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_full_foreground_shapes(
     cells: &[alacritty_terminal::grid::Indexed<&Cell>],
@@ -706,9 +858,13 @@ fn build_full_foreground_shapes(
     row_stride: usize,
     background_shapes: &mut Vec<Shape>,
     foreground_shapes: &mut Vec<Shape>,
-    push_text: &mut impl FnMut(&mut Vec<Shape>, egui::Pos2, &str, Color32, f32),
+    push_text: &mut impl FnMut(&mut Vec<Shape>, egui::Pos2, &str, Color32, f32, bool),
 ) {
-    let mut char_buf = [0u8; 4];
+    let mut run = TextRun::default();
+    // Las decoraciones van después del texto (tachado sobre el glifo), como
+    // en el camino pre-batching; se juntan aparte porque el run se emite al
+    // final del tramo, no celda a celda.
+    let mut decorations: Vec<Shape> = Vec::new();
     for indexed in cells {
         let Some(point) = point_to_viewport(display_offset, indexed.point) else {
             continue;
@@ -719,18 +875,15 @@ fn build_full_foreground_shapes(
         }
         let col = point.column.0;
         let cell = indexed.cell;
+        let text_pos = pos2(
+            base_x + col as f32 * metrics.cell_width,
+            base_y + row as f32 * metrics.cell_height,
+        );
 
         if let Some(selection) = selection {
             if selection.contains_cell(indexed, cursor.point, cursor.shape) {
-                let rect = Rect::from_min_size(
-                    pos2(
-                        base_x + col as f32 * metrics.cell_width,
-                        base_y + row as f32 * metrics.cell_height,
-                    ),
-                    vec2(metrics.cell_width, metrics.cell_height),
-                );
                 background_shapes.push(Shape::rect_filled(
-                    rect,
+                    Rect::from_min_size(text_pos, vec2(metrics.cell_width, metrics.cell_height)),
                     0.0,
                     Color32::from_rgba_premultiplied(208, 208, 208, 80),
                 ));
@@ -738,23 +891,33 @@ fn build_full_foreground_shapes(
         }
 
         let ch = cell.c;
-        if ch == ' ' || ch == '\0' || cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
-            continue;
-        }
+        let (fg, italic_offset, bold) = effective_text_style(cell, colors);
+        let width = metrics.cell_width
+            * if cell.flags.contains(Flags::WIDE_CHAR) {
+                2.0
+            } else {
+                1.0
+            };
+        let drawable = ch != ' '
+            && ch != '\0'
+            && !cell.flags.contains(Flags::WIDE_CHAR_SPACER)
+            && !cell.flags.contains(Flags::HIDDEN);
 
-        let text_pos = pos2(
-            base_x + col as f32 * metrics.cell_width,
-            base_y + row as f32 * metrics.cell_height,
-        );
-        let (fg, italic_offset) = effective_text_style(cell, colors);
-        if cell.flags.contains(Flags::HIDDEN) {
-            continue;
+        if drawable && run.can_extend(fg, text_pos.x, text_pos.y, italic_offset, bold) {
+            run.extend(ch, width);
+        } else {
+            run.flush(foreground_shapes, push_text);
+            if drawable {
+                run.start(ch, text_pos.x, text_pos.y, width, fg, italic_offset, bold);
+            }
         }
-        let encoded = ch.encode_utf8(&mut char_buf);
-        push_text(foreground_shapes, text_pos, encoded, fg, italic_offset);
-
-        draw_decoration_shapes(foreground_shapes, text_pos, metrics, cell.flags, fg);
+        if drawable {
+            draw_decoration_shapes(&mut decorations, text_pos, metrics, cell.flags, fg);
+        }
     }
+
+    run.flush(foreground_shapes, push_text);
+    foreground_shapes.extend(decorations);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -770,32 +933,9 @@ fn build_reduced_foreground_shapes(
     row_stride: usize,
     background_shapes: &mut Vec<Shape>,
     foreground_shapes: &mut Vec<Shape>,
-    push_text: &mut impl FnMut(&mut Vec<Shape>, egui::Pos2, &str, Color32, f32),
+    push_text: &mut impl FnMut(&mut Vec<Shape>, egui::Pos2, &str, Color32, f32, bool),
 ) {
-    #[derive(Default)]
-    struct TextRun {
-        text: String,
-        x: f32,
-        y: f32,
-        next_x: f32,
-        fg: Color32,
-        italic_offset: f32,
-    }
-
     let mut run = TextRun::default();
-    let mut flush_run = |run: &mut TextRun, foreground_shapes: &mut Vec<Shape>| {
-        if run.text.is_empty() {
-            return;
-        }
-        push_text(
-            foreground_shapes,
-            pos2(run.x, run.y),
-            &run.text,
-            run.fg,
-            run.italic_offset,
-        );
-        run.text.clear();
-    };
 
     for indexed in cells {
         let Some(point) = point_to_viewport(display_offset, indexed.point) else {
@@ -823,7 +963,7 @@ fn build_reduced_foreground_shapes(
         }
 
         let ch = cell.c;
-        let (fg, italic_offset) = effective_text_style(cell, colors);
+        let (fg, italic_offset, bold) = effective_text_style(cell, colors);
         let width = metrics.cell_width
             * if cell.flags.contains(Flags::WIDE_CHAR) {
                 2.0
@@ -836,38 +976,30 @@ fn build_reduced_foreground_shapes(
             && !cell.flags.contains(Flags::HIDDEN)
             && !cell.flags.intersects(Flags::ALL_UNDERLINES)
             && !cell.flags.contains(Flags::STRIKEOUT);
-        let same_run = !run.text.is_empty()
-            && run.fg == fg
-            && (run.y - text_pos.y).abs() < 0.1
-            && (run.next_x - text_pos.x).abs() < 0.5
-            && (run.italic_offset - italic_offset).abs() < 0.1;
 
-        if drawable && same_run {
-            run.text.push(ch);
-            run.next_x += width;
+        if drawable && run.can_extend(fg, text_pos.x, text_pos.y, italic_offset, bold) {
+            run.extend(ch, width);
             continue;
         }
 
-        flush_run(&mut run, foreground_shapes);
+        run.flush(foreground_shapes, push_text);
 
         if drawable {
-            run.text.push(ch);
-            run.x = text_pos.x;
-            run.y = text_pos.y;
-            run.next_x = text_pos.x + width;
-            run.fg = fg;
-            run.italic_offset = italic_offset;
+            run.start(ch, text_pos.x, text_pos.y, width, fg, italic_offset, bold);
         } else {
             draw_decoration_shapes(foreground_shapes, text_pos, metrics, cell.flags, fg);
         }
     }
 
-    flush_run(&mut run, foreground_shapes);
+    run.flush(foreground_shapes, push_text);
 }
 
-fn effective_text_style(cell: &Cell, colors: &Colors) -> (Color32, f32) {
+fn effective_text_style(cell: &Cell, colors: &Colors) -> (Color32, f32, bool) {
     let mut fg = foreground_color(cell, colors);
-    if cell.flags.contains(Flags::BOLD) {
+    let bold = cell.flags.contains(Flags::BOLD);
+    if bold {
+        // Los terminales clásicos también brillan el bold (colores bright);
+        // la variante bold de la fuente se suma cuando está disponible.
         fg = brighten(fg);
     }
     if cell.flags.contains(Flags::DIM) {
@@ -878,7 +1010,20 @@ fn effective_text_style(cell: &Cell, colors: &Colors) -> (Color32, f32) {
     } else {
         0.0
     };
-    (fg, italic_offset)
+    (fg, italic_offset, bold)
+}
+
+/// FontId del grid: usa la familia bold registrada si el texto es bold y la
+/// variante se cargó al arrancar; si no, monoespaciada normal.
+fn terminal_font_id(font_size: f32, bold: bool) -> FontId {
+    if bold && bold_font_available() {
+        FontId {
+            size: font_size,
+            family: FontFamily::Name(TERMINAL_BOLD_FONT.into()),
+        }
+    } else {
+        FontId::monospace(font_size)
+    }
 }
 
 fn draw_decoration_shapes(
@@ -1060,7 +1205,7 @@ fn truncate_preview_label(label: &str, max_chars: usize) -> String {
 
 fn scaled_metrics(zoom: f32) -> RenderMetrics {
     let zoom = zoom.max(0.01);
-    let font_size = FONT_SIZE * zoom;
+    let font_size = base_font_size() * zoom;
     RenderMetrics {
         font_size,
         cell_width: font_size * CELL_WIDTH_FACTOR,
@@ -1162,7 +1307,7 @@ mod tests {
 
     use super::{
         blink_phase_visible, cursor_visible, render_terminal, render_terminal_reduced,
-        terminal_background_color, GridCacheKey, TerminalGridCache,
+        terminal_background_color, AtlasWatermark, GridCacheKey, TerminalGridCache,
     };
 
     #[cfg(feature = "ghostty-vt")]
@@ -1266,11 +1411,105 @@ mod tests {
     }
 
     #[test]
+    fn scroll_points_per_line_matches_cell_height() {
+        assert_eq!(
+            crate::terminal::metrics::scroll_points_per_line(),
+            super::base_font_size() * super::CELL_HEIGHT_FACTOR
+        );
+    }
+
+    #[test]
+    fn atlas_watermark_detects_recreation_by_fill_drop_or_ppp_change() {
+        let start = AtlasWatermark {
+            pixels_per_point: 2.0,
+            fill_ratio: 0.4,
+            generation: 0,
+        };
+
+        let grown = start.advance(2.0, 0.6);
+        assert_eq!(grown.generation, 0, "fill creciente no es recreación");
+
+        let recreated = grown.advance(2.0, 0.1);
+        assert_eq!(recreated.generation, 1, "caída de fill delata recreación");
+
+        let dpi_change = recreated.advance(1.0, 0.1);
+        assert_eq!(dpi_change.generation, 2, "cambio de ppp recrea el atlas");
+    }
+
+    #[test]
+    fn atlas_watermark_generation_is_monotonic_and_stable_under_any_inputs() {
+        let mut rng: u64 = 0xA71A5;
+        let mut watermark = AtlasWatermark {
+            pixels_per_point: 2.0,
+            fill_ratio: 0.0,
+            generation: 0,
+        };
+
+        for _ in 0..2000 {
+            rng = rng
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let ppp = if (rng >> 33).is_multiple_of(2) {
+                1.0
+            } else {
+                2.0
+            };
+            let fill = ((rng >> 40) % 1000) as f32 / 1000.0;
+
+            let advanced = watermark.advance(ppp, fill);
+            // La generación nunca retrocede y crece a lo sumo de a uno.
+            assert!(advanced.generation >= watermark.generation);
+            assert!(advanced.generation <= watermark.generation + 1);
+
+            // Re-observar exactamente lo mismo jamás bumpea (si lo hiciera,
+            // el cache de shapes se invalidaría cada frame).
+            let repeated = advanced.advance(ppp, fill);
+            assert_eq!(repeated.generation, advanced.generation);
+
+            watermark = advanced;
+        }
+    }
+
+    #[test]
+    fn font_atlas_generation_increments_when_fill_ratio_drops() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run(RawInput::default(), |_| {});
+
+        let initial = super::font_atlas_generation(&ctx);
+        assert_eq!(initial, super::font_atlas_generation(&ctx));
+
+        // Simular que el atlas estaba casi lleno y epaint lo recreó
+        // (el fill real del contexto es mucho menor que 0.95).
+        let pixels_per_point = ctx.pixels_per_point();
+        ctx.data_mut(|data| {
+            data.insert_temp(
+                super::atlas_watermark_id(),
+                AtlasWatermark {
+                    pixels_per_point,
+                    fill_ratio: 0.95,
+                    generation: initial,
+                },
+            );
+        });
+
+        assert_eq!(super::font_atlas_generation(&ctx), initial + 1);
+    }
+
+    #[test]
+    fn grid_cache_key_tracks_atlas_generation() {
+        let rect = Rect::from_min_size(pos2(20.0, 20.0), vec2(220.0, 120.0));
+        let first = GridCacheKey::new(rect, 1.0, 7, 1, 0);
+        let after_atlas_recreation = GridCacheKey::new(rect, 1.0, 7, 1, 1);
+
+        assert_ne!(first, after_atlas_recreation);
+    }
+
+    #[test]
     fn grid_cache_key_tracks_revision_and_display_offset() {
         let rect = Rect::from_min_size(pos2(20.0, 20.0), vec2(220.0, 120.0));
-        let first = GridCacheKey::new(rect, 1.0, 7, 1);
-        let different_revision = GridCacheKey::new(rect, 1.0, 8, 1);
-        let different_offset = GridCacheKey::new(rect, 1.0, 7, 1);
+        let first = GridCacheKey::new(rect, 1.0, 7, 1, 0);
+        let different_revision = GridCacheKey::new(rect, 1.0, 8, 1, 0);
+        let different_offset = GridCacheKey::new(rect, 1.0, 7, 1, 0);
 
         assert_ne!(first, different_revision);
         assert_eq!(first, different_offset);
@@ -1279,7 +1518,7 @@ mod tests {
     #[test]
     fn grid_cache_reuses_shapes_only_for_identical_keys() {
         let rect = Rect::from_min_size(pos2(20.0, 20.0), vec2(220.0, 120.0));
-        let key = GridCacheKey::new(rect, 1.0, 7, 1);
+        let key = GridCacheKey::new(rect, 1.0, 7, 1, 0);
         let mut cache = TerminalGridCache::default();
 
         assert!(!cache.matches(key));
@@ -1291,7 +1530,7 @@ mod tests {
             sample_term("hello").renderable_content().cursor,
         );
         assert!(cache.matches(key));
-        assert!(!cache.matches(GridCacheKey::new(rect, 1.0, 8, 1)));
+        assert!(!cache.matches(GridCacheKey::new(rect, 1.0, 8, 1, 0)));
     }
 
     #[test]
@@ -1328,6 +1567,58 @@ mod tests {
                 second_hit = render_terminal(
                     ui.painter(),
                     content_rect,
+                    &term,
+                    true,
+                    0.0,
+                    1.0,
+                    Rounding::ZERO,
+                    Some(&mut cache),
+                    7,
+                );
+            });
+        });
+
+        assert!(!first_hit);
+        assert!(second_hit);
+    }
+
+    #[test]
+    fn render_cache_survives_panel_movement() {
+        let ctx = egui::Context::default();
+        let raw_input = RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(640.0, 480.0))),
+            ..Default::default()
+        };
+        let term = sample_term("hello");
+        let mut cache = TerminalGridCache::default();
+        let rect_a = Rect::from_min_size(pos2(20.0, 20.0), vec2(220.0, 120.0));
+        let rect_b = Rect::from_min_size(pos2(340.0, 180.0), vec2(220.0, 120.0));
+        let mut first_hit = true;
+        let mut second_hit = false;
+
+        let _ = ctx.run(raw_input.clone(), |ctx| {
+            CentralPanel::default().show(ctx, |ui| {
+                first_hit = render_terminal(
+                    ui.painter(),
+                    rect_a,
+                    &term,
+                    true,
+                    0.0,
+                    1.0,
+                    Rounding::ZERO,
+                    Some(&mut cache),
+                    7,
+                );
+            });
+        });
+
+        // Mismo tamaño y revisión, distinta posición: el cache debe seguir
+        // valiendo (shapes locales + traslación al pintar).
+        let _ = ctx.run(raw_input, |ctx| {
+            CentralPanel::default().show(ctx, |ui| {
+                second_hit = render_terminal(
+                    ui.painter(),
+                    rect_b,
                     &term,
                     true,
                     0.0,
@@ -1389,6 +1680,132 @@ mod tests {
 
         assert!(!first_hit);
         assert!(second_hit);
+    }
+
+    #[test]
+    fn full_renderer_batches_same_style_runs_into_single_text_shape() {
+        let ctx = egui::Context::default();
+        let raw_input = RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(320.0, 240.0))),
+            ..Default::default()
+        };
+        let content_rect = Rect::from_min_size(pos2(20.0, 20.0), vec2(220.0, 120.0));
+        // 12 glifos contiguos del mismo estilo: antes eran 12 Shape::text
+        // (12 galleys); con run-batching es 1.
+        let term = sample_term("abcdefghijkl");
+
+        let output = ctx.run(raw_input, |ctx| {
+            CentralPanel::default().show(ctx, |ui| {
+                render_terminal(
+                    ui.painter(),
+                    content_rect,
+                    &term,
+                    false,
+                    0.0,
+                    1.0,
+                    Rounding::ZERO,
+                    None,
+                    0,
+                );
+            });
+        });
+
+        let text_shapes = output
+            .shapes
+            .iter()
+            .filter(|clipped| matches!(clipped.shape, egui::epaint::Shape::Text(_)))
+            .count();
+        assert_eq!(
+            text_shapes, 1,
+            "un tramo contiguo del mismo estilo debe emitir un solo shape de texto"
+        );
+    }
+
+    #[test]
+    fn full_renderer_keeps_every_visible_row() {
+        let ctx = egui::Context::default();
+        let raw_input = RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(320.0, 240.0))),
+            ..Default::default()
+        };
+        let content_rect = Rect::from_min_size(pos2(20.0, 20.0), vec2(220.0, 120.0));
+        let term = sample_term("first\nsecond\nthird");
+
+        let output = ctx.run(raw_input, |ctx| {
+            CentralPanel::default().show(ctx, |ui| {
+                render_terminal(
+                    ui.painter(),
+                    content_rect,
+                    &term,
+                    false,
+                    0.0,
+                    1.0,
+                    Rounding::ZERO,
+                    None,
+                    0,
+                );
+            });
+        });
+
+        assert_eq!(distinct_text_rows(&output.shapes), 3);
+    }
+
+    #[test]
+    fn effective_text_style_reports_bold_flag() {
+        use alacritty_terminal::term::cell::{Cell, Flags};
+        use alacritty_terminal::term::color::Colors;
+
+        let cell = Cell {
+            c: 'x',
+            flags: Flags::BOLD,
+            ..Cell::default()
+        };
+        let (_, _, bold) = super::effective_text_style(&cell, &Colors::default());
+        assert!(bold);
+
+        let plain = Cell {
+            c: 'x',
+            ..Cell::default()
+        };
+        let (_, _, bold) = super::effective_text_style(&plain, &Colors::default());
+        assert!(!bold);
+    }
+
+    #[test]
+    fn bold_text_renders_without_bold_font_loaded() {
+        // Sin la variante bold registrada (contexto de test default) el
+        // renderer cae al fallback sin romperse.
+        let ctx = egui::Context::default();
+        let raw_input = RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(320.0, 240.0))),
+            ..Default::default()
+        };
+        let content_rect = Rect::from_min_size(pos2(20.0, 20.0), vec2(220.0, 120.0));
+        let term = sample_term("\x1b[1mboldtext\x1b[0m");
+
+        let output = ctx.run(raw_input, |ctx| {
+            CentralPanel::default().show(ctx, |ui| {
+                render_terminal(
+                    ui.painter(),
+                    content_rect,
+                    &term,
+                    false,
+                    0.0,
+                    1.0,
+                    Rounding::ZERO,
+                    None,
+                    0,
+                );
+            });
+        });
+
+        assert!(
+            output
+                .shapes
+                .iter()
+                .any(|clipped| matches!(clipped.shape, egui::epaint::Shape::Text(_))),
+            "el texto bold debe renderizarse aun sin fuente bold cargada"
+        );
     }
 
     fn sample_term(text: &str) -> Term<EventProxy> {
