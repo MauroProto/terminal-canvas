@@ -299,9 +299,46 @@ pub(super) fn should_draw_resize_grip(screen_rect: Rect) -> bool {
 }
 
 pub(super) fn should_render_terminal_contents(content_rect: Rect, zoom: f32) -> bool {
-    zoom >= MIN_TERMINAL_RENDER_ZOOM
+    zoom >= min_terminal_render_zoom()
         && content_rect.width() >= MIN_TERMINAL_RENDER_WIDTH
         && content_rect.height() >= MIN_TERMINAL_RENDER_HEIGHT
+}
+
+/// Separación mínima entre el final del título y el badge de branch: si no
+/// entra con este aire, no se dibuja. El título siempre gana.
+const BRANCH_BADGE_GAP: f32 = 12.0;
+/// Margen entre el badge y el borde derecho de la barra de título.
+const BRANCH_BADGE_MARGIN: f32 = 10.0;
+
+/// Rect del badge de branch, pegado a la derecha de la barra de título.
+///
+/// Devuelve `None` cuando el badge no entra sin pisar el texto del título
+/// (`title_right` es el borde derecho del título ya dibujado). Preferimos no
+/// mostrar nada antes que solapar o recortar el nombre del panel.
+pub(super) fn branch_badge_rect(
+    title_rect: Rect,
+    title_right: f32,
+    badge_size: Vec2,
+) -> Option<Rect> {
+    if badge_size.x <= 0.0 || badge_size.y <= 0.0 {
+        return None;
+    }
+    // El badge no puede ser más alto que la barra.
+    if badge_size.y > title_rect.height() {
+        return None;
+    }
+    let right = title_rect.right() - BRANCH_BADGE_MARGIN;
+    let left = right - badge_size.x;
+    if left < title_right + BRANCH_BADGE_GAP {
+        return None;
+    }
+    // En paneles angostos el badge podría empezar antes del borde izquierdo de
+    // la barra: ahí tampoco se dibuja.
+    if left < title_rect.left() + BRANCH_BADGE_MARGIN {
+        return None;
+    }
+    let top = title_rect.center().y - badge_size.y * 0.5;
+    Some(Rect::from_min_size(pos2(left, top), badge_size))
 }
 
 pub(super) fn rect_to_saved_bounds(rect: Rect) -> SavedPanelBounds {
@@ -457,7 +494,7 @@ pub(super) fn should_render_live_terminal(
     fast_path_render: bool,
 ) -> bool {
     matches!(
-        render_tier_for_panel(content_rect, zoom, lod, fast_path_render, false, false),
+        render_tier_for_panel(content_rect, zoom, lod, fast_path_render, false),
         RenderTier::Full | RenderTier::ReducedLive
     )
 }
@@ -510,7 +547,6 @@ pub(super) fn render_tier_for_panel(
     lod: PanelLod,
     fast_path_render: bool,
     focused: bool,
-    streaming: bool,
 ) -> RenderTier {
     let previewable = content_rect.width() >= 24.0 && content_rect.height() >= 18.0;
     if !previewable {
@@ -522,14 +558,15 @@ pub(super) fn render_tier_for_panel(
     if focused {
         return RenderTier::Full;
     }
-    if fast_path_render || streaming {
+    // Los paneles visibles sin foco también renderizan todas las filas:
+    // saltear filas (ReducedLive) se ve como texto roto, incluso con
+    // output streaming. El tier reducido queda solo para gestos activos
+    // (fast path), donde el rect cambia cada frame y el cache de shapes
+    // no puede amortiguar el costo.
+    if fast_path_render {
         return RenderTier::ReducedLive;
     }
     RenderTier::Full
-}
-
-pub(super) fn is_streaming_output(pty: &PtyHandle) -> bool {
-    pty.output_elapsed() <= STREAMING_OUTPUT_WINDOW
 }
 
 pub(super) fn body_input_rect(body_rect: Rect) -> Rect {
