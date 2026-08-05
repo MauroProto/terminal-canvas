@@ -2,7 +2,9 @@ use alacritty_terminal::index::Side;
 use egui::{Pos2, Rect};
 
 use super::input::GridPoint;
-use crate::terminal::renderer::{CELL_HEIGHT_FACTOR, CELL_WIDTH_FACTOR, FONT_SIZE, PAD_X, PAD_Y};
+use crate::terminal::metrics::{
+    base_font_size, CELL_HEIGHT_FACTOR, CELL_WIDTH_FACTOR, PAD_X, PAD_Y,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GridMetrics {
@@ -12,7 +14,7 @@ pub struct GridMetrics {
 
 pub fn grid_metrics(zoom: f32) -> GridMetrics {
     let zoom = zoom.max(0.01);
-    let font_size = FONT_SIZE * zoom;
+    let font_size = base_font_size() * zoom;
     GridMetrics {
         char_width: font_size * CELL_WIDTH_FACTOR,
         line_height: font_size * CELL_HEIGHT_FACTOR,

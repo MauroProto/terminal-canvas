@@ -115,6 +115,9 @@ mod tests {
     #[cfg(not(feature = "ghostty-vt"))]
     #[test]
     fn runtime_backend_falls_back_to_alacritty_without_ghostty_feature() {
+        // SAFETY: mutar el entorno es sound acá porque este es el único
+        // test que toca MI_TERMINAL_BACKEND y no hay otros hilos leyendo
+        // el entorno durante su ejecución.
         unsafe {
             std::env::set_var("MI_TERMINAL_BACKEND", "ghostty");
         }
@@ -122,6 +125,8 @@ mod tests {
             super::runtime_backend_from_env(),
             TerminalBackendKind::Alacritty
         );
+        // SAFETY: ídem set_var; restaura el entorno sin lectores
+        // concurrentes.
         unsafe {
             std::env::remove_var("MI_TERMINAL_BACKEND");
         }
