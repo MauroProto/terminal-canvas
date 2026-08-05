@@ -1,5 +1,7 @@
 use egui::{Key, Modifiers};
 
+use super::metrics::scroll_points_per_line;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GridPoint {
     pub line: usize,
@@ -11,6 +13,10 @@ pub struct InputMode {
     pub app_cursor: bool,
     pub bracketed_paste: bool,
     pub mouse_mode: bool,
+    /// El TUI pidió tracking de movimiento con botón presionado (1002/1003).
+    pub mouse_drag: bool,
+    /// El TUI pidió tracking de todo movimiento, incluso sin botón (1003).
+    pub mouse_motion: bool,
     pub alt_screen: bool,
 }
 
@@ -20,44 +26,96 @@ pub enum WheelAction {
     Scrollback(i32),
 }
 
-pub fn wheel_action(delta: f32, mode: &InputMode, point: Option<GridPoint>) -> Option<WheelAction> {
+// Los puntos por línea de scroll salen de `terminal::metrics` (compartidos
+// con el renderer; el harness de runtime monta este módulo sin el renderer,
+// por eso viven allá).
+
+/// Convierte los deltas de la rueda (en puntos) en líneas enteras de
+/// terminal, acumulando el resto entre llamadas. El trackpad con momentum
+/// entrega un delta chico por frame durante segundos; emitir "al menos una
+/// línea" por llamada (el comportamiento anterior) producía ~120 líneas/s
+/// con un flick suave: scroll incontrolable.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ScrollAccumulator {
+    pending: f32,
+}
+
+impl ScrollAccumulator {
+    /// Líneas enteras cruzadas por `delta`; positivo = hacia el historial.
+    pub fn take_lines(&mut self, delta: f32) -> i32 {
+        let toward_history = if native_scrolls_toward_history(delta) {
+            delta.abs()
+        } else {
+            -delta.abs()
+        };
+        // Invertir el sentido no paga el resto del gesto anterior: la
+        // respuesta inmediata importa más que esa fracción de línea.
+        if self.pending != 0.0 && (toward_history > 0.0) != (self.pending > 0.0) {
+            self.pending = 0.0;
+        }
+        self.pending += toward_history;
+        let points_per_line = scroll_points_per_line();
+        let lines = (self.pending / points_per_line).trunc() as i32;
+        self.pending -= lines as f32 * points_per_line;
+        lines
+    }
+}
+
+pub fn wheel_action(
+    delta: f32,
+    mode: &InputMode,
+    point: Option<GridPoint>,
+    accumulator: &mut ScrollAccumulator,
+) -> Option<WheelAction> {
     if delta.abs() <= f32::EPSILON {
         return None;
     }
 
-    if mode.alt_screen {
-        return Some(WheelAction::Pty(alt_screen_scroll_sequence(delta).to_vec()));
-    }
-
+    // El mouse reportado tiene prioridad sobre alt screen: los TUIs de
+    // pantalla completa que piden mouse (codex, ratatui, etc.) scrollean
+    // nativo con estos reportes.
     if mode.mouse_mode {
+        let lines = accumulator.take_lines(delta);
+        if lines == 0 {
+            return None;
+        }
         let point = point.unwrap_or(GridPoint { line: 0, column: 0 });
-        return Some(WheelAction::Pty(mouse_scroll_sgr_sequence(
-            mouse_scroll_button(delta),
-            point.column,
-            point.line,
-        )));
+        let button = if lines > 0 { 64 } else { 65 };
+        let mut bytes = Vec::new();
+        for _ in 0..lines.unsigned_abs() {
+            bytes.extend_from_slice(&mouse_scroll_sgr_sequence(button, point.column, point.line));
+        }
+        return Some(WheelAction::Pty(bytes));
     }
 
-    Some(WheelAction::Scrollback(scrollback_delta_from_input(delta)))
-}
-
-pub fn scroll_lines_from_input_delta(delta: f32) -> i32 {
-    ((delta.abs() / 24.0).round() as i32).max(1)
-}
-
-pub fn alt_screen_scroll_sequence(delta: f32) -> &'static [u8] {
-    if scrollback_delta_from_input(delta) > 0 {
-        b"\x1b[A"
-    } else {
-        b"\x1b[B"
+    if mode.alt_screen {
+        // La app es dueña de la pantalla y no pidió mouse: inyectar flechas
+        // fantasma corrompe su input (p. ej. recall de historial en el
+        // prompt de Claude Code), así que la rueda no hace nada.
+        return None;
     }
+
+    let lines = accumulator.take_lines(delta);
+    if lines == 0 {
+        return None;
+    }
+    Some(WheelAction::Scrollback(lines))
 }
 
-pub fn mouse_scroll_button(delta: f32) -> u8 {
-    if scrollback_delta_from_input(delta) > 0 {
-        64
-    } else {
-        65
+/// egui-winit intercepta los atajos de clipboard y entrega
+/// `Event::Copy`/`Event::Cut` en lugar de la tecla. Sin selección, en las
+/// plataformas donde Ctrl actúa como "command" (Linux/Windows) hay que
+/// reenviar el byte de control al PTY para no perder Ctrl+C (SIGINT) ni
+/// Ctrl+X; en macOS Cmd+C sin selección no hace nada, como Terminal.app.
+pub fn clipboard_event_fallback_bytes(cut: bool) -> Option<&'static [u8]> {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = cut;
+        None
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Some(if cut { b"\x18" } else { b"\x03" })
     }
 }
 
@@ -65,13 +123,52 @@ pub fn mouse_scroll_sgr_sequence(button: u8, column: usize, row: usize) -> Vec<u
     format!("\x1b[<{};{};{}M", button, column + 1, row + 1).into_bytes()
 }
 
-pub fn scrollback_delta_from_input(delta: f32) -> i32 {
-    let lines = scroll_lines_from_input_delta(delta);
-    if native_scrolls_toward_history(delta) {
-        lines
-    } else {
-        -lines
-    }
+/// Bits de modificadores SGR (shift=4, meta/alt=8, ctrl=16).
+fn sgr_modifier_bits(modifiers: &Modifiers) -> u8 {
+    4 * u8::from(modifiers.shift) + 8 * u8::from(modifiers.alt) + 16 * u8::from(modifiers.ctrl)
+}
+
+/// Secuencia SGR (1006) de click: `button` 0=izq, 1=medio, 2=der. `release`
+/// usa el terminador `m` en vez de `M`.
+pub fn mouse_click_sgr_sequence(
+    button: u8,
+    release: bool,
+    modifiers: &Modifiers,
+    column: usize,
+    row: usize,
+) -> Vec<u8> {
+    let cb = button + sgr_modifier_bits(modifiers);
+    let terminator = if release { 'm' } else { 'M' };
+    format!("\x1b[<{};{};{}{}", cb, column + 1, row + 1, terminator).into_bytes()
+}
+
+/// Secuencia SGR de movimiento: bit 32 sobre el botón. `button` 3 = sin
+/// botón (hover), 0/1/2 = arrastre con ese botón.
+pub fn mouse_motion_sgr_sequence(
+    button: u8,
+    modifiers: &Modifiers,
+    column: usize,
+    row: usize,
+) -> Vec<u8> {
+    let cb = 32 + button + sgr_modifier_bits(modifiers);
+    format!("\x1b[<{};{};{}M", cb, column + 1, row + 1).into_bytes()
+}
+
+/// Neutraliza los bytes de escape de un prompt antes de inyectarlo en un
+/// agente (idea de orca): un prompt no debe poder emitir secuencias de
+/// control al terminal.
+pub fn sanitize_agent_prompt(text: &str) -> String {
+    text.replace('\x1b', "<ESC>")
+}
+
+/// Compone los bytes para inyectar un prompt/feedback en un agente:
+/// sanitizado + bracketed paste (si el TUI lo activó) + Enter para enviarlo.
+/// El paste atómico evita que un prompt multi-línea ejecute la 1ª línea sola.
+pub fn agent_prompt_bytes(text: &str, mode: &InputMode) -> Vec<u8> {
+    let sanitized = sanitize_agent_prompt(text.trim());
+    let mut bytes = paste_bytes(&sanitized, mode);
+    bytes.push(b'\r');
+    bytes
 }
 
 #[inline]
@@ -395,21 +492,235 @@ mod tests {
             mouse_mode: true,
             ..InputMode::default()
         };
+        let mut accumulator = super::ScrollAccumulator::default();
 
-        let action = wheel_action(-48.0, &mode, Some(GridPoint { line: 2, column: 3 })).unwrap();
+        let action = wheel_action(
+            -48.0,
+            &mode,
+            Some(GridPoint { line: 2, column: 3 }),
+            &mut accumulator,
+        )
+        .unwrap();
 
+        // 48 puntos ≈ 2 líneas: dos reportes SGR en la celda del puntero.
         #[cfg(target_os = "macos")]
-        assert_eq!(action, WheelAction::Pty(b"\x1b[<65;4;3M".to_vec()));
+        assert_eq!(
+            action,
+            WheelAction::Pty(b"\x1b[<65;4;3M\x1b[<65;4;3M".to_vec())
+        );
         #[cfg(not(target_os = "macos"))]
-        assert_eq!(action, WheelAction::Pty(b"\x1b[<64;4;3M".to_vec()));
+        assert_eq!(
+            action,
+            WheelAction::Pty(b"\x1b[<64;4;3M\x1b[<64;4;3M".to_vec())
+        );
+    }
+
+    #[test]
+    fn wheel_action_ignores_alt_screen_without_mouse_reports() {
+        let mode = InputMode {
+            alt_screen: true,
+            ..InputMode::default()
+        };
+        let mut accumulator = super::ScrollAccumulator::default();
+        // Nada de flechas fantasma: corrompen el input de los TUIs.
+        assert!(wheel_action(-48.0, &mode, None, &mut accumulator).is_none());
+        assert!(wheel_action(48.0, &mode, None, &mut accumulator).is_none());
+    }
+
+    #[test]
+    fn wheel_action_prefers_mouse_reports_over_alt_screen() {
+        let mode = InputMode {
+            alt_screen: true,
+            mouse_mode: true,
+            ..InputMode::default()
+        };
+        let mut accumulator = super::ScrollAccumulator::default();
+        let action = wheel_action(
+            -48.0,
+            &mode,
+            Some(GridPoint { line: 2, column: 3 }),
+            &mut accumulator,
+        )
+        .unwrap();
+        assert!(matches!(action, WheelAction::Pty(_)));
+    }
+
+    #[test]
+    fn scroll_accumulator_smooths_trackpad_momentum() {
+        let mode = InputMode::default();
+        let mut accumulator = super::ScrollAccumulator::default();
+        let mut total = 0;
+
+        // Momentum: muchos eventos chicos (2 puntos por frame). Antes cada
+        // uno emitía al menos una línea (30 en total); acumulados son
+        // 60 puntos ≈ 3 líneas.
+        for _ in 0..30 {
+            if let Some(WheelAction::Scrollback(lines)) =
+                wheel_action(2.0, &mode, None, &mut accumulator)
+            {
+                total += lines;
+            }
+        }
+
+        assert_eq!(total.abs(), 3);
+    }
+
+    #[test]
+    fn scroll_accumulator_resets_pending_on_direction_change() {
+        let mut accumulator = super::ScrollAccumulator::default();
+
+        assert_eq!(accumulator.take_lines(17.0), 0);
+        // El resto acumulado no amortigua el gesto en sentido contrario.
+        assert_eq!(accumulator.take_lines(-17.0), 0);
+        assert_eq!(accumulator.take_lines(-2.0).abs(), 1);
+    }
+
+    /// LCG determinista para tests de propiedades sin dependencias.
+    fn next_pseudo_random(state: &mut u64) -> u64 {
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        *state >> 33
+    }
+
+    #[test]
+    fn scroll_accumulator_conserves_total_lines_for_any_same_sign_gesture() {
+        let mut rng: u64 = 0x5EED;
+
+        for case in 0..100 {
+            let mut accumulator = super::ScrollAccumulator::default();
+            let mut total_points = 0.0f32;
+            let mut emitted: i64 = 0;
+
+            for _ in 0..200 {
+                // Deltas de 0.01 a 40.0 puntos, como los del trackpad.
+                let delta = (next_pseudo_random(&mut rng) % 4000 + 1) as f32 / 100.0;
+                total_points += delta;
+                emitted += i64::from(accumulator.take_lines(delta));
+            }
+
+            // Propiedad: las líneas emitidas equivalen al total desplazado
+            // (±1 por redondeo flotante). El bug anterior (mínimo una línea
+            // por evento) emitía ~200 acá.
+            let expected = (total_points / super::scroll_points_per_line()).trunc() as i64;
+            assert!(
+                (emitted.abs() - expected).abs() <= 1,
+                "caso {case}: emitidas {emitted} vs esperadas ±{expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn scroll_accumulator_pending_never_reaches_a_full_line() {
+        let mut rng: u64 = 0xACC0;
+        let mut accumulator = super::ScrollAccumulator::default();
+
+        for _ in 0..2000 {
+            // Deltas con signo alternante pseudoaleatorio.
+            let magnitude = (next_pseudo_random(&mut rng) % 6000) as f32 / 100.0;
+            let delta = if next_pseudo_random(&mut rng).is_multiple_of(2) {
+                magnitude
+            } else {
+                -magnitude
+            };
+            let _ = accumulator.take_lines(delta);
+            assert!(
+                accumulator.pending.abs() < super::scroll_points_per_line(),
+                "el resto acumulado nunca debe llegar a una línea entera"
+            );
+        }
+    }
+
+    #[test]
+    fn mouse_click_sgr_encodes_press_and_release() {
+        let press = super::mouse_click_sgr_sequence(0, false, &Modifiers::NONE, 4, 2);
+        assert_eq!(press, b"\x1b[<0;5;3M");
+        let release = super::mouse_click_sgr_sequence(0, true, &Modifiers::NONE, 4, 2);
+        assert_eq!(release, b"\x1b[<0;5;3m");
+    }
+
+    #[test]
+    fn mouse_click_sgr_includes_modifier_bits() {
+        let modifiers = Modifiers {
+            shift: true,
+            ctrl: true,
+            ..Modifiers::NONE
+        };
+        // 0 base + 4 (shift) + 16 (ctrl) = 20.
+        let seq = super::mouse_click_sgr_sequence(0, false, &modifiers, 0, 0);
+        assert_eq!(seq, b"\x1b[<20;1;1M");
+    }
+
+    #[test]
+    fn mouse_motion_sgr_sets_motion_bit() {
+        let drag = super::mouse_motion_sgr_sequence(0, &Modifiers::NONE, 1, 1);
+        assert_eq!(drag, b"\x1b[<32;2;2M");
+        // Botón 3 = movimiento sin botón presionado (hover, modo 1003).
+        let hover = super::mouse_motion_sgr_sequence(3, &Modifiers::NONE, 1, 1);
+        assert_eq!(hover, b"\x1b[<35;2;2M");
+    }
+
+    #[test]
+    fn sanitize_agent_prompt_neutralizes_escape_bytes() {
+        assert_eq!(
+            super::sanitize_agent_prompt("fix \x1b[31m bug"),
+            "fix <ESC>[31m bug"
+        );
+        assert_eq!(super::sanitize_agent_prompt("plain brief"), "plain brief");
+    }
+
+    #[test]
+    fn agent_prompt_bytes_wraps_bracketed_and_submits() {
+        let mode = super::InputMode {
+            bracketed_paste: true,
+            ..super::InputMode::default()
+        };
+        let bytes = super::agent_prompt_bytes("revisá el error", &mode);
+        assert_eq!(bytes, b"\x1b[200~revis\xc3\xa1 el error\x1b[201~\r");
+    }
+
+    #[test]
+    fn agent_prompt_bytes_raw_without_bracketed_and_trims() {
+        let mode = super::InputMode::default();
+        let bytes = super::agent_prompt_bytes("  hello  ", &mode);
+        assert_eq!(bytes, b"hello\r");
+    }
+
+    #[test]
+    fn agent_prompt_bytes_sanitizes_escapes() {
+        let mode = super::InputMode::default();
+        let bytes = super::agent_prompt_bytes("a\x1bb", &mode);
+        assert_eq!(bytes, b"a<ESC>b\r");
+    }
+
+    #[test]
+    fn clipboard_event_fallback_matches_platform() {
+        #[cfg(target_os = "macos")]
+        {
+            assert!(super::clipboard_event_fallback_bytes(false).is_none());
+            assert!(super::clipboard_event_fallback_bytes(true).is_none());
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert_eq!(
+                super::clipboard_event_fallback_bytes(false),
+                Some(b"\x03".as_slice())
+            );
+            assert_eq!(
+                super::clipboard_event_fallback_bytes(true),
+                Some(b"\x18".as_slice())
+            );
+        }
     }
 
     #[test]
     fn wheel_action_falls_back_to_scrollback_without_mouse_mode() {
+        let mut accumulator = super::ScrollAccumulator::default();
         let action = wheel_action(
             48.0,
             &InputMode::default(),
             Some(GridPoint { line: 0, column: 0 }),
+            &mut accumulator,
         )
         .unwrap();
 
