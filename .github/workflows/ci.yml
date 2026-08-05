@@ -7,9 +7,23 @@ on:
       - "codex/**"
   pull_request:
 
+# Un push nuevo cancela la corrida anterior de la misma rama (en master no,
+# para no perder señal de commits intermedios).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
 jobs:
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      # macOS es la plataforma primaria: sin este runner, los caminos
+      # #[cfg(target_os = "macos")] (clipboard, dirección de scroll,
+      # atajos) no se compilan ni testean nunca en CI. Windows cubre los
+      # caminos #[cfg(windows)] (shell por COMSPEC, PTY de ConPTY).
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
 
     steps:
       - name: Checkout
@@ -23,17 +37,27 @@ jobs:
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
-
       - name: Format check
+        if: matrix.os == 'ubuntu-latest'
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Run test suite
+        run: cargo test --all-targets --locked --quiet
+
+  audit:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
 
       - name: Audit dependencies
         run: cargo audit
-
-      - name: Run test suite
-        run: cargo test --all-targets --quiet

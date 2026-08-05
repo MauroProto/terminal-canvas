@@ -1,0 +1,15 @@
+# Actualizaciones automatizadas de dependencias: un PR semanal por
+# ecosistema, para que las correcciones de seguridad no dependan de que
+# alguien se acuerde de correr `cargo update`.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
