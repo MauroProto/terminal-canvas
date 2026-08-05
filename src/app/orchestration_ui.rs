@@ -45,6 +45,26 @@ impl TerminalApp {
             }
         }
         self.orchestrator.prune_missing_panels(&live_panel_ids);
+        self.prune_panel_keyed_state(&live_panel_ids);
+    }
+
+    /// Descarta el estado por panel de los paneles que ya no existen.
+    ///
+    /// Estos dos mapas se llenaban al abrir un panel y no se vaciaban nunca:
+    /// en una sesión larga, cada terminal abierto y cerrado dejaba su entrada
+    /// para siempre. Es poca memoria por entrada, pero crecimiento sin cota al
+    /// fin y al cabo.
+    fn prune_panel_keyed_state(&mut self, live_panel_ids: &HashSet<Uuid>) {
+        self.scrollback_restored
+            .retain(|panel_id| live_panel_ids.contains(panel_id));
+        // `agent_status_seen` va por sesión de runtime, no por panel.
+        let live_sessions: HashSet<Uuid> = self
+            .workspaces
+            .iter()
+            .flat_map(|workspace| workspace.panels.iter())
+            .filter_map(|panel| panel.runtime_session_id())
+            .collect();
+        retain_seen_sessions(&mut self.agent_status_seen, &live_sessions);
     }
 
     pub(super) fn collect_observations(&self) -> Vec<PanelRuntimeObservation> {
@@ -230,6 +250,17 @@ impl TerminalApp {
 /// Dada la historia de estados vistos y los estados actuales, devuelve
 /// `(title, body)` para cada sesión que TRANSICIONÓ a un estado de atención.
 /// Actualiza `seen` como efecto lateral. Pura y testeable (sin notificar).
+/// Descarta el estado de sesiones que ya no existen.
+///
+/// `attention_transitions` inserta una entrada por cada sesión que observa y
+/// nunca borra: sin esta poda el mapa crece durante toda la vida del proceso.
+fn retain_seen_sessions(
+    seen: &mut std::collections::HashMap<Uuid, crate::orchestration::AgentStatus>,
+    live_sessions: &HashSet<Uuid>,
+) {
+    seen.retain(|session_id, _| live_sessions.contains(session_id));
+}
+
 fn attention_transitions(
     seen: &mut std::collections::HashMap<Uuid, crate::orchestration::AgentStatus>,
     sessions: &[(
@@ -327,5 +358,54 @@ mod attention_tests {
             1,
             "transición a otro estado de atención notifica"
         );
+    }
+    #[test]
+    fn seen_state_stays_bounded_when_sessions_come_and_go() {
+        // Regresión de fuga: sin poda, cada sesión observada dejaba su entrada
+        // para siempre. Simulamos 500 sesiones efímeras con una sola viva.
+        use std::collections::HashSet;
+
+        let survivor = Uuid::new_v4();
+        let mut seen = HashMap::new();
+
+        for _ in 0..500 {
+            let ephemeral = Uuid::new_v4();
+            let batch = vec![
+                session(survivor, AgentStatus::Running, "vive"),
+                session(ephemeral, AgentStatus::Running, "efimera"),
+            ];
+            attention_transitions(&mut seen, &batch);
+
+            // La sesión efímera se cierra; sólo sobrevive la otra.
+            let live: HashSet<Uuid> = [survivor].into_iter().collect();
+            super::retain_seen_sessions(&mut seen, &live);
+        }
+
+        assert_eq!(
+            seen.len(),
+            1,
+            "the map must not grow with sessions that already died"
+        );
+        assert!(seen.contains_key(&survivor));
+    }
+
+    #[test]
+    fn pruning_keeps_every_live_session() {
+        use std::collections::HashSet;
+
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let mut seen = HashMap::new();
+        attention_transitions(
+            &mut seen,
+            &[
+                session(a, AgentStatus::Running, "a"),
+                session(b, AgentStatus::Idle, "b"),
+            ],
+        );
+
+        let live: HashSet<Uuid> = [a, b].into_iter().collect();
+        super::retain_seen_sessions(&mut seen, &live);
+        assert_eq!(seen.len(), 2, "live sessions must never be dropped");
     }
 }
