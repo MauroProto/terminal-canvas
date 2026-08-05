@@ -4,6 +4,7 @@ pub mod colors;
 pub mod ghostty_backend;
 pub mod input;
 pub mod layout;
+pub mod metrics;
 pub mod panel;
 pub mod pty;
 pub mod renderer;
