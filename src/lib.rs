@@ -7,6 +7,7 @@ pub mod app;
 pub mod canvas;
 pub mod collab;
 pub mod command_palette;
+pub mod config;
 pub mod orchestration;
 pub mod panel;
 pub mod runtime;
