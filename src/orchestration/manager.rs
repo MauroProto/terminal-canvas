@@ -12,8 +12,20 @@ use super::matching::{
     event_matches_filters, inbox_matches_query, session_matches_query, task_matches_filters,
     task_matches_query,
 };
+use crate::terminal::agent_status::{AgentStatusReport, AgentStatusState};
+use crate::terminal::pty::pty_clock_now_ms;
 
 const GIT_INSPECT_INTERVAL_SECS: i64 = 8;
+/// Cadencia de inspección git para terminales no orquestados: sólo alimentan el
+/// badge de branch, que cambia poquísimo.
+const GIT_INSPECT_INTERVAL_PLAIN_SECS: i64 = 64;
+// Invariante de diseño: observar un terminal común nunca puede costar más que
+// observar un agente.
+const _: () = assert!(GIT_INSPECT_INTERVAL_PLAIN_SECS > GIT_INSPECT_INTERVAL_SECS);
+/// Un report OSC 9999 deja de ser autoritativo si el agente no emite uno
+/// nuevo en este plazo (orca usa 30 min; con 5 min el estado heurístico
+/// recupera el control rápido si el canal se silencia).
+const AGENT_STATUS_TTL_MS: i64 = 5 * 60 * 1000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum AgentProvider {
@@ -103,7 +115,6 @@ impl AgentStatus {
         }
     }
 
-    #[allow(dead_code)]
     pub fn is_attention(self) -> bool {
         matches!(
             self,
@@ -395,6 +406,8 @@ pub struct PanelRuntimeObservation {
     pub recent_output: bool,
     pub attached: bool,
     pub minimized: bool,
+    /// Último report del canal OSC 9999 (estado autoritativo del agente).
+    pub agent_status: Option<AgentStatusReport>,
 }
 
 #[allow(dead_code)]
@@ -948,12 +961,23 @@ impl Orchestrator {
                     .unwrap_or(AgentProvider::Unknown);
             }
             session.command_summary = summarize_command_output(&observation.visible_text);
-            session.status = derive_status(
-                observation.alive,
-                observation.recent_output,
-                &observation.visible_text,
-                session.review_summary.last_error.as_deref(),
-            );
+            if let Some(report) =
+                fresh_agent_status(observation.agent_status.as_ref(), pty_clock_now_ms())
+            {
+                if let Some(tool) = report.tool.as_deref().filter(|tool| !tool.is_empty()) {
+                    session.command_summary = Some(agent_tool_summary(tool, report));
+                }
+            }
+            session.status =
+                authoritative_agent_status(observation.agent_status.as_ref(), observation.alive)
+                    .unwrap_or_else(|| {
+                        derive_status(
+                            observation.alive,
+                            observation.recent_output,
+                            &observation.visible_text,
+                            session.review_summary.last_error.as_deref(),
+                        )
+                    });
             let should_inspect_git = should_inspect_git_for_session(
                 session,
                 observation,
@@ -1465,6 +1489,75 @@ pub fn launch_presets() -> [AgentProvider; 5] {
     ]
 }
 
+/// Estado autoritativo emitido por el propio agente vía OSC 9999. Tiene
+/// prioridad sobre las heurísticas de texto visible mientras sea fresco.
+fn authoritative_agent_status(
+    report: Option<&AgentStatusReport>,
+    alive: bool,
+) -> Option<AgentStatus> {
+    let report = fresh_agent_status(report, pty_clock_now_ms())?;
+    Some(match report.state {
+        AgentStatusState::Working => AgentStatus::Running,
+        AgentStatusState::Blocked => AgentStatus::WaitingApproval,
+        AgentStatusState::Waiting => AgentStatus::NeedsInput,
+        // "done" con el proceso vivo = el agente terminó su turno y espera
+        // el próximo prompt (idle); con el proceso muerto = terminó de verdad.
+        AgentStatusState::Done => {
+            if alive {
+                AgentStatus::Idle
+            } else {
+                AgentStatus::Done
+            }
+        }
+    })
+}
+
+fn fresh_agent_status(
+    report: Option<&AgentStatusReport>,
+    now_ms: i64,
+) -> Option<&AgentStatusReport> {
+    let report = report?;
+    if now_ms.saturating_sub(report.received_at_ms) > AGENT_STATUS_TTL_MS {
+        return None;
+    }
+    Some(report)
+}
+
+fn agent_tool_summary(tool: &str, report: &AgentStatusReport) -> CommandSummary {
+    let detail = report.prompt.as_deref().unwrap_or_default();
+    let title = if detail.is_empty() {
+        truncate_text(tool, 60)
+    } else {
+        truncate_text(&format!("{} {}", tool, detail.replace('\n', " ")), 60)
+    };
+    CommandSummary {
+        title,
+        excerpt: truncate_text(detail, 160),
+        failed: false,
+    }
+}
+
+/// Rango de caracteres del spinner braille que los CLIs de agentes (Claude
+/// Code, Codex, etc.) muestran en la última línea mientras trabajan.
+fn has_braille_spinner(line: &str) -> bool {
+    line.chars()
+        .any(|ch| ('\u{2800}'..='\u{28FF}').contains(&ch))
+}
+
+fn status_tail_lines(visible_text: &str, max_lines: usize) -> String {
+    visible_text
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.trim().is_empty())
+        .rev()
+        .take(max_lines)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn derive_status(
     alive: bool,
     recent_output: bool,
@@ -1472,6 +1565,18 @@ fn derive_status(
     last_error: Option<&str>,
 ) -> AgentStatus {
     use crate::utils::ascii_icontains;
+    // Las heurísticas de keywords solo miran las últimas líneas: buscar
+    // "error" en las 16 líneas visibles completas daba falsos positivos con
+    // cualquier salida de log o `ls` que mencionara la palabra.
+    let tail = status_tail_lines(visible_text, 4);
+    let last_line = tail.lines().next_back().unwrap_or_default();
+
+    // Spinner braille en la última línea = el agente está trabajando ahora
+    // mismo; gana sobre texto de error viejo que siga visible.
+    if alive && recent_output && has_braille_spinner(last_line) {
+        return AgentStatus::Running;
+    }
+
     let has_error = last_error.is_some()
         || [
             "error",
@@ -1482,7 +1587,7 @@ fn derive_status(
             "command failed",
         ]
         .into_iter()
-        .any(|needle| ascii_icontains(visible_text, needle));
+        .any(|needle| ascii_icontains(&tail, needle));
     let waiting_approval = [
         "approve",
         "approval",
@@ -1490,7 +1595,7 @@ fn derive_status(
         "waiting for approval",
     ]
     .into_iter()
-    .any(|needle| ascii_icontains(visible_text, needle));
+    .any(|needle| ascii_icontains(&tail, needle));
     let needs_input = [
         "press enter",
         "continue?",
@@ -1499,7 +1604,7 @@ fn derive_status(
         "[y/n]",
     ]
     .into_iter()
-    .any(|needle| ascii_icontains(visible_text, needle));
+    .any(|needle| ascii_icontains(&tail, needle));
     let ready_for_review = [
         "ready for review",
         "review ready",
@@ -1507,7 +1612,7 @@ fn derive_status(
         "done. changed files",
     ]
     .into_iter()
-    .any(|needle| ascii_icontains(visible_text, needle));
+    .any(|needle| ascii_icontains(&tail, needle));
 
     if waiting_approval {
         AgentStatus::WaitingApproval
@@ -1576,12 +1681,19 @@ fn should_inspect_git_for_session(
     let explicitly_orchestrated = session.task_id.is_some()
         || session.worktree_path.is_some()
         || session.startup_command.is_some();
-    if !explicitly_orchestrated {
-        return false;
-    }
+    // Los paneles orquestados alimentan el code review y el inbox, así que se
+    // refrescan seguido. Los terminales comunes sólo alimentan el badge de
+    // branch de la barra de título, que casi no cambia: se inspeccionan a una
+    // cadencia mucho más lenta para no pagar `git status` de más en repos
+    // grandes.
+    let interval = if explicitly_orchestrated {
+        GIT_INSPECT_INTERVAL_SECS
+    } else {
+        GIT_INSPECT_INTERVAL_PLAIN_SECS
+    };
 
     last_inspect_at
-        .map(|last| now.signed_duration_since(last).num_seconds() >= GIT_INSPECT_INTERVAL_SECS)
+        .map(|last| now.signed_duration_since(last).num_seconds() >= interval)
         .unwrap_or(true)
 }
 
@@ -1755,7 +1867,7 @@ mod tests {
         derive_status, launch_presets, preview_label, provider_bootstrap, short_uuid,
         should_inspect_git_for_session, slugify, AgentLaunchRequest, AgentProvider, AgentStatus,
         DependencyKind, DiffStats, LaunchPreparation, Orchestrator, PanelRuntimeObservation,
-        TaskState, WorktreeMode, GIT_INSPECT_INTERVAL_SECS,
+        TaskState, WorktreeMode, GIT_INSPECT_INTERVAL_PLAIN_SECS, GIT_INSPECT_INTERVAL_SECS,
     };
 
     #[test]
@@ -1808,6 +1920,106 @@ mod tests {
             AgentStatus::Reviewing
         );
         assert_eq!(derive_status(false, false, "Done", None), AgentStatus::Done);
+    }
+
+    #[test]
+    fn braille_spinner_marks_running_over_stale_error_text() {
+        let text = "error: old failure\n\u{2838}\u{2838}\u{2838} Working on it";
+        assert_eq!(derive_status(true, true, text, None), AgentStatus::Running);
+    }
+
+    #[test]
+    fn error_keywords_only_match_recent_lines() {
+        let text = "error: ancient problem\nok line\nanother ok line\nprompt ready\nall good now";
+        assert_eq!(derive_status(true, false, text, None), AgentStatus::Idle);
+    }
+
+    #[test]
+    fn fresh_osc_status_overrides_text_heuristics() {
+        use crate::terminal::agent_status::{AgentStatusReport, AgentStatusState};
+        use crate::terminal::pty::pty_clock_now_ms;
+
+        let mut orchestrator = Orchestrator::new();
+        let workspace_id = uuid::Uuid::new_v4();
+        let panel_id = uuid::Uuid::new_v4();
+        let session_id = orchestrator.ensure_panel_session(
+            workspace_id,
+            None,
+            panel_id,
+            Some(uuid::Uuid::new_v4()),
+            "claude",
+        );
+
+        orchestrator.apply_observations(vec![PanelRuntimeObservation {
+            panel_id,
+            runtime_session_id: Some(uuid::Uuid::new_v4()),
+            workspace_id,
+            title: "claude".to_owned(),
+            // El texto visible diría Failed, pero el canal OSC 9999 manda.
+            visible_text: "error: something failed badly".to_owned(),
+            alive: true,
+            recent_output: true,
+            attached: true,
+            minimized: false,
+            agent_status: Some(AgentStatusReport {
+                state: AgentStatusState::Working,
+                tool: Some("Edit".to_owned()),
+                prompt: Some("src/main.rs".to_owned()),
+                received_at_ms: pty_clock_now_ms(),
+            }),
+        }]);
+
+        let session = orchestrator
+            .sessions()
+            .iter()
+            .find(|session| session.session_id == session_id)
+            .unwrap();
+        assert_eq!(session.status, AgentStatus::Running);
+        let summary = session.command_summary.as_ref().unwrap();
+        assert!(summary.title.contains("Edit"));
+    }
+
+    #[test]
+    fn stale_osc_status_falls_back_to_heuristics() {
+        use crate::terminal::agent_status::{AgentStatusReport, AgentStatusState};
+        use crate::terminal::pty::pty_clock_now_ms;
+
+        let mut orchestrator = Orchestrator::new();
+        let workspace_id = uuid::Uuid::new_v4();
+        let panel_id = uuid::Uuid::new_v4();
+        let session_id = orchestrator.ensure_panel_session(
+            workspace_id,
+            None,
+            panel_id,
+            Some(uuid::Uuid::new_v4()),
+            "claude",
+        );
+
+        orchestrator.apply_observations(vec![PanelRuntimeObservation {
+            panel_id,
+            runtime_session_id: Some(uuid::Uuid::new_v4()),
+            workspace_id,
+            title: "claude".to_owned(),
+            visible_text: "Tests passed. Ready for review.".to_owned(),
+            alive: true,
+            recent_output: true,
+            attached: true,
+            minimized: false,
+            agent_status: Some(AgentStatusReport {
+                state: AgentStatusState::Working,
+                tool: None,
+                prompt: None,
+                received_at_ms: pty_clock_now_ms()
+                    .saturating_sub(super::AGENT_STATUS_TTL_MS + 5_000),
+            }),
+        }]);
+
+        let session = orchestrator
+            .sessions()
+            .iter()
+            .find(|session| session.session_id == session_id)
+            .unwrap();
+        assert_eq!(session.status, AgentStatus::Reviewing);
     }
 
     #[test]
@@ -1883,6 +2095,7 @@ mod tests {
             recent_output: true,
             attached: true,
             minimized: false,
+            agent_status: None,
         }]);
 
         let session = orchestrator
@@ -1900,7 +2113,7 @@ mod tests {
     }
 
     #[test]
-    fn git_inspection_skips_heuristic_generic_panel_sessions() {
+    fn git_inspection_of_plain_terminals_uses_the_slow_cadence() {
         let mut orchestrator = Orchestrator::new();
         let workspace_id = uuid::Uuid::new_v4();
         let panel_id = uuid::Uuid::new_v4();
@@ -1927,13 +2140,80 @@ mod tests {
             recent_output: true,
             attached: true,
             minimized: false,
+            agent_status: None,
         };
 
+        let now = Utc::now();
+        // Un terminal común sí se inspecciona (alimenta el badge de branch)...
+        assert!(should_inspect_git_for_session(
+            session,
+            &observation,
+            now,
+            None
+        ));
+        // ...pero la cadencia rápida de los agentes no le alcanza: entre
+        // GIT_INSPECT_INTERVAL_SECS y GIT_INSPECT_INTERVAL_PLAIN_SECS no se
+        // vuelve a inspeccionar.
         assert!(!should_inspect_git_for_session(
             session,
             &observation,
-            Utc::now(),
-            None,
+            now,
+            Some(now - chrono::Duration::seconds(GIT_INSPECT_INTERVAL_SECS + 1)),
+        ));
+        assert!(should_inspect_git_for_session(
+            session,
+            &observation,
+            now,
+            Some(now - chrono::Duration::seconds(GIT_INSPECT_INTERVAL_PLAIN_SECS + 1)),
+        ));
+    }
+
+    #[test]
+    fn minimized_or_detached_panels_are_never_inspected() {
+        let mut orchestrator = Orchestrator::new();
+        let workspace_id = uuid::Uuid::new_v4();
+        let panel_id = uuid::Uuid::new_v4();
+        let session_id = orchestrator.ensure_panel_session(
+            workspace_id,
+            Some(PathBuf::from("/tmp")),
+            panel_id,
+            Some(uuid::Uuid::new_v4()),
+            "zsh",
+        );
+        let session = orchestrator
+            .state
+            .sessions
+            .iter()
+            .find(|session| session.session_id == session_id)
+            .unwrap();
+        let base = PanelRuntimeObservation {
+            panel_id,
+            runtime_session_id: Some(uuid::Uuid::new_v4()),
+            workspace_id,
+            title: "zsh".to_owned(),
+            visible_text: String::new(),
+            alive: true,
+            recent_output: false,
+            attached: true,
+            minimized: false,
+            agent_status: None,
+        };
+        let now = Utc::now();
+
+        let minimized = PanelRuntimeObservation {
+            minimized: true,
+            ..base.clone()
+        };
+        assert!(!should_inspect_git_for_session(
+            session, &minimized, now, None
+        ));
+
+        let detached = PanelRuntimeObservation {
+            attached: false,
+            ..base.clone()
+        };
+        assert!(!should_inspect_git_for_session(
+            session, &detached, now, None
         ));
     }
 
@@ -1977,6 +2257,7 @@ mod tests {
             recent_output: true,
             attached: true,
             minimized: false,
+            agent_status: None,
         };
         let now = Utc::now();
 
@@ -2060,6 +2341,7 @@ mod tests {
             recent_output: true,
             attached: true,
             minimized: false,
+            agent_status: None,
         }]);
 
         let matching = orchestrator.session_items(
