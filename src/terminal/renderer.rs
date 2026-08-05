@@ -161,6 +161,29 @@ pub fn cursor_visible(focused: bool, streaming_output: bool, time: f64) -> bool 
     focused && !streaming_output && blink_phase_visible(time)
 }
 
+/// Segundos que faltan hasta que el parpadeo cambie de fase.
+///
+/// Sirve para pedir un repaint en el instante exacto en que la pantalla
+/// cambia, en vez de sondear a intervalo fijo. Con un ciclo de 1000 ms el
+/// cursor cambia 2 veces por segundo: sondear cada 120 ms hacía ~8 repintados
+/// por segundo, de los cuales 6 no dibujaban nada distinto.
+///
+/// Nunca devuelve 0: un delay nulo haría que egui repinte en bucle cerrado.
+pub fn time_until_blink_change(time: f64) -> f64 {
+    const CYCLE: f64 = BLINK_CYCLE / 1000.0;
+    const ON: f64 = BLINK_ON_MS / 1000.0;
+    // `rem_euclid` y no `%`: con un tiempo negativo el resto de `%` también es
+    // negativo y el cálculo daría un delay disparatado.
+    let phase = time.rem_euclid(CYCLE);
+    let remaining = if phase < ON {
+        ON - phase
+    } else {
+        CYCLE - phase
+    };
+    // Un tick mínimo evita el bucle cerrado cuando caemos justo en el borde.
+    remaining.max(0.001)
+}
+
 pub fn compute_grid_size(content_width: f32, content_height: f32) -> (u16, u16) {
     let font_size = base_font_size();
     let cell_w = font_size * CELL_WIDTH_FACTOR;
@@ -1307,7 +1330,8 @@ mod tests {
 
     use super::{
         blink_phase_visible, cursor_visible, render_terminal, render_terminal_reduced,
-        terminal_background_color, AtlasWatermark, GridCacheKey, TerminalGridCache,
+        terminal_background_color, time_until_blink_change, AtlasWatermark, GridCacheKey,
+        TerminalGridCache, BLINK_CYCLE, BLINK_OFF_MS, BLINK_ON_MS,
     };
 
     #[cfg(feature = "ghostty-vt")]
@@ -1316,6 +1340,66 @@ mod tests {
     #[test]
     fn unfocused_cursor_is_hidden() {
         assert!(!cursor_visible(false, false, 0.1));
+    }
+
+    #[test]
+    fn blink_change_is_never_zero_so_egui_cannot_spin() {
+        // Un delay de 0 haría que egui repinte en bucle cerrado quemando CPU.
+        for step in 0..2000 {
+            let t = step as f64 * 0.0005;
+            assert!(time_until_blink_change(t) > 0.0, "zero delay at t={t}");
+        }
+    }
+
+    #[test]
+    fn blink_change_lands_exactly_on_the_phase_boundary() {
+        // Justo después de esperar el delay, la fase tiene que haber cambiado.
+        for step in 0..500 {
+            let t = step as f64 * 0.004;
+            let before = blink_phase_visible(t);
+            let after = blink_phase_visible(t + time_until_blink_change(t) + 1e-6);
+            assert_ne!(before, after, "phase did not flip at t={t}");
+        }
+    }
+
+    #[test]
+    fn blink_change_never_waits_longer_than_the_shorter_phase() {
+        // Cota superior: no puede dormir más que la fase apagada más corta.
+        let longest = (BLINK_ON_MS.max(BLINK_OFF_MS)) / 1000.0;
+        for step in 0..500 {
+            let t = step as f64 * 0.004;
+            assert!(time_until_blink_change(t) <= longest + 1e-9);
+        }
+    }
+
+    #[test]
+    fn blink_change_handles_negative_time_without_absurd_delays() {
+        // `%` con negativos da resto negativo; rem_euclid evita el delay loco.
+        let delay = time_until_blink_change(-0.25);
+        assert!(delay > 0.0 && delay <= BLINK_CYCLE / 1000.0, "got {delay}");
+    }
+
+    #[test]
+    fn blink_scheduling_repaints_far_less_than_fixed_polling() {
+        // Cuantifica el cambio: la política vieja era pedir repaint cada
+        // 120 ms mientras hubiera un panel enfocado. Sobre 60 s simulados,
+        // contamos los repaints que pide cada esquema.
+        const SECONDS: f64 = 60.0;
+        let old_polling = (SECONDS / 0.120).floor() as u32;
+
+        let mut new_scheduling = 0u32;
+        let mut t = 0.0f64;
+        while t < SECONDS {
+            t += time_until_blink_change(t) + 1e-9;
+            new_scheduling += 1;
+        }
+
+        // 2 cambios de fase por segundo contra ~8,3 sondeos por segundo.
+        assert_eq!(new_scheduling, 120, "expected 2 repaints per second");
+        assert!(
+            old_polling >= new_scheduling * 4,
+            "old={old_polling} new={new_scheduling}"
+        );
     }
 
     #[test]

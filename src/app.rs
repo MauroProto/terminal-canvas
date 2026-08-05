@@ -89,6 +89,7 @@ pub struct TerminalApp {
     search_panel_id: Option<Uuid>,
     code_review: Option<CodeReviewState>,
     diff_loader: crate::orchestration::DiffLoader,
+    worktree_ops: crate::orchestration::WorktreeOps,
     quick_open: Option<QuickOpenState>,
     quick_open_rx: Option<std::sync::mpsc::Receiver<Vec<String>>>,
     file_viewer: Option<file_viewer_ui::FileViewerState>,
@@ -177,6 +178,7 @@ impl TerminalApp {
                 search_panel_id: None,
                 code_review: None,
                 diff_loader: crate::orchestration::DiffLoader::default(),
+                worktree_ops: crate::orchestration::WorktreeOps::default(),
                 quick_open: None,
                 quick_open_rx: None,
                 file_viewer: None,
@@ -248,6 +250,7 @@ impl TerminalApp {
                 search_panel_id: None,
                 code_review: None,
                 diff_loader: crate::orchestration::DiffLoader::default(),
+                worktree_ops: crate::orchestration::WorktreeOps::default(),
                 quick_open: None,
                 quick_open_rx: None,
                 file_viewer: None,
@@ -708,6 +711,7 @@ impl TerminalApp {
         self.sync_window_transitions(ctx);
         self.maybe_refresh_orchestration();
         self.poll_diff_loader();
+        self.poll_worktree_ops();
         self.poll_quick_open();
         if self.code_review.as_ref().is_some_and(|state| state.loading) {
             ctx.request_repaint_after(std::time::Duration::from_millis(80));
@@ -832,6 +836,36 @@ impl TerminalApp {
 
     /// Sesiones de agente del workspace activo que piden atención, para la
     /// sección "Atención" del sidebar.
+    /// Cuándo hay que repintar para animar el cursor, o `None` si no hace falta
+    /// repintar por su cuenta.
+    ///
+    /// Antes esto era un repaint fijo cada 120 ms mientras hubiera un panel
+    /// enfocado y vivo: ~8 frames por segundo para siempre, aunque no cambiara
+    /// nada. Dos recortes:
+    ///
+    /// - Con la ventana del SO sin foco no se dibuja cursor, así que la app en
+    ///   segundo plano no repinta nada.
+    /// - Con foco se pide el repaint en el instante exacto del próximo cambio
+    ///   de fase (2 por segundo) en vez de sondear.
+    fn cursor_blink_repaint_delay(&self, ctx: &egui::Context) -> Option<Duration> {
+        let window_focused = ctx.input(|input| input.focused);
+        if !window_focused {
+            return None;
+        }
+        let has_live_focused_panel = self
+            .ws()
+            .panels
+            .iter()
+            .any(|panel| panel.focused() && panel.is_alive() && !panel.minimized());
+        if !has_live_focused_panel {
+            return None;
+        }
+        let now = ctx.input(|input| input.time);
+        Some(Duration::from_secs_f64(
+            crate::terminal::renderer::time_until_blink_change(now),
+        ))
+    }
+
     /// Guarda el scrollback de cada panel vivo de todos los workspaces y borra
     /// los archivos de paneles que ya no existen.
     fn persist_scrollbacks(&mut self) {
@@ -1151,13 +1185,8 @@ impl TerminalApp {
 
         if let Some(delay) = self.repaint_policy.next_repaint_delay(Instant::now()) {
             ctx.request_repaint_after(delay.max(Duration::from_millis(1)));
-        } else if self
-            .ws()
-            .panels
-            .iter()
-            .any(|panel| panel.focused() && panel.is_alive())
-        {
-            ctx.request_repaint_after(Duration::from_millis(120));
+        } else if let Some(delay) = self.cursor_blink_repaint_delay(ctx) {
+            ctx.request_repaint_after(delay);
         }
         perf_snapshot.frame_time = frame_started_at.elapsed();
         self.last_perf_snapshot = perf_snapshot;
