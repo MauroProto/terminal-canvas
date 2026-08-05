@@ -9,6 +9,7 @@ pub mod panel;
 pub mod pty;
 pub mod renderer;
 pub mod scrollbar;
+pub mod search;
 pub mod session_controller;
 
 #[cfg(test)]
