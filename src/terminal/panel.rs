@@ -11,11 +11,14 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use egui::{pos2, vec2, Align2, Color32, FontId, Pos2, Rect, Rounding, Sense, Stroke, Vec2};
+use egui::{
+    pos2, vec2, Align2, Color32, FontId, Modifiers, PointerButton, Pos2, Rect, Rounding, Sense,
+    Stroke, Vec2,
+};
 use uuid::Uuid;
 
 use alacritty_terminal::grid::{Dimensions, Scroll};
-use alacritty_terminal::index::{Column, Point, Side};
+use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{point_to_viewport, viewport_to_point, Term};
@@ -34,21 +37,28 @@ use crate::state::PanelState;
 #[cfg(feature = "ghostty-vt")]
 use crate::terminal::backend::TerminalBackendKind;
 use crate::terminal::input::{
-    is_paste_shortcut, key_to_bytes, paste_bytes, should_copy_selection, wheel_action, WheelAction,
+    agent_prompt_bytes, clipboard_event_fallback_bytes, is_paste_shortcut, key_to_bytes,
+    mouse_click_sgr_sequence, mouse_motion_sgr_sequence, paste_bytes, should_copy_selection,
+    wheel_action, InputMode, ScrollAccumulator, WheelAction,
 };
 use crate::terminal::layout::{
-    cell_side_from_position, grid_metrics, grid_point_from_position, terminal_cell_from_pointer,
+    cell_side_from_position, grid_metrics, grid_padding, grid_point_from_position,
+    terminal_cell_from_pointer,
 };
+use crate::terminal::metrics::{base_font_size, MIN_TEXT_RENDER_FONT_SIZE, PAD_X, PAD_Y};
 use crate::terminal::pty::{PtyHandle, TerminalScrollState};
 use crate::terminal::renderer::{
     compute_grid_size, render_terminal, render_terminal_preview, render_terminal_reduced,
-    TerminalGridCache, FONT_SIZE, MIN_TEXT_RENDER_FONT_SIZE, PAD_X, PAD_Y,
+    TerminalGridCache,
 };
 #[cfg(feature = "ghostty-vt")]
 use crate::terminal::renderer::{render_ghostty_text_snapshot, GhosttyGridCache};
 use crate::terminal::scrollbar::{
     scrollbar_pointer_to_scrollback, scrollbar_thumb_height, terminal_body_rect,
     terminal_scrollbar_rect,
+};
+use crate::terminal::search::{
+    display_offset_for_match, find_next, SearchQuery, MAX_HIGHLIGHT_LINES,
 };
 use crate::terminal::session_controller::{session_spec, SessionController};
 use crate::utils::platform::default_shell;
@@ -68,6 +78,10 @@ pub const BORDER_DEFAULT: Color32 = Color32::from_rgb(56, 56, 56);
 pub const BORDER_FOCUS: Color32 = Color32::from_rgb(110, 110, 110);
 pub const FG: Color32 = Color32::from_rgb(244, 244, 244);
 pub const DIM_FG: Color32 = Color32::from_rgb(110, 110, 110);
+/// Fondo del badge de branch: apenas más claro que la barra de título.
+const BRANCH_BADGE_BG: Color32 = Color32::from_rgb(38, 38, 38);
+/// Punto que marca "hay cambios sin commitear" (ámbar, no rojo: no es error).
+const BRANCH_DIRTY_DOT: Color32 = Color32::from_rgb(226, 178, 96);
 pub const MAC_RED: Color32 = Color32::from_rgb(244, 244, 244);
 pub const MAC_YELLOW: Color32 = Color32::from_rgb(170, 170, 170);
 pub const MAC_GREEN: Color32 = Color32::from_rgb(208, 208, 208);
@@ -78,10 +92,11 @@ pub const MIN_TITLE_TEXT_WIDTH: f32 = 132.0;
 pub const MIN_RESIZE_GRIP_WIDTH: f32 = 150.0;
 #[allow(dead_code)]
 pub const MIN_RESIZE_GRIP_HEIGHT: f32 = 110.0;
-pub const MIN_TERMINAL_RENDER_ZOOM: f32 = MIN_TEXT_RENDER_FONT_SIZE / FONT_SIZE;
+pub fn min_terminal_render_zoom() -> f32 {
+    MIN_TEXT_RENDER_FONT_SIZE / base_font_size()
+}
 pub const MIN_TERMINAL_RENDER_WIDTH: f32 = 40.0;
 pub const MIN_TERMINAL_RENDER_HEIGHT: f32 = 28.0;
-const STREAMING_OUTPUT_WINDOW: Duration = Duration::from_millis(350);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResizeHandle {
@@ -114,6 +129,18 @@ pub struct PanelInteraction {
     pub cache_hit: bool,
 }
 
+/// Estado de búsqueda en el scrollback de este panel. La consulta se edita
+/// desde la barra de búsqueda de la app; el match actual se resalta y Enter
+/// salta al siguiente (con wrap-around).
+#[derive(Default, Clone)]
+pub struct PanelSearch {
+    pub query: String,
+    pub current: Option<(Point, Point)>,
+    /// Resultado del último `search_find_next`: `Some(false)` = sin
+    /// coincidencias (para mostrar feedback), `None` = todavía no se buscó.
+    pub found: Option<bool>,
+}
+
 pub struct TerminalPanel {
     pub id: Uuid,
     pub title: String,
@@ -144,6 +171,9 @@ pub struct TerminalPanel {
     #[cfg(feature = "ghostty-vt")]
     ghostty_render_cache: GhosttyGridCache,
     last_scrollbar_state: Option<TerminalScrollState>,
+    scroll_accumulator: ScrollAccumulator,
+    last_mouse_cell: Option<(usize, usize)>,
+    search: Option<PanelSearch>,
 }
 
 impl TerminalPanel {
@@ -176,6 +206,9 @@ impl TerminalPanel {
             #[cfg(feature = "ghostty-vt")]
             ghostty_render_cache: GhosttyGridCache::default(),
             last_scrollbar_state: None,
+            scroll_accumulator: ScrollAccumulator::default(),
+            last_mouse_cell: None,
+            search: None,
         }
     }
 
@@ -235,6 +268,11 @@ impl TerminalPanel {
 
     pub fn runtime_session_attached(&self) -> bool {
         self.session.is_attached()
+    }
+
+    /// Último cwd reportado por el shell vía OSC 7, si el shell lo emite.
+    pub fn current_cwd(&self) -> Option<String> {
+        self.with_pty(|pty| pty.current_cwd()).flatten()
     }
 
     pub fn set_share_scope(&mut self, scope: PanelShareScope) {
@@ -412,12 +450,14 @@ impl TerminalPanel {
 
     pub fn orchestration_observation(&self, workspace_id: Uuid) -> PanelRuntimeObservation {
         let mut visible_text = String::new();
+        let mut agent_status = None;
         let attached = self.runtime_session_attached();
         let recent_output = self
             .with_pty(|pty| {
                 if let Ok(term) = pty.term.try_lock() {
                     visible_text = visible_text_snapshot(&term, 16, 180);
                 }
+                agent_status = pty.agent_status_snapshot();
                 pty.output_elapsed() <= Duration::from_secs(4)
             })
             .unwrap_or(false);
@@ -440,6 +480,11 @@ impl TerminalPanel {
             },
             attached,
             minimized: self.minimized,
+            agent_status: if self.minimized || !attached {
+                None
+            } else {
+                agent_status
+            },
         }
     }
 
@@ -497,6 +542,22 @@ impl TerminalPanel {
                         let bytes = paste_bytes(text, &mode);
                         let _ = self.with_pty(|pty| pty.write_all(&bytes));
                         self.record_input_text(text);
+                    }
+                    // egui-winit intercepta Cmd+C/Cmd+X (y Ctrl+C/Ctrl+X donde
+                    // Ctrl es "command") y entrega estos eventos en lugar de
+                    // la tecla: el atajo de copiar solo llega por acá.
+                    egui::Event::Copy | egui::Event::Cut => {
+                        if has_selection {
+                            if let Some(text) = self.selected_text() {
+                                if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                                    let _ = clipboard.set_text(text);
+                                }
+                            }
+                        } else if let Some(bytes) =
+                            clipboard_event_fallback_bytes(matches!(event, egui::Event::Cut))
+                        {
+                            let _ = self.with_pty(|pty| pty.write_all(bytes));
+                        }
                     }
                     _ => {}
                 }
@@ -562,7 +623,7 @@ impl TerminalPanel {
         let point = pointer
             .and_then(|pointer| self.mouse_cell_from_pointer(pointer, viewport, canvas_rect));
 
-        match wheel_action(delta, &mode, point) {
+        match wheel_action(delta, &mode, point, &mut self.scroll_accumulator) {
             Some(WheelAction::Pty(bytes)) => {
                 let _ = self.with_pty(|pty| pty.write_all(&bytes));
             }
@@ -571,6 +632,176 @@ impl TerminalPanel {
             }
             None => {}
         }
+    }
+
+    pub fn search_active(&self) -> bool {
+        self.search.is_some()
+    }
+
+    pub fn search_query(&self) -> &str {
+        self.search
+            .as_ref()
+            .map(|search| search.query.as_str())
+            .unwrap_or("")
+    }
+
+    pub fn search_open(&mut self) {
+        if self.search.is_none() {
+            self.search = Some(PanelSearch::default());
+        }
+    }
+
+    pub fn search_close(&mut self) {
+        if self.search.take().is_some() {
+            self.session.with_pty(PtyHandle::mark_render_dirty);
+        }
+    }
+
+    /// Actualiza la consulta; si cambió, descarta el match actual (Enter lo
+    /// re-busca desde el inicio).
+    pub fn search_set_query(&mut self, query: String) {
+        let Some(search) = self.search.as_mut() else {
+            return;
+        };
+        if search.query != query {
+            search.query = query;
+            search.current = None;
+            search.found = None;
+        }
+    }
+
+    /// Resultado del último `search_find_next` (para feedback en la barra).
+    pub fn search_found(&self) -> Option<bool> {
+        self.search.as_ref().and_then(|search| search.found)
+    }
+
+    /// Busca el próximo match desde el actual (wrap-around al fondo del
+    /// historial si no queda nada adelante) y lo revela haciendo scroll.
+    pub fn search_find_next(&mut self) {
+        let Some((query_text, after)) = self
+            .search
+            .as_ref()
+            .map(|search| (search.query.clone(), search.current.map(|(_, end)| end)))
+        else {
+            return;
+        };
+        let mut query = match SearchQuery::compile(&query_text) {
+            Some(query) => query,
+            None => {
+                if let Some(search) = self.search.as_mut() {
+                    search.current = None;
+                }
+                return;
+            }
+        };
+        let Some(handle) = self.session_handle() else {
+            return;
+        };
+        let Ok(pty) = handle.lock() else {
+            return;
+        };
+        let new_match = {
+            let Ok(term) = pty.term.try_lock() else {
+                return;
+            };
+            find_next(&term, &mut query, after).map(|matched| (*matched.start(), *matched.end()))
+        };
+        if let Some((start, _)) = new_match {
+            if let Some(state) = pty.scroll_state() {
+                if let Some(target) = display_offset_for_match(
+                    start,
+                    state.display_offset,
+                    state.visible_rows,
+                    state.history_size,
+                ) {
+                    pty.scroll_to_display_offset(target);
+                }
+            }
+        }
+        if let Some(search) = self.search.as_mut() {
+            search.found = Some(new_match.is_some());
+            search.current = new_match;
+        }
+        pty.mark_render_dirty();
+    }
+
+    /// Inyecta un prompt/feedback en el terminal del agente: sanitiza bytes de
+    /// escape, lo manda como bracketed paste (si el TUI lo activó) y lo
+    /// submits con Enter. Si el panel estaba detached (recién spawneado),
+    /// difiere la inyección hasta que el TUI renderice algo, para no mandar el
+    /// texto a un agente que todavía arranca.
+    pub fn send_prompt(&mut self, text: &str) {
+        if text.trim().is_empty() {
+            return;
+        }
+        let was_attached = self.session.is_attached();
+        self.session.ensure_attached();
+        if was_attached {
+            // Ya está corriendo: inyectá directo.
+            let mode = self.session.input_mode();
+            let bytes = agent_prompt_bytes(text, &mode);
+            let _ = self.with_pty(|pty| pty.write_all(&bytes));
+        } else {
+            // Recién spawneado: diferí hasta que renderice.
+            self.session.queue_prompt(text);
+        }
+    }
+
+    /// Badge `⎇ branch` con un punto cuando el repo está sucio. Se dibuja sólo
+    /// si `branch_badge_rect` confirma que hay lugar libre a la derecha del
+    /// título.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_branch_badge(
+        &self,
+        painter: &egui::Painter,
+        title_rect: Rect,
+        title_right: f32,
+        branch: &str,
+        dirty: bool,
+        chrome_zoom: f32,
+    ) {
+        let font = FontId::proportional((11.0 * chrome_zoom).clamp(7.0, 11.0));
+        let label = format!("⎇ {branch}");
+        let galley = painter.layout_no_wrap(label, font, DIM_FG);
+        // El punto de "sucio" va después del texto, con su propio aire.
+        let dot_radius = (2.5 * chrome_zoom).clamp(1.5, 2.5);
+        let dot_space = if dirty { dot_radius * 2.0 + 5.0 } else { 0.0 };
+        let padding = vec2(8.0, 3.0);
+        let size = vec2(
+            galley.size().x + dot_space + padding.x * 2.0,
+            galley.size().y + padding.y * 2.0,
+        );
+        let Some(rect) = branch_badge_rect(title_rect, title_right, size) else {
+            return;
+        };
+        painter.rect_filled(rect, 5.0, BRANCH_BADGE_BG);
+        let text_pos = pos2(
+            rect.left() + padding.x,
+            rect.center().y - galley.size().y * 0.5,
+        );
+        painter.galley(text_pos, galley, DIM_FG);
+        if dirty {
+            painter.circle_filled(
+                pos2(rect.right() - padding.x - dot_radius, rect.center().y),
+                dot_radius,
+                BRANCH_DIRTY_DOT,
+            );
+        }
+    }
+
+    /// Reinyecta el historial guardado de una corrida anterior en el grid.
+    /// Devuelve `false` si el panel todavía no tiene terminal (sigue detached),
+    /// para que quien llama pueda reintentarlo cuando se attachee.
+    pub fn restore_history(&mut self, text: &str) -> bool {
+        let bytes = crate::state::scrollback_store::replay_bytes(text);
+        self.with_pty(|pty| pty.replay_history(&bytes)).is_some()
+    }
+
+    /// Historial completo (scrollback + pantalla) como texto plano. `None` si
+    /// la sesión está detached y no tiene un terminal vivo que leer.
+    pub fn scrollback_text(&self) -> Option<String> {
+        self.with_pty(|pty| pty.with_term(|term| crate::terminal::export::scrollback_to_text(term)))
+            .flatten()
     }
 
     pub fn shared_snapshot(&self) -> SharedPanelSnapshot {
@@ -639,6 +870,51 @@ impl TerminalPanel {
             column: column.min(max_column),
             line: row.min(max_row),
         })
+    }
+
+    fn report_mouse_click(
+        &mut self,
+        button: u8,
+        release: bool,
+        modifiers: &Modifiers,
+        pointer: Pos2,
+        viewport: &Viewport,
+        canvas_rect: Rect,
+    ) {
+        let Some(cell) = self.mouse_cell_from_pointer(pointer, viewport, canvas_rect) else {
+            return;
+        };
+        self.last_mouse_cell = Some((cell.column, cell.line));
+        let bytes = mouse_click_sgr_sequence(button, release, modifiers, cell.column, cell.line);
+        let _ = self.with_pty(|pty| pty.write_all(&bytes));
+    }
+
+    fn report_mouse_motion_if_moved(
+        &mut self,
+        mode: &InputMode,
+        modifiers: &Modifiers,
+        primary_down: bool,
+        pointer: Pos2,
+        viewport: &Viewport,
+        canvas_rect: Rect,
+    ) {
+        let drag_ok = primary_down && mode.mouse_drag;
+        let hover_ok = !primary_down && mode.mouse_motion;
+        if !drag_ok && !hover_ok {
+            return;
+        }
+        let Some(cell) = self.mouse_cell_from_pointer(pointer, viewport, canvas_rect) else {
+            return;
+        };
+        let cell_key = (cell.column, cell.line);
+        if self.last_mouse_cell == Some(cell_key) {
+            return;
+        }
+        self.last_mouse_cell = Some(cell_key);
+        // SGR: botón 0 = arrastre con izquierdo; 3 = movimiento sin botón.
+        let button = if primary_down { 0 } else { 3 };
+        let bytes = mouse_motion_sgr_sequence(button, modifiers, cell.column, cell.line);
+        let _ = self.with_pty(|pty| pty.write_all(&bytes));
     }
 
     pub fn hit_test(
@@ -748,29 +1024,144 @@ impl TerminalPanel {
                 ui.id().with(("body", self.id)),
                 Sense::click_and_drag(),
             );
-            if body_response.clicked() {
-                interaction.clicked = true;
-                self.session.clear_selection();
+            let input_mode = self.session.input_mode();
+            let pointer_in_body = ui
+                .ctx()
+                .input(|input| input.pointer.latest_pos())
+                .filter(|pos| body_hit_rect.contains(*pos));
+            // Si el TUI pidió reporte de mouse (htop, vim, codex, apps
+            // ratatui) los clicks/drags se reenvían como secuencias SGR 1006
+            // en vez de iniciar selección local.
+            let mouse_reporting = input_mode.mouse_mode && pointer_in_body.is_some();
+            if mouse_reporting {
+                self.session.ensure_attached();
+                if let Some(pointer) = pointer_in_body {
+                    let modifiers = ui.ctx().input(|input| input.modifiers);
+                    let button_events: Vec<(u8, bool, bool)> = ui.ctx().input(|input| {
+                        [
+                            (PointerButton::Primary, 0_u8),
+                            (PointerButton::Middle, 1),
+                            (PointerButton::Secondary, 2),
+                        ]
+                        .iter()
+                        .map(|(button, code)| {
+                            (
+                                *code,
+                                input.pointer.button_pressed(*button),
+                                input.pointer.button_released(*button),
+                            )
+                        })
+                        .collect()
+                    });
+                    for (code, pressed, released) in button_events {
+                        if pressed {
+                            interaction.clicked = true;
+                            self.report_mouse_click(
+                                code,
+                                false,
+                                &modifiers,
+                                pointer,
+                                viewport,
+                                canvas_rect,
+                            );
+                        }
+                        if released {
+                            self.report_mouse_click(
+                                code,
+                                true,
+                                &modifiers,
+                                pointer,
+                                viewport,
+                                canvas_rect,
+                            );
+                        }
+                    }
+                    let primary_down = ui.ctx().input(|input| input.pointer.primary_down());
+                    if !primary_down || input_mode.mouse_drag || input_mode.mouse_motion {
+                        self.report_mouse_motion_if_moved(
+                            &input_mode,
+                            &modifiers,
+                            primary_down,
+                            pointer,
+                            viewport,
+                            canvas_rect,
+                        );
+                    }
+                }
+            } else {
+                self.last_mouse_cell = None;
+                if body_response.clicked() {
+                    // Cmd+click (macOS) / Ctrl+click abre la URL bajo el cursor.
+                    let url_mods = ui.ctx().input(|input| input.modifiers);
+                    let url_click = if cfg!(target_os = "macos") {
+                        url_mods.command
+                    } else {
+                        url_mods.ctrl
+                    };
+                    let mut opened_url = false;
+                    if url_click {
+                        if let Some(pointer) = body_response.interact_pointer_pos() {
+                            opened_url = self.try_open_url_at_pointer(
+                                pointer,
+                                content_rect,
+                                canvas_rect,
+                                zoom,
+                            );
+                        }
+                    }
+                    interaction.clicked = true;
+                    if !opened_url {
+                        self.session.clear_selection();
+                    }
+                }
+                if body_response.double_clicked() {
+                    interaction.clicked = true;
+                    if let Some(pointer) = body_response.interact_pointer_pos() {
+                        self.begin_selection(
+                            pointer,
+                            content_rect,
+                            canvas_rect,
+                            zoom,
+                            SelectionType::Semantic,
+                        );
+                        self.copy_selection_if_enabled();
+                    }
+                }
+                if body_response.triple_clicked() {
+                    interaction.clicked = true;
+                    if let Some(pointer) = body_response.interact_pointer_pos() {
+                        self.begin_selection(
+                            pointer,
+                            content_rect,
+                            canvas_rect,
+                            zoom,
+                            SelectionType::Lines,
+                        );
+                        self.copy_selection_if_enabled();
+                    }
+                }
+                if body_response.drag_started() {
+                    interaction.clicked = true;
+                    if let Some(pointer) = body_response.interact_pointer_pos() {
+                        self.begin_selection(
+                            pointer,
+                            content_rect,
+                            canvas_rect,
+                            zoom,
+                            SelectionType::Simple,
+                        );
+                    }
+                }
+                if body_response.dragged() {
+                    if let Some(pointer) = body_response.interact_pointer_pos() {
+                        self.update_selection(pointer, content_rect, canvas_rect, zoom);
+                    }
+                }
+                if body_response.drag_stopped() && !body_response.clicked() {
+                    self.copy_selection_if_enabled();
+                }
             }
             interaction.hovered_terminal = body_response.hovered();
-
-            if body_response.drag_started() {
-                interaction.clicked = true;
-                if let Some(pointer) = body_response.interact_pointer_pos() {
-                    self.begin_selection(
-                        pointer,
-                        content_rect,
-                        canvas_rect,
-                        zoom,
-                        SelectionType::Simple,
-                    );
-                }
-            }
-            if body_response.dragged() {
-                if let Some(pointer) = body_response.interact_pointer_pos() {
-                    self.update_selection(pointer, content_rect, canvas_rect, zoom);
-                }
-            }
         } else {
             interaction.hovered_terminal = false;
         }
@@ -871,16 +1262,32 @@ impl TerminalPanel {
                     PanelLod::Full => 12.0,
                 }
             };
-            chrome_painter.text(
+            let title_galley_rect = chrome_painter.text(
                 title_rect.left_center() + vec2(title_offset, 0.0),
                 Align2::LEFT_CENTER,
                 title_text,
                 FontId::proportional((15.5 * chrome_zoom).clamp(7.0, 15.5)),
                 if self.is_alive() { FG } else { DIM_FG },
             );
+            // Badge de branch a la derecha, sólo en LOD Full y sólo si entra
+            // sin pisar el título (branch_badge_rect decide). El resto de los
+            // badges se sacó antes por ruido visual; este se limita a mostrar
+            // el contexto git, que es lo que importa en multi-agente.
+            if matches!(lod, PanelLod::Full) {
+                if let Some(overlay) = overlay {
+                    if let Some(branch) = overlay.branch.as_deref().filter(|b| !b.is_empty()) {
+                        self.draw_branch_badge(
+                            &chrome_painter,
+                            title_rect,
+                            title_galley_rect.right(),
+                            branch,
+                            overlay.dirty,
+                            chrome_zoom,
+                        );
+                    }
+                }
+            }
         }
-        // Share-scope and backend badges removed: they don't aid the user
-        // and clutter the minimal header.
         let content_clip_rect = content_rect.intersect(canvas_rect);
         let content_painter = painter.with_clip_rect(content_clip_rect);
         let content_rounding = roundings.body;
@@ -899,14 +1306,8 @@ impl TerminalPanel {
         let mut updated_activity_label: Option<Option<String>> = None;
         let mut activity_label_scan_at = None;
         let mut scrollbar_state = self.last_scrollbar_state;
-        let render_tier = render_tier_for_panel(
-            content_rect,
-            zoom,
-            lod,
-            fast_path_render,
-            self.focused,
-            self.session.with_pty(is_streaming_output).unwrap_or(false),
-        );
+        let render_tier =
+            render_tier_for_panel(content_rect, zoom, lod, fast_path_render, self.focused);
         interaction.render_tier = Some(render_tier);
         if matches!(render_tier, RenderTier::Full | RenderTier::ReducedLive) {
             let (cols, rows) = compute_grid_size(self.size.x, self.size.y - TITLE_BAR_HEIGHT);
@@ -956,6 +1357,7 @@ impl TerminalPanel {
                 {
                     if let Ok(mut term) = pty.term.try_lock() {
                         term.is_focused = self.focused;
+                        let display_offset_now = term.grid().display_offset();
                         scrollbar_state = Some(TerminalScrollState {
                             display_offset: term.grid().display_offset(),
                             visible_rows: term.screen_lines(),
@@ -996,6 +1398,18 @@ impl TerminalPanel {
                                 );
                             }
                             RenderTier::Preview | RenderTier::Hidden => {}
+                        }
+                        if let Some(search) = self.search.as_ref() {
+                            if let Some((start, end)) = search.current {
+                                draw_search_highlight(
+                                    &content_painter,
+                                    content_rect,
+                                    zoom,
+                                    display_offset_now,
+                                    start,
+                                    end,
+                                );
+                            }
                         }
                     } else {
                         let preview_label = overlay
@@ -1057,7 +1471,7 @@ impl TerminalPanel {
                 content_rect.left_top() + vec2(12.0, 12.0),
                 Align2::LEFT_TOP,
                 error,
-                FontId::monospace(FONT_SIZE),
+                FontId::monospace(base_font_size()),
                 Color32::from_rgb(244, 244, 244),
             );
         }
@@ -1095,6 +1509,54 @@ impl TerminalPanel {
 
     fn selected_text(&self) -> Option<String> {
         self.session.selected_text()
+    }
+
+    /// Copia la selección al portapapeles si `copy_on_select` está activo.
+    fn copy_selection_if_enabled(&self) {
+        if !crate::config::runtime_config().copy_on_select {
+            return;
+        }
+        if let Some(text) = self.selected_text().filter(|text| !text.is_empty()) {
+            if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                let _ = clipboard.set_text(text);
+            }
+        }
+    }
+
+    /// Si hay una URL en la celda bajo el puntero, la abre con la app default
+    /// del SO. Devuelve true si abrió algo.
+    fn try_open_url_at_pointer(
+        &self,
+        pointer: Pos2,
+        content_rect: Rect,
+        canvas_rect: Rect,
+        zoom: f32,
+    ) -> bool {
+        let Some(handle) = self.session_handle() else {
+            return false;
+        };
+        let Ok(pty) = handle.lock() else {
+            return false;
+        };
+        let Ok(term) = pty.term.try_lock() else {
+            return false;
+        };
+        let visible_rows = term.screen_lines() as u16;
+        let visible_cols = term.columns() as u16;
+        let cell = terminal_cell_from_pointer(
+            content_rect.intersect(canvas_rect),
+            pointer,
+            zoom,
+            visible_rows,
+            visible_cols,
+        );
+        let url = cell.and_then(|cell| url_at_cell(&term, cell.line, cell.column));
+        drop(term);
+        let Some(url) = url else {
+            return false;
+        };
+        let _ = crate::utils::platform::open_path_external(std::path::Path::new(&url));
+        true
     }
 
     fn record_input_text(&mut self, text: &str) {
@@ -1288,5 +1750,64 @@ impl TerminalPanel {
 impl Drop for TerminalPanel {
     fn drop(&mut self) {
         self.close_runtime_session();
+    }
+}
+
+const SEARCH_HIGHLIGHT: Color32 = Color32::from_rgb(212, 160, 60);
+
+/// Resalta el match de búsqueda visible: un rect por línea del rango que
+/// entra en el viewport (las líneas fuera de pantalla se saltean).
+fn draw_search_highlight(
+    painter: &egui::Painter,
+    content_rect: Rect,
+    zoom: f32,
+    display_offset: usize,
+    start: Point,
+    end: Point,
+) {
+    let metrics = grid_metrics(zoom);
+    let (pad_x, pad_y) = grid_padding(zoom);
+    let cols = {
+        let last_col = end.column.0.max(start.column.0);
+        last_col + 1
+    };
+    let mut line = start.line;
+    let mut drawn_lines = 0usize;
+    loop {
+        let col_start = if line == start.line {
+            start.column.0
+        } else {
+            0
+        };
+        let col_end = if line == end.line {
+            end.column.0
+        } else {
+            cols.saturating_sub(1)
+        };
+        if let Some(viewport_point) =
+            point_to_viewport(display_offset, Point::new(line, Column(col_start)))
+        {
+            let x0 = content_rect.left() + pad_x + col_start as f32 * metrics.char_width;
+            let x1 = content_rect.left() + pad_x + (col_end as f32 + 1.0) * metrics.char_width;
+            let y = content_rect.top() + pad_y + viewport_point.line as f32 * metrics.line_height;
+            let rect =
+                Rect::from_min_size(pos2(x0, y), vec2((x1 - x0).max(1.0), metrics.line_height));
+            painter.rect_filled(
+                rect,
+                2.0,
+                Color32::from_rgba_premultiplied(
+                    SEARCH_HIGHLIGHT.r(),
+                    SEARCH_HIGHLIGHT.g(),
+                    SEARCH_HIGHLIGHT.b(),
+                    70,
+                ),
+            );
+            painter.rect_stroke(rect, 2.0, Stroke::new(1.0, SEARCH_HIGHLIGHT));
+        }
+        drawn_lines += 1;
+        if line == end.line || drawn_lines >= MAX_HIGHLIGHT_LINES {
+            break;
+        }
+        line = Line(line.0 + 1);
     }
 }
