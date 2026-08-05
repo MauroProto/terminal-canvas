@@ -17,6 +17,7 @@ use portable_pty::{native_pty_system, Child, ChildKiller, CommandBuilder, Master
 use uuid::Uuid;
 
 use crate::runtime::SharedRuntimeScheduler;
+use crate::terminal::agent_status::{AgentStatusReport, AgentStatusStream};
 #[cfg(feature = "ghostty-vt")]
 use crate::terminal::backend::{runtime_backend_from_env, TerminalBackendKind};
 use crate::terminal::colors::indexed_to_egui;
@@ -42,9 +43,10 @@ impl EventListener for EventProxy {
 }
 
 fn osc52_clipboard_enabled() -> bool {
+    // El env tiene prioridad (override rápido); sin env manda la config.
     std::env::var("MI_TERMINAL_ALLOW_OSC52")
         .map(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
-        .unwrap_or(false)
+        .unwrap_or_else(|_| crate::config::runtime_config().allow_osc52)
 }
 
 fn pty_clock_epoch() -> Instant {
@@ -52,7 +54,10 @@ fn pty_clock_epoch() -> Instant {
     *EPOCH.get_or_init(Instant::now)
 }
 
-fn pty_clock_now_ms() -> i64 {
+/// Reloj monotónico del runtime (ms desde el arranque). Lo comparten el
+/// lector PTY (última salida, reports de estado de agente) y la orquestación
+/// (chequeo de frescura), así que debe ser el mismo reloj.
+pub(crate) fn pty_clock_now_ms() -> i64 {
     Instant::now()
         .saturating_duration_since(pty_clock_epoch())
         .as_millis() as i64
@@ -67,6 +72,9 @@ pub struct PtyHandle {
     last_output_at: Arc<AtomicI64>,
     window_size: Arc<Mutex<WindowSize>>,
     render_revision: Arc<AtomicU64>,
+    agent_status: Arc<ArcSwap<Option<AgentStatusReport>>>,
+    /// Último cwd reportado por el shell vía OSC 7 (si el shell lo emite).
+    cwd: Arc<ArcSwap<Option<String>>>,
     scrollback_limit: usize,
     #[cfg(feature = "ghostty-vt")]
     backend_kind: TerminalBackendKind,
@@ -119,8 +127,13 @@ impl PtyHandle {
             cell_height: 0,
         }));
         let render_revision = Arc::new(AtomicU64::new(0));
+        let agent_status = Arc::new(ArcSwap::from_pointee(None));
+        let cwd = Arc::new(ArcSwap::from_pointee(None));
         let (event_tx, event_rx) = mpsc::channel::<Event>();
-        let term_config = TermConfig::default();
+        let term_config = TermConfig {
+            scrolling_history: crate::config::runtime_config().scrollback_lines,
+            ..TermConfig::default()
+        };
         let scrollback_limit = term_config.scrolling_history;
         let term = Arc::new(Mutex::new(Term::new(
             term_config,
@@ -160,6 +173,8 @@ impl PtyHandle {
         let ghostty_for_reader = ghostty_runtime.clone();
         let window_size_for_reader = Arc::clone(&window_size);
         let render_revision_for_reader = Arc::clone(&render_revision);
+        let agent_status_for_reader = Arc::clone(&agent_status);
+        let cwd_for_reader = Arc::clone(&cwd);
         let scheduler_for_reader = Arc::clone(&scheduler);
         let reader_thread = thread::spawn(move || {
             // The parser processes untrusted terminal output; if it ever
@@ -168,19 +183,29 @@ impl PtyHandle {
             let loop_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let mut buf = vec![0_u8; 65_536];
                 let mut processor = Processor::<StdSyncHandler>::new();
+                let mut agent_stream = AgentStatusStream::new();
                 loop {
                     match reader.read(&mut buf) {
                         Ok(0) => break,
                         Ok(read) => {
+                            let now_ms = pty_clock_now_ms();
+                            let (clean, agent_reports, cwd_reports) =
+                                agent_stream.process(&buf[..read], now_ms);
+                            if let Some(report) = agent_reports.into_iter().next_back() {
+                                agent_status_for_reader.store(Arc::new(Some(report)));
+                            }
+                            if let Some(new_cwd) = cwd_reports.into_iter().next_back() {
+                                cwd_for_reader.store(Arc::new(Some(new_cwd)));
+                            }
                             if let Ok(mut term) = term_for_reader.lock() {
-                                processor.advance(&mut *term, &buf[..read]);
+                                processor.advance(&mut *term, &clean);
                             }
                             #[cfg(feature = "ghostty-vt")]
                             if let Some(ghostty) = &ghostty_for_reader {
-                                ghostty.feed(&buf[..read]);
+                                ghostty.feed(&clean);
                             }
                             render_revision_for_reader.fetch_add(1, Ordering::Relaxed);
-                            output_for_reader.store(pty_clock_now_ms(), Ordering::Relaxed);
+                            output_for_reader.store(now_ms, Ordering::Relaxed);
                             if let Ok(mut scheduler) = scheduler_for_reader.lock() {
                                 scheduler.record_output(session_id);
                             }
@@ -227,6 +252,8 @@ impl PtyHandle {
             last_output_at,
             window_size,
             render_revision,
+            agent_status,
+            cwd,
             scrollback_limit,
             #[cfg(feature = "ghostty-vt")]
             backend_kind,
@@ -287,8 +314,21 @@ impl PtyHandle {
             app_cursor: mode.contains(TermMode::APP_CURSOR),
             bracketed_paste: mode.contains(TermMode::BRACKETED_PASTE),
             mouse_mode: mode.intersects(TermMode::MOUSE_MODE),
+            mouse_drag: mode.intersects(TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION),
+            mouse_motion: mode.contains(TermMode::MOUSE_MOTION),
             alt_screen: mode.contains(TermMode::ALT_SCREEN),
         }
+    }
+
+    /// Último report de estado de agente recibido por el canal OSC 9999,
+    /// si alguno. El sello `received_at_ms` usa `pty_clock_now_ms`.
+    pub fn agent_status_snapshot(&self) -> Option<AgentStatusReport> {
+        (*self.agent_status.load_full()).clone()
+    }
+
+    /// Último cwd reportado por el shell vía OSC 7, si alguno.
+    pub fn current_cwd(&self) -> Option<String> {
+        (*self.cwd.load_full()).clone()
     }
 
     #[cfg(feature = "ghostty-vt")]
@@ -325,6 +365,25 @@ impl PtyHandle {
     pub fn with_term<R>(&self, f: impl FnOnce(&mut Term<EventProxy>) -> R) -> Option<R> {
         let mut term = self.term.try_lock().ok()?;
         Some(f(&mut term))
+    }
+
+    /// Reinyecta bytes directamente en el grid, **sin** pasarlos al PTY: se usa
+    /// para restaurar el scrollback de una sesión anterior. Usa un parser
+    /// propio y efímero porque es una pasada única y no debe compartir estado
+    /// con el parser del hilo lector.
+    pub fn replay_history(&self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        // `lock` (no `try_lock`): la restauración ocurre una sola vez y perder
+        // el historial por contención sería peor que esperar un instante.
+        let Ok(mut term) = self.term.lock() else {
+            return;
+        };
+        let mut processor = Processor::<StdSyncHandler>::new();
+        processor.advance(&mut *term, bytes);
+        drop(term);
+        self.mark_render_dirty();
     }
 
     pub fn title_snapshot(&self) -> Option<String> {
@@ -385,10 +444,25 @@ impl PtyHandle {
 }
 
 fn shell_command(cwd: Option<&Path>) -> CommandBuilder {
+    let configured_shell = crate::config::runtime_config()
+        .shell
+        .filter(|shell| !shell.trim().is_empty());
+
     #[cfg(unix)]
-    let mut cmd = CommandBuilder::new_default_prog();
+    let mut cmd = match configured_shell {
+        Some(shell) => {
+            let mut builder = CommandBuilder::new(shell);
+            // Login shell, como el default del sistema.
+            builder.arg("-l");
+            builder
+        }
+        None => CommandBuilder::new_default_prog(),
+    };
     #[cfg(windows)]
-    let mut cmd = CommandBuilder::new(default_shell());
+    let mut cmd = match configured_shell {
+        Some(shell) => CommandBuilder::new(shell),
+        None => CommandBuilder::new(default_shell()),
+    };
 
     if let Some(cwd) = cwd {
         cmd.cwd(cwd);
@@ -470,6 +544,9 @@ fn drain_terminal_events(
             Event::Bell => {
                 bell_fired.store(true, Ordering::Relaxed);
                 sched_flags.bell = true;
+                if crate::config::runtime_config().audio_bell {
+                    crate::utils::platform::play_bell_sound();
+                }
             }
             Event::Exit | Event::ChildExit(_) => {
                 alive.store(false, Ordering::Relaxed);
