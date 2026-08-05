@@ -189,3 +189,112 @@ pub(super) fn cwd_label(cwd: Option<&Path>) -> String {
         .unwrap_or("Terminal")
         .to_owned()
 }
+
+/// Busca una URL en la celda (fila de viewport `row`, columna `col`) del
+/// grid visible. Extrae el token contiguo alrededor de la celda y lo valida
+/// como URL (scheme http/https o `www.`). Devuelve `None` si no hay URL.
+pub(super) fn url_at_cell(
+    term: &Term<crate::terminal::pty::EventProxy>,
+    row: usize,
+    col: usize,
+) -> Option<String> {
+    let content = term.renderable_content();
+    let display_offset = content.display_offset;
+
+    // Juntá los caracteres de la fila objetivo, ordenados por columna.
+    let mut cells: Vec<(usize, char)> = Vec::new();
+    for indexed in content.display_iter {
+        let Some(point) = point_to_viewport(display_offset, indexed.point) else {
+            continue;
+        };
+        if point.line != row {
+            continue;
+        }
+        let ch = indexed.cell.c;
+        if ch == '\0' || indexed.cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+            continue;
+        }
+        cells.push((point.column.0, if ch.is_control() { ' ' } else { ch }));
+    }
+    if cells.is_empty() {
+        return None;
+    }
+    cells.sort_by_key(|(column, _)| *column);
+
+    // Mapeá columnas a índices de la fila (una columna por glifo).
+    let cols: Vec<usize> = cells.iter().map(|(column, _)| *column).collect();
+    let chars: Vec<char> = cells.iter().map(|(_, ch)| *ch).collect();
+    let idx = cols.iter().position(|column| *column == col)?;
+
+    let is_url_char = |c: char| {
+        !c.is_whitespace() && !matches!(c, '"' | '\'' | '<' | '>' | '`' | '|' | '(' | ')')
+    };
+    let mut start = idx;
+    while start > 0 && is_url_char(chars[start - 1]) {
+        start -= 1;
+    }
+    let mut end = idx;
+    while end + 1 < chars.len() && is_url_char(chars[end + 1]) {
+        end += 1;
+    }
+    let token: String = chars[start..=end].iter().collect();
+    let token = token.trim_end_matches(['.', ',', ';', ':', ')', ']', '}']);
+    looks_like_url(token).then(|| token.to_owned())
+}
+
+fn looks_like_url(token: &str) -> bool {
+    let lower = token.to_ascii_lowercase();
+    (lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("www."))
+        && token.chars().count() >= 8
+}
+
+#[cfg(test)]
+mod url_tests {
+    use super::{looks_like_url, url_at_cell};
+
+    #[test]
+    fn url_validation_requires_scheme_or_www() {
+        assert!(looks_like_url("https://example.com/path"));
+        assert!(looks_like_url("http://localhost:8080"));
+        assert!(looks_like_url("www.example.com"));
+        assert!(!looks_like_url("example.com"));
+        assert!(!looks_like_url("notaurl"));
+        assert!(!looks_like_url("http://"));
+    }
+
+    fn term_with(text: &str) -> alacritty_terminal::term::Term<crate::terminal::pty::EventProxy> {
+        use alacritty_terminal::term::test::TermSize;
+        use alacritty_terminal::term::{Config as TermConfig, Term};
+        use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut term = Term::new(
+            TermConfig::default(),
+            &TermSize::new(60, 5),
+            crate::terminal::pty::EventProxy::new(tx),
+        );
+        let mut processor = Processor::<StdSyncHandler>::new();
+        processor.advance(&mut term, text.as_bytes());
+        term
+    }
+
+    #[test]
+    fn url_at_cell_extracts_url_under_cursor() {
+        let term = term_with("visit https://example.com/page now");
+        // "visit " ocupa cols 0-5; la URL arranca en col 6.
+        let url = url_at_cell(&term, 0, 10);
+        assert_eq!(url.as_deref(), Some("https://example.com/page"));
+    }
+
+    #[test]
+    fn url_at_cell_returns_none_for_plain_text() {
+        let term = term_with("hello world no links here");
+        assert_eq!(url_at_cell(&term, 0, 3), None);
+    }
+
+    #[test]
+    fn url_at_cell_strips_trailing_punctuation() {
+        let term = term_with("see https://example.com/a.");
+        let url = url_at_cell(&term, 0, 8);
+        assert_eq!(url.as_deref(), Some("https://example.com/a"));
+    }
+}
