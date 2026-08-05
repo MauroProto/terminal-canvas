@@ -6,6 +6,7 @@ use crate::state::Workspace;
 use crate::theme::colors::{DIM, FOCUS, INK, LINE, RAISED, SURFACE, TEXT, TEXT_STRONG};
 use crate::update::UpdateState;
 
+pub mod file_tree;
 pub mod workspace_list;
 
 pub const SIDEBAR_BG: egui::Color32 = INK;
@@ -23,10 +24,11 @@ pub const ITEM_BG: egui::Color32 = RAISED;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SidebarTab {
     Workspaces,
+    Files,
     Online,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SidebarResponse {
     SwitchWorkspace(usize),
     OpenFolder,
@@ -38,6 +40,37 @@ pub enum SidebarResponse {
     FocusPanel(uuid::Uuid),
     SpawnTerminal(usize),
     RenamePanel(uuid::Uuid),
+    ReviewPanelChanges(uuid::Uuid),
+    OpenSettings,
+    OpenBroadcast,
+    ExportScrollback,
+    /// Abrir este archivo en el visor interno (desde el explorador).
+    OpenFileInViewer(std::path::PathBuf),
+}
+
+/// Acciones del pie del sidebar. Están acá (y no sólo en la paleta de comandos
+/// y los atajos) porque si no hay un botón visible, la función no existe para
+/// quien no se aprendió el atajo.
+///
+/// Los iconos se limitan a glifos que las fuentes por defecto de egui sí
+/// traen: con símbolos exóticos (U+21C9, U+2B33) salía el cuadrito vacío.
+fn footer_actions() -> [(&'static str, &'static str, SidebarResponse); 3] {
+    [
+        ("⚙", "Settings", SidebarResponse::OpenSettings),
+        ("»", "Broadcast", SidebarResponse::OpenBroadcast),
+        ("↓", "Export output", SidebarResponse::ExportScrollback),
+    ]
+}
+const FOOTER_ACTION_COUNT: usize = 3;
+
+/// Sesión de agente que pide atención (esperando aprobación, input o fallida);
+/// el sidebar la lista con acción de foco directo.
+#[derive(Debug, Clone)]
+pub struct AttentionItem {
+    pub panel_id: uuid::Uuid,
+    pub label: String,
+    pub provider: &'static str,
+    pub status: &'static str,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,6 +130,8 @@ impl Sidebar {
         update_state: &UpdateState,
         collab_mode: CollabMode,
         collab_state: CollabSessionState,
+        attention: &[AttentionItem],
+        file_tree: &mut file_tree::FileTreeState,
     ) -> Vec<SidebarResponse> {
         let mut responses = Vec::new();
 
@@ -119,6 +154,10 @@ impl Sidebar {
         responses.extend(self.show_tabs(ui));
         ui.add_space(8.0);
 
+        // Reservamos el alto del pie para que la lista no lo tape.
+        let footer_height = FOOTER_ACTION_COUNT as f32 * FOOTER_ROW_HEIGHT + 16.0;
+        let scroll_height = (ui.available_height() - footer_height).max(0.0);
+
         ui.scope(|ui| {
             // Ocultamos el thumb del scrollbar (la "barrita blanca") manteniendo
             // el track. El usuario sigue pudiendo scrollear con rueda/trackpad.
@@ -126,14 +165,27 @@ impl Sidebar {
             visuals.widgets.inactive.bg_fill = egui::Color32::TRANSPARENT;
             visuals.widgets.hovered.bg_fill = egui::Color32::TRANSPARENT;
             visuals.widgets.active.bg_fill = egui::Color32::TRANSPARENT;
-            ScrollArea::vertical().show(ui, |ui| match self.active_tab {
-                SidebarTab::Workspaces => {
-                    responses.extend(draw_workspace_tree(ui, workspaces, active_ws));
-                }
-                SidebarTab::Online => {
-                    responses.extend(self.show_online_panel(ui, collab_mode, collab_state));
-                }
-            });
+            ScrollArea::vertical()
+                .max_height(scroll_height)
+                .show(ui, |ui| match self.active_tab {
+                    SidebarTab::Workspaces => {
+                        if !attention.is_empty() {
+                            responses.extend(draw_attention_section(ui, attention));
+                        }
+                        responses.extend(draw_workspace_tree(ui, workspaces, active_ws));
+                    }
+                    SidebarTab::Files => {
+                        responses.extend(file_tree::draw_file_tree(ui, file_tree));
+                    }
+                    SidebarTab::Online => {
+                        responses.extend(self.show_online_panel(ui, collab_mode, collab_state));
+                    }
+                });
+        });
+
+        // El pie queda pegado al fondo del sidebar, no debajo de la lista.
+        ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+            responses.extend(draw_sidebar_footer(ui));
         });
 
         responses
@@ -154,6 +206,7 @@ impl Sidebar {
                 "Workspaces",
                 "sidebar-tab-workspaces",
             ),
+            (SidebarTab::Files, "Files", "sidebar-tab-files"),
             (SidebarTab::Online, "Online", "sidebar-tab-online"),
         ];
 
@@ -275,6 +328,152 @@ impl Sidebar {
 
         responses
     }
+}
+
+/// Lista de sesiones que piden atención: un click lleva el foco al panel.
+fn draw_attention_section(ui: &mut Ui, attention: &[AttentionItem]) -> Vec<SidebarResponse> {
+    let mut responses = Vec::new();
+    ui.add_space(2.0);
+    ui.horizontal(|ui| {
+        ui.add_space(14.0);
+        ui.label(
+            RichText::new(format!("Atención ({})", attention.len()))
+                .size(11.0)
+                .color(TEXT_PRIMARY),
+        );
+    });
+    ui.add_space(2.0);
+    for item in attention.iter().take(8) {
+        let (rect, response) =
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), 30.0), Sense::click());
+        if response.hovered() {
+            ui.painter().rect_filled(rect.shrink(1.0), 4.0, ITEM_BG);
+        }
+        let dot_color = if item.status == "Failed" {
+            egui::Color32::from_rgb(224, 108, 108)
+        } else {
+            egui::Color32::from_rgb(222, 178, 92)
+        };
+        ui.painter().circle_filled(
+            egui::pos2(rect.left() + 18.0, rect.center().y),
+            3.0,
+            dot_color,
+        );
+        let label = if item.label.trim().is_empty() {
+            format!("{} · {}", item.provider, item.status)
+        } else {
+            format!(
+                "{} · {}",
+                truncate_sidebar_label(&item.label, 18),
+                item.status
+            )
+        };
+        ui.painter().text(
+            egui::pos2(rect.left() + 30.0, rect.center().y),
+            Align2::LEFT_CENTER,
+            label,
+            FontId::proportional(11.0),
+            if response.hovered() {
+                TEXT_PRIMARY
+            } else {
+                TEXT
+            },
+        );
+        // Botón "diff": abre el code review de esa sesión.
+        let diff_rect = egui::Rect::from_min_size(
+            egui::pos2(rect.right() - 52.0, rect.center().y - 9.0),
+            egui::vec2(44.0, 18.0),
+        );
+        let diff_response = ui.interact(
+            diff_rect,
+            ui.id().with(("attention-diff", item.panel_id)),
+            Sense::click(),
+        );
+        let diff_color = if diff_response.hovered() {
+            TEXT_PRIMARY
+        } else {
+            TEXT_MUTED
+        };
+        ui.painter()
+            .rect_stroke(diff_rect, 4.0, Stroke::new(1.0, diff_color));
+        ui.painter().text(
+            diff_rect.center(),
+            Align2::CENTER_CENTER,
+            "diff",
+            FontId::monospace(9.5),
+            diff_color,
+        );
+        if diff_response.clicked() {
+            responses.push(SidebarResponse::ReviewPanelChanges(item.panel_id));
+        } else if response.clicked() {
+            responses.push(SidebarResponse::FocusPanel(item.panel_id));
+        }
+    }
+    ui.add_space(8.0);
+    responses
+}
+
+fn truncate_sidebar_label(label: &str, max_chars: usize) -> String {
+    let count = label.chars().count();
+    if count <= max_chars {
+        label.to_owned()
+    } else {
+        format!(
+            "{}…",
+            label
+                .chars()
+                .take(max_chars.saturating_sub(1))
+                .collect::<String>()
+        )
+    }
+}
+
+const FOOTER_ROW_HEIGHT: f32 = 26.0;
+
+/// Fila de acciones al pie del sidebar. `bottom_up` hace que se dibujen de
+/// abajo hacia arriba, así que iteramos al revés para que queden en el orden
+/// declarado en `FOOTER_ACTIONS`.
+fn draw_sidebar_footer(ui: &mut Ui) -> Vec<SidebarResponse> {
+    let mut responses = Vec::new();
+    ui.add_space(8.0);
+    let width = ui.available_width();
+    for (icon, label, response) in footer_actions().into_iter().rev() {
+        if footer_button(ui, icon, label, width) {
+            responses.push(response);
+        }
+    }
+    responses
+}
+
+fn footer_button(ui: &mut Ui, icon: &str, label: &str, width: f32) -> bool {
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(width.max(60.0), FOOTER_ROW_HEIGHT),
+        Sense::click(),
+    );
+    if response.hovered() {
+        ui.painter()
+            .rect_filled(rect.shrink2(egui::vec2(4.0, 2.0)), 5.0, RAISED);
+    }
+    let color = if response.hovered() {
+        TEXT_PRIMARY
+    } else {
+        TEXT_MUTED
+    };
+    ui.painter().text(
+        egui::pos2(rect.left() + 10.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        icon,
+        FontId::proportional(12.5),
+        color,
+    );
+    ui.painter().text(
+        egui::pos2(rect.left() + 28.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        label,
+        FontId::proportional(11.5),
+        color,
+    );
+    response.clicked()
 }
 
 fn render_text_link(ui: &mut Ui, label: &str, slot_width: f32, primary: bool) -> bool {
