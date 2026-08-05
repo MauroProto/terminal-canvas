@@ -26,6 +26,12 @@ impl WorkspacePanel {
         }
     }
 
+    pub fn current_cwd(&self) -> Option<String> {
+        match self {
+            Self::Terminal(panel) => panel.current_cwd(),
+        }
+    }
+
     pub fn title(&self) -> &str {
         match self {
             Self::Terminal(panel) => &panel.title,
@@ -286,6 +292,66 @@ impl WorkspacePanel {
     pub fn shared_snapshot(&self) -> SharedPanelSnapshot {
         match self {
             Self::Terminal(panel) => panel.shared_snapshot(),
+        }
+    }
+
+    pub fn search_active(&self) -> bool {
+        match self {
+            Self::Terminal(panel) => panel.search_active(),
+        }
+    }
+
+    pub fn search_query(&self) -> &str {
+        match self {
+            Self::Terminal(panel) => panel.search_query(),
+        }
+    }
+
+    pub fn search_open(&mut self) {
+        match self {
+            Self::Terminal(panel) => panel.search_open(),
+        }
+    }
+
+    pub fn search_close(&mut self) {
+        match self {
+            Self::Terminal(panel) => panel.search_close(),
+        }
+    }
+
+    pub fn search_set_query(&mut self, query: String) {
+        match self {
+            Self::Terminal(panel) => panel.search_set_query(query),
+        }
+    }
+
+    pub fn search_found(&self) -> Option<bool> {
+        match self {
+            Self::Terminal(panel) => panel.search_found(),
+        }
+    }
+
+    pub fn search_find_next(&mut self) {
+        match self {
+            Self::Terminal(panel) => panel.search_find_next(),
+        }
+    }
+
+    pub fn send_prompt(&mut self, text: &str) {
+        match self {
+            Self::Terminal(panel) => panel.send_prompt(text),
+        }
+    }
+
+    pub fn scrollback_text(&self) -> Option<String> {
+        match self {
+            Self::Terminal(panel) => panel.scrollback_text(),
+        }
+    }
+
+    pub fn restore_history(&mut self, text: &str) -> bool {
+        match self {
+            Self::Terminal(panel) => panel.restore_history(text),
         }
     }
 }

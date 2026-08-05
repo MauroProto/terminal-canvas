@@ -198,13 +198,25 @@ impl Workspace {
         }
         // El foco lo asigna bring_to_front al final; escribirlo acá dejaría
         // dos paneles enfocados hasta esa llamada.
-        let cwd = request.cwd.as_deref().or(self.cwd.as_deref());
+        //
+        // Herencia de cwd: primero el pedido explícito, después el cwd que el
+        // shell del panel enfocado reportó vía OSC 7 (si existe el dir), y al
+        // final el cwd del workspace.
+        let focused_cwd = self
+            .focused_panel()
+            .and_then(|panel| panel.current_cwd())
+            .filter(|cwd| Path::new(cwd).is_dir());
+        let cwd: Option<PathBuf> = request
+            .cwd
+            .clone()
+            .or_else(|| focused_cwd.map(PathBuf::from))
+            .or_else(|| self.cwd.clone());
         panel.attach_session_with_spec(
             Arc::clone(&self.pty_manager),
-            cwd,
+            cwd.as_deref(),
             SessionSpec {
                 title: panel.title.clone(),
-                cwd: cwd.map(Path::to_path_buf),
+                cwd: cwd.clone(),
                 startup_command: request.startup_command.clone(),
                 startup_input: request.startup_input.clone(),
             },
@@ -409,6 +421,22 @@ impl Workspace {
 
     pub fn panel(&self, panel_id: Uuid) -> Option<&CanvasPanel> {
         self.panels.iter().find(|panel| panel.id() == panel_id)
+    }
+
+    pub fn panel_mut(&mut self, panel_id: Uuid) -> Option<&mut CanvasPanel> {
+        self.panels.iter_mut().find(|panel| panel.id() == panel_id)
+    }
+
+    /// Inyecta un prompt/feedback en el panel indicado (si existe y es un
+    /// terminal). Usado por el code review para devolverle notas al agente.
+    pub fn send_prompt_to_panel(&mut self, panel_id: Uuid, text: &str) -> bool {
+        match self.panel_mut(panel_id) {
+            Some(panel) => {
+                panel.send_prompt(text);
+                true
+            }
+            None => false,
+        }
     }
 
     pub fn panel_pair_mut(

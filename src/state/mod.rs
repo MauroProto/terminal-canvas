@@ -1,5 +1,6 @@
 pub mod panel_state;
 pub mod persistence;
+pub mod scrollback_store;
 pub mod workspace;
 
 pub use panel_state::{PanelPlacement, PanelState, SnapSlot};
