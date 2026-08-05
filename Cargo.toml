@@ -81,6 +81,8 @@ rustls = "0.23"
 rustls-pemfile = "2"
 mimalloc = { version = "0.1", default-features = false }
 arc-swap = "1"
+syntect = { version = "5.3.0", default-features = false, features = ["default-fancy"] }
+two-face = { version = "0.5.1", default-features = false, features = ["syntect-fancy"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
@@ -97,10 +99,24 @@ opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
+# Un overflow aritmético silencioso corrompe estado (índices de grid,
+# offsets de scrollback); panichear lo convierte en un bug visible que el
+# contenedor de panics del update loop absorbe sin cerrar la app.
+overflow-checks = true
 
 [profile.dist]
 inherits = "release"
 lto = "thin"
 
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
 [lints.clippy]
 too_many_arguments = "allow"
+# Todo bloque unsafe debe justificar por qué es sound.
+undocumented_unsafe_blocks = "deny"
+# Marcadores de trabajo a medias no llegan a master.
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+mem_forget = "deny"
