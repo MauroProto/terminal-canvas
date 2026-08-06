@@ -211,6 +211,9 @@ impl Workspace {
             .clone()
             .or_else(|| focused_cwd.map(PathBuf::from))
             .or_else(|| self.cwd.clone());
+        // Recordamos con qué comando arrancó para poder reanudar la
+        // conversación del agente si la app se reinicia.
+        panel.set_agent_command(request.startup_command.clone());
         panel.attach_session_with_spec(
             Arc::clone(&self.pty_manager),
             cwd.as_deref(),
@@ -729,6 +732,7 @@ mod tests {
                 restore_placement: None,
                 restore_bounds: Some(SavedPanelBounds::new([20.0, 30.0], [420.0, 260.0])),
                 share_scope: PanelShareScope::VisibleOnly,
+                agent_command: None,
             }],
             desktop: WorkspaceDesktopState {
                 next_z: 2,
@@ -772,6 +776,7 @@ mod tests {
                 restore_placement: None,
                 restore_bounds: Some(SavedPanelBounds::new([20.0, 30.0], [420.0, 260.0])),
                 share_scope: PanelShareScope::VisibleOnly,
+                agent_command: None,
             }],
             desktop: WorkspaceDesktopState {
                 next_z: 2,
@@ -816,6 +821,7 @@ mod tests {
                     [420.0, 260.0],
                 )),
                 share_scope: PanelShareScope::VisibleOnly,
+                agent_command: None,
             })
             .collect();
         let state = WorkspaceState {

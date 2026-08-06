@@ -411,6 +411,7 @@ mod tests {
                     restore_placement: None,
                     restore_bounds: Some(SavedPanelBounds::new([10.0, 20.0], [300.0, 200.0])),
                     share_scope: PanelShareScope::VisibleOnly,
+                    agent_command: None,
                 }],
                 desktop: WorkspaceDesktopState {
                     next_z: 2,

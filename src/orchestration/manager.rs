@@ -1856,6 +1856,49 @@ fn extract_prompt_command(visible_text: &str) -> Option<String> {
     None
 }
 
+/// Comando con el que relanzar un agente al restaurar un panel, de forma que
+/// **continúe** la conversación anterior en vez de empezar una nueva.
+///
+/// Los CLI de agentes guardan su historial indexado por directorio de trabajo
+/// (Claude Code, por ejemplo, en `~/.claude/projects/<cwd-slug>/`). El
+/// historial nunca se perdía; lo que faltaba era volver a entrar con la bandera
+/// de continuación, porque un `claude` pelado abre sesión nueva.
+///
+/// Si el comando ya trae una bandera de continuación se devuelve intacto, para
+/// no terminar con `claude --continue --continue`.
+pub fn resume_command(provider: AgentProvider, launch_command: &str) -> String {
+    let command = launch_command.trim();
+    if command.is_empty() {
+        return String::new();
+    }
+    let Some(flag) = resume_flag(provider) else {
+        return command.to_owned();
+    };
+    if already_resuming(command) {
+        return command.to_owned();
+    }
+    format!("{command} {flag}")
+}
+
+/// Bandera de continuación por proveedor, o `None` si no se conoce una (en ese
+/// caso se relanza el comando tal cual: mejor una sesión nueva que un flag
+/// inventado que haga fallar el arranque).
+fn resume_flag(provider: AgentProvider) -> Option<&'static str> {
+    match provider {
+        AgentProvider::ClaudeCode => Some("--continue"),
+        AgentProvider::OpenCode => Some("--continue"),
+        // Codex, Gemini y Aider no exponen una bandera equivalente estable.
+        AgentProvider::CodexCli | AgentProvider::GeminiCli | AgentProvider::Aider => None,
+        AgentProvider::Unknown => None,
+    }
+}
+
+fn already_resuming(command: &str) -> bool {
+    command.split_whitespace().any(|token| {
+        matches!(token, "--continue" | "-c" | "--resume" | "-r") || token.starts_with("--resume=")
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -1864,10 +1907,11 @@ mod tests {
 
     use super::super::git::parse_diff_stats;
     use super::{
-        derive_status, launch_presets, preview_label, provider_bootstrap, short_uuid,
-        should_inspect_git_for_session, slugify, AgentLaunchRequest, AgentProvider, AgentStatus,
-        DependencyKind, DiffStats, LaunchPreparation, Orchestrator, PanelRuntimeObservation,
-        TaskState, WorktreeMode, GIT_INSPECT_INTERVAL_PLAIN_SECS, GIT_INSPECT_INTERVAL_SECS,
+        derive_status, launch_presets, preview_label, provider_bootstrap, resume_command,
+        short_uuid, should_inspect_git_for_session, slugify, AgentLaunchRequest, AgentProvider,
+        AgentStatus, DependencyKind, DiffStats, LaunchPreparation, Orchestrator,
+        PanelRuntimeObservation, TaskState, WorktreeMode, GIT_INSPECT_INTERVAL_PLAIN_SECS,
+        GIT_INSPECT_INTERVAL_SECS,
     };
 
     #[test]
@@ -2376,5 +2420,62 @@ mod tests {
 
         assert_eq!(bootstrap.command.as_deref(), Some("codex"));
         assert_eq!(bootstrap.initial_input.as_deref(), Some("Review backend"));
+    }
+
+    #[test]
+    fn claude_and_opencode_resume_instead_of_starting_fresh() {
+        assert_eq!(
+            resume_command(AgentProvider::ClaudeCode, "claude"),
+            "claude --continue"
+        );
+        assert_eq!(
+            resume_command(AgentProvider::OpenCode, "opencode"),
+            "opencode --continue"
+        );
+    }
+
+    #[test]
+    fn a_command_that_already_resumes_is_left_alone() {
+        // Sin esto, restaurar dos veces daría "claude --continue --continue".
+        for command in [
+            "claude --continue",
+            "claude -c",
+            "claude --resume",
+            "claude -r 1234",
+            "claude --resume=1234",
+        ] {
+            assert_eq!(
+                resume_command(AgentProvider::ClaudeCode, command),
+                command,
+                "{command} should be untouched"
+            );
+        }
+    }
+
+    #[test]
+    fn providers_without_a_known_flag_relaunch_verbatim() {
+        // Inventar una bandera haría fallar el arranque; preferimos sesión
+        // nueva antes que un agente que no levanta.
+        for provider in [
+            AgentProvider::CodexCli,
+            AgentProvider::GeminiCli,
+            AgentProvider::Aider,
+            AgentProvider::Unknown,
+        ] {
+            assert_eq!(resume_command(provider, "algo --flag"), "algo --flag");
+        }
+    }
+
+    #[test]
+    fn extra_arguments_are_preserved() {
+        assert_eq!(
+            resume_command(AgentProvider::ClaudeCode, "claude --model opus"),
+            "claude --model opus --continue"
+        );
+    }
+
+    #[test]
+    fn an_empty_command_stays_empty() {
+        assert!(resume_command(AgentProvider::ClaudeCode, "   ").is_empty());
     }
 }

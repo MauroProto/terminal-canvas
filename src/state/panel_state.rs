@@ -58,6 +58,12 @@ pub struct PanelState {
     pub restore_bounds: Option<SavedPanelBounds>,
     #[serde(default)]
     pub share_scope: PanelShareScope,
+    /// Comando de agente con el que se lanzó este panel (`claude`, `opencode`,
+    /// …). Se persiste para poder volver a entrar al agente al restaurar; sin
+    /// esto el panel volvía como shell pelado y la conversación quedaba
+    /// huérfana en el historial del CLI.
+    #[serde(default)]
+    pub agent_command: Option<String>,
 }
 
 #[cfg(test)]
@@ -82,6 +88,7 @@ mod tests {
             restore_placement: None,
             restore_bounds: Some(SavedPanelBounds::new([40.0, 72.0], [920.0, 640.0])),
             share_scope: PanelShareScope::VisibleOnly,
+            agent_command: None,
         }
     }
 

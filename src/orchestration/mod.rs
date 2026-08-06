@@ -10,9 +10,9 @@ pub use code_diff::{
 };
 #[allow(unused_imports)]
 pub use manager::{
-    launch_presets, AgentLaunchPlan, AgentLaunchRequest, AgentProvider, AgentSessionMeta,
-    AgentStatus, CommandSummary, DependencyEdge, DependencyKind, DiffStats, InboxEvent,
-    InboxEventKind, LaunchOutcome, LaunchPreparation, OrchestrationState, Orchestrator,
+    launch_presets, resume_command, AgentLaunchPlan, AgentLaunchRequest, AgentProvider,
+    AgentSessionMeta, AgentStatus, CommandSummary, DependencyEdge, DependencyKind, DiffStats,
+    InboxEvent, InboxEventKind, LaunchOutcome, LaunchPreparation, OrchestrationState, Orchestrator,
     PanelOverlay, PanelRuntimeObservation, ReviewSummary, SceneTemplate, SceneTemplateKind,
     SessionListItem, TaskCard, TaskState, TestStatus, WorktreeMode,
 };

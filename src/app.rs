@@ -1212,8 +1212,13 @@ impl eframe::App for TerminalApp {
                     self.consecutive_update_panics
                 );
                 if self.consecutive_update_panics >= MAX_CONSECUTIVE_UPDATE_PANICS {
+                    // Camino catastrófico: acá se pierde todo lo que no esté en
+                    // disco, así que se guarda lo mismo que en una salida
+                    // limpia. Antes sólo se guardaba el layout y el scrollback
+                    // de la sesión se perdía entero.
                     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         save_state(&self.snapshot_state());
+                        self.persist_scrollbacks();
                     }));
                     std::process::exit(1);
                 }

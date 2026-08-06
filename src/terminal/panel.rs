@@ -167,6 +167,8 @@ pub struct TerminalPanel {
     command_buffer: String,
     last_activity_scan_at: f64,
     share_scope: PanelShareScope,
+    /// Comando de agente con el que se lanzó el panel, para poder reanudarlo.
+    agent_command: Option<String>,
     render_cache: TerminalGridCache,
     #[cfg(feature = "ghostty-vt")]
     ghostty_render_cache: GhosttyGridCache,
@@ -202,6 +204,7 @@ impl TerminalPanel {
             command_buffer: String::new(),
             last_activity_scan_at: 0.0,
             share_scope: PanelShareScope::VisibleOnly,
+            agent_command: None,
             render_cache: TerminalGridCache::default(),
             #[cfg(feature = "ghostty-vt")]
             ghostty_render_cache: GhosttyGridCache::default(),
@@ -230,6 +233,7 @@ impl TerminalPanel {
             .custom_title
             .clone()
             .unwrap_or_else(|| saved.title.clone());
+        panel.agent_command = saved.agent_command.clone();
         panel.focused = saved.focused && !saved.minimized;
         panel.minimized = saved.minimized;
         panel.placement = saved.placement.clone();
@@ -240,9 +244,22 @@ impl TerminalPanel {
             .or_else(|| Some(panel.rect()));
         panel.share_scope = saved.share_scope;
         let (cols, rows) = compute_grid_size(panel.size.x, panel.size.y - TITLE_BAR_HEIGHT);
+        // Si el panel corría un agente, al restaurarlo se vuelve a entrar con
+        // la bandera de continuación para retomar la conversación. Antes se
+        // pasaba `None` acá: el panel volvía como shell pelado y la sesión
+        // anterior quedaba huérfana en el historial del CLI.
+        let startup_command = panel.agent_command.as_deref().map(|command| {
+            let provider = AgentProvider::detect(command).unwrap_or_default();
+            crate::orchestration::resume_command(provider, command)
+        });
         panel.session.restore_detached_with_spec(
             pty_manager,
-            session_spec(panel.title.clone(), cwd.map(Path::to_path_buf), None, None),
+            session_spec(
+                panel.title.clone(),
+                cwd.map(Path::to_path_buf),
+                startup_command,
+                None,
+            ),
             cols,
             rows,
         );
@@ -333,6 +350,7 @@ impl TerminalPanel {
                 self.restore_bounds.unwrap_or_else(|| self.rect()),
             )),
             share_scope: self.share_scope,
+            agent_command: self.agent_command.clone(),
         }
     }
 
@@ -787,6 +805,14 @@ impl TerminalPanel {
                 BRANCH_DIRTY_DOT,
             );
         }
+    }
+
+    pub fn set_agent_command(&mut self, command: Option<String>) {
+        self.agent_command = command;
+    }
+
+    pub fn agent_command(&self) -> Option<&str> {
+        self.agent_command.as_deref()
     }
 
     /// Reinyecta el historial guardado de una corrida anterior en el grid.
