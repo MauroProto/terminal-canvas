@@ -29,6 +29,7 @@
 - [6. Estimación de tiempo y costo](#6-estimación-de-tiempo-y-costo)
 - [7. Lo que al plan le faltaba (autocrítica)](#7-lo-que-al-plan-le-faltaba-autocrítica)
 - [8. Protocolo de ejecución](#8-protocolo-de-ejecución-cómo-se-trabaja-cada-ítem)
+- [9. Desglose ejecutable completo](#9-desglose-ejecutable-completo-p1-p2-p3-y-ship-it)
 
 ---
 
@@ -730,6 +731,258 @@ Al abrir la tanda de un ítem: (1) escribir en el commit inicial el desglose de
 pasos como este, contra el código de ese momento; (2) si el ítem excede su
 presupuesto de tandas en +50%, parar y renegociar el alcance en vez de
 arrastrarlo. El presupuesto está en §6.
+
+---
+
+## 9. Desglose ejecutable completo: P1, P2, P3 y ship-it
+
+> Regla de vigencia: estos pasos se escribieron contra el código de hoy
+> (commit `5544795`). Al abrir cada tanda, el primer paso es re-validarlos
+> contra el código de ese momento; si difieren, se corrigen en el commit
+> inicial de la tanda. La definición de terminado es siempre la de §8.
+
+### P1.6 — Anotaciones por línea en el diff (2–3 tandas)
+
+**Tanda 1 — modelo puro.**
+1. Nuevo `src/orchestration/diff_notes.rs`:
+   `DiffNote { id: Uuid, file_path: String, start_line: Option<u32>, line: u32, body: String, created_at, sent_at: Option<DateTime<Utc>> }`
+   y `DiffNotes { notes: Vec<DiffNote> }` con `add`, `edit` (borra `sent_at`),
+   `remove`, `pending()` (sin `sent_at`), `mark_sent(ids, now)`.
+2. `format_note(&DiffNote) -> String` con el contrato exacto:
+   `File: {path}\nLines: {a}-{b}\nUser comment: "{body escapado}"` — body
+   escapa `"` y colapsa saltos de línea a `\n` literales.
+3. Persistencia: `save_notes/load_notes` en JSON por `repo_root` slugificado en
+   el data dir (mismo patrón que `scrollback_store::scrollback_dir`).
+4. Tests: editar borra `sent_at`; `pending` filtra; formato byte-exacto;
+   round-trip a disco; archivo corrupto → lista vacía sin panic.
+
+**Tanda 2 — UI en el review.**
+5. `src/app/code_review_ui.rs`: en el listado virtualizado de `DiffLine`s, al
+   hover de una fila pintar un `+` en el gutter (mismo patrón de hit-rect que
+   `footer_button` del sidebar). Click → estado `editing_note: Option<(file, line)>`.
+6. Fila sintética de editor debajo de la línea: `TextEdit::multiline` + botones
+   Guardar/Cancelar. Insertarla en el conteo de `show_rows` (el review ya
+   inserta filas sintéticas para headers de archivo — usar el mismo mecanismo).
+7. Notas existentes se dibujan como fila con fondo `RAISED`, borde `LINE`, y
+   botones Editar/Borrar. Contador "N notas" en el header del review.
+
+**Tanda 3 — envío.**
+8. Botón "Enviar N notas" en el header → reusar la selección de destinos de
+   `broadcast_ui` (extraer `BroadcastTarget`/listado a un helper compartido
+   `agent_targets()` en `app.rs` para no duplicar).
+9. Confirmar → concatenar `format_note()` de todas las pendientes con `\n\n`,
+   `send_prompt_to_panel`, `mark_sent`, toast "N notas enviadas".
+10. Done: captura mostrando nota creada, editada (vuelve a pendiente) y enviada.
+
+### P1.7 — Scrollback ANSI + log incremental (2–3 tandas)
+
+**Tanda 1 — export con estilo.**
+1. `src/terminal/export.rs`: nueva `scrollback_to_ansi(term) -> String` — por
+   celda emitir SGR mínimo cuando cambia respecto de la celda anterior:
+   `\x1b[38;2;r;g;bm` fg, `48;2` bg solo si ≠ default, `1m/22m` bold; `\x1b[0m`
+   al final de cada línea (evita sangrado de estilo). Reusar el recorte de
+   padding de `row_to_string`.
+2. `scrollback_store::save/load` pasan a guardar ese ANSI (el replay ya pasa
+   por el parser: los colores se restauran sin tocar nada más).
+3. Tests: una línea roja round-trip mantiene el SGR; el clamp nunca corta en
+   medio de una secuencia `\x1b[...m` (buscar el `m` de cierre al recortar).
+
+**Tanda 2 — log incremental.**
+4. Nuevo `src/state/scrollback_log.rs`: formato binario — header `MTLG` + u8
+   versión + u32 generation; frames `u8 kind (1=output,2=resize,3=clear) +
+   u32 len + payload`; `append_frame`, `read_frames` que trunca cola rota y
+   devuelve `generation`.
+5. `PtyManager`: en el drenado de output (donde ya se cuentan bytes por sesión)
+   acumular por panel un buffer "pendiente de log"; cada autosave (2 s) se
+   appendea al log en vez de reescribir el checkpoint.
+6. Checkpoint completo (el archivo actual) solo cuando: log > 1 MB (resetea con
+   generation+1), cierre limpio, o panel cerrado. Cooldown 30 s.
+7. Restore: leer checkpoint, verificar generation del log, replay checkpoint +
+   frames. Resize se aplica como `pty.resize` antes de seguir el replay.
+8. Tests: crash a mitad de frame (bytes truncados) → replay hasta el último
+   frame completo; generation mismatch → ignora el log; resize refluye.
+
+### P1.8 — Unread persistente + cooldown de notificaciones (2 tandas)
+
+**Tanda 1.**
+1. `PanelState`: campo `unread: bool` (serde default). `TerminalPanel`: setter
+   + query. Se marca `unread=true` en la transición de atención que ya computa
+   `attention_transitions` (orchestration_ui) si el panel NO está enfocado o la
+   ventana no tiene foco (`ctx.input(|i| i.focused)`).
+2. Clear "show until interact": en `forward_input_to_focused_panel`, cualquier
+   keystroke/click dirigido al panel limpia `unread`. La mera selección no.
+3. Taskbar: punto naranja (mismo dibujo del badge dirty del branch) junto al
+   título si `unread`.
+
+**Tanda 2.**
+4. Nuevo `src/app/notify_policy.rs`: `NotificationGate { last_by_workspace: HashMap<Uuid, Instant> }`
+   con `allow(workspace_id, now) -> bool` (cooldown 5 s). Puro + tests.
+5. En el dispatcher de notificaciones actual: chequear liveness del panel AL
+   despachar (si `!is_alive`, descartar — caza timers stale) y pasar por el
+   gate. Bell y agente-terminó comparten el gate por workspace.
+6. Tests: dos eventos en <5 s → una notificación; panel muerto → cero.
+
+### P1.9 — Trash diferido + salvaguardas (1–2 tandas)
+1. Nuevo `src/orchestration/worktree_trash.rs`:
+   `move_to_trash(worktree) -> Option<PathBuf>` — rename a
+   `<repo>/.terminalcanvas-trash/wt-<epoch>-<nonce8hex>`; si falla (cross-volume)
+   devolver None y seguir con borrado directo.
+2. `WorktreeOps` (ya existe): `Remove` primero desregistra
+   (`git worktree remove` sobre el dir ya renombrado falla — orden correcto:
+   rename → `git worktree prune`), después encola el delete recursivo en el
+   worker, serializado (el worker ya es un hilo único: gratis).
+3. `sweep_stale_trash(repo_root)` al abrir un workspace: borra entradas que
+   matcheen `^wt-\d+-[0-9a-f]{8}$` con edad > 5 min. Nunca sigue symlinks.
+4. Salvaguardas antes de CUALQUIER delete recursivo, en
+   `worktree_removal_safety.rs`: rechazar si path == repo_root, es ancestro del
+   repo, es `/` o un home, o contiene otro worktree registrado. Un test por
+   regla + uno de "la forma del path no es autoridad" (dir con nombre de
+   worktree pero sin `.git` file que pruebe la relación → rechazado).
+
+### P1.10 — Tabla completa de providers (1 tanda)
+1. `AgentProvider`: sumar `CursorAgent, Copilot, Goose, Amp, Crush` (los que
+   uses primero) con `launch_command`, color de taskbar, `detect()`.
+2. `resume_flag()` → `resume_invocation(provider, cmd, id) -> String` para
+   soportar el subcomando de codex (`codex resume <id>` — insertar tras el
+   binario, no al final) y `opencode --session <id>`.
+3. Sanitización P0.3 aplicada acá. Tests por provider con id inyectado.
+
+### P2.11 — Terminal splits (3–5 tandas)
+**T1**: `src/terminal/split_tree.rs` puro (enum `SplitNode`, `split/close/
+focus_next/ratio`, serde) + tests exhaustivos (cerrar hoja única, ratios clamp,
+orden de foco DFS estable).
+**T2**: `TerminalPanel` pasa de 1 `SessionController` a `HashMap<LeafId,
+SessionController>` + árbol. `show()` recorre el árbol asignando Rects (los
+helpers de grid ya toman Rect arbitrario). Render de divisores (1 px LINE, hit
+área 6 px).
+**T3**: input — foco interno por hoja (borde FOCUS en la hoja activa), atajos
+`Cmd+D/Cmd+Shift+D/Cmd+W` (cerrar hoja), drag del divisor actualiza ratio.
+**T4**: persistencia — `PanelState.split_tree: Option<Value>`; scrollback por
+`(panel_id, leaf_id)` (cambiar la clave del store con migración: archivos
+viejos = hoja raíz). Restore reanuda cada hoja (el resume por comando ya es por
+sesión).
+**T5**: pulido verificado en pantalla: badge/título por hoja activa, broadcast
+lista hojas como destinos.
+
+### P2.12 — Hooks de agente (3–4 tandas)
+**T1**: `src/orchestration/hook_server.rs`: axum en `127.0.0.1:0` (puerto
+efímero), `POST /hook/:provider` con header `X-TC-Token`; escribe
+`endpoint file` (`<data>/agent-hooks/endpoint.sh`: `export TC_HOOK_URL=...
+TC_HOOK_TOKEN=...`) en cada arranque. Canal mpsc hacia el app loop
+(`poll_hook_events` en `begin_frame`).
+**T2**: `src/orchestration/claude_hooks.rs`: merge cuidadoso de
+`~/.claude/settings.json` — insertar nuestros hooks (eventos `Stop`,
+`UserPromptSubmit`, `PermissionRequest`, `PreToolUse`) marcados con
+`"_managed_by": "terminalcanvas"`, preservando los del usuario; el comando es
+un sh de 3 líneas que sourcea el endpoint file y hace
+`curl -m 1.5 --connect-timeout 0.5 -H token -d @- $URL/hook/claude`.
+Desinstalación limpia. Tests sobre JSON de settings real (fixtures).
+**T3**: env vars al spawn (`TC_PANEL_ID`, `TC_WORKSPACE_ID`) vía
+`CommandBuilder.env` en `pty.rs::spawn`; el listener resuelve pane→panel.
+Estados: payload `Stop` → `Done`; `PermissionRequest` → `WaitingApproval`;
+`UserPromptSubmit` → `Running`. Capturar `session_id` → guardarlo en el panel
+(resume exacto: `--resume <id>` en vez de `--continue`).
+**T4**: prioridad de fuentes en `orchestration/manager.rs`: hook > OSC 9999 >
+heurística de texto, con frescura de 10 s como Orca. Tests de precedencia.
+
+### P2.13 — GitHub in-app vía gh (3–4 tandas)
+**T1**: `src/orchestration/gh_client.rs`: worker (patrón `DiffLoader`) que corre
+`gh pr list --json number,title,headRefName,state,updatedAt` y
+`gh issue list --json ...` con timeout 20 s; detección de `gh` ausente / no
+auth (`gh auth status`) → estado `Unavailable(reason)`. Cache 60 s. Tests
+parseando JSON fixture.
+**T2**: tab "Tasks" en el sidebar (tercera pestaña, patrón `SidebarTab::Files`):
+lista PRs e issues con estado y branch; refresh manual + al abrir.
+**T3**: "Start work" en un issue: crea worktree `issue-<n>-<slug>` (código de
+`prepare_launch` existente con `WorktreeMode`), lanza agente con prompt
+"Trabajá en el issue #N: <title>\n<body>" vía `startup_command` +
+`queue_prompt`. Guardar `linked_issue: Option<u64>` en la metadata del panel.
+**T4**: badge `#N` clickeable en el título del panel (abre la URL con
+`open_path_external`), y el diff del review muestra "PR #N" si la branch tiene
+PR asociado.
+
+### P2.14 — Quick open unificado (2 tandas)
+**T1**: `src/command_palette/rank.rs`: reglas ordinales antes del fuzzy —
+(1) match exacto de comando, (2) prefijo de comando, (3) nombre de panel,
+(4) archivo con bonus boundary (`/`, `.`, `-`) y bonus filename-contiene-query;
+top-K=50 con `BinaryHeap`. Cap de query 2 KB. Tests de cada regla ordinal.
+**T2**: fuentes mezcladas en `quick_open_ui`: prefijo `>` = comandos de la
+paleta, `@` = paneles/agentes, sin prefijo = archivos (+ comandos si matchean
+exacto). Enter ejecuta según tipo. Query vacío = paneles por recencia de foco.
+
+### P3.15 — Daemon de PTYs (5–8 tandas, después de P1.7)
+**T1**: `src/bin/mi-terminal-daemon.rs` + `src/daemon/protocol.rs`: NDJSON
+sobre unix socket `<data>/daemon/daemon-v1.sock` (versión en el nombre), token
+en archivo 0600, mensajes `Hello{version,token}`, `Spawn{spec}`, `Attach{id}`,
+`Write`, `Resize`, `Kill`, `List`, eventos `Output{id,seq,bytes}`, `Exit{id}`.
+**T2**: mover la posesión del PTY: el daemon linkea `terminal/pty.rs` (los
+harness de tests ya montan módulos por `#[path]` — mismo truco) y mantiene
+`HashMap<SessionId, PtyHandle>`; escribe checkpoint+log (P1.7) él mismo.
+**T3**: `PtyManager` del app pasa a cliente: `DaemonConn` con reconexión
+(`ECONNREFUSED` → respawn `fork+setsid`, 1 retry), y modo fallback in-process
+si el daemon no puede arrancar (feature flag `daemon` para migrar gradual).
+**T4**: reattach caliente — `Attach` devuelve snapshot serializado + `seq`
+actual; el cliente descarta eventos con `seq` ≤ snapshot (dedup).
+**T5**: ciclo de vida — pid-file con nonce, adoption timeout 2 min,
+`shutdownIfIdle` al cerrar la última app, kill de huérfanos cuyo workspace ya
+no existe (el daemon recibe `ReconcileLive{ids}`).
+**T6–T8**: colchón para lo que aparezca (buffer del presupuesto §6) +
+integración con collab y tests de proceso real (spawn daemon en tmp, matar la
+"app", reattach, verificar historial).
+
+### P3.16 — Flow control (2–3 tandas)
+**T1**: en el reader thread de `pty.rs`: si el buffer pendiente del panel
+supera 256 KB, **dejar de leer del fd** (el kernel bloquea al hijo); reanudar
+bajo 32 KB. Failsafe: nunca más de 5 s sin leer (timer que fuerza resume) — un
+resume perdido no puede colgar un shell. Tests con un generador que escribe
+más rápido de lo que se drena.
+**T2**: carril interactivo: el drenado por frame (pty_manager) procesa primero
+la sesión del panel enfocado con presupuesto propio (32 KB) antes del resto.
+Medir con `tests/runtime/perf_scenarios`.
+
+### P3.17 — Linear (2 tandas)
+**T1**: `linear_client.rs`: GraphQL (`issues(filter: {state})`) con token de
+`config.toml [integrations] linear_token`; mismo worker/estados que gh_client.
+**T2**: fuente extra en la tab Tasks + "Start work" idéntico a P2.13-T3.
+
+### P3.18 — Design Mode por extensión (3–4 tandas)
+**T1**: endpoint `POST /design/capture` en el hook server (P2.12) que recibe
+`{html, css, rect, screenshot_b64}` y lo escribe a tmp + arma el prompt.
+**T2**: extensión MV3 mínima (`extension/`): content script con alt+click →
+`getBoundingClientRect` + `outerHTML` + estilos computados filtrados (los ~40
+props no-default) + `chrome.tabs.captureVisibleTab` recortado → POST local.
+**T3**: en la app: toast "Elemento capturado" + envío al agente enfocado con
+formato determinístico (`Element: <selector>\nHTML: ...\nCSS: ...\n
+Screenshot: <path>`).
+**T4**: docs de instalación de la extensión (cargar descomprimida) + captura
+end-to-end verificada.
+
+### Ship-it (§7) ejecutable
+**7.1 Empaquetado (3–4 tandas)**: T1 `cargo-bundle` o script `scripts/bundle.sh`
+(estructura .app + Info.plist con `CFBundleIdentifier`, `NSHighResolutionCapable`,
+icono .icns desde assets); T2 firma `codesign --deep --options runtime` +
+notarización `notarytool` (requiere tu Developer ID — decisión tuya); T3
+`update.rs`: descargar el .dmg nuevo, montar, verificar firma, swap en
+`/Applications` al salir; T4 cask en un tap propio.
+**7.2 Onboarding (2 tandas)**: T1 `which` de cada provider al arrancar (worker)
+→ launcher solo muestra instalados, con hint de instalación para el resto; T2
+empty states (sin carpeta → botón Abrir; sin paneles → hint `Ctrl+Shift+T`) +
+overlay de 3 pasos con `dismissed` persistido en config.
+**7.3 Perf budgets (2 tandas)**: T1 en `tests/runtime/perf_scenarios.rs`:
+asserts duros — frame p95 simulado < 8 ms con 20 sesiones, 0 repaints
+programados sin foco (usar `cursor_blink_repaint_delay` con ctx sin foco);
+T2 `benches/` con criterion (render de 2000 celdas, highlight de 2000 líneas,
+parseo de diff 5000 líneas) + job de CI que compara contra el commit anterior
+y falla a +15%.
+**7.4 Smoke E2E (2–3 tandas)**: T1 agregar `egui_kittest` como dev-dep, harness
+que construye `TerminalApp` con `new_for_tests` (agregar constructor sin
+eframe::CreationContext — hoy es el único acople); T2 escenario: abrir panel →
+escribir `echo hola` fake por el PTY de test → assert del grid; abrir settings
+con Ctrl+, → assert del nodo; T3 correrlo en CI (sin GPU: kittest usa software).
+**7.5 Diagnóstico exportable (1 tanda)**: comando "Export Diagnostics" →
+zip (crate `zip`) con panic.log, runs.log, config.toml (sin secretos: filtrar
+`token`), versión, `layout.json` con títulos reemplazados por hashes → toast
+con el path en Descargas.
 
 ## Apéndice: archivos de Orca consultados
 
