@@ -1,3 +1,4 @@
+pub mod diagnostics;
 pub mod platform;
 
 pub fn ascii_icontains(haystack: &str, needle: &str) -> bool {

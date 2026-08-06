@@ -514,6 +514,7 @@ impl TerminalApp {
             Command::QuickOpen => self.open_quick_open(),
             Command::OpenSettings => self.open_settings(),
             Command::ExportScrollback => self.export_focused_scrollback(),
+            Command::ExportDiagnostics => self.export_diagnostics(),
             Command::AttachScreenshot => self.start_screenshot_capture(ctx),
             Command::BroadcastCommand => self.open_broadcast(),
             Command::ResumeConversation => self.open_resume_picker(),
@@ -965,6 +966,17 @@ impl TerminalApp {
         Some(Duration::from_secs_f64(
             crate::terminal::renderer::time_until_blink_change(now),
         ))
+    }
+
+    /// Exporta el diagnóstico a Descargas (Ship-it 7.5). Sin secretos: los
+    /// tokens se redactan y los títulos/paths se hashean.
+    fn export_diagnostics(&mut self) {
+        match crate::utils::diagnostics::export(env!("CARGO_PKG_VERSION")) {
+            Ok(path) => {
+                self.toast_success(format!("Diagnóstico en {}", path.display()));
+            }
+            Err(err) => self.toast_error(format!("No se pudo exportar el diagnóstico: {err}")),
+        }
     }
 
     /// Guarda el scrollback de cada panel vivo de todos los workspaces y borra

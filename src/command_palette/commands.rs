@@ -12,6 +12,7 @@ pub enum Command {
     QuickOpen,
     OpenSettings,
     ExportScrollback,
+    ExportDiagnostics,
     AttachScreenshot,
     BroadcastCommand,
     ResumeConversation,
@@ -144,6 +145,11 @@ pub const COMMANDS: &[CommandEntry] = &[
         command: Command::FocusPrev,
         label: "Focus Prev",
         shortcut: "Ctrl+Shift+[",
+    },
+    CommandEntry {
+        command: Command::ExportDiagnostics,
+        label: "Export Diagnostics",
+        shortcut: "",
     },
     CommandEntry {
         command: Command::SplitRight,

@@ -83,6 +83,7 @@ mimalloc = { version = "0.1", default-features = false }
 arc-swap = "1"
 syntect = { version = "5.3.0", default-features = false, features = ["default-fancy"] }
 two-face = { version = "0.5.1", default-features = false, features = ["syntect-fancy"] }
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
