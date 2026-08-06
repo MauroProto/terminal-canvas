@@ -200,13 +200,17 @@ impl TerminalApp {
             return;
         };
         // `--resume <id>` entra a esa conversación puntual, a diferencia de
-        // `--continue`, que toma la más reciente. El id se sanitiza antes de
-        // usarlo: un archivo de sesión malicioso no puede inyectar flags.
-        let Some(session_id) = crate::orchestration::sanitize_session_id(&entry.id) else {
+        // `--continue`, que toma la más reciente. `resume_invocation`
+        // sanitiza el id: un archivo de sesión malicioso no puede inyectar
+        // flags.
+        let Some(command) = crate::orchestration::resume_invocation(
+            crate::orchestration::AgentProvider::ClaudeCode,
+            "claude",
+            &entry.id,
+        ) else {
             self.toast_error("Esa conversación tiene un id inválido; no se puede retomar");
             return;
         };
-        let command = format!("claude --resume {session_id}");
         let title = entry.title.clone();
 
         let panel_id = self.ws().focused_panel().map(|panel| panel.id());

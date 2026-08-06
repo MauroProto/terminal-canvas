@@ -163,6 +163,11 @@ pub(super) fn taskbar_provider_accent(provider: AgentProvider) -> Color32 {
         AgentProvider::OpenCode => Color32::from_rgb(176, 176, 184),
         AgentProvider::GeminiCli => Color32::from_rgb(96, 230, 196),
         AgentProvider::Aider => Color32::from_rgb(214, 152, 255),
+        AgentProvider::CursorAgent => Color32::from_rgb(140, 210, 255),
+        AgentProvider::Copilot => Color32::from_rgb(150, 200, 250),
+        AgentProvider::Goose => Color32::from_rgb(250, 200, 110),
+        AgentProvider::Amp => Color32::from_rgb(235, 130, 130),
+        AgentProvider::Crush => Color32::from_rgb(255, 150, 190),
         AgentProvider::Unknown => Color32::from_rgb(108, 108, 116),
     }
 }

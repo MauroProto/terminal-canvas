@@ -1,11 +1,11 @@
 # Progreso de implementación del PLAN-MAESTRO
 
 ## P0 — Quick wins
-- [ ] P0.1 Drag & drop de archivos
-- [ ] P0.2 Screenshot al agente
-- [ ] P0.3 Sanitización de session ids
-- [ ] P0.4 Worktree add robusto (timeout + --no-track)
-- [ ] P0.5 Escritura durable del layout
+- [x] P0.1 Drag & drop de archivos
+- [x] P0.2 Screenshot al agente
+- [x] P0.3 Sanitización de session ids
+- [x] P0.4 Worktree add robusto (timeout + --no-track)
+- [x] P0.5 Escritura durable del layout
 
 ## P1 — Completar flujos
 - [ ] P1.6 Anotaciones por línea en diff → agente

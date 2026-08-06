@@ -13,9 +13,9 @@ pub use code_diff::{
 };
 #[allow(unused_imports)]
 pub use manager::{
-    launch_presets, resume_command, AgentLaunchPlan, AgentLaunchRequest, AgentProvider,
-    AgentSessionMeta, AgentStatus, CommandSummary, DependencyEdge, DependencyKind, DiffStats,
-    InboxEvent, InboxEventKind, LaunchOutcome, LaunchPreparation, OrchestrationState, Orchestrator,
-    PanelOverlay, PanelRuntimeObservation, ReviewSummary, SceneTemplate, SceneTemplateKind,
-    SessionListItem, TaskCard, TaskState, TestStatus, WorktreeMode,
+    launch_presets, resume_command, resume_invocation, AgentLaunchPlan, AgentLaunchRequest,
+    AgentProvider, AgentSessionMeta, AgentStatus, CommandSummary, DependencyEdge, DependencyKind,
+    DiffStats, InboxEvent, InboxEventKind, LaunchOutcome, LaunchPreparation, OrchestrationState,
+    Orchestrator, PanelOverlay, PanelRuntimeObservation, ReviewSummary, SceneTemplate,
+    SceneTemplateKind, SessionListItem, TaskCard, TaskState, TestStatus, WorktreeMode,
 };

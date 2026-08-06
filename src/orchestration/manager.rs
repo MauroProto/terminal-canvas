@@ -34,6 +34,11 @@ pub enum AgentProvider {
     GeminiCli,
     Aider,
     OpenCode,
+    CursorAgent,
+    Copilot,
+    Goose,
+    Amp,
+    Crush,
     #[default]
     Unknown,
 }
@@ -46,6 +51,11 @@ impl AgentProvider {
             Self::GeminiCli => "Gemini",
             Self::Aider => "Aider",
             Self::OpenCode => "OpenCode",
+            Self::CursorAgent => "Cursor",
+            Self::Copilot => "Copilot",
+            Self::Goose => "Goose",
+            Self::Amp => "Amp",
+            Self::Crush => "Crush",
             Self::Unknown => "Terminal",
         }
     }
@@ -57,6 +67,11 @@ impl AgentProvider {
             Self::GeminiCli => "gemini",
             Self::Aider => "aider",
             Self::OpenCode => "opencode",
+            Self::CursorAgent => "cursor",
+            Self::Copilot => "copilot",
+            Self::Goose => "goose",
+            Self::Amp => "amp",
+            Self::Crush => "crush",
             Self::Unknown => "terminal",
         }
     }
@@ -68,25 +83,41 @@ impl AgentProvider {
             Self::GeminiCli => Some("gemini"),
             Self::Aider => Some("aider"),
             Self::OpenCode => Some("opencode"),
+            Self::CursorAgent => Some("cursor-agent"),
+            Self::Copilot => Some("copilot"),
+            Self::Goose => Some("goose"),
+            Self::Amp => Some("amp"),
+            Self::Crush => Some("crush"),
             Self::Unknown => None,
         }
     }
 
     pub fn detect(text: &str) -> Option<Self> {
-        use crate::utils::ascii_icontains;
+        use crate::utils::{ascii_icontains, ascii_icontains_word};
         let normalized = text.trim();
-        [
+        let by_substring = [
             ("openclaude", Self::OpenCode),
             ("opencode", Self::OpenCode),
             ("claude code", Self::ClaudeCode),
             ("claude-code", Self::ClaudeCode),
             ("claude", Self::ClaudeCode),
+            ("cursor-agent", Self::CursorAgent),
+            ("cursor", Self::CursorAgent),
+            ("copilot", Self::Copilot),
+            ("goose", Self::Goose),
             ("codex", Self::CodexCli),
             ("gemini", Self::GeminiCli),
             ("aider", Self::Aider),
+            ("crush", Self::Crush),
         ]
         .into_iter()
-        .find_map(|(needle, provider)| ascii_icontains(normalized, needle).then_some(provider))
+        .find_map(|(needle, provider)| ascii_icontains(normalized, needle).then_some(provider));
+        if by_substring.is_some() {
+            return by_substring;
+        }
+        // "amp" es demasiado corto para substring: "example"/"sample" lo
+        // contienen. Solo cuenta como palabra aislada.
+        ascii_icontains_word(normalized, "amp").then_some(Self::Amp)
     }
 }
 
@@ -1479,13 +1510,18 @@ impl Orchestrator {
     }
 }
 
-pub fn launch_presets() -> [AgentProvider; 5] {
+pub fn launch_presets() -> [AgentProvider; 10] {
     [
         AgentProvider::ClaudeCode,
         AgentProvider::CodexCli,
         AgentProvider::GeminiCli,
         AgentProvider::Aider,
         AgentProvider::OpenCode,
+        AgentProvider::CursorAgent,
+        AgentProvider::Copilot,
+        AgentProvider::Goose,
+        AgentProvider::Amp,
+        AgentProvider::Crush,
     ]
 }
 
@@ -1760,7 +1796,12 @@ fn provider_bootstrap(provider: AgentProvider, brief: &str) -> ProviderBootstrap
             command: provider.launch_command().map(str::to_owned),
             initial_input: (!brief.is_empty()).then(|| brief.to_owned()),
         },
-        AgentProvider::Aider => ProviderBootstrap {
+        AgentProvider::Aider
+        | AgentProvider::CursorAgent
+        | AgentProvider::Copilot
+        | AgentProvider::Goose
+        | AgentProvider::Amp
+        | AgentProvider::Crush => ProviderBootstrap {
             command: provider.launch_command().map(str::to_owned),
             initial_input: (!brief.is_empty()).then(|| brief.to_owned()),
         },
@@ -1883,13 +1924,69 @@ pub fn resume_command(provider: AgentProvider, launch_command: &str) -> String {
 /// Bandera de continuación por proveedor, o `None` si no se conoce una (en ese
 /// caso se relanza el comando tal cual: mejor una sesión nueva que un flag
 /// inventado que haga fallar el arranque).
+///
+/// Los proveedores cuyo resume exige un **id** (codex usa el subcomando
+/// `codex resume <id>`, gemini usa `--resume <id>`) no entran acá: sin id no
+/// hay forma segura de continuar; los maneja [`resume_invocation`].
 fn resume_flag(provider: AgentProvider) -> Option<&'static str> {
     match provider {
         AgentProvider::ClaudeCode => Some("--continue"),
         AgentProvider::OpenCode => Some("--continue"),
-        // Codex, Gemini y Aider no exponen una bandera equivalente estable.
-        AgentProvider::CodexCli | AgentProvider::GeminiCli | AgentProvider::Aider => None,
-        AgentProvider::Unknown => None,
+        AgentProvider::CodexCli
+        | AgentProvider::GeminiCli
+        | AgentProvider::Aider
+        | AgentProvider::CursorAgent
+        | AgentProvider::Copilot
+        | AgentProvider::Goose
+        | AgentProvider::Amp
+        | AgentProvider::Crush
+        | AgentProvider::Unknown => None,
+    }
+}
+
+/// Comando para retomar una sesión **por id exacto**, o `None` si el
+/// proveedor no tiene mecanismo conocido de resume por id o el id no pasa la
+/// sanitización. El id se sanitiza acá (no antes) porque este es el punto
+/// donde se convierte en argv.
+///
+/// Tabla verificada contra Orca (`agent-session-resume.ts`):
+/// claude `--resume <id>`, codex subcomando `resume <id>` (va tras el
+/// binario, no al final), gemini `--resume <id>`, opencode `--session <id>`.
+pub fn resume_invocation(
+    provider: AgentProvider,
+    launch_command: &str,
+    session_id: &str,
+) -> Option<String> {
+    let command = launch_command.trim();
+    if command.is_empty() {
+        return None;
+    }
+    let id = crate::orchestration::agent_sessions::sanitize_session_id(session_id)?;
+    match provider {
+        AgentProvider::ClaudeCode => Some(format!("{command} --resume {id}")),
+        AgentProvider::GeminiCli => Some(format!("{command} --resume {id}")),
+        AgentProvider::OpenCode => Some(format!("{command} --session {id}")),
+        AgentProvider::CodexCli => {
+            // `codex resume <id>`: el subcomando va después del binario y
+            // antes de cualquier flag que ya traiga el launch command.
+            let mut tokens = command.split_whitespace();
+            let bin = tokens.next()?;
+            let rest = tokens.collect::<Vec<_>>().join(" ");
+            Some(if rest.is_empty() {
+                format!("{bin} resume {id}")
+            } else {
+                format!("{bin} resume {id} {rest}")
+            })
+        }
+        // El resto no tiene resume por id verificado: sesión nueva antes que
+        // un flag inventado.
+        AgentProvider::Aider
+        | AgentProvider::CursorAgent
+        | AgentProvider::Copilot
+        | AgentProvider::Goose
+        | AgentProvider::Amp
+        | AgentProvider::Crush
+        | AgentProvider::Unknown => None,
     }
 }
 
@@ -1908,8 +2005,8 @@ mod tests {
     use super::super::git::parse_diff_stats;
     use super::{
         derive_status, launch_presets, preview_label, provider_bootstrap, resume_command,
-        short_uuid, should_inspect_git_for_session, slugify, AgentLaunchRequest, AgentProvider,
-        AgentStatus, DependencyKind, DiffStats, LaunchPreparation, Orchestrator,
+        resume_invocation, short_uuid, should_inspect_git_for_session, slugify, AgentLaunchRequest,
+        AgentProvider, AgentStatus, DependencyKind, DiffStats, LaunchPreparation, Orchestrator,
         PanelRuntimeObservation, TaskState, WorktreeMode, GIT_INSPECT_INTERVAL_PLAIN_SECS,
         GIT_INSPECT_INTERVAL_SECS,
     };
@@ -2460,6 +2557,11 @@ mod tests {
             AgentProvider::CodexCli,
             AgentProvider::GeminiCli,
             AgentProvider::Aider,
+            AgentProvider::CursorAgent,
+            AgentProvider::Copilot,
+            AgentProvider::Goose,
+            AgentProvider::Amp,
+            AgentProvider::Crush,
             AgentProvider::Unknown,
         ] {
             assert_eq!(resume_command(provider, "algo --flag"), "algo --flag");
@@ -2477,5 +2579,95 @@ mod tests {
     #[test]
     fn an_empty_command_stays_empty() {
         assert!(resume_command(AgentProvider::ClaudeCode, "   ").is_empty());
+    }
+
+    #[test]
+    fn resume_invocation_builds_the_per_provider_command() {
+        let id = "3f7b2c1e-9a04-4d21-8c5f-6e1d2b3a4c5d";
+        assert_eq!(
+            resume_invocation(AgentProvider::ClaudeCode, "claude", id),
+            Some(format!("claude --resume {id}"))
+        );
+        assert_eq!(
+            resume_invocation(AgentProvider::GeminiCli, "gemini", id),
+            Some(format!("gemini --resume {id}"))
+        );
+        // opencode usa --session, no --resume (tabla de Orca).
+        assert_eq!(
+            resume_invocation(AgentProvider::OpenCode, "opencode", id),
+            Some(format!("opencode --session {id}"))
+        );
+    }
+
+    #[test]
+    fn codex_resume_inserts_the_subcommand_after_the_binary() {
+        // codex usa subcomando (`codex resume <id>`), no un flag al final:
+        // debe ir tras el binario y antes de los flags existentes.
+        let id = "abc123";
+        assert_eq!(
+            resume_invocation(AgentProvider::CodexCli, "codex", id),
+            Some("codex resume abc123".to_owned())
+        );
+        assert_eq!(
+            resume_invocation(AgentProvider::CodexCli, "codex --model gpt-5", id),
+            Some("codex resume abc123 --model gpt-5".to_owned())
+        );
+    }
+
+    #[test]
+    fn resume_invocation_rejects_malicious_ids_for_every_provider() {
+        // Regresión de inyección: ningún id puede entrar a argv sin pasar la
+        // sanitización (prefijo '-', control chars, largo excesivo).
+        let overlong = "a".repeat(600);
+        let hostile = ["-rf /", "--help", "id\x1b[31m", "", overlong.as_str()];
+        for provider in [
+            AgentProvider::ClaudeCode,
+            AgentProvider::CodexCli,
+            AgentProvider::GeminiCli,
+            AgentProvider::OpenCode,
+        ] {
+            for id in hostile {
+                assert_eq!(
+                    resume_invocation(provider, "binario", id),
+                    None,
+                    "provider {provider:?} aceptó el id hostil {id:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn providers_without_id_resume_return_none() {
+        for provider in [
+            AgentProvider::Aider,
+            AgentProvider::CursorAgent,
+            AgentProvider::Copilot,
+            AgentProvider::Goose,
+            AgentProvider::Amp,
+            AgentProvider::Crush,
+            AgentProvider::Unknown,
+        ] {
+            assert_eq!(resume_invocation(provider, "cmd", "id-valido"), None);
+        }
+    }
+
+    #[test]
+    fn new_providers_are_detected_from_command_text() {
+        use AgentProvider as P;
+        assert_eq!(P::detect("cursor-agent"), Some(P::CursorAgent));
+        assert_eq!(P::detect("cursor-agent --model fast"), Some(P::CursorAgent));
+        assert_eq!(P::detect("github copilot"), Some(P::Copilot));
+        assert_eq!(P::detect("goose run"), Some(P::Goose));
+        assert_eq!(P::detect("crush"), Some(P::Crush));
+    }
+
+    #[test]
+    fn amp_detection_needs_a_word_boundary() {
+        use AgentProvider as P;
+        assert_eq!(P::detect("amp"), Some(P::Amp));
+        assert_eq!(P::detect("amp --thread 4"), Some(P::Amp));
+        // Regresión: substring simple lo pintaría mal en estos títulos.
+        assert_eq!(P::detect("example-server.log"), None);
+        assert_eq!(P::detect("sample data"), None);
     }
 }
