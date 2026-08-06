@@ -6,6 +6,7 @@ use crate::theme::colors as palette;
 
 pub mod commands;
 pub mod fuzzy;
+pub mod rank;
 
 #[derive(Default)]
 pub struct CommandPalette {

@@ -18,7 +18,7 @@
 - [x] P2.11 Terminal splits
 - [x] P2.12 Hooks de agente
 - [x] P2.13 GitHub in-app vía gh
-- [ ] P2.14 Quick open unificado
+- [x] P2.14 Quick open unificado
 
 ## P3 — Arquitectura
 - [ ] P3.15 Daemon de PTYs

@@ -5,14 +5,17 @@ use std::path::{Path, PathBuf};
 
 use egui::{pos2, vec2, Align2, FontId, RichText, ScrollArea, Sense};
 
-use crate::command_palette::fuzzy::fuzzy_score;
+use crate::command_palette::commands::COMMANDS;
+use crate::command_palette::rank::{
+    clamp_query, rank_command, rank_file, rank_panel, top_k, QuickOpenKind, RankClass, RankedItem,
+    TOP_K,
+};
 use crate::theme::colors as palette;
 
 use super::TerminalApp;
 
 const MAX_FILES: usize = 10_000;
 const MAX_VISITED: usize = 60_000;
-const MAX_RESULTS: usize = 50;
 const SKIP_DIRS: &[&str] = &[
     ".git",
     "target",
@@ -79,25 +82,6 @@ pub(super) fn collect_files(root: &Path) -> Vec<String> {
     files
 }
 
-/// Filtra y ordena los archivos por score fuzzy. Con query vacía devuelve los
-/// primeros (orden alfabético).
-pub(super) fn match_files<'a>(query: &str, files: &'a [String]) -> Vec<&'a String> {
-    let query = query.trim();
-    if query.is_empty() {
-        return files.iter().take(MAX_RESULTS).collect();
-    }
-    let mut scored: Vec<(i32, &String)> = files
-        .iter()
-        .filter_map(|file| fuzzy_score(query, file).map(|score| (score, file)))
-        .collect();
-    scored.sort_by(|a, b| b.0.cmp(&a.0));
-    scored
-        .into_iter()
-        .take(MAX_RESULTS)
-        .map(|(_, file)| file)
-        .collect()
-}
-
 impl TerminalApp {
     pub(super) fn open_quick_open(&mut self) {
         let Some(cwd) = self.ws().cwd.clone() else {
@@ -154,6 +138,7 @@ impl TerminalApp {
 
         let mut close = false;
         let mut open_file: Option<PathBuf> = None;
+        let mut chosen: Option<RankedItem> = None;
 
         egui::Area::new(egui::Id::new("quick-open"))
             .order(egui::Order::Foreground)
@@ -167,7 +152,7 @@ impl TerminalApp {
                     .show(ui, |ui| {
                         ui.set_min_width(460.0);
                         ui.label(
-                            RichText::new("Quick Open — buscar archivo")
+                            RichText::new("Quick Open — archivos, > comandos, @ paneles")
                                 .size(12.0)
                                 .color(palette::DIM),
                         );
@@ -175,7 +160,7 @@ impl TerminalApp {
                         let edit = egui::TextEdit::singleline(
                             &mut self.quick_open.as_mut().unwrap().query,
                         )
-                        .hint_text("Escribí para filtrar archivos…")
+                        .hint_text("archivo · > comando · @ panel")
                         .text_color(palette::TEXT_STRONG)
                         .margin(egui::Margin::symmetric(10.0, 6.0));
                         let response = ui.add_sized(vec2(432.0, 30.0), edit);
@@ -189,12 +174,11 @@ impl TerminalApp {
 
                         // Los matches se computan una sola vez por frame
                         // (el fuzzy es O(archivos); no repetir 3 veces).
-                        let results: Vec<String> = {
-                            let state = self.quick_open.as_ref().unwrap();
-                            match_files(&state.query, &state.files)
-                                .into_iter()
-                                .cloned()
-                                .collect()
+                        let results: Vec<RankedItem> = {
+                            let query = self.quick_open.as_ref().unwrap().query.clone();
+                            let files = &self.quick_open.as_ref().unwrap().files;
+                            let panels = self.quick_open_panels();
+                            unified_results(&query, files, &panels)
                         };
 
                         // Navegación por teclado.
@@ -211,11 +195,10 @@ impl TerminalApp {
                             close = true;
                         }
                         if ctx.input(|input| input.key_pressed(egui::Key::Enter)) {
-                            let root = self.quick_open.as_ref().unwrap().root.clone();
-                            if let Some(file) =
+                            if let Some(item) =
                                 results.get(selected.min(results.len().saturating_sub(1)))
                             {
-                                open_file = Some(root.join(file));
+                                chosen = Some(item.clone());
                                 close = true;
                             }
                         }
@@ -231,11 +214,35 @@ impl TerminalApp {
                                     .color(palette::DIM),
                             );
                         } else {
-                            self.quick_open_results(ui, &results, &mut open_file, &mut close);
+                            self.quick_open_results(ui, &results, &mut chosen, &mut close);
                         }
                     });
             });
 
+        if let Some(item) = chosen {
+            let root = self
+                .quick_open
+                .as_ref()
+                .map(|state| state.root.clone())
+                .unwrap_or_default();
+            match item.kind {
+                QuickOpenKind::File => open_file = Some(root.join(&item.label)),
+                QuickOpenKind::Panel(panel_id) => {
+                    self.focus_panel_across_workspaces(panel_id, Some(ctx.available_rect()));
+                }
+                QuickOpenKind::Command => {
+                    if let Some(entry) = COMMANDS
+                        .iter()
+                        .find(|entry| entry.label == item.label)
+                        .copied()
+                    {
+                        let canvas_rect = ctx.available_rect();
+                        self.quick_open = None;
+                        self.execute_command(entry.command, ctx, canvas_rect);
+                    }
+                }
+            }
+        }
         if let Some(path) = open_file {
             // Abrí el visor in-app; el editor externo queda como botón ahí.
             self.open_file_viewer(path);
@@ -245,22 +252,35 @@ impl TerminalApp {
         }
     }
 
+    /// Paneles del workspace activo ordenados por recencia de foco (el
+    /// z_index más alto es el que se tocó último).
+    pub(super) fn quick_open_panels(&self) -> Vec<(uuid::Uuid, String)> {
+        let mut panels: Vec<(uuid::Uuid, String, u32)> = self
+            .ws()
+            .panels
+            .iter()
+            .map(|panel| (panel.id(), panel.title().to_owned(), panel.z_index()))
+            .collect();
+        panels.sort_by(|a, b| b.2.cmp(&a.2));
+        panels
+            .into_iter()
+            .map(|(id, title, _)| (id, title))
+            .collect()
+    }
+
     fn quick_open_results(
         &mut self,
         ui: &mut egui::Ui,
-        results: &[String],
-        open_file: &mut Option<PathBuf>,
+        results: &[RankedItem],
+        chosen: &mut Option<RankedItem>,
         close: &mut bool,
     ) {
-        let (root, selected) = {
-            let state = self.quick_open.as_ref().unwrap();
-            (state.root.clone(), state.selected)
-        };
+        let selected = self.quick_open.as_ref().unwrap().selected;
 
         if results.is_empty() {
             ui.add_space(8.0);
             ui.label(
-                RichText::new("Sin archivos coincidentes")
+                RichText::new("Sin coincidencias")
                     .size(11.5)
                     .color(palette::DIM),
             );
@@ -272,7 +292,7 @@ impl TerminalApp {
             .max_height(320.0)
             .show(ui, |ui| {
                 ui.set_min_width(432.0);
-                for (index, file) in results.iter().enumerate() {
+                for (index, item) in results.iter().enumerate() {
                     let (rect, response) =
                         ui.allocate_exact_size(vec2(432.0, 26.0), Sense::click());
                     if index == selected {
@@ -285,15 +305,29 @@ impl TerminalApp {
                     } else {
                         palette::TEXT
                     };
+                    // Un glifo por tipo: se ve de un vistazo si es comando,
+                    // panel o archivo.
+                    let glyph = match item.kind {
+                        QuickOpenKind::Command => "\u{203a}",
+                        QuickOpenKind::Panel(_) => "@",
+                        QuickOpenKind::File => " ",
+                    };
                     ui.painter().text(
                         pos2(rect.left() + 10.0, rect.center().y),
                         Align2::LEFT_CENTER,
-                        file.as_str(),
+                        glyph,
+                        FontId::monospace(11.5),
+                        palette::DIM,
+                    );
+                    ui.painter().text(
+                        pos2(rect.left() + 26.0, rect.center().y),
+                        Align2::LEFT_CENTER,
+                        item.label.as_str(),
                         FontId::monospace(11.5),
                         color,
                     );
                     if response.clicked() {
-                        *open_file = Some(root.join(file));
+                        *chosen = Some(item.clone());
                         *close = true;
                     }
                 }
@@ -301,9 +335,69 @@ impl TerminalApp {
     }
 }
 
+/// Fuentes mezcladas del quick open (P2.14, T2). Los prefijos deciden la
+/// fuente: `>` comandos, `@` paneles/agentes, sin prefijo archivos (más los
+/// comandos que matcheen exacto, para que "New Terminal" siga siendo tipeable
+/// sin prefijo). Query vacía = paneles por recencia de foco.
+pub(super) fn unified_results(
+    query: &str,
+    files: &[String],
+    panels: &[(uuid::Uuid, String)],
+) -> Vec<RankedItem> {
+    let query = clamp_query(query).trim();
+
+    // Query vacía: los paneles, en el orden de recencia que ya viene dado.
+    if query.is_empty() {
+        return panels
+            .iter()
+            .enumerate()
+            .map(|(index, (panel_id, title))| RankedItem {
+                class: RankClass::PanelName,
+                // El primero de la lista es el más reciente.
+                score: (panels.len() - index) as i32,
+                label: title.clone(),
+                kind: QuickOpenKind::Panel(*panel_id),
+            })
+            .collect();
+    }
+
+    if let Some(rest) = query.strip_prefix('>') {
+        let rest = rest.trim();
+        return top_k(
+            COMMANDS
+                .iter()
+                .filter_map(|entry| rank_command(rest, entry.label)),
+            TOP_K,
+        );
+    }
+    if let Some(rest) = query.strip_prefix('@') {
+        let rest = rest.trim();
+        return top_k(
+            panels
+                .iter()
+                .filter_map(|(panel_id, title)| rank_panel(rest, title, *panel_id)),
+            TOP_K,
+        );
+    }
+
+    // Sin prefijo: archivos, más los comandos que matcheen exacto o por
+    // prefijo (las reglas ordinales los ponen arriba solos).
+    let commands = COMMANDS.iter().filter_map(|entry| {
+        rank_command(query, entry.label).filter(|item| {
+            matches!(
+                item.class,
+                RankClass::ExactCommand | RankClass::CommandPrefix
+            )
+        })
+    });
+    let files = files.iter().filter_map(|path| rank_file(query, path));
+    top_k(commands.chain(files), TOP_K)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{collect_files, match_files};
+    use super::{collect_files, unified_results};
+    use crate::command_palette::rank::QuickOpenKind;
 
     #[test]
     fn collect_files_walks_and_skips_heavy_dirs() {
@@ -325,21 +419,75 @@ mod tests {
         assert!(!files.iter().any(|f| f.starts_with(".git")));
     }
 
-    #[test]
-    fn match_files_filters_and_ranks() {
-        let files = vec![
+    fn sample_files() -> Vec<String> {
+        vec![
             "src/main.rs".to_owned(),
             "src/lib.rs".to_owned(),
             "README.md".to_owned(),
-        ];
-        let results = match_files("main", &files);
+        ]
+    }
+
+    fn sample_panels() -> Vec<(uuid::Uuid, String)> {
+        vec![
+            (uuid::Uuid::new_v4(), "claude code".to_owned()),
+            (uuid::Uuid::new_v4(), "shell".to_owned()),
+        ]
+    }
+
+    #[test]
+    fn no_prefix_searches_files() {
+        let results = unified_results("main", &sample_files(), &sample_panels());
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0], "src/main.rs");
+        assert_eq!(results[0].label, "src/main.rs");
+        assert_eq!(results[0].kind, QuickOpenKind::File);
+    }
 
-        let all = match_files("", &files);
-        assert_eq!(all.len(), 3);
+    #[test]
+    fn the_command_prefix_only_lists_commands() {
+        let results = unified_results("> new", &sample_files(), &sample_panels());
+        assert!(!results.is_empty());
+        assert!(
+            results
+                .iter()
+                .all(|item| item.kind == QuickOpenKind::Command),
+            "solo comandos"
+        );
+        assert!(results.iter().any(|item| item.label == "New Terminal"));
+    }
 
-        let none = match_files("zzz", &files);
-        assert!(none.is_empty());
+    #[test]
+    fn the_at_prefix_only_lists_panels() {
+        let panels = sample_panels();
+        let results = unified_results("@claude", &sample_files(), &panels);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].label, "claude code");
+        assert!(matches!(results[0].kind, QuickOpenKind::Panel(_)));
+    }
+
+    #[test]
+    fn an_exact_command_shows_up_without_a_prefix() {
+        let results = unified_results("New Terminal", &sample_files(), &sample_panels());
+        assert_eq!(
+            results[0].label, "New Terminal",
+            "el comando exacto va primero"
+        );
+        assert_eq!(results[0].kind, QuickOpenKind::Command);
+    }
+
+    #[test]
+    fn an_empty_query_lists_panels_by_recency() {
+        let panels = sample_panels();
+        let results = unified_results("", &sample_files(), &panels);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].label, "claude code", "el más reciente primero");
+        assert!(results
+            .iter()
+            .all(|item| matches!(item.kind, QuickOpenKind::Panel(_))));
+    }
+
+    #[test]
+    fn a_query_with_no_matches_is_empty() {
+        let results = unified_results("zzzzz", &sample_files(), &sample_panels());
+        assert!(results.is_empty());
     }
 }
