@@ -89,6 +89,7 @@ zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 tower = { version = "0.5", features = ["util"] }
 tokio-tungstenite = "0.24"
 criterion = { version = "0.8.2", features = ["html_reports"] }
+egui_kittest = "0.30"
 
 [profile.dev]
 opt-level = 1

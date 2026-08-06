@@ -158,8 +158,34 @@ impl TerminalApp {
     pub fn new(cc: &eframe::CreationContext<'_>, pending_join_invite: Option<String>) -> Self {
         setup_fonts(cc);
         let brand_texture = load_brand_texture(cc);
-        let update_checker = UpdateChecker::new(&cc.egui_ctx);
-        let loaded_state = load_state();
+        Self::build(
+            &cc.egui_ctx,
+            brand_texture,
+            load_state(),
+            pending_join_invite,
+            true,
+        )
+    }
+
+    /// Constructor sin `eframe::CreationContext` (Ship-it 7.4): el único
+    /// acople con eframe eran las fuentes y la textura de marca, que acá no
+    /// hacen falta. **No lee estado de disco**: el harness arranca limpio y
+    /// nunca toca el layout real del usuario.
+    #[cfg(test)]
+    pub fn new_for_tests(ctx: &egui::Context) -> Self {
+        // `side_effects: false`: el harness no levanta el hook server ni
+        // instala hooks en el ~/.claude del usuario que corre los tests.
+        Self::build(ctx, None, None, None, false)
+    }
+
+    fn build(
+        egui_ctx: &egui::Context,
+        brand_texture: Option<egui::TextureHandle>,
+        loaded_state: Option<crate::state::persistence::AppState>,
+        pending_join_invite: Option<String>,
+        side_effects: bool,
+    ) -> Self {
+        let update_checker = UpdateChecker::new(egui_ctx);
         let has_saved_state = loaded_state.is_some();
 
         let mut app = if let Some(saved) = loaded_state {
@@ -175,7 +201,7 @@ impl TerminalApp {
             let local_device_id = saved.local_device_id.clone();
             let mut workspaces = Vec::new();
             for workspace in saved.workspaces {
-                workspaces.push(Workspace::from_saved(workspace, &cc.egui_ctx));
+                workspaces.push(Workspace::from_saved(workspace, egui_ctx));
             }
             let active_ws = saved.active_ws.min(workspaces.len().saturating_sub(1));
             let viewport = workspaces
@@ -194,7 +220,7 @@ impl TerminalApp {
                 sidebar_visible: saved.sidebar_visible,
                 show_grid: saved.legacy_canvas_ui.show_grid,
                 show_minimap: saved.legacy_canvas_ui.show_minimap,
-                ctx: Some(cc.egui_ctx.clone()),
+                ctx: Some(egui_ctx.clone()),
                 command_palette: CommandPalette::default(),
                 renaming_panel: None,
                 rename_buf: String::new(),
@@ -220,7 +246,7 @@ impl TerminalApp {
                 notification_gate: notify_policy::NotificationGate::new(
                     notify_policy::NOTIFICATION_COOLDOWN,
                 ),
-                hook_server: start_hook_server(),
+                hook_server: side_effects.then(start_hook_server).flatten(),
                 gh_client: Default::default(),
                 linear_client: Default::default(),
                 agent_detector: crate::orchestration::AgentDetector::start(),
@@ -270,7 +296,7 @@ impl TerminalApp {
             let collab = CollabManager::new();
             let broker_url = collab.broker_url().to_owned();
             let mut workspace = Workspace::new("Default", None);
-            workspace.spawn_terminal(&cc.egui_ctx);
+            workspace.spawn_terminal(egui_ctx);
             Self {
                 workspaces: vec![workspace],
                 active_ws: 0,
@@ -280,7 +306,7 @@ impl TerminalApp {
                 sidebar_visible: true,
                 show_grid: true,
                 show_minimap: true,
-                ctx: Some(cc.egui_ctx.clone()),
+                ctx: Some(egui_ctx.clone()),
                 command_palette: CommandPalette::default(),
                 renaming_panel: None,
                 rename_buf: String::new(),
@@ -306,7 +332,7 @@ impl TerminalApp {
                 notification_gate: notify_policy::NotificationGate::new(
                     notify_policy::NOTIFICATION_COOLDOWN,
                 ),
-                hook_server: start_hook_server(),
+                hook_server: side_effects.then(start_hook_server).flatten(),
                 gh_client: Default::default(),
                 linear_client: Default::default(),
                 agent_detector: crate::orchestration::AgentDetector::start(),
@@ -756,6 +782,12 @@ impl TerminalApp {
 }
 
 impl TerminalApp {
+    /// Un frame de la app, para el harness E2E (Ship-it 7.4).
+    #[cfg(test)]
+    pub fn update_for_tests(&mut self, ctx: &egui::Context) {
+        self.update_impl(ctx);
+    }
+
     fn update_impl(&mut self, ctx: &egui::Context) {
         let frame_started_at = Instant::now();
         let mut perf_snapshot = FramePerfSnapshot::default();
@@ -1651,4 +1683,97 @@ pub(crate) fn gesture_pointer_pos(
     hover_pos: Option<Pos2>,
 ) -> Option<Pos2> {
     latest_pos.or(interact_pos).or(hover_pos)
+}
+
+/// Smoke E2E de la app real montada sobre egui_kittest (Ship-it 7.4).
+///
+/// No es un test de píxeles: monta `TerminalApp` entero, lo corre por frames y
+/// verifica el árbol de accesibilidad, que es lo que un usuario "ve". Cubre el
+/// camino que ningún test unitario toca: construcción + update + render.
+#[cfg(test)]
+mod smoke_e2e {
+    use super::TerminalApp;
+
+    /// Corre la app dentro del harness, opcionalmente inyectando eventos antes
+    /// de los últimos frames, y devuelve el dump de accesibilidad.
+    fn run_app(frames: usize, events: Vec<egui::Event>) -> String {
+        let mut app: Option<TerminalApp> = None;
+        let mut harness = egui_kittest::Harness::new(|ctx| {
+            let app = app.get_or_insert_with(|| TerminalApp::new_for_tests(ctx));
+            app.update_for_tests(ctx);
+        });
+        for _ in 0..frames {
+            harness.run();
+        }
+        if !events.is_empty() {
+            harness.input_mut().events.extend(events);
+            harness.run();
+            harness.run();
+        }
+        format!("{:#?}", harness.kittest_state())
+    }
+
+    fn ctrl(key: egui::Key) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::CTRL,
+        }
+    }
+
+    #[test]
+    fn a_fresh_app_shows_the_empty_state_and_its_action() {
+        // Sin estado en disco no hay carpeta: lo primero que se ofrece es
+        // abrir una (Ship-it 7.2).
+        let tree = run_app(3, Vec::new());
+        assert!(
+            tree.contains("Todavía no hay carpeta abierta"),
+            "falta el empty state:\n{tree}"
+        );
+        assert!(
+            tree.contains("label: \"Abrir carpeta\""),
+            "el empty state tiene que ofrecer la acción, no solo el texto"
+        );
+    }
+
+    #[test]
+    fn the_onboarding_overlay_shows_its_three_steps() {
+        let tree = run_app(3, Vec::new());
+        assert!(
+            tree.contains("Primeros pasos"),
+            "falta el overlay de onboarding:\n{tree}"
+        );
+        assert!(tree.contains("1. Abrí una carpeta"));
+        assert!(tree.contains("2. Abrí un terminal"));
+        assert!(tree.contains("3. Revisá los cambios"));
+        assert!(
+            tree.contains("label: \"Entendido\""),
+            "falta el botón de cierre"
+        );
+    }
+
+    #[test]
+    fn ctrl_comma_opens_settings() {
+        let before = run_app(3, Vec::new());
+        assert!(
+            !before.contains("Configuración"),
+            "settings no debería arrancar abierto"
+        );
+
+        let after = run_app(3, vec![ctrl(egui::Key::Comma)]);
+        assert!(
+            after.contains("Configuración"),
+            "Ctrl+, no abrió settings:\n{after}"
+        );
+    }
+
+    #[test]
+    fn running_many_frames_never_panics_or_deadlocks() {
+        // La regresión que esto caza: un frame que se cuelga tomando dos
+        // locks, o que paniquea en el frame N por estado acumulado.
+        let tree = run_app(20, Vec::new());
+        assert!(!tree.is_empty());
+    }
 }

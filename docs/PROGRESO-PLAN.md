@@ -28,7 +28,7 @@
 
 ## Ship-it
 - [x] 7.2 Onboarding (detección de agentes + empty states)
-- [ ] 7.3 Perf budgets
-- [ ] 7.4 Smoke E2E
+- [x] 7.3 Perf budgets
+- [x] 7.4 Smoke E2E
 - [x] 7.5 Diagnóstico exportable
 - [ ] 7.1 Empaquetado (parcial: bundle script; firma/notarización requieren Developer ID del usuario)
