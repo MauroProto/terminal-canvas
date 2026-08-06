@@ -128,6 +128,8 @@ pub struct PanelInteraction {
     pub guides: Vec<SnapGuide>,
     pub render_tier: Option<RenderTier>,
     pub cache_hit: bool,
+    /// El usuario clickeó el badge `#N` del issue vinculado (P2.13).
+    pub open_issue: Option<u64>,
 }
 
 /// Estado de búsqueda en el scrollback de este panel. La consulta se edita
@@ -173,6 +175,9 @@ pub struct TerminalPanel {
     /// Atención pendiente de ver (P1.8): bell / agente esperando mientras el
     /// panel no estaba enfocado. Se limpia al interactuar con el panel.
     unread: bool,
+    /// Issue de GitHub que este panel está trabajando (P2.13), para el badge
+    /// `#N` clickeable del título.
+    linked_issue: Option<u64>,
     /// Árbol de splits (P2.11). `None` = una sola sesión (comportamiento
     /// clásico). Cuando existe, cada hoja tiene su propia sesión.
     split_tree: Option<crate::terminal::split_tree::SplitNode>,
@@ -220,6 +225,7 @@ impl TerminalPanel {
             share_scope: PanelShareScope::VisibleOnly,
             agent_command: None,
             unread: false,
+            linked_issue: None,
             split_tree: None,
             root_leaf: uuid::Uuid::new_v4(),
             leaf_sessions: std::collections::HashMap::new(),
@@ -256,6 +262,7 @@ impl TerminalPanel {
             .unwrap_or_else(|| saved.title.clone());
         panel.agent_command = saved.agent_command.clone();
         panel.unread = saved.unread;
+        panel.linked_issue = saved.linked_issue;
         panel.restore_split_tree(
             saved.split_tree.as_ref(),
             saved.focused_leaf.as_deref(),
@@ -382,6 +389,7 @@ impl TerminalPanel {
             share_scope: self.share_scope,
             agent_command: self.agent_command.clone(),
             unread: self.unread,
+            linked_issue: self.linked_issue,
             split_tree: self
                 .split_tree
                 .as_ref()
@@ -402,6 +410,15 @@ impl TerminalPanel {
     /// ¿Hay atención pendiente de ver en este panel? (P1.8)
     pub fn unread(&self) -> bool {
         self.unread
+    }
+
+    /// Issue de GitHub vinculado a este panel (P2.13).
+    pub fn linked_issue(&self) -> Option<u64> {
+        self.linked_issue
+    }
+
+    pub fn set_linked_issue(&mut self, issue: Option<u64>) {
+        self.linked_issue = issue;
     }
 
     // ----- Splits (P2.11) -----
@@ -1019,6 +1036,41 @@ impl TerminalPanel {
     /// si `branch_badge_rect` confirma que hay lugar libre a la derecha del
     /// título.
     #[allow(clippy::too_many_arguments)]
+    /// Badge `#N` del issue vinculado, pegado a la derecha del título
+    /// (P2.13). Devuelve su rect para poder hacerlo clickeable.
+    fn draw_issue_badge(
+        &self,
+        painter: &egui::Painter,
+        title_rect: Rect,
+        title_right: f32,
+        issue: u64,
+        chrome_zoom: f32,
+    ) -> Option<Rect> {
+        let font = FontId::proportional((11.0 * chrome_zoom).clamp(7.0, 11.0));
+        let galley = painter.layout_no_wrap(format!("#{issue}"), font, DIM_FG);
+        let padding = vec2(7.0, 3.0);
+        let size = vec2(
+            galley.size().x + padding.x * 2.0,
+            galley.size().y + padding.y * 2.0,
+        );
+        // Va inmediatamente a la derecha del título; si no entra, no se dibuja.
+        let left = title_right + 8.0;
+        if left + size.x > title_rect.right() - 8.0 {
+            return None;
+        }
+        let rect = Rect::from_min_size(pos2(left, title_rect.center().y - size.y * 0.5), size);
+        painter.rect_filled(rect, 5.0, BRANCH_BADGE_BG);
+        painter.galley(
+            pos2(
+                rect.left() + padding.x,
+                rect.center().y - galley.size().y * 0.5,
+            ),
+            galley,
+            DIM_FG,
+        );
+        Some(rect)
+    }
+
     fn draw_branch_badge(
         &self,
         painter: &egui::Painter,
@@ -1600,6 +1652,27 @@ impl TerminalPanel {
                             overlay.dirty,
                             chrome_zoom,
                         );
+                    }
+                }
+                // Badge `#N` del issue de GitHub que trabaja este panel
+                // (P2.13): clickeable, abre el issue en el navegador.
+                if let Some(issue) = self.linked_issue {
+                    let issue_rect = self.draw_issue_badge(
+                        &chrome_painter,
+                        title_rect,
+                        title_galley_rect.right(),
+                        issue,
+                        chrome_zoom,
+                    );
+                    if let Some(issue_rect) = issue_rect {
+                        let response = ui.interact(
+                            issue_rect,
+                            ui.id().with(("issue-badge", self.id)),
+                            Sense::click(),
+                        );
+                        if response.clicked() {
+                            interaction.open_issue = Some(issue);
+                        }
                     }
                 }
             }

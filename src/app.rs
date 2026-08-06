@@ -114,6 +114,11 @@ pub struct TerminalApp {
     notification_gate: notify_policy::NotificationGate,
     /// Servidor local de hooks de agentes (P2.12). `None` si no arrancó.
     hook_server: Option<crate::orchestration::HookServer>,
+    /// Worker de la CLI `gh` y estado de la pestaña Tasks (P2.13).
+    gh_client: crate::orchestration::GhClient,
+    tasks_state: crate::sidebar::tasks::TasksState,
+    /// Issues que esperan a que su worktree termine para pegarse al panel.
+    pending_issue_links: HashMap<Uuid, u64>,
     /// ¿La ventana tiene foco del SO? (P1.8) Se refresca cada frame.
     window_focused: bool,
     brand_texture: Option<egui::TextureHandle>,
@@ -208,6 +213,9 @@ impl TerminalApp {
                     notify_policy::NOTIFICATION_COOLDOWN,
                 ),
                 hook_server: start_hook_server(),
+                gh_client: Default::default(),
+                tasks_state: Default::default(),
+                pending_issue_links: HashMap::new(),
                 window_focused: false,
                 brand_texture,
                 sidebar: Sidebar::default(),
@@ -287,6 +295,9 @@ impl TerminalApp {
                     notify_policy::NOTIFICATION_COOLDOWN,
                 ),
                 hook_server: start_hook_server(),
+                gh_client: Default::default(),
+                tasks_state: Default::default(),
+                pending_issue_links: HashMap::new(),
                 window_focused: false,
                 brand_texture,
                 sidebar: Sidebar::default(),
@@ -685,6 +696,9 @@ impl TerminalApp {
                 }
                 SidebarResponse::OpenSettings => self.open_settings(),
                 SidebarResponse::OpenBroadcast => self.open_broadcast(),
+                SidebarResponse::RefreshTasks => self.refresh_github_tasks(true),
+                SidebarResponse::OpenTask(number) => self.open_github_task(number),
+                SidebarResponse::StartWorkOnIssue(number) => self.start_work_on_issue(number),
                 SidebarResponse::ExportScrollback => self.export_focused_scrollback(),
                 SidebarResponse::OpenFileInViewer(path) => self.open_file_viewer(path),
             }
@@ -767,6 +781,7 @@ impl TerminalApp {
         self.poll_worktree_ops();
         self.poll_quick_open();
         self.poll_hook_events();
+        self.poll_gh_client();
         self.poll_screenshot_capture(ctx);
         if self.code_review.as_ref().is_some_and(|state| state.loading) {
             ctx.request_repaint_after(std::time::Duration::from_millis(80));
@@ -890,6 +905,11 @@ impl TerminalApp {
                     // El explorador sigue la carpeta del workspace activo.
                     let ws_root = self.workspaces[self.active_ws].cwd.clone();
                     self.file_tree.set_root(ws_root);
+                    // Con la pestaña Tasks abierta se refresca respetando el
+                    // cache de 60 s (P2.13).
+                    if self.sidebar.active_tab == crate::sidebar::SidebarTab::Tasks {
+                        self.refresh_github_tasks(false);
+                    }
                     let responses = self.sidebar.show(
                         ui,
                         self.brand_texture.as_ref(),
@@ -900,6 +920,7 @@ impl TerminalApp {
                         self.collab.session_state(),
                         &attention,
                         &mut self.file_tree,
+                        &self.tasks_state,
                     );
                     self.handle_sidebar_responses(responses, ctx);
                 });
@@ -1256,6 +1277,9 @@ impl TerminalApp {
             };
             perf_snapshot.visible_panels += 1;
             perf_snapshot.note_render(interaction.render_tier, interaction.cache_hit);
+            if let Some(issue) = interaction.open_issue {
+                self.open_github_task(issue);
+            }
             guides.extend(interaction.guides);
         }
 

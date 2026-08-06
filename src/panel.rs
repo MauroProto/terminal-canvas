@@ -375,6 +375,17 @@ impl WorkspacePanel {
         }
     }
 
+    pub fn linked_issue(&self) -> Option<u64> {
+        match self {
+            Self::Terminal(panel) => panel.linked_issue(),
+        }
+    }
+
+    pub fn set_linked_issue(&mut self, issue: Option<u64>) {
+        let Self::Terminal(panel) = self;
+        panel.set_linked_issue(issue);
+    }
+
     pub fn set_unread(&mut self, unread: bool) {
         match self {
             Self::Terminal(panel) => panel.set_unread(unread),

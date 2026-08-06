@@ -2,6 +2,7 @@ mod agent_sessions;
 mod claude_hooks;
 mod code_diff;
 mod diff_notes;
+mod gh_client;
 mod git;
 mod hook_server;
 mod manager;
@@ -22,6 +23,11 @@ pub use code_diff::{
 };
 #[allow(unused_imports)]
 pub use diff_notes::{format_note, load_notes, save_notes, DiffNote, DiffNotes};
+#[allow(unused_imports)]
+pub use gh_client::{
+    issue_branch_name, issue_prompt, GhAvailability, GhClient, GhResult, GhSnapshot, Issue,
+    PullRequest,
+};
 #[allow(unused_imports)]
 pub use hook_server::{HookEvent, HookKind, HookServer};
 #[allow(unused_imports)]

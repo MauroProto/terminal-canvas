@@ -382,6 +382,7 @@ mod tests {
                     unread: false,
                     split_tree: None,
                     focused_leaf: None,
+                    linked_issue: None,
                 }],
                 desktop: WorkspaceDesktopState {
                     next_z: 2,

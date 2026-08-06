@@ -771,6 +771,7 @@ mod tests {
                 unread: false,
                 split_tree: None,
                 focused_leaf: None,
+                linked_issue: None,
             }],
             desktop: WorkspaceDesktopState {
                 next_z: 2,
@@ -818,6 +819,7 @@ mod tests {
                 unread: false,
                 split_tree: None,
                 focused_leaf: None,
+                linked_issue: None,
             }],
             desktop: WorkspaceDesktopState {
                 next_z: 2,
@@ -866,6 +868,7 @@ mod tests {
                 unread: false,
                 split_tree: None,
                 focused_leaf: None,
+                linked_issue: None,
             })
             .collect();
         let state = WorkspaceState {

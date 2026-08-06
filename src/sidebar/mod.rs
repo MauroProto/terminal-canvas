@@ -7,6 +7,7 @@ use crate::theme::colors::{DIM, FOCUS, INK, LINE, RAISED, SURFACE, TEXT, TEXT_ST
 use crate::update::UpdateState;
 
 pub mod file_tree;
+pub mod tasks;
 pub mod workspace_list;
 
 pub const SIDEBAR_BG: egui::Color32 = INK;
@@ -25,11 +26,15 @@ pub const ITEM_BG: egui::Color32 = RAISED;
 pub enum SidebarTab {
     Workspaces,
     Files,
+    Tasks,
     Online,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SidebarResponse {
+    RefreshTasks,
+    OpenTask(u64),
+    StartWorkOnIssue(u64),
     SwitchWorkspace(usize),
     OpenFolder,
     DeleteWorkspace(usize),
@@ -132,6 +137,7 @@ impl Sidebar {
         collab_state: CollabSessionState,
         attention: &[AttentionItem],
         file_tree: &mut file_tree::FileTreeState,
+        tasks_state: &tasks::TasksState,
     ) -> Vec<SidebarResponse> {
         let mut responses = Vec::new();
 
@@ -177,6 +183,9 @@ impl Sidebar {
                     SidebarTab::Files => {
                         responses.extend(file_tree::draw_file_tree(ui, file_tree));
                     }
+                    SidebarTab::Tasks => {
+                        responses.extend(tasks::draw_tasks(ui, tasks_state));
+                    }
                     SidebarTab::Online => {
                         responses.extend(self.show_online_panel(ui, collab_mode, collab_state));
                     }
@@ -207,6 +216,7 @@ impl Sidebar {
                 "sidebar-tab-workspaces",
             ),
             (SidebarTab::Files, "Files", "sidebar-tab-files"),
+            (SidebarTab::Tasks, "Tasks", "sidebar-tab-tasks"),
             (SidebarTab::Online, "Online", "sidebar-tab-online"),
         ];
 

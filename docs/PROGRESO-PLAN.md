@@ -17,7 +17,7 @@
 ## P2 — Capacidades nuevas
 - [x] P2.11 Terminal splits
 - [x] P2.12 Hooks de agente
-- [ ] P2.13 GitHub in-app vía gh
+- [x] P2.13 GitHub in-app vía gh
 - [ ] P2.14 Quick open unificado
 
 ## P3 — Arquitectura

@@ -182,6 +182,104 @@ impl TerminalApp {
         self.repaint_policy.note_runtime_event();
     }
 
+    // ----- GitHub in-app vía `gh` (P2.13) -----
+
+    /// Pide (o refresca) PRs e issues del repo del workspace activo.
+    pub(super) fn refresh_github_tasks(&mut self, force: bool) {
+        let Some(repo_root) = self.ws().cwd.clone() else {
+            return;
+        };
+        self.tasks_state.loading = true;
+        self.gh_client.request(repo_root, force);
+    }
+
+    /// Drena los resultados del worker de `gh` hacia la pestaña Tasks.
+    pub(super) fn poll_gh_client(&mut self) {
+        for result in self.gh_client.poll() {
+            self.tasks_state.loading = false;
+            self.tasks_state.availability = Some(result.availability);
+            self.tasks_state.snapshot = result.snapshot;
+        }
+    }
+
+    /// Abre el PR/issue en el navegador con `gh browse`, que resuelve la URL
+    /// del remoto sin que tengamos que armarla a mano.
+    pub(super) fn open_github_task(&mut self, number: u64) {
+        let Some(repo_root) = self.ws().cwd.clone() else {
+            return;
+        };
+        let spawned = std::process::Command::new("gh")
+            .current_dir(&repo_root)
+            .args(["browse", &number.to_string()])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        if spawned.is_err() {
+            self.toast_error("No se pudo abrir con gh");
+        }
+    }
+
+    /// "Start work" sobre un issue: worktree `issue-<n>-<slug>` y agente
+    /// arrancado con el prompt del issue.
+    pub(super) fn start_work_on_issue(&mut self, number: u64) {
+        let Some(issue) = self
+            .tasks_state
+            .snapshot
+            .issues
+            .iter()
+            .find(|issue| issue.number == number)
+            .cloned()
+        else {
+            return;
+        };
+        let workspace_id = self.ws().id;
+        let request = AgentLaunchRequest {
+            workspace_id,
+            task_id: None,
+            base_cwd: self.ws().cwd.clone(),
+            provider: AgentProvider::ClaudeCode,
+            task_title: crate::orchestration::issue_branch_name(number, &issue.title),
+            brief: crate::orchestration::issue_prompt(number, &issue.title, &issue.body),
+            worktree_mode: WorktreeMode::Auto,
+        };
+        match self.orchestrator.prepare_launch(request) {
+            Ok(LaunchPreparation::Ready(plan)) => {
+                if let Some(ctx) = self.ctx.clone() {
+                    if self.spawn_agent_panel(&ctx, &plan) {
+                        self.link_issue_to_panel(plan.session_id, number);
+                    }
+                }
+            }
+            Ok(LaunchPreparation::PendingWorktree { session_id }) => {
+                // El worktree se crea en el worker; al aterrizar el panel se
+                // le pega el issue.
+                self.pending_issue_links.insert(session_id, number);
+            }
+            Err(err) => self.toast_error(format!("No se pudo arrancar el issue #{number}: {err}")),
+        }
+    }
+
+    /// Asocia el issue al panel recién creado, para el badge `#N`.
+    pub(super) fn link_issue_to_panel(&mut self, session_id: Uuid, issue: u64) {
+        let panel_id = self
+            .orchestrator
+            .sessions()
+            .iter()
+            .find(|session| session.session_id == session_id)
+            .and_then(|session| session.panel_id);
+        let Some(panel_id) = panel_id else {
+            return;
+        };
+        for workspace in &mut self.workspaces {
+            for panel in &mut workspace.panels {
+                if panel.id() == panel_id {
+                    panel.set_linked_issue(Some(issue));
+                }
+            }
+        }
+    }
+
     pub(super) fn maybe_refresh_orchestration(&mut self) {
         if self.panel_gesture.is_some() {
             return;
@@ -255,6 +353,13 @@ impl TerminalApp {
             match outcome {
                 LaunchOutcome::Ready(plan) => {
                     let spawned = self.spawn_agent_panel(ctx, &plan);
+                    // Si este launch venía de un "Start work" sobre un issue,
+                    // recién ahora existe el panel al que pegarle el badge.
+                    if spawned {
+                        if let Some(issue) = self.pending_issue_links.remove(&plan.session_id) {
+                            self.link_issue_to_panel(plan.session_id, issue);
+                        }
+                    }
                     let matches_draft = self
                         .launch_agent
                         .as_ref()

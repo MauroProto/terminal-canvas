@@ -74,6 +74,9 @@ pub struct PanelState {
     /// Hoja con el foco de teclado dentro del split (P2.11).
     #[serde(default)]
     pub focused_leaf: Option<String>,
+    /// Issue de GitHub que este panel está trabajando (P2.13).
+    #[serde(default)]
+    pub linked_issue: Option<u64>,
 }
 
 #[cfg(test)]
@@ -102,6 +105,7 @@ mod tests {
             unread: false,
             split_tree: None,
             focused_leaf: None,
+            linked_issue: None,
         }
     }
 
