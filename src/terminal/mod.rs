@@ -14,6 +14,7 @@ pub mod scrollbar;
 pub mod search;
 pub mod session_controller;
 pub mod shell_quote;
+pub mod split_tree;
 
 #[cfg(test)]
 mod tests {
