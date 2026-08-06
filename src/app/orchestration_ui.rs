@@ -191,14 +191,63 @@ impl TerminalApp {
         };
         self.tasks_state.loading = true;
         self.gh_client.request(repo_root, force);
+        // Linear es opt-in: sin token en config.toml el worker ni se toca, y
+        // la sección no se dibuja.
+        let linear_token = crate::config::runtime_config().linear_token;
+        if linear_token.is_some() {
+            self.linear_client.request(linear_token, force);
+        }
     }
 
-    /// Drena los resultados del worker de `gh` hacia la pestaña Tasks.
+    /// Drena los resultados de los workers de `gh` y Linear hacia la pestaña.
     pub(super) fn poll_gh_client(&mut self) {
         for result in self.gh_client.poll() {
             self.tasks_state.loading = false;
             self.tasks_state.availability = Some(result.availability);
             self.tasks_state.snapshot = result.snapshot;
+        }
+        for result in self.linear_client.poll() {
+            self.tasks_state.linear_availability = Some(result.availability);
+            self.tasks_state.linear_snapshot = result.snapshot;
+        }
+    }
+
+    /// "Start work" sobre un issue de Linear (P3.17, T2): mismo camino que el
+    /// de GitHub, con el identificador legible como nombre de worktree.
+    pub(super) fn start_work_on_linear_issue(&mut self, identifier: &str) {
+        let Some(issue) = self
+            .tasks_state
+            .linear_snapshot
+            .issues
+            .iter()
+            .find(|issue| issue.identifier == identifier)
+            .cloned()
+        else {
+            return;
+        };
+        let request = AgentLaunchRequest {
+            workspace_id: self.ws().id,
+            task_id: None,
+            base_cwd: self.ws().cwd.clone(),
+            provider: AgentProvider::ClaudeCode,
+            task_title: crate::orchestration::linear_branch_name(&issue.identifier, &issue.title),
+            brief: crate::orchestration::linear_prompt(
+                &issue.identifier,
+                &issue.title,
+                &issue.description,
+            ),
+            worktree_mode: WorktreeMode::Auto,
+        };
+        match self.orchestrator.prepare_launch(request) {
+            Ok(LaunchPreparation::Ready(plan)) => {
+                if let Some(ctx) = self.ctx.clone() {
+                    self.spawn_agent_panel(&ctx, &plan);
+                }
+            }
+            // El worktree se crea en el worker; poll_pending_launches lo
+            // aterriza (Linear no tiene badge numérico que enganchar).
+            Ok(LaunchPreparation::PendingWorktree { .. }) => {}
+            Err(err) => self.toast_error(format!("No se pudo arrancar {identifier}: {err}")),
         }
     }
 

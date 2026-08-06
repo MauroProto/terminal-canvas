@@ -28,6 +28,9 @@ pub struct AppConfig {
     /// Shell personalizada para los terminales nuevos; `None` = login shell
     /// del sistema.
     pub shell: Option<String>,
+    /// Token de API de Linear (`[integrations] linear_token`), para la fuente
+    /// de issues de la pestaña Tasks (P3.17). `None` = integración apagada.
+    pub linear_token: Option<String>,
 }
 
 impl Default for AppConfig {
@@ -42,6 +45,7 @@ impl Default for AppConfig {
             copy_on_select: false,
             agent_notifications: true,
             shell: None,
+            linear_token: None,
         }
     }
 }
@@ -50,6 +54,14 @@ impl Default for AppConfig {
 struct ConfigFile {
     #[serde(default)]
     terminal: TerminalSection,
+    #[serde(default)]
+    integrations: IntegrationsSection,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+struct IntegrationsSection {
+    #[serde(default)]
+    linear_token: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -96,7 +108,13 @@ pub fn load_from_path(path: &std::path::Path) -> AppConfig {
         toml::from_str::<ConfigFile>(raw).ok()
     });
     match parsed {
-        Some(file) => apply_terminal_section(&mut config, file.terminal),
+        Some(file) => {
+            apply_terminal_section(&mut config, file.terminal);
+            if let Some(token) = file.integrations.linear_token {
+                let token = token.trim().to_owned();
+                config.linear_token = if token.is_empty() { None } else { Some(token) };
+            }
+        }
         None if path.exists() => {
             log::warn!("config.toml inválido (ni backups parsean): se usan defaults");
         }
@@ -176,6 +194,9 @@ pub fn save_to_path(config: &AppConfig, path: &std::path::Path) -> anyhow::Resul
             agent_notifications: Some(config.agent_notifications),
             shell: config.shell.clone(),
         },
+        integrations: IntegrationsSection {
+            linear_token: config.linear_token.clone(),
+        },
     };
     let raw = toml::to_string_pretty(&file)?;
     crate::state::durable_write::write_durable(path, raw.as_bytes())?;
@@ -249,6 +270,7 @@ mod tests {
             copy_on_select: true,
             agent_notifications: false,
             shell: Some("/bin/zsh".to_owned()),
+            linear_token: Some("lin_api_test".to_owned()),
         };
         assert_ne!(config, AppConfig::default());
 

@@ -45,6 +45,9 @@ impl SettingsDraft {
             copy_on_select: self.copy_on_select,
             agent_notifications: self.agent_notifications,
             shell: if shell.is_empty() { None } else { Some(shell) },
+            // El token de Linear no se edita acá (vive en config.toml):
+            // se conserva tal cual para que guardar Settings no lo borre.
+            linear_token: crate::config::runtime_config().linear_token,
         }
     }
 }
@@ -284,6 +287,7 @@ mod tests {
             copy_on_select: true,
             agent_notifications: false,
             shell: Some("/opt/homebrew/bin/fish".to_owned()),
+            linear_token: None,
         }
     }
 

@@ -6,7 +6,7 @@
 use egui::{RichText, Ui};
 
 use super::{SidebarResponse, TEXT_MUTED, TEXT_PRIMARY};
-use crate::orchestration::{GhAvailability, GhSnapshot};
+use crate::orchestration::{GhAvailability, GhSnapshot, LinearAvailability, LinearSnapshot};
 
 /// Estado de la pestaña que vive en el app (no en el sidebar).
 #[derive(Debug, Clone, Default)]
@@ -14,6 +14,9 @@ pub struct TasksState {
     pub availability: Option<GhAvailability>,
     pub snapshot: GhSnapshot,
     pub loading: bool,
+    /// Fuente extra de issues: Linear (P3.17).
+    pub linear_availability: Option<LinearAvailability>,
+    pub linear_snapshot: LinearSnapshot,
 }
 
 /// Color del estado de un PR/issue.
@@ -150,5 +153,64 @@ pub fn draw_tasks(ui: &mut Ui, state: &TasksState) -> Vec<SidebarResponse> {
         }
     }
 
+    draw_linear_section(ui, state, &mut responses);
+
     responses
+}
+
+/// Issues de Linear como fuente extra de la pestaña (P3.17, T2).
+fn draw_linear_section(ui: &mut Ui, state: &TasksState, responses: &mut Vec<SidebarResponse>) {
+    // La integración es opt-in: sin token configurado no se muestra nada, para
+    // no llenar el panel de ruido a quien no la usa.
+    let Some(availability) = state.linear_availability.as_ref() else {
+        return;
+    };
+    ui.add_space(10.0);
+    ui.horizontal(|ui| {
+        ui.add_space(12.0);
+        ui.label(
+            RichText::new("Linear")
+                .size(11.0)
+                .color(TEXT_MUTED)
+                .strong(),
+        );
+    });
+    if let LinearAvailability::Unavailable(reason) = availability {
+        ui.horizontal_wrapped(|ui| {
+            ui.add_space(12.0);
+            ui.label(RichText::new(reason).size(11.0).color(TEXT_MUTED));
+        });
+        return;
+    }
+    if state.linear_snapshot.issues.is_empty() {
+        ui.horizontal(|ui| {
+            ui.add_space(12.0);
+            ui.label(
+                RichText::new("Sin issues asignados")
+                    .size(11.0)
+                    .color(TEXT_MUTED),
+            );
+        });
+        return;
+    }
+    for issue in &state.linear_snapshot.issues {
+        ui.horizontal(|ui| {
+            ui.add_space(12.0);
+            ui.label(
+                RichText::new(&issue.identifier)
+                    .size(11.0)
+                    .color(state_color(&issue.state))
+                    .monospace(),
+            );
+            ui.label(RichText::new(&issue.title).size(11.5).color(TEXT_PRIMARY));
+        });
+        ui.horizontal(|ui| {
+            ui.add_space(30.0);
+            if ui.small_button("Start work").clicked() {
+                responses.push(SidebarResponse::StartWorkOnLinearIssue(
+                    issue.identifier.clone(),
+                ));
+            }
+        });
+    }
 }

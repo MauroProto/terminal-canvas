@@ -35,6 +35,7 @@ pub enum SidebarResponse {
     RefreshTasks,
     OpenTask(u64),
     StartWorkOnIssue(u64),
+    StartWorkOnLinearIssue(String),
     SwitchWorkspace(usize),
     OpenFolder,
     DeleteWorkspace(usize),

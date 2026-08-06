@@ -116,6 +116,8 @@ pub struct TerminalApp {
     hook_server: Option<crate::orchestration::HookServer>,
     /// Worker de la CLI `gh` y estado de la pestaña Tasks (P2.13).
     gh_client: crate::orchestration::GhClient,
+    /// Worker de la API de Linear (P3.17).
+    linear_client: crate::orchestration::LinearClient,
     tasks_state: crate::sidebar::tasks::TasksState,
     /// Issues que esperan a que su worktree termine para pegarse al panel.
     pending_issue_links: HashMap<Uuid, u64>,
@@ -214,6 +216,7 @@ impl TerminalApp {
                 ),
                 hook_server: start_hook_server(),
                 gh_client: Default::default(),
+                linear_client: Default::default(),
                 tasks_state: Default::default(),
                 pending_issue_links: HashMap::new(),
                 window_focused: false,
@@ -296,6 +299,7 @@ impl TerminalApp {
                 ),
                 hook_server: start_hook_server(),
                 gh_client: Default::default(),
+                linear_client: Default::default(),
                 tasks_state: Default::default(),
                 pending_issue_links: HashMap::new(),
                 window_focused: false,
@@ -699,6 +703,9 @@ impl TerminalApp {
                 SidebarResponse::RefreshTasks => self.refresh_github_tasks(true),
                 SidebarResponse::OpenTask(number) => self.open_github_task(number),
                 SidebarResponse::StartWorkOnIssue(number) => self.start_work_on_issue(number),
+                SidebarResponse::StartWorkOnLinearIssue(identifier) => {
+                    self.start_work_on_linear_issue(&identifier)
+                }
                 SidebarResponse::ExportScrollback => self.export_focused_scrollback(),
                 SidebarResponse::OpenFileInViewer(path) => self.open_file_viewer(path),
             }

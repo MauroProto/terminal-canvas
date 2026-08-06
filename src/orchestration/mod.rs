@@ -5,6 +5,7 @@ mod diff_notes;
 mod gh_client;
 mod git;
 mod hook_server;
+mod linear_client;
 mod manager;
 mod matching;
 mod worktree_removal_safety;
@@ -30,6 +31,11 @@ pub use gh_client::{
 };
 #[allow(unused_imports)]
 pub use hook_server::{HookEvent, HookKind, HookServer};
+#[allow(unused_imports)]
+pub use linear_client::{
+    linear_branch_name, linear_prompt, LinearAvailability, LinearClient, LinearIssue,
+    LinearSnapshot,
+};
 #[allow(unused_imports)]
 pub use manager::{
     launch_presets, resume_command, resume_invocation, AgentLaunchPlan, AgentLaunchRequest,

@@ -67,6 +67,9 @@ audio_bell = false      # play a sound on bell (in addition to the visual flash)
 copy_on_select = false  # auto-copy to clipboard when you select text
 agent_notifications = true  # OS notification when an agent needs attention
 # shell = "/opt/homebrew/bin/fish"   # custom shell (default: system login shell)
+
+[integrations]
+# linear_token = "lin_api_..."   # enables the Linear source in the Tasks tab
 ```
 
 The `MI_TERMINAL_ALLOW_OSC52` environment variable still overrides `allow_osc52`.
