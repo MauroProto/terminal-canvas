@@ -33,6 +33,11 @@ Native desktop workspace for terminals and coding agents.
   from a list (dead panels can't be selected)
 - Export terminal output (`Ctrl+Shift+E`): dump the focused terminal's scrollback to a text
   file in your Downloads folder
+- Drag & drop files from the OS onto a terminal: their paths are typed shell-escaped
+  (single-quoted, like Terminal.app), ready to submit; dropping onto the code viewer opens
+  the file there
+- Attach a screenshot to the focused agent (`Ctrl+Shift+K`): pick a screen region and the
+  capture's path is pasted into the agent's prompt
 - Git branch badge in each panel's title bar, with a dot when the repo is dirty (drawn only
   when it fits without covering the title)
 - Resume past agent conversations: the app does not store them, it reads the history the CLI
@@ -79,6 +84,7 @@ The `MI_TERMINAL_ALLOW_OSC52` environment variable still overrides `allow_osc52`
 | Quick open file (opens the built-in viewer) | `Ctrl+P` |
 | Settings | `Ctrl+,` |
 | Export terminal output | `Ctrl+Shift+E` |
+| Attach screenshot to agent | `Ctrl+Shift+K` |
 | Broadcast command to terminals | `Ctrl+Shift+Enter` |
 | Resume a past agent conversation | `Ctrl+Shift+R` |
 | Launch agent | `Ctrl+Shift+A` |

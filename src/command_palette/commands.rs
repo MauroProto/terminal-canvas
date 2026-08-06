@@ -12,6 +12,7 @@ pub enum Command {
     QuickOpen,
     OpenSettings,
     ExportScrollback,
+    AttachScreenshot,
     BroadcastCommand,
     ResumeConversation,
     SharePanelPrivate,
@@ -95,6 +96,11 @@ pub const COMMANDS: &[CommandEntry] = &[
         command: Command::ExportScrollback,
         label: "Export Terminal Output",
         shortcut: "Ctrl+Shift+E",
+    },
+    CommandEntry {
+        command: Command::AttachScreenshot,
+        label: "Attach Screenshot To Agent",
+        shortcut: "Ctrl+Shift+K",
     },
     CommandEntry {
         command: Command::BroadcastCommand,

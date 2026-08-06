@@ -169,6 +169,73 @@ pub fn notify(title: &str, message: &str) {
     }
 }
 
+/// Directorio donde guardar las capturas de pantalla que se mandan al agente.
+pub fn screenshots_dir() -> Option<PathBuf> {
+    let dirs = directories::ProjectDirs::from("", "", "terminal-app")?;
+    Some(dirs.data_dir().join("screenshots"))
+}
+
+/// Captura interactiva de pantalla: el usuario selecciona un área y el SO la
+/// guarda como PNG en `dest`. **Bloquea** hasta que el usuario termina o
+/// cancela — llamar desde un worker thread, nunca desde el hilo de UI.
+///
+/// macOS: `screencapture -i`. Linux: `gnome-screenshot -a`, y si no existe,
+/// `slurp` + `grim` (compositores wlroots). Windows no tiene CLI de captura
+/// interactiva: devuelve error para que la UI lo explique.
+pub fn capture_interactive(dest: &Path) -> anyhow::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let status = Command::new("screencapture").arg("-i").arg(dest).status()?;
+        // Cancelar (Esc / clic derecho) sale sin éxito y sin archivo.
+        if !status.success() || !dest.exists() {
+            anyhow::bail!("la captura se canceló");
+        }
+        Ok(())
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        match Command::new("gnome-screenshot")
+            .args(["-a", "-f"])
+            .arg(dest)
+            .status()
+        {
+            Ok(status) => {
+                if status.success() && dest.exists() {
+                    return Ok(());
+                }
+                anyhow::bail!("la captura se canceló");
+            }
+            // No existe gnome-screenshot: probar slurp + grim.
+            Err(_) => {}
+        }
+        let region = Command::new("slurp").output().map_err(|_| {
+            anyhow::anyhow!("no hay herramienta de captura (gnome-screenshot o slurp+grim)")
+        })?;
+        if !region.status.success() {
+            anyhow::bail!("la captura se canceló");
+        }
+        let geometry = String::from_utf8_lossy(&region.stdout).trim().to_owned();
+        if geometry.is_empty() {
+            anyhow::bail!("no se seleccionó ninguna región");
+        }
+        let status = Command::new("grim")
+            .args(["-g", &geometry])
+            .arg(dest)
+            .status()?;
+        if !status.success() || !dest.exists() {
+            anyhow::bail!("grim no pudo guardar la captura");
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let _ = dest;
+        anyhow::bail!("la captura interactiva no está soportada en Windows")
+    }
+}
+
 pub fn default_share_base_url(port: u16) -> Option<String> {
     let host = local_network_host().unwrap_or_else(|| "127.0.0.1".to_owned());
     let host = if host.contains(':') && !host.starts_with('[') {

@@ -93,6 +93,9 @@ pub struct TerminalApp {
     worktree_ops: crate::orchestration::WorktreeOps,
     quick_open: Option<QuickOpenState>,
     quick_open_rx: Option<std::sync::mpsc::Receiver<Vec<String>>>,
+    /// Resultado pendiente de la captura interactiva de pantalla (corre en un
+    /// worker porque bloquea hasta que el usuario selecciona o cancela).
+    screenshot_rx: Option<std::sync::mpsc::Receiver<anyhow::Result<PathBuf>>>,
     file_viewer: Option<file_viewer_ui::FileViewerState>,
     settings_open: bool,
     settings_draft: Option<settings_ui::SettingsDraft>,
@@ -183,6 +186,7 @@ impl TerminalApp {
                 worktree_ops: crate::orchestration::WorktreeOps::default(),
                 quick_open: None,
                 quick_open_rx: None,
+                screenshot_rx: None,
                 file_viewer: None,
                 settings_open: false,
                 settings_draft: None,
@@ -256,6 +260,7 @@ impl TerminalApp {
                 worktree_ops: crate::orchestration::WorktreeOps::default(),
                 quick_open: None,
                 quick_open_rx: None,
+                screenshot_rx: None,
                 file_viewer: None,
                 settings_open: false,
                 settings_draft: None,
@@ -477,6 +482,7 @@ impl TerminalApp {
             Command::QuickOpen => self.open_quick_open(),
             Command::OpenSettings => self.open_settings(),
             Command::ExportScrollback => self.export_focused_scrollback(),
+            Command::AttachScreenshot => self.start_screenshot_capture(ctx),
             Command::BroadcastCommand => self.open_broadcast(),
             Command::ResumeConversation => self.open_resume_picker(),
             Command::SharePanelPrivate => {
@@ -726,6 +732,7 @@ impl TerminalApp {
         self.poll_diff_loader();
         self.poll_worktree_ops();
         self.poll_quick_open();
+        self.poll_screenshot_capture(ctx);
         if self.code_review.as_ref().is_some_and(|state| state.loading) {
             ctx.request_repaint_after(std::time::Duration::from_millis(80));
         }
@@ -1186,6 +1193,81 @@ impl TerminalApp {
     /// (`dropped_files`) se tipean los paths shell-escapados en ese panel,
     /// precedidos de espacio, igual que Terminal.app: varios archivos quedan
     /// en una sola línea listos para Enter.
+    /// Lanza la captura interactiva de pantalla en un worker (bloquea hasta
+    /// que el usuario selecciona el área o cancela) y deja el receiver para
+    /// mandarle el path al agente enfocado cuando llegue.
+    fn start_screenshot_capture(&mut self, ctx: &egui::Context) {
+        if self.screenshot_rx.is_some() {
+            self.toast_error("Ya hay una captura en curso");
+            return;
+        }
+        let Some(dir) = crate::utils::platform::screenshots_dir() else {
+            self.toast_error("No pude resolver el directorio de capturas");
+            return;
+        };
+        if let Err(err) = std::fs::create_dir_all(&dir) {
+            self.toast_error(format!("No pude crear el directorio de capturas: {err}"));
+            return;
+        }
+        let dest = dir.join(format!(
+            "captura-{}.png",
+            chrono::Local::now().format("%Y%m%d-%H%M%S")
+        ));
+        let (tx, rx) = std::sync::mpsc::channel();
+        // Si el hilo no arranca, el receiver se desconecta y el poll lo
+        // descarta: nunca queda colgado.
+        let _ = std::thread::Builder::new()
+            .name("screenshot".to_owned())
+            .spawn(move || {
+                let result = crate::utils::platform::capture_interactive(&dest).map(|()| dest);
+                let _ = tx.send(result);
+            });
+        self.screenshot_rx = Some(rx);
+        self.toast_success("Seleccioná el área de la pantalla a capturar");
+        ctx.request_repaint();
+    }
+
+    fn poll_screenshot_capture(&mut self, ctx: &egui::Context) {
+        let Some(rx) = self.screenshot_rx.as_ref() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok(path)) => {
+                self.screenshot_rx = None;
+                self.deliver_screenshot(path);
+            }
+            Ok(Err(err)) => {
+                self.screenshot_rx = None;
+                self.toast_error(err.to_string());
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                // La captura sigue abierta: volver a preguntar más tarde.
+                ctx.request_repaint_after(Duration::from_millis(100));
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.screenshot_rx = None;
+            }
+        }
+    }
+
+    fn deliver_screenshot(&mut self, path: PathBuf) {
+        let Some(panel_id) = self.ws().focused_panel().map(|panel| panel.id()) else {
+            self.toast_error("No hay terminal enfocado donde mandarla");
+            return;
+        };
+        // El path va quoteado: los agentes reciben el literal exacto aunque
+        // tenga espacios o caracteres raros.
+        let prompt = format!(
+            "Mirá esta captura: {}",
+            crate::terminal::shell_quote::quote_path(&path.to_string_lossy())
+        );
+        if self.ws_mut().send_prompt_to_panel(panel_id, &prompt) {
+            self.toast_success("Captura enviada al agente");
+        } else {
+            self.toast_error("No se pudo escribir en ese terminal");
+        }
+    }
+
     fn handle_file_drop(
         &mut self,
         ctx: &egui::Context,
