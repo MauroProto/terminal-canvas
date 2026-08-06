@@ -17,4 +17,6 @@ pub mod state;
 pub mod terminal;
 pub mod theme;
 pub mod update;
+#[cfg(target_os = "macos")]
+pub mod update_install;
 pub mod utils;

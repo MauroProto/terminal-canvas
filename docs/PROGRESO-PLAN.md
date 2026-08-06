@@ -31,4 +31,4 @@
 - [x] 7.3 Perf budgets
 - [x] 7.4 Smoke E2E
 - [x] 7.5 Diagnóstico exportable
-- [ ] 7.1 Empaquetado (parcial: bundle script; firma/notarización requieren Developer ID del usuario)
+- [x] 7.1 Empaquetado (firma/notarización quedan a tu Developer ID)
