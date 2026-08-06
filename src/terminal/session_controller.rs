@@ -254,12 +254,15 @@ pub fn session_spec(
     cwd: Option<PathBuf>,
     startup_command: Option<String>,
     startup_input: Option<String>,
+    panel_id: Option<Uuid>,
 ) -> SessionSpec {
     SessionSpec {
         title,
         cwd,
         startup_command,
         startup_input,
+        panel_id,
+        workspace_id: None,
     }
 }
 

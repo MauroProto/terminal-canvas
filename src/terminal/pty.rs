@@ -103,6 +103,7 @@ impl PtyHandle {
         rows: u16,
         session_id: Uuid,
         scheduler: SharedRuntimeScheduler,
+        hooks: HookIdentity,
     ) -> anyhow::Result<Self> {
         let pty_system = native_pty_system();
         let pair = pty_system.openpty(PtySize {
@@ -112,7 +113,7 @@ impl PtyHandle {
             pixel_height: 0,
         })?;
 
-        let cmd = shell_command(cwd);
+        let cmd = shell_command(cwd, hooks);
 
         let child = pair.slave.spawn_command(cmd).context("spawn PTY child")?;
         let killer = child.clone_killer();
@@ -526,7 +527,7 @@ impl PtyHandle {
     }
 }
 
-fn shell_command(cwd: Option<&Path>) -> CommandBuilder {
+fn shell_command(cwd: Option<&Path>, hooks: HookIdentity) -> CommandBuilder {
     let configured_shell = crate::config::runtime_config()
         .shell
         .filter(|shell| !shell.trim().is_empty());
@@ -553,7 +554,23 @@ fn shell_command(cwd: Option<&Path>) -> CommandBuilder {
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
     cmd.env("MI_TERMINAL", "1");
+    // Identidad del pane para los hooks del agente (P2.12): el hook las
+    // reenvía como query params y el listener resuelve pane -> panel.
+    if let Some(panel_id) = hooks.panel_id {
+        cmd.env("TC_PANEL_ID", panel_id.to_string());
+    }
+    if let Some(workspace_id) = hooks.workspace_id {
+        cmd.env("TC_WORKSPACE_ID", workspace_id.to_string());
+    }
     cmd
+}
+
+/// Identidad que se exporta al shell para que los hooks sepan de qué panel
+/// vienen (P2.12).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HookIdentity {
+    pub panel_id: Option<Uuid>,
+    pub workspace_id: Option<Uuid>,
 }
 
 fn drain_terminal_events(
@@ -704,7 +721,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn shell_command_uses_login_shell_on_unix() {
-        let command = shell_command(None);
+        let command = shell_command(None, super::HookIdentity::default());
 
         assert!(command.is_default_prog());
     }
@@ -712,7 +729,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn shell_command_uses_explicit_shell_on_windows() {
-        let command = shell_command(None);
+        let command = shell_command(None, super::HookIdentity::default());
 
         assert!(!command.is_default_prog());
         assert_eq!(command.get_argv().len(), 1);
@@ -721,7 +738,7 @@ mod tests {
     #[test]
     fn shell_command_preserves_cwd_and_terminal_env() {
         let cwd = Path::new("/tmp");
-        let command = shell_command(Some(cwd));
+        let command = shell_command(Some(cwd), super::HookIdentity::default());
 
         assert_eq!(command.get_cwd(), Some(&OsString::from(cwd)));
         assert_eq!(command.get_env("TERM"), Some("xterm-256color".as_ref()));

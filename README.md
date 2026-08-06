@@ -89,6 +89,8 @@ The `MI_TERMINAL_ALLOW_OSC52` environment variable still overrides `allow_osc52`
 | Resume a past agent conversation | `Ctrl+Shift+R` |
 | Launch agent | `Ctrl+Shift+A` |
 | Focus next / prev | `Ctrl+Shift+]` / `Ctrl+Shift+[` |
+| Split terminal right / down | `Cmd+D` / `Cmd+Shift+D` |
+| Close split (leaf) | `Cmd+W` |
 | Toggle sidebar | `Ctrl+B` |
 | Toggle fullscreen | `F11` |
 

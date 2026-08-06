@@ -68,6 +68,8 @@ impl RuntimeHarness {
                     ),
                     startup_command: None,
                     startup_input: None,
+                    panel_id: None,
+                    workspace_id: None,
                 },
             );
 
@@ -134,6 +136,8 @@ impl RuntimeHarness {
                     ),
                     startup_command: None,
                     startup_input: None,
+                    panel_id: None,
+                    workspace_id: None,
                 },
             );
 

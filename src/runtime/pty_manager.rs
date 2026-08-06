@@ -249,6 +249,8 @@ impl PtyManager {
             cwd: spec.cwd.clone().or_else(|| cwd.map(Path::to_path_buf)),
             startup_command: spec.startup_command.clone(),
             startup_input: spec.startup_input.clone(),
+            panel_id: None,
+            workspace_id: None,
         };
         self.sessions
             .insert(session_id, ManagedSession::detached(detached_spec));
@@ -279,6 +281,10 @@ impl PtyManager {
             rows,
             session_id,
             Arc::clone(&self.scheduler),
+            crate::terminal::pty::HookIdentity {
+                panel_id: spec.panel_id,
+                workspace_id: spec.workspace_id,
+            },
         )?;
         if let Some(command) = spec
             .startup_command

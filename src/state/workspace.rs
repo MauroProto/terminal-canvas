@@ -222,6 +222,8 @@ impl Workspace {
                 cwd: cwd.clone(),
                 startup_command: request.startup_command.clone(),
                 startup_input: request.startup_input.clone(),
+                panel_id: Some(panel.id),
+                workspace_id: Some(self.id),
             },
         );
         let id = panel.id;

@@ -8,6 +8,11 @@ pub struct SessionSpec {
     pub cwd: Option<PathBuf>,
     pub startup_command: Option<String>,
     pub startup_input: Option<String>,
+    /// Panel dueño de la sesión, exportado como `TC_PANEL_ID` para que los
+    /// hooks del agente puedan decir de dónde vienen (P2.12).
+    pub panel_id: Option<Uuid>,
+    /// Workspace dueño de la sesión, exportado como `TC_WORKSPACE_ID`.
+    pub workspace_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,6 +38,8 @@ impl Default for SessionSpec {
             cwd: None,
             startup_command: None,
             startup_input: None,
+            panel_id: None,
+            workspace_id: None,
         }
     }
 }

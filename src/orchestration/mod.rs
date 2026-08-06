@@ -1,7 +1,9 @@
 mod agent_sessions;
+mod claude_hooks;
 mod code_diff;
 mod diff_notes;
 mod git;
+mod hook_server;
 mod manager;
 mod matching;
 mod worktree_removal_safety;
@@ -10,12 +12,18 @@ mod worktree_trash;
 #[allow(unused_imports)]
 pub use agent_sessions::{list_claude_sessions, sanitize_session_id, AgentSessionEntry};
 #[allow(unused_imports)]
+pub use claude_hooks::{
+    install_to_disk as install_claude_hooks, uninstall_from_disk as uninstall_claude_hooks,
+};
+#[allow(unused_imports)]
 pub use code_diff::{
     list_git_worktrees, parse_unified_diff, remove_git_worktree, DiffLine, DiffLineKind,
     DiffLoader, FileDiff, RepoDiff, WorktreeInfo, WorktreeJob, WorktreeOps,
 };
 #[allow(unused_imports)]
 pub use diff_notes::{format_note, load_notes, save_notes, DiffNote, DiffNotes};
+#[allow(unused_imports)]
+pub use hook_server::{HookEvent, HookKind, HookServer};
 #[allow(unused_imports)]
 pub use manager::{
     launch_presets, resume_command, resume_invocation, AgentLaunchPlan, AgentLaunchRequest,

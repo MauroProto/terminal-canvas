@@ -286,6 +286,7 @@ impl TerminalPanel {
                 cwd.map(Path::to_path_buf),
                 startup_command,
                 None,
+                Some(panel.id),
             ),
             cols,
             rows,
@@ -463,6 +464,7 @@ impl TerminalPanel {
                 cwd.map(Path::to_path_buf),
                 None,
                 None,
+                Some(self.id),
             ),
             cwd,
             cols.max(1) / 2,
@@ -575,7 +577,7 @@ impl TerminalPanel {
             let mut controller = SessionController::default();
             controller.attach_new_with_spec(
                 Arc::clone(pty_manager),
-                session_spec("Terminal".to_owned(), None, None, None),
+                session_spec("Terminal".to_owned(), None, None, None, Some(self.id)),
                 None,
                 40,
                 24,

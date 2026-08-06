@@ -112,6 +112,8 @@ pub struct TerminalApp {
     agent_status_seen: HashMap<Uuid, crate::orchestration::AgentStatus>,
     /// Gate de notificaciones del SO por workspace (cooldown, P1.8).
     notification_gate: notify_policy::NotificationGate,
+    /// Servidor local de hooks de agentes (P2.12). `None` si no arrancó.
+    hook_server: Option<crate::orchestration::HookServer>,
     /// ¿La ventana tiene foco del SO? (P1.8) Se refresca cada frame.
     window_focused: bool,
     brand_texture: Option<egui::TextureHandle>,
@@ -205,6 +207,7 @@ impl TerminalApp {
                 notification_gate: notify_policy::NotificationGate::new(
                     notify_policy::NOTIFICATION_COOLDOWN,
                 ),
+                hook_server: start_hook_server(),
                 window_focused: false,
                 brand_texture,
                 sidebar: Sidebar::default(),
@@ -283,6 +286,7 @@ impl TerminalApp {
                 notification_gate: notify_policy::NotificationGate::new(
                     notify_policy::NOTIFICATION_COOLDOWN,
                 ),
+                hook_server: start_hook_server(),
                 window_focused: false,
                 brand_texture,
                 sidebar: Sidebar::default(),
@@ -762,6 +766,7 @@ impl TerminalApp {
         self.poll_diff_loader();
         self.poll_worktree_ops();
         self.poll_quick_open();
+        self.poll_hook_events();
         self.poll_screenshot_capture(ctx);
         if self.code_review.as_ref().is_some_and(|state| state.loading) {
             ctx.request_repaint_after(std::time::Duration::from_millis(80));
@@ -1507,6 +1512,24 @@ impl eframe::App for TerminalApp {
         // guardamos el scrollback definitivo para no perder las últimas líneas.
         self.persist_scrollbacks(true);
         crate::state::run_marker::end_run_clean();
+    }
+}
+
+/// Arranca el servidor de hooks e instala los hooks de Claude (P2.12).
+/// Best-effort: si algo falla, la app sigue andando con OSC 9999 y heurística.
+fn start_hook_server() -> Option<crate::orchestration::HookServer> {
+    match crate::orchestration::HookServer::start() {
+        Ok(server) => {
+            log::info!("hook server escuchando en {}", server.url());
+            if let Err(err) = crate::orchestration::install_claude_hooks() {
+                log::warn!("no se pudieron instalar los hooks de Claude: {err}");
+            }
+            Some(server)
+        }
+        Err(err) => {
+            log::warn!("no se pudo arrancar el hook server: {err}");
+            None
+        }
     }
 }
 

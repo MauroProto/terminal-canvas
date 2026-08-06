@@ -151,6 +151,37 @@ impl TerminalApp {
         }
     }
 
+    /// Drena los eventos de hooks de agentes y los aplica al orquestador
+    /// (P2.12). El estado del hook gana sobre OSC 9999 y la heurística.
+    pub(super) fn poll_hook_events(&mut self) {
+        let Some(server) = self.hook_server.as_ref() else {
+            return;
+        };
+        let events = server.poll();
+        if events.is_empty() {
+            return;
+        }
+        let now = chrono::Utc::now();
+        for event in events {
+            // El hook dice de qué panel viene; si ese panel ya no existe, se
+            // descarta (hook viejo de una sesión cerrada).
+            let Some(panel_id) = event.panel_id else {
+                continue;
+            };
+            let Some(alive) = self
+                .workspaces
+                .iter()
+                .flat_map(|workspace| workspace.panels.iter())
+                .find(|panel| panel.id() == panel_id)
+                .map(|panel| panel.is_alive())
+            else {
+                continue;
+            };
+            self.orchestrator.apply_hook_event(&event, alive, now);
+        }
+        self.repaint_policy.note_runtime_event();
+    }
+
     pub(super) fn maybe_refresh_orchestration(&mut self) {
         if self.panel_gesture.is_some() {
             return;

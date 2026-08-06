@@ -484,6 +484,41 @@ pub struct Orchestrator {
     // Planes cuyo worktree se está creando en el worker; el panel se spawnea
     // cuando poll_ready_launches entrega el plan.
     pending_launches: HashMap<Uuid, AgentLaunchPlan>,
+    /// Último estado reportado por un hook del agente, por panel (P2.12).
+    /// Gana sobre OSC 9999 y sobre la heurística de texto mientras sea fresco.
+    hook_status: HashMap<Uuid, HookStatus>,
+}
+
+/// Estado reportado por un hook, con su sello para la ventana de frescura.
+#[derive(Debug, Clone)]
+pub struct HookStatus {
+    pub status: AgentStatus,
+    pub at: DateTime<Utc>,
+    pub session_id: Option<String>,
+}
+
+/// Ventana de frescura de un hook: pasada esta, se vuelve a OSC/heurística.
+pub const HOOK_FRESHNESS_SECS: i64 = 10;
+
+/// Estado de agente que implica un hook. `Stop` con el proceso vivo es
+/// "terminó el turno" (Idle); con el proceso muerto, Done.
+pub fn hook_agent_status(kind: super::HookKind, alive: bool) -> AgentStatus {
+    match kind {
+        super::HookKind::Stop => {
+            if alive {
+                AgentStatus::Idle
+            } else {
+                AgentStatus::Done
+            }
+        }
+        super::HookKind::PermissionRequest => AgentStatus::WaitingApproval,
+        super::HookKind::UserPromptSubmit | super::HookKind::PreToolUse => AgentStatus::Running,
+    }
+}
+
+/// ¿El hook sigue siendo autoritativo? (frescura de 10 s, como Orca)
+pub fn hook_is_fresh(at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+    now.signed_duration_since(at).num_seconds() < HOOK_FRESHNESS_SECS
 }
 
 impl Orchestrator {
@@ -498,7 +533,43 @@ impl Orchestrator {
             git_inspector: GitInspector::default(),
             worktree_creator: WorktreeCreator::default(),
             pending_launches: HashMap::new(),
+            hook_status: HashMap::new(),
         }
+    }
+
+    /// Registra un evento de hook del agente (P2.12). El estado que implica
+    /// gana sobre OSC 9999 y la heurística durante `HOOK_FRESHNESS_SECS`.
+    pub fn apply_hook_event(&mut self, event: &super::HookEvent, alive: bool, now: DateTime<Utc>) {
+        let Some(panel_id) = event.panel_id else {
+            return;
+        };
+        let session_id = event.session_id.clone().or_else(|| {
+            self.hook_status
+                .get(&panel_id)
+                .and_then(|previous| previous.session_id.clone())
+        });
+        self.hook_status.insert(
+            panel_id,
+            HookStatus {
+                status: hook_agent_status(event.kind, alive),
+                at: now,
+                session_id,
+            },
+        );
+    }
+
+    /// Id de sesión que reportó el último hook de ese panel, para el resume
+    /// exacto (`--resume <id>` en vez de `--continue`).
+    pub fn hook_session_id(&self, panel_id: Uuid) -> Option<&str> {
+        self.hook_status
+            .get(&panel_id)
+            .and_then(|hook| hook.session_id.as_deref())
+    }
+
+    /// Estado autoritativo de hook para ese panel, si sigue fresco.
+    fn fresh_hook_status(&self, panel_id: Uuid, now: DateTime<Utc>) -> Option<AgentStatus> {
+        let hook = self.hook_status.get(&panel_id)?;
+        hook_is_fresh(hook.at, now).then_some(hook.status)
     }
 
     pub fn snapshot(&self) -> OrchestrationState {
@@ -975,6 +1046,15 @@ impl Orchestrator {
             .into_iter()
             .map(|observation| (observation.panel_id, observation))
             .collect::<HashMap<_, _>>();
+        // Los estados de hook frescos se resuelven antes del loop: adentro
+        // `self.state.sessions` está prestado mutable (P2.12).
+        let fresh_hooks: HashMap<Uuid, AgentStatus> = observations_by_panel
+            .keys()
+            .filter_map(|panel_id| {
+                self.fresh_hook_status(*panel_id, now)
+                    .map(|status| (*panel_id, status))
+            })
+            .collect();
 
         for session in &mut self.state.sessions {
             let Some(panel_id) = session.panel_id else {
@@ -999,16 +1079,22 @@ impl Orchestrator {
                     session.command_summary = Some(agent_tool_summary(tool, report));
                 }
             }
-            session.status =
-                authoritative_agent_status(observation.agent_status.as_ref(), observation.alive)
-                    .unwrap_or_else(|| {
-                        derive_status(
-                            observation.alive,
-                            observation.recent_output,
-                            &observation.visible_text,
-                            session.review_summary.last_error.as_deref(),
-                        )
-                    });
+            // Precedencia de fuentes (P2.12): hook > OSC 9999 > heurística de
+            // texto. Las dos primeras solo mientras sean frescas.
+            session.status = fresh_hooks
+                .get(&panel_id)
+                .copied()
+                .or_else(|| {
+                    authoritative_agent_status(observation.agent_status.as_ref(), observation.alive)
+                })
+                .unwrap_or_else(|| {
+                    derive_status(
+                        observation.alive,
+                        observation.recent_output,
+                        &observation.visible_text,
+                        session.review_summary.last_error.as_deref(),
+                    )
+                });
             let should_inspect_git = should_inspect_git_for_session(
                 session,
                 observation,
@@ -2669,5 +2755,159 @@ mod tests {
         // Regresión: substring simple lo pintaría mal en estos títulos.
         assert_eq!(P::detect("example-server.log"), None);
         assert_eq!(P::detect("sample data"), None);
+    }
+
+    fn hook_event(
+        panel_id: uuid::Uuid,
+        kind: crate::orchestration::HookKind,
+    ) -> crate::orchestration::HookEvent {
+        crate::orchestration::HookEvent {
+            provider: "claude".to_owned(),
+            kind,
+            panel_id: Some(panel_id),
+            workspace_id: None,
+            session_id: Some("sess-42".to_owned()),
+        }
+    }
+
+    fn observation_for(
+        panel_id: uuid::Uuid,
+        workspace_id: uuid::Uuid,
+        text: &str,
+    ) -> PanelRuntimeObservation {
+        PanelRuntimeObservation {
+            panel_id,
+            runtime_session_id: None,
+            workspace_id,
+            title: "Claude Code — Build feature".to_owned(),
+            visible_text: text.to_owned(),
+            alive: true,
+            recent_output: true,
+            attached: true,
+            minimized: false,
+            agent_status: None,
+        }
+    }
+
+    #[test]
+    fn hook_kind_maps_to_the_expected_status() {
+        use crate::orchestration::HookKind;
+        assert_eq!(
+            super::hook_agent_status(HookKind::PermissionRequest, true),
+            AgentStatus::WaitingApproval
+        );
+        assert_eq!(
+            super::hook_agent_status(HookKind::UserPromptSubmit, true),
+            AgentStatus::Running
+        );
+        assert_eq!(
+            super::hook_agent_status(HookKind::PreToolUse, true),
+            AgentStatus::Running
+        );
+        // Stop con el proceso vivo = terminó el turno; muerto = terminó todo.
+        assert_eq!(
+            super::hook_agent_status(HookKind::Stop, true),
+            AgentStatus::Idle
+        );
+        assert_eq!(
+            super::hook_agent_status(HookKind::Stop, false),
+            AgentStatus::Done
+        );
+    }
+
+    #[test]
+    fn hook_freshness_expires_after_ten_seconds() {
+        let now = Utc::now();
+        assert!(super::hook_is_fresh(now, now));
+        assert!(super::hook_is_fresh(
+            now,
+            now + chrono::Duration::seconds(9)
+        ));
+        assert!(!super::hook_is_fresh(
+            now,
+            now + chrono::Duration::seconds(11)
+        ));
+    }
+
+    #[test]
+    fn a_fresh_hook_beats_the_text_heuristic() {
+        let mut orchestrator = Orchestrator::new();
+        let workspace_id = uuid::Uuid::new_v4();
+        let panel_id = uuid::Uuid::new_v4();
+        orchestrator.ensure_panel_session(workspace_id, None, panel_id, None, "Claude Code");
+
+        // El texto visible dice "waiting for approval", pero el hook dice que
+        // el usuario acaba de mandar un prompt: gana el hook.
+        orchestrator.apply_hook_event(
+            &hook_event(panel_id, crate::orchestration::HookKind::UserPromptSubmit),
+            true,
+            Utc::now(),
+        );
+        orchestrator.apply_observations(vec![observation_for(
+            panel_id,
+            workspace_id,
+            "Waiting for approval to run command",
+        )]);
+
+        let session = orchestrator
+            .sessions()
+            .iter()
+            .find(|session| session.panel_id == Some(panel_id))
+            .expect("sesión");
+        assert_eq!(session.status, AgentStatus::Running, "el hook manda");
+    }
+
+    #[test]
+    fn a_stale_hook_falls_back_to_the_heuristic() {
+        let mut orchestrator = Orchestrator::new();
+        let workspace_id = uuid::Uuid::new_v4();
+        let panel_id = uuid::Uuid::new_v4();
+        orchestrator.ensure_panel_session(workspace_id, None, panel_id, None, "Claude Code");
+
+        // Hook viejo (fuera de la ventana de 10 s): vuelve la heurística.
+        orchestrator.apply_hook_event(
+            &hook_event(panel_id, crate::orchestration::HookKind::UserPromptSubmit),
+            true,
+            Utc::now() - chrono::Duration::seconds(30),
+        );
+        orchestrator.apply_observations(vec![observation_for(
+            panel_id,
+            workspace_id,
+            "Waiting for approval to run command",
+        )]);
+
+        let session = orchestrator
+            .sessions()
+            .iter()
+            .find(|session| session.panel_id == Some(panel_id))
+            .expect("sesión");
+        assert_eq!(session.status, AgentStatus::WaitingApproval);
+    }
+
+    #[test]
+    fn hooks_remember_the_session_id_for_exact_resume() {
+        let mut orchestrator = Orchestrator::new();
+        let panel_id = uuid::Uuid::new_v4();
+        orchestrator.apply_hook_event(
+            &hook_event(panel_id, crate::orchestration::HookKind::Stop),
+            true,
+            Utc::now(),
+        );
+        assert_eq!(orchestrator.hook_session_id(panel_id), Some("sess-42"));
+
+        // Un hook posterior sin session_id no lo borra.
+        let mut without = hook_event(panel_id, crate::orchestration::HookKind::PreToolUse);
+        without.session_id = None;
+        orchestrator.apply_hook_event(&without, true, Utc::now());
+        assert_eq!(orchestrator.hook_session_id(panel_id), Some("sess-42"));
+    }
+
+    #[test]
+    fn a_hook_without_panel_id_is_ignored() {
+        let mut orchestrator = Orchestrator::new();
+        let mut event = hook_event(uuid::Uuid::new_v4(), crate::orchestration::HookKind::Stop);
+        event.panel_id = None;
+        orchestrator.apply_hook_event(&event, true, Utc::now());
+        assert_eq!(orchestrator.hook_session_id(uuid::Uuid::new_v4()), None);
     }
 }
