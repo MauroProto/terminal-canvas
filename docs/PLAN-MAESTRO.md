@@ -28,6 +28,7 @@
 - [5. Roadmap priorizado](#5-roadmap-priorizado)
 - [6. Estimación de tiempo y costo](#6-estimación-de-tiempo-y-costo)
 - [7. Lo que al plan le faltaba (autocrítica)](#7-lo-que-al-plan-le-faltaba-autocrítica)
+- [8. Protocolo de ejecución](#8-protocolo-de-ejecución-cómo-se-trabaja-cada-ítem)
 
 ---
 
@@ -657,6 +658,78 @@ adjuntar a un reporte. 1 tanda.
 | Tiempo de agente | 22–39 h | **28–48 h** |
 | Costo API | 185–360 | **230–440 USD** |
 | Calendario | 3–5 semanas | **4–6 semanas** |
+
+---
+
+## 8. Protocolo de ejecución (cómo se trabaja cada ítem)
+
+Autocrítica honesta: la sección 1 está a nivel ejecutable; las secciones 2, 3 y
+7 están a nivel de diseño. Eso es deliberado — detallar 60 tandas por
+adelantado produce pasos stale (el código cambia debajo del plan). La regla es:
+
+> **Cada tanda arranca escribiendo sus pasos concretos contra el código actual,
+> y termina cumpliendo la definición de terminado. El plan fija el qué y el
+> porqué; la tanda fija el cómo.**
+
+### Definición de "terminado" (vale para TODO ítem del plan)
+1. Lógica nueva en módulo propio con **tests que fijan el comportamiento**
+   (incluido el caso borde que motivó el diseño — si Orca lo arregló por un
+   bug, nuestro test cita ese caso).
+2. `cargo fmt --check` limpio, `clippy --all-targets -- -D warnings` en **0**,
+   suite completa verde, `check --release` OK, feature `ghostty-vt` OK.
+3. Si toca UI: verificado en pantalla (captura), no solo compilado.
+4. Commit con mensaje que explica el porqué; sin código muerto ni `TODO`.
+5. El README/atajos actualizados si hay superficie nueva.
+
+### P0 a nivel ejecutable (para arrancar sin pensar)
+
+**P0.1 — Drag & drop de archivos** *(1 tanda)*
+- `src/app.rs::begin_frame`: leer `ctx.input(|i| i.raw.dropped_files)` y
+  `hovered_files`.
+- Hit-test del puntero contra paneles (existe `Workspace::panel_at` /
+  `hit_test` en `terminal/panel.rs`); resaltar destino con el ring de foco.
+- Nuevo `src/terminal/shell_quote.rs`: `quote_path()` POSIX (comillas simples,
+  escape de `'`) + tests con espacios, `'`, unicode, y path con `-` inicial.
+- Soltar sobre terminal → `write_all` del path quoteado + espacio. Sobre el
+  visor de código → `open_file_viewer(path)`.
+- Done: test de shell_quote + captura arrastrando un archivo.
+
+**P0.2 — Screenshot al agente** *(1 tanda)*
+- `Command::AttachScreenshot` en paleta (`Ctrl+Shift+S` libre — verificar en
+  `shortcuts/mod.rs`).
+- `utils/platform.rs`: `capture_interactive() -> Option<PathBuf>` — macOS
+  `screencapture -i <tmp>`; Linux `gnome-screenshot -a`/`slurp+grim` si
+  existen; Windows: devolver None con toast explicando.
+- Con el path: `send_prompt_to_panel(focused, "Mirá esta captura: <path>")`.
+- Done: captura llega como path al prompt del agente enfocado; toast confirma.
+
+**P0.3 — Sanitización de session ids** *(1 tanda)*
+- `orchestration/agent_sessions.rs`: `sanitize_session_id()` — ≤512 chars, sin
+  control chars, rechazar prefijo `-`. Aplicar en `resume_ui` antes de armar
+  `claude --resume <id>`.
+- Tests: id normal, id `-rf /`, id con `\x1b`, id de 600 chars.
+
+**P0.4 — Worktree add robusto** *(1 tanda)*
+- `orchestration/git.rs::create_git_worktree`: timeout de 180 s (matar el
+  child al vencer), `--no-track`, y `push.autoSetupRemote=true` solo si
+  `git config --get` en todos los scopes da exit 1.
+- Tests: los existentes siguen verdes + uno de timeout con un `git` fake que
+  duerme.
+
+**P0.5 — Escritura durable del layout** *(1 tanda)*
+- Nuevo `src/state/durable_write.rs`: `write_durable(path, bytes)` = tmp →
+  `File::sync_all` → rename → `File::open(dir).sync_all()` (best-effort en
+  Windows). Ring `.bak.0..4` con espaciado ≥1 h; `load con fallback` slot por
+  slot si el principal no parsea.
+- Cablear en `state/persistence.rs::save_state_to_path` y `config.rs::save`.
+- Tests: round-trip, backup rota con espaciado, restore desde backup con
+  principal corrupto, hash no-op (no reescribir si no cambió).
+
+### Regla para P1–P3
+Al abrir la tanda de un ítem: (1) escribir en el commit inicial el desglose de
+pasos como este, contra el código de ese momento; (2) si el ítem excede su
+presupuesto de tandas en +50%, parar y renegociar el alcance en vez de
+arrastrarlo. El presupuesto está en §6.
 
 ## Apéndice: archivos de Orca consultados
 
