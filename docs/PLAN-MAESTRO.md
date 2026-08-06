@@ -27,6 +27,7 @@
 - [4. Cosas chicas de código (quick wins)](#4-cosas-chicas-de-código-quick-wins)
 - [5. Roadmap priorizado](#5-roadmap-priorizado)
 - [6. Estimación de tiempo y costo](#6-estimación-de-tiempo-y-costo)
+- [7. Lo que al plan le faltaba (autocrítica)](#7-lo-que-al-plan-le-faltaba-autocrítica)
 
 ---
 
@@ -587,6 +588,75 @@ humana entre tandas. A un ritmo sostenible de 2–4 tandas por día:
 Lo que NO puede pasar con este plan: quedar a mitad de camino con algo roto.
 Cada fila de la tabla deja la app en un estado mejor y estable — el orden está
 elegido para que cortar en cualquier punto sea seguro.
+
+---
+
+## 7. Lo que al plan le faltaba (autocrítica)
+
+Revisión honesta: las secciones 1–5 cubren el **producto**, pero un proyecto
+top necesita además la capa de **ship it**. Esto faltaba y ahora es parte del
+plan:
+
+### 7.1 Empaquetado y distribución (P1 — antes de lo que parece)
+Hoy la app es un binario que se lanza desde una terminal de desarrollo. Varios
+problemas que sufrimos (la ventana perdida en otro Space, el foco que no se
+puede pedir por AppleScript) existen porque **no es un `.app` bundle real**.
+- `.app` con `cargo-bundle` o script propio: Info.plist, icono, categoría.
+- Firma + notarización de macOS (sin esto, Gatekeeper asusta a cualquier
+  usuario que no seas vos).
+- Canal de updates: ya existe `update.rs` (checker); falta el instalador.
+  Referencia: el updater de Orca (`src/main/updater.ts`) — check cada 24 h,
+  backoff 1 h→6 h, y difiere el quit hasta que el installer está listo.
+- Homebrew cask propio (Orca lo hace en su repo `Casks/`).
+*Estimado: 3–4 tandas.*
+
+### 7.2 Experiencia de primer arranque (P1)
+Nada en el plan cubría el minuto cero:
+- Detección de agentes instalados (`which claude/codex/opencode/...`) y
+  mostrar solo los que existen en el launcher.
+- Estados vacíos con acción ("No hay carpeta abierta → Abrir carpeta") en vez
+  de paneles en blanco.
+- Un tour de 3 pasos como overlay descartable (workspace → agente → review).
+*Estimado: 2 tandas.*
+
+### 7.3 Presupuestos de rendimiento con regresión automática (P1)
+Arreglamos el CPU ocioso midiendo a mano; eso tiene que ser un contrato:
+- Budgets explícitos en `tests/runtime`: frame p95 < 8 ms con 20 terminales
+  vivos, 0 repaints con ventana sin foco, RSS < 150 MB en idle.
+- Bench de `criterion` para las rutas calientes (render de grid, highlight,
+  parseo de diff) corriendo en CI con umbral de regresión.
+*Estimado: 2 tandas.*
+
+### 7.4 Test de humo end-to-end (P2)
+420 tests unitarios y cero tests del app loop entero. `egui_kittest` (harness
+oficial de egui) permite: arrancar la app headless, abrir un panel, escribir,
+verificar el grid — sin pantalla. Un smoke test así habría cazado varios de
+los bugs que encontramos a mano.
+*Estimado: 2–3 tandas.*
+
+### 7.5 Diagnóstico exportable (P2, chico)
+Ya hay panic log, runs.log y perf HUD. Falta el botón "Exportar diagnóstico"
+que junte todo (logs + config + versión + layout anonimizado) en un zip para
+adjuntar a un reporte. 1 tanda.
+
+### 7.6 Lo que decidimos NO hacer (igual de importante)
+- **Mobile companion** (Orca lo tiene): no — otra plataforma entera, cero
+  sinergia con la base Rust/egui actual.
+- **SSH worktrees** (Orca lo tiene): no por ahora — duplica cada camino de I/O;
+  reevaluar solo si aparece la necesidad real.
+- **Telemetría**: no — proyecto personal; el diagnóstico exportable (7.5) cubre
+  la necesidad sin recolectar nada.
+- **i18n**: no — un solo usuario, un solo idioma. La arquitectura no lo impide
+  si algún día hace falta.
+
+### Totales corregidos con esta sección
+
+| | Antes (§6) | Con §7 |
+|---|---|---|
+| Tandas | 37–48 | **47–60** |
+| Tiempo de agente | 22–39 h | **28–48 h** |
+| Costo API | 185–360 | **230–440 USD** |
+| Calendario | 3–5 semanas | **4–6 semanas** |
 
 ## Apéndice: archivos de Orca consultados
 
