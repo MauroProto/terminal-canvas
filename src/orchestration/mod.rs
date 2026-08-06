@@ -5,7 +5,7 @@ mod manager;
 mod matching;
 
 #[allow(unused_imports)]
-pub use agent_sessions::{list_claude_sessions, AgentSessionEntry};
+pub use agent_sessions::{list_claude_sessions, sanitize_session_id, AgentSessionEntry};
 #[allow(unused_imports)]
 pub use code_diff::{
     list_git_worktrees, parse_unified_diff, remove_git_worktree, DiffLine, DiffLineKind,

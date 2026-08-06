@@ -17,6 +17,31 @@ use std::path::{Path, PathBuf};
 const MAX_SCAN_BYTES: u64 = 4 * 1024 * 1024;
 /// Tope de sesiones a listar por proyecto.
 const MAX_SESSIONS: usize = 100;
+/// Largo máximo aceptable para un id de sesión usado como argv. Los ids reales
+/// de Claude son UUIDs de 36 chars; 512 deja margen sin aceptar abuso.
+/// Why: Orca (`agent-session-resume.ts`) sanitiza los ids antes de usarlos
+/// como argv; un id arbitrario puede ser un vector de inyección de flags.
+const MAX_SESSION_ID_CHARS: usize = 512;
+
+/// Valida un id de sesión antes de usarlo como argumento de un comando
+/// (`claude --resume <id>`). Devuelve `None` si el id no es seguro.
+///
+/// Reglas (las mismas que aplica Orca en `agent-session-resume.ts`):
+/// - vacío o más largo que [`MAX_SESSION_ID_CHARS`] → rechazado;
+/// - cualquier control char (incluye `\n` y ESC) → rechazado;
+/// - prefijo `-` → rechazado: un id `-rf` sería parseado como flag por el CLI.
+pub fn sanitize_session_id(id: &str) -> Option<String> {
+    if id.is_empty() || id.chars().count() > MAX_SESSION_ID_CHARS {
+        return None;
+    }
+    if id.starts_with('-') {
+        return None;
+    }
+    if id.chars().any(char::is_control) {
+        return None;
+    }
+    Some(id.to_owned())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentSessionEntry {
@@ -188,7 +213,10 @@ fn clean_title(raw: &str) -> String {
 mod tests {
     use std::path::Path;
 
-    use super::{clean_title, json_string_field, session_title_from_lines, slug_variants};
+    use super::{
+        clean_title, json_string_field, sanitize_session_id, session_title_from_lines,
+        slug_variants,
+    };
 
     #[test]
     fn slug_replaces_separators_with_dashes() {
@@ -296,6 +324,39 @@ mod tests {
         let long = "ñ".repeat(200);
         let capped = clean_title(&long);
         assert!(capped.chars().count() <= 72);
+    }
+
+    #[test]
+    fn a_well_formed_session_id_passes_sanitization() {
+        let id = "3f7b2c1e-9a04-4d21-8c5f-6e1d2b3a4c5d";
+        assert_eq!(sanitize_session_id(id), Some(id.to_owned()));
+    }
+
+    #[test]
+    fn a_flag_shaped_id_is_rejected() {
+        // Regresión: un id "-rf /" sería parseado como flag por el CLI.
+        assert_eq!(sanitize_session_id("-rf /"), None);
+        assert_eq!(sanitize_session_id("--help"), None);
+    }
+
+    #[test]
+    fn an_id_with_control_characters_is_rejected() {
+        assert_eq!(sanitize_session_id("abc\x1bdef"), None);
+        assert_eq!(sanitize_session_id("abc\ndef"), None);
+    }
+
+    #[test]
+    fn an_overlong_id_is_rejected() {
+        let long = "a".repeat(600);
+        assert_eq!(sanitize_session_id(&long), None);
+        // 512 exactos sí pasan: el límite es inclusivo.
+        let at_limit = "a".repeat(512);
+        assert!(sanitize_session_id(&at_limit).is_some());
+    }
+
+    #[test]
+    fn an_empty_id_is_rejected() {
+        assert_eq!(sanitize_session_id(""), None);
     }
     /// Diagnóstico contra el disco real de quien corre los tests. Se ignora por
     /// defecto porque depende del entorno; se corre con
