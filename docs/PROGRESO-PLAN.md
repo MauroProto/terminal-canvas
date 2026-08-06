@@ -8,11 +8,11 @@
 - [x] P0.5 Escritura durable del layout
 
 ## P1 — Completar flujos
-- [ ] P1.6 Anotaciones por línea en diff → agente
-- [ ] P1.7 Scrollback ANSI + log incremental
+- [x] P1.6 Anotaciones por línea en diff → agente
+- [x] P1.7 Scrollback ANSI + log incremental
 - [ ] P1.8 Unread persistente + cooldown de notificaciones
 - [ ] P1.9 Trash diferido + salvaguardas de borrado
-- [ ] P1.10 Tabla de providers + resume por id
+- [x] P1.10 Tabla de providers + resume por id
 
 ## P2 — Capacidades nuevas
 - [ ] P2.11 Terminal splits

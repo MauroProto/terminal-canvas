@@ -576,3 +576,60 @@ fn approx_rect(a: Rect, b: Rect) -> bool {
 fn approx_eq(a: f32, b: f32) -> bool {
     (a - b).abs() <= 0.5
 }
+
+#[test]
+fn session_frames_replay_when_generation_matches() {
+    use crate::state::scrollback_log::{encode_frame, FrameKind};
+    use crate::state::scrollback_store::scrollback_log_file_name;
+    let dir = std::env::temp_dir().join(format!("tc-frames-ok-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let panel = Uuid::new_v4();
+
+    let mut bytes = crate::state::scrollback_log::encode_header(0);
+    bytes.extend_from_slice(&encode_frame(FrameKind::Output, b"hola\r\n"));
+    std::fs::write(dir.join(scrollback_log_file_name(panel)), &bytes).unwrap();
+
+    let frames = super::load_session_frames(&dir, panel);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(frames.len(), 1, "gen 0 == gen 0 por defecto");
+}
+
+#[test]
+fn session_frames_ignored_on_generation_mismatch() {
+    use crate::state::scrollback_log::{encode_frame, FrameKind};
+    use crate::state::scrollback_store::scrollback_log_file_name;
+    let dir = std::env::temp_dir().join(format!("tc-frames-mismatch-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let panel = Uuid::new_v4();
+
+    // Checkpoint de generation 3 pero log viejo de generation 2: se ignora.
+    super::write_generation(&dir, panel, 3).unwrap();
+    let mut bytes = crate::state::scrollback_log::encode_header(2);
+    bytes.extend_from_slice(&encode_frame(FrameKind::Output, b"viejo\r\n"));
+    std::fs::write(dir.join(scrollback_log_file_name(panel)), &bytes).unwrap();
+
+    let frames = super::load_session_frames(&dir, panel);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(frames.is_empty(), "mismatch de generation descarta el log");
+}
+
+#[test]
+fn session_frames_survive_a_truncated_tail() {
+    use crate::state::scrollback_log::{encode_frame, FrameKind};
+    use crate::state::scrollback_store::scrollback_log_file_name;
+    let dir = std::env::temp_dir().join(format!("tc-frames-trunc-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let panel = Uuid::new_v4();
+
+    let mut bytes = crate::state::scrollback_log::encode_header(0);
+    bytes.extend_from_slice(&encode_frame(FrameKind::Output, b"completo\r\n"));
+    bytes.push(FrameKind::Output as u8);
+    bytes.extend_from_slice(&999u32.to_le_bytes());
+    bytes.extend_from_slice(b"trun"); // crash a mitad de frame
+    std::fs::write(dir.join(scrollback_log_file_name(panel)), &bytes).unwrap();
+
+    let frames = super::load_session_frames(&dir, panel);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(frames.len(), 1, "solo llega el frame completo");
+    assert_eq!(frames[0].payload, b"completo\r\n".to_vec());
+}

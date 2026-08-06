@@ -25,8 +25,20 @@ pub fn scrollback_file_name(panel_id: Uuid) -> String {
     format!("{}.txt", panel_id.simple())
 }
 
-/// Recorta el historial al tope conservando el **final**, y alineado a un
-/// borde de línea para no restaurar una línea cortada al medio.
+/// Nombre del log incremental de un panel (P1.7).
+pub fn scrollback_log_file_name(panel_id: Uuid) -> String {
+    format!("{}.mtlg", panel_id.simple())
+}
+
+/// Nombre del archivo de generation de un panel (P1.7).
+pub fn scrollback_gen_file_name(panel_id: Uuid) -> String {
+    format!("{}.gen", panel_id.simple())
+}
+
+/// Recorta el historial al tope conservando el **final**, alineado a un borde
+/// de línea para no restaurar una línea cortada al medio, y sin partir nunca
+/// una secuencia SGR (`\x1b[...m`): si el corte cae adentro de una, avanza
+/// hasta su `m` de cierre antes de alinear a la línea siguiente.
 pub fn clamp_scrollback(text: &str, max_bytes: usize) -> &str {
     if text.len() <= max_bytes {
         return text;
@@ -37,6 +49,18 @@ pub fn clamp_scrollback(text: &str, max_bytes: usize) -> &str {
     let mut start = cut;
     while start < text.len() && !text.is_char_boundary(start) {
         start += 1;
+    }
+    // Si el corte cayó dentro de una secuencia SGR, el `\x1b` que la abre
+    // quedó en el prefijo descartado: buscamos hacia atrás el escape más
+    // cercano y avanzamos hasta su `m` de cierre para no emitir un `;204;0;0m`
+    // huérfano que el parser mostraría como texto.
+    if let Some(escape_start) = text[..start].rfind('\x1b') {
+        if let Some(offset) = text[escape_start..].find('m') {
+            let escape_end = escape_start + offset + 1;
+            if escape_end > start {
+                start = escape_end;
+            }
+        }
     }
     let tail = &text[start..];
     // Descartamos la primera línea parcial.
@@ -73,9 +97,9 @@ pub fn load_scrollback(dir: &Path, panel_id: Uuid) -> Option<String> {
 /// Borra los archivos de paneles que ya no existen, para que el directorio no
 /// crezca sin límite a medida que se abren y cierran terminales.
 pub fn prune_scrollback(dir: &Path, live_panel_ids: &[Uuid]) -> usize {
-    let live: Vec<String> = live_panel_ids
+    let live_stems: Vec<String> = live_panel_ids
         .iter()
-        .map(|id| scrollback_file_name(*id))
+        .map(|id| id.simple().to_string())
         .collect();
     let Ok(entries) = std::fs::read_dir(dir) else {
         return 0;
@@ -83,8 +107,9 @@ pub fn prune_scrollback(dir: &Path, live_panel_ids: &[Uuid]) -> usize {
     let mut removed = 0usize;
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
-        // Sólo tocamos nuestros propios archivos.
-        if !name.ends_with(".txt") || live.contains(&name) {
+        // Sólo tocamos nuestros propios archivos (checkpoint, log, generation).
+        let ours = name.ends_with(".txt") || name.ends_with(".mtlg") || name.ends_with(".gen");
+        if !ours || live_stems.iter().any(|stem| stem == stem_of(&name)) {
             continue;
         }
         if std::fs::remove_file(entry.path()).is_ok() {
@@ -94,21 +119,49 @@ pub fn prune_scrollback(dir: &Path, live_panel_ids: &[Uuid]) -> usize {
     removed
 }
 
+/// Stem de un archivo de scrollback sin la extensión, para comparar paneles
+/// vivos contra sus tres tipos de archivo (.txt/.mtlg/.gen).
+fn stem_of(name: &str) -> &str {
+    if let Some(stem) = name.strip_suffix(".txt") {
+        stem
+    } else if let Some(stem) = name.strip_suffix(".mtlg") {
+        stem
+    } else if let Some(stem) = name.strip_suffix(".gen") {
+        stem
+    } else {
+        name
+    }
+}
+
 /// Convierte el texto guardado en bytes listos para reinyectar en el grid del
 /// terminal: los saltos de línea pasan a CRLF porque el parser ANSI necesita el
 /// retorno de carro explícito para volver a la columna 0.
 ///
 /// Además se marca el final con un separador atenuado, para que quede claro que
 /// eso es historial de una sesión anterior y no salida en vivo.
-pub fn replay_bytes(text: &str) -> Vec<u8> {
-    let mut out = Vec::with_capacity(text.len() + 96);
+/// Cuerpo de replay: los saltos de línea pasan a CRLF porque el parser ANSI
+/// necesita el retorno de carro explícito para volver a la columna 0.
+pub fn replay_body(text: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(text.len() + 8);
     for line in text.lines() {
         out.extend_from_slice(line.as_bytes());
         out.extend_from_slice(b"\r\n");
     }
+    out
+}
+
+pub fn replay_bytes(text: &str) -> Vec<u8> {
+    let mut out = replay_body(text);
     // SGR 90 = gris; se resetea con SGR 0 para no teñir la salida siguiente.
     out.extend_from_slice("\x1b[90m── sesión anterior ──\x1b[0m\r\n".as_bytes());
     out
+}
+
+/// Separador atenuado que marca dónde terminó la sesión anterior.
+pub fn replay_marker() -> Vec<u8> {
+    "\x1b[90m── sesión anterior ──\x1b[0m\r\n"
+        .as_bytes()
+        .to_vec()
 }
 
 #[cfg(test)]
@@ -163,6 +216,29 @@ mod tests {
                 ["bbbb", "cccc"].contains(&line),
                 "partial line leaked: {line:?}"
             );
+        }
+    }
+
+    #[test]
+    fn clamping_never_splits_an_sgr_sequence() {
+        // Líneas con escapes SGR intercalados: para todo tope, el resultado
+        // no puede contener un `\x1b` sin su `m` de cierre.
+        let mut text = String::new();
+        for index in 0..40 {
+            text.push_str(&format!("\x1b[38;2;204;0;0mroja {index}\x1b[0m\n"));
+        }
+        for max in 1..text.len() {
+            let clamped = clamp_scrollback(&text, max);
+            assert!(text.contains(clamped), "clamped must be a real slice");
+            let mut rest = clamped;
+            while let Some(pos) = rest.find('\x1b') {
+                let closes = rest[pos..].find('m');
+                assert!(
+                    closes.is_some(),
+                    "dangling escape at max={max}: {clamped:?}"
+                );
+                rest = &rest[pos + closes.unwrap() + 1..];
+            }
         }
     }
 

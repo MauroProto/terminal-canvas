@@ -20,11 +20,17 @@ mod terminal {
 
 #[path = "../../src/state/durable_write.rs"]
 pub mod durable_write_impl;
+#[path = "../../src/state/scrollback_log.rs"]
+pub mod scrollback_log_impl;
+#[path = "../../src/state/scrollback_store.rs"]
+pub mod scrollback_store_impl;
 
 mod state {
     #![allow(dead_code)]
 
     pub use super::durable_write_impl as durable_write;
+    pub use super::scrollback_log_impl as scrollback_log;
+    pub use super::scrollback_store_impl as scrollback_store;
 }
 
 #[allow(dead_code)]

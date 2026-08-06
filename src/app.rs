@@ -676,7 +676,8 @@ impl TerminalApp {
                         self.autosave.mark_saved(now);
                         // El scrollback va junto al layout: si guardamos uno sin
                         // el otro, al restaurar el historial no matchea.
-                        self.persist_scrollbacks();
+                        // Autosave de 2 s → solo log incremental (P1.7).
+                        self.persist_scrollbacks(false);
                     }
                     Err(err) => {
                         log::warn!("Autosave failed: {err}");
@@ -889,7 +890,10 @@ impl TerminalApp {
 
     /// Guarda el scrollback de cada panel vivo de todos los workspaces y borra
     /// los archivos de paneles que ya no existen.
-    fn persist_scrollbacks(&mut self) {
+    ///
+    /// `full` reescribe el checkpoint completo (cierre limpio / panic /
+    /// rollover); `false` appendea solo el log incremental (autosave de 2 s).
+    fn persist_scrollbacks(&mut self, full: bool) {
         let Some(dir) = crate::state::scrollback_store::scrollback_dir() else {
             return;
         };
@@ -897,18 +901,63 @@ impl TerminalApp {
         for workspace in &self.workspaces {
             for panel in &workspace.panels {
                 live_ids.push(panel.id());
-                // Un panel detached no tiene texto que leer; su archivo previo
-                // se conserva tal cual (es justo el historial a restaurar).
-                if let Some(text) = panel.scrollback_text() {
-                    if let Err(err) =
-                        crate::state::scrollback_store::save_scrollback(&dir, panel.id(), &text)
-                    {
-                        log::warn!("No se pudo guardar el scrollback del panel: {err}");
-                    }
+                if full {
+                    self.persist_full_checkpoint(&dir, panel);
+                } else {
+                    self.persist_incremental_log(&dir, panel);
                 }
             }
         }
         crate::state::scrollback_store::prune_scrollback(&dir, &live_ids);
+    }
+
+    /// Checkpoint completo ANSI + sube la generation y descarta el log (P1.7).
+    fn persist_full_checkpoint(&self, dir: &std::path::Path, panel: &crate::panel::CanvasPanel) {
+        let panel_id = panel.id();
+        // Un panel detached no tiene texto que leer; su archivo previo se
+        // conserva tal cual (es justo el historial a restaurar).
+        let Some(text) = panel.scrollback_ansi() else {
+            return;
+        };
+        let gen = read_generation(dir, panel_id);
+        // Orden a prueba de crash: primero la generation nueva, luego el
+        // checkpoint, al final borro el log. Si cae a mitad, el mismatch de
+        // generation descarta el log viejo y nunca se duplica output.
+        let _ = write_generation(dir, panel_id, gen + 1);
+        if let Err(err) = crate::state::scrollback_store::save_scrollback(dir, panel_id, &text) {
+            log::warn!("No se pudo guardar el scrollback del panel: {err}");
+        }
+        let _ = std::fs::remove_file(dir.join(
+            crate::state::scrollback_store::scrollback_log_file_name(panel_id),
+        ));
+    }
+
+    /// Appendea los frames pendientes al log; si supera el tope, rollover a
+    /// checkpoint completo (P1.7).
+    fn persist_incremental_log(&self, dir: &std::path::Path, panel: &crate::panel::CanvasPanel) {
+        let panel_id = panel.id();
+        if let Some(frames) = panel.drain_pending_log() {
+            if !frames.is_empty() {
+                let log_path = dir.join(crate::state::scrollback_store::scrollback_log_file_name(
+                    panel_id,
+                ));
+                // Si el log no existe, se crea con la generation del checkpoint
+                // actual para que el restore los asocie.
+                if !log_path.exists() {
+                    let gen = read_generation(dir, panel_id);
+                    let _ = crate::state::scrollback_log::reset_log(&log_path, gen);
+                }
+                if let Err(err) = crate::state::scrollback_log::append_frames(&log_path, &frames) {
+                    log::warn!("No se pudo appendear al log del panel: {err}");
+                }
+                // Rollover: log demasiado grande → checkpoint completo.
+                if std::fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0)
+                    > crate::state::scrollback_log::MAX_LOG_BYTES
+                {
+                    self.persist_full_checkpoint(dir, panel);
+                }
+            }
+        }
     }
 
     /// Reinyecta el historial guardado en los paneles que acaban de conseguir
@@ -934,12 +983,15 @@ impl TerminalApp {
                 self.scrollback_restored.insert(panel_id);
                 continue;
             };
+            // Log incremental (P1.7): solo se replaya si la generation coincide
+            // con la del checkpoint; si no, se ignora (mismatch o cola rota).
+            let frames = load_session_frames(&dir, panel_id);
             let restored = self
                 .workspaces
                 .iter_mut()
                 .flat_map(|workspace| workspace.panels.iter_mut())
                 .find(|panel| panel.id() == panel_id)
-                .map(|panel| panel.restore_history(&text))
+                .map(|panel| panel.restore_session(&text, &frames))
                 .unwrap_or(true);
             // Si todavía está detached, se reintenta en un frame posterior.
             if restored {
@@ -1394,7 +1446,7 @@ impl eframe::App for TerminalApp {
                     // de la sesión se perdía entero.
                     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         save_state(&self.snapshot_state());
-                        self.persist_scrollbacks();
+                        self.persist_scrollbacks(true);
                     }));
                     std::process::exit(1);
                 }
@@ -1408,9 +1460,49 @@ impl eframe::App for TerminalApp {
         save_state(&self.snapshot_state());
         // El autosave puede tener hasta AUTOSAVE_INTERVAL de atraso: al salir
         // guardamos el scrollback definitivo para no perder las últimas líneas.
-        self.persist_scrollbacks();
+        self.persist_scrollbacks(true);
         crate::state::run_marker::end_run_clean();
     }
+}
+
+/// Lee la generation persistida de un panel (P1.7); 0 si no existe.
+fn read_generation(dir: &std::path::Path, panel_id: Uuid) -> u32 {
+    let path = dir.join(crate::state::scrollback_store::scrollback_gen_file_name(
+        panel_id,
+    ));
+    std::fs::read(path)
+        .ok()
+        .filter(|bytes| bytes.len() >= 4)
+        .map(|bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+        .unwrap_or(0)
+}
+
+fn write_generation(dir: &std::path::Path, panel_id: Uuid, generation: u32) -> std::io::Result<()> {
+    let path = dir.join(crate::state::scrollback_store::scrollback_gen_file_name(
+        panel_id,
+    ));
+    std::fs::write(path, generation.to_le_bytes())
+}
+
+/// Frames del log incremental que corresponden al checkpoint actual (P1.7).
+/// Devuelve vacío si no hay log o si la generation no matchea.
+fn load_session_frames(
+    dir: &std::path::Path,
+    panel_id: Uuid,
+) -> Vec<crate::state::scrollback_log::Frame> {
+    let log_path = dir.join(crate::state::scrollback_store::scrollback_log_file_name(
+        panel_id,
+    ));
+    let Ok(bytes) = std::fs::read(log_path) else {
+        return Vec::new();
+    };
+    let Some((log_gen, frames)) = crate::state::scrollback_log::read_frames(&bytes) else {
+        return Vec::new();
+    };
+    if log_gen != read_generation(dir, panel_id) {
+        return Vec::new();
+    }
+    frames
 }
 
 fn load_brand_texture(cc: &eframe::CreationContext<'_>) -> Option<egui::TextureHandle> {

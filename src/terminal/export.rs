@@ -9,7 +9,9 @@ use alacritty_terminal::grid::{Dimensions, Row};
 use alacritty_terminal::index::Line;
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::Term;
+use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor};
 
+use super::colors::{dim_color, indexed_to_egui};
 use super::pty::EventProxy;
 
 /// Convierte historial + pantalla activa en texto plano. Cada fila del grid es
@@ -25,6 +27,137 @@ pub fn scrollback_to_text(term: &Term<EventProxy>) -> String {
         lines.push(row_to_string(&grid[Line(line)]));
     }
     join_document(lines)
+}
+
+/// Historial + pantalla como texto con colores ANSI (SGR mínimo).
+///
+/// Cada celda compara su estilo con el de la anterior y emite SGR solo cuando
+/// cambia: `38;2;r;g;b` para el foreground, `48;2;…` para el background distinto
+/// del default (`39`/`49` para volver al default) y `1`/`22` para bold. Cada
+/// línea cierra con `\x1b[0m` para que ningún estilo se derrame a la siguiente.
+/// El replay ya pasa por el parser VTE, así que restaurar esto devuelve los
+/// colores sin tocar nada más.
+pub fn scrollback_to_ansi(term: &Term<EventProxy>) -> String {
+    let grid = term.grid();
+    let history = grid.history_size();
+    let rows = grid.screen_lines();
+    let mut lines = Vec::with_capacity(history + rows);
+    for line in -(history as i32)..rows as i32 {
+        lines.push(row_to_ansi(&grid[Line(line)]));
+    }
+    join_document(lines)
+}
+
+/// Fila del grid con SGR mínimo y sin el relleno de la derecha (misma regla de
+/// recorte que `row_to_string`).
+fn row_to_ansi(row: &Row<Cell>) -> String {
+    let visible_chars = row_to_string(row).chars().count();
+
+    type Rgb = (u8, u8, u8);
+    let mut out = String::new();
+    let (mut fg, mut bg, mut bold): (Option<Rgb>, Option<Rgb>, bool) = (None, None, false);
+    let mut emitted = 0usize;
+    for cell in row {
+        if emitted >= visible_chars {
+            break; // padding de la derecha recortado
+        }
+        if cell
+            .flags
+            .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER | Flags::HIDDEN)
+        {
+            continue;
+        }
+        let want_fg = color_rgb(&cell.fg, true);
+        let want_bg = color_rgb(&cell.bg, false);
+        let want_bold = cell.flags.contains(Flags::BOLD);
+
+        if want_fg != fg || want_bg != bg || want_bold != bold {
+            let mut parts: Vec<String> = Vec::new();
+            if want_bold != bold {
+                parts.push(if want_bold {
+                    "1".to_owned()
+                } else {
+                    "22".to_owned()
+                });
+            }
+            if want_fg != fg {
+                match want_fg {
+                    Some((r, g, b)) => parts.push(format!("38;2;{r};{g};{b}")),
+                    None => parts.push("39".to_owned()),
+                }
+            }
+            if want_bg != bg {
+                match want_bg {
+                    Some((r, g, b)) => parts.push(format!("48;2;{r};{g};{b}")),
+                    None => parts.push("49".to_owned()),
+                }
+            }
+            out.push_str("\x1b[");
+            out.push_str(&parts.join(";"));
+            out.push('m');
+            (fg, bg, bold) = (want_fg, want_bg, want_bold);
+        }
+
+        out.push(cell.c);
+        emitted += 1;
+    }
+    if fg.is_some() || bg.is_some() || bold {
+        // Cierra el estilo de la línea: nada se derrama a la siguiente.
+        out.push_str("\x1b[0m");
+    }
+    out
+}
+
+/// RGB de un color ANSI. `None` significa "default del terminal" (no emitir
+/// SGR): foreground para el texto y background para el fondo.
+fn color_rgb(color: &AnsiColor, foreground: bool) -> Option<(u8, u8, u8)> {
+    let rgb = match color {
+        AnsiColor::Spec(rgb) => (rgb.r, rgb.g, rgb.b),
+        AnsiColor::Indexed(idx) => {
+            let c = indexed_to_egui(*idx);
+            (c.r(), c.g(), c.b())
+        }
+        AnsiColor::Named(name) => named_to_rgb(*name, foreground)?,
+    };
+    Some(rgb)
+}
+
+/// Equivalente RGB de un color nombrado; `None` para los defaults del terminal
+/// (foreground/background según el rol).
+fn named_to_rgb(name: NamedColor, foreground: bool) -> Option<(u8, u8, u8)> {
+    let c = match name {
+        NamedColor::Foreground | NamedColor::BrightForeground if foreground => return None,
+        NamedColor::Background if !foreground => return None,
+        NamedColor::Foreground | NamedColor::BrightForeground => indexed_to_egui(7),
+        NamedColor::Background | NamedColor::DimForeground | NamedColor::DimBlack => {
+            egui::Color32::from_rgb(0, 0, 0)
+        }
+        NamedColor::Cursor => egui::Color32::from_rgb(244, 244, 244),
+        NamedColor::Black => indexed_to_egui(0),
+        NamedColor::Red => indexed_to_egui(1),
+        NamedColor::Green => indexed_to_egui(2),
+        NamedColor::Yellow => indexed_to_egui(3),
+        NamedColor::Blue => indexed_to_egui(4),
+        NamedColor::Magenta => indexed_to_egui(5),
+        NamedColor::Cyan => indexed_to_egui(6),
+        NamedColor::White => indexed_to_egui(7),
+        NamedColor::BrightBlack => indexed_to_egui(8),
+        NamedColor::BrightRed => indexed_to_egui(9),
+        NamedColor::BrightGreen => indexed_to_egui(10),
+        NamedColor::BrightYellow => indexed_to_egui(11),
+        NamedColor::BrightBlue => indexed_to_egui(12),
+        NamedColor::BrightMagenta => indexed_to_egui(13),
+        NamedColor::BrightCyan => indexed_to_egui(14),
+        NamedColor::BrightWhite => indexed_to_egui(15),
+        NamedColor::DimRed => dim_color(indexed_to_egui(1)),
+        NamedColor::DimGreen => dim_color(indexed_to_egui(2)),
+        NamedColor::DimYellow => dim_color(indexed_to_egui(3)),
+        NamedColor::DimBlue => dim_color(indexed_to_egui(4)),
+        NamedColor::DimMagenta => dim_color(indexed_to_egui(5)),
+        NamedColor::DimCyan => dim_color(indexed_to_egui(6)),
+        NamedColor::DimWhite => dim_color(indexed_to_egui(7)),
+    };
+    Some((c.r(), c.g(), c.b()))
 }
 
 /// Texto de una fila del grid, sin el relleno de la derecha.
@@ -95,6 +228,7 @@ pub fn export_timestamp(now: chrono::DateTime<chrono::Local>) -> String {
 #[cfg(test)]
 mod tests {
     use alacritty_terminal::grid::Row;
+    use alacritty_terminal::index::Line;
     use alacritty_terminal::term::cell::{Cell, Flags};
     use alacritty_terminal::term::test::TermSize;
     use alacritty_terminal::term::{Config as TermConfig, Term};
@@ -243,6 +377,49 @@ mod tests {
         let name = super::export_file_name(&"ab ".repeat(60), "ts");
         assert!(name.len() < 80, "got {} chars: {name}", name.len());
         assert!(!name.contains("-.txt"), "got {name}");
+    }
+
+    #[test]
+    fn ansi_export_emits_sgr_for_colored_text() {
+        // SGR 31 = rojo nombrado; el export lo baja a RGB de la paleta.
+        let term = term_with("\x1b[31mrojo\x1b[0m\r\n", 6, 20);
+        let ansi = super::scrollback_to_ansi(&term);
+        assert!(
+            ansi.contains("\x1b[38;2;204;0;0m"),
+            "expected red SGR, got {ansi:?}"
+        );
+        // Cada línea cierra su estilo.
+        assert!(ansi.contains("\x1b[0m"), "got {ansi:?}");
+    }
+
+    #[test]
+    fn ansi_round_trip_restores_the_color_in_a_fresh_term() {
+        let term = term_with("\x1b[31mrojo\x1b[0m\r\n", 6, 20);
+        let ansi = super::scrollback_to_ansi(&term);
+        let replayed = term_with(&ansi, 6, 40);
+        let grid = replayed.grid();
+        let fg = grid[Line(0)][alacritty_terminal::index::Column(0)].fg;
+        match fg {
+            alacritty_terminal::vte::ansi::Color::Spec(rgb) => {
+                assert_eq!((rgb.r, rgb.g, rgb.b), (204, 0, 0), "got {fg:?}");
+            }
+            other => panic!("expected truecolor fg, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ansi_export_stays_plain_for_default_text() {
+        let term = term_with("plain\r\n", 6, 20);
+        let ansi = super::scrollback_to_ansi(&term);
+        assert!(!ansi.contains("38;2"), "no fg SGR for default: {ansi:?}");
+        assert!(!ansi.contains("48;2"), "no bg SGR for default: {ansi:?}");
+    }
+
+    #[test]
+    fn ansi_export_emits_bold_transitions() {
+        let term = term_with("\x1b[1mfuerte\x1b[22m suave\r\n", 6, 30);
+        let ansi = super::scrollback_to_ansi(&term);
+        assert!(ansi.contains("\x1b[1m"), "bold on: {ansi:?}");
     }
 
     #[test]

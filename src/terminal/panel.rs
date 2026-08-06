@@ -841,6 +841,33 @@ impl TerminalPanel {
             .flatten()
     }
 
+    /// Historial completo con colores ANSI (SGR mínimo), para persistir y
+    /// restaurar con estilo. `None` si la sesión está detached.
+    pub fn scrollback_ansi(&self) -> Option<String> {
+        self.with_pty(|pty| pty.with_term(|term| crate::terminal::export::scrollback_to_ansi(term)))
+            .flatten()
+    }
+
+    /// Drena los frames de log incremental pendientes (P1.7). `None` si está
+    /// detached.
+    pub fn drain_pending_log(&self) -> Option<Vec<u8>> {
+        self.with_pty(|pty| pty.drain_pending_log())
+    }
+
+    /// Restaura checkpoint + frames del log incremental (P1.7). Devuelve
+    /// `false` si el panel aún no tiene terminal (reintentar después).
+    pub fn restore_session(
+        &mut self,
+        checkpoint: &str,
+        frames: &[crate::state::scrollback_log::Frame],
+    ) -> bool {
+        let bytes = crate::state::scrollback_store::replay_body(checkpoint);
+        self.with_pty(|pty| {
+            pty.replay_session(&bytes, frames);
+        })
+        .is_some()
+    }
+
     pub fn shared_snapshot(&self) -> SharedPanelSnapshot {
         let mut visible_text = String::new();
         let mut history_text = String::new();

@@ -355,6 +355,28 @@ impl WorkspacePanel {
         }
     }
 
+    pub fn scrollback_ansi(&self) -> Option<String> {
+        match self {
+            Self::Terminal(panel) => panel.scrollback_ansi(),
+        }
+    }
+
+    pub fn drain_pending_log(&self) -> Option<Vec<u8>> {
+        match self {
+            Self::Terminal(panel) => panel.drain_pending_log(),
+        }
+    }
+
+    pub fn restore_session(
+        &mut self,
+        checkpoint: &str,
+        frames: &[crate::state::scrollback_log::Frame],
+    ) -> bool {
+        match self {
+            Self::Terminal(panel) => panel.restore_session(checkpoint, frames),
+        }
+    }
+
     pub fn restore_history(&mut self, text: &str) -> bool {
         match self {
             Self::Terminal(panel) => panel.restore_history(text),

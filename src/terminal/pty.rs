@@ -75,6 +75,9 @@ pub struct PtyHandle {
     agent_status: Arc<ArcSwap<Option<AgentStatusReport>>>,
     /// Último cwd reportado por el shell vía OSC 7 (si el shell lo emite).
     cwd: Arc<ArcSwap<Option<String>>>,
+    /// Frames de log incremental pendientes de appendear al disco (P1.7).
+    /// El hilo lector y `resize` empujan frames; el autosave los drena.
+    pending_log: Arc<Mutex<Vec<u8>>>,
     scrollback_limit: usize,
     #[cfg(feature = "ghostty-vt")]
     backend_kind: TerminalBackendKind,
@@ -129,6 +132,7 @@ impl PtyHandle {
         let render_revision = Arc::new(AtomicU64::new(0));
         let agent_status = Arc::new(ArcSwap::from_pointee(None));
         let cwd = Arc::new(ArcSwap::from_pointee(None));
+        let pending_log = Arc::new(Mutex::new(Vec::<u8>::new()));
         let (event_tx, event_rx) = mpsc::channel::<Event>();
         let term_config = TermConfig {
             scrolling_history: crate::config::runtime_config().scrollback_lines,
@@ -175,6 +179,7 @@ impl PtyHandle {
         let render_revision_for_reader = Arc::clone(&render_revision);
         let agent_status_for_reader = Arc::clone(&agent_status);
         let cwd_for_reader = Arc::clone(&cwd);
+        let pending_log_for_reader = Arc::clone(&pending_log);
         let scheduler_for_reader = Arc::clone(&scheduler);
         let reader_thread = thread::spawn(move || {
             // The parser processes untrusted terminal output; if it ever
@@ -199,6 +204,18 @@ impl PtyHandle {
                             }
                             if let Ok(mut term) = term_for_reader.lock() {
                                 processor.advance(&mut *term, &clean);
+                            }
+                            // Log incremental (P1.7): el mismo byte-stream que
+                            // alimenta el grid queda pendiente de appendear.
+                            if !clean.is_empty() {
+                                if let Ok(mut pending) = pending_log_for_reader.lock() {
+                                    pending.extend_from_slice(
+                                        &crate::state::scrollback_log::encode_frame(
+                                            crate::state::scrollback_log::FrameKind::Output,
+                                            &clean,
+                                        ),
+                                    );
+                                }
                             }
                             #[cfg(feature = "ghostty-vt")]
                             if let Some(ghostty) = &ghostty_for_reader {
@@ -254,6 +271,7 @@ impl PtyHandle {
             render_revision,
             agent_status,
             cwd,
+            pending_log,
             scrollback_limit,
             #[cfg(feature = "ghostty-vt")]
             backend_kind,
@@ -273,16 +291,30 @@ impl PtyHandle {
             pixel_width: 0,
             pixel_height: 0,
         });
-        if let Ok(mut window_size) = self.window_size.lock() {
+        let size_changed = if let Ok(mut window_size) = self.window_size.lock() {
+            let changed = window_size.num_lines != rows || window_size.num_cols != cols;
             *window_size = WindowSize {
                 num_lines: rows,
                 num_cols: cols,
                 cell_width: 0,
                 cell_height: 0,
             };
-        }
+            changed
+        } else {
+            true
+        };
         if let Ok(mut term) = self.term.lock() {
             term.resize(TermSize::new(cols as usize, rows as usize));
+        }
+        // Log incremental (P1.7): un resize real se registra para que el
+        // replay reaplique el tamaño antes de seguir con el output.
+        if size_changed {
+            if let Ok(mut pending) = self.pending_log.lock() {
+                pending.extend_from_slice(&crate::state::scrollback_log::encode_frame(
+                    crate::state::scrollback_log::FrameKind::Resize,
+                    &crate::state::scrollback_log::resize_payload(cols, rows),
+                ));
+            }
         }
         #[cfg(feature = "ghostty-vt")]
         if let Some(ghostty) = &self.ghostty_runtime {
@@ -382,6 +414,57 @@ impl PtyHandle {
         };
         let mut processor = Processor::<StdSyncHandler>::new();
         processor.advance(&mut *term, bytes);
+        drop(term);
+        self.mark_render_dirty();
+    }
+
+    /// Drena los frames de log incremental acumulados desde el último autosave
+    /// (P1.7). Devuelve los bytes ya encodeados, listos para appendear.
+    pub fn drain_pending_log(&self) -> Vec<u8> {
+        self.pending_log
+            .lock()
+            .map(|mut p| p.split_off(0))
+            .unwrap_or_default()
+    }
+
+    /// Restaura checkpoint + frames del log incremental en orden (P1.7).
+    /// Los resize se aplican como `term.resize` antes de seguir el replay del
+    /// output posterior, para que el grid tenga el tamaño correcto.
+    pub fn replay_session(
+        &self,
+        checkpoint: &[u8],
+        frames: &[crate::state::scrollback_log::Frame],
+    ) {
+        if !checkpoint.is_empty() {
+            self.replay_history(checkpoint);
+        }
+        if frames.is_empty() {
+            return;
+        }
+        let Ok(mut term) = self.term.lock() else {
+            return;
+        };
+        let mut processor = Processor::<StdSyncHandler>::new();
+        for frame in frames {
+            match frame.kind {
+                crate::state::scrollback_log::FrameKind::Output => {
+                    processor.advance(&mut *term, &frame.payload);
+                }
+                crate::state::scrollback_log::FrameKind::Resize => {
+                    if let Some((cols, rows)) =
+                        crate::state::scrollback_log::parse_resize(&frame.payload)
+                    {
+                        term.resize(TermSize::new(cols as usize, rows as usize));
+                    }
+                }
+                crate::state::scrollback_log::FrameKind::Clear => {
+                    // Equivalente ANSI de un clear: pantalla + scrollback.
+                    processor.advance(&mut *term, b"\x1b[2J\x1b[3J");
+                }
+            }
+        }
+        // El marcador de "sesión anterior" va al final de todo el replay.
+        processor.advance(&mut *term, &crate::state::scrollback_store::replay_marker());
         drop(term);
         self.mark_render_dirty();
     }
