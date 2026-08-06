@@ -35,6 +35,10 @@ Native desktop workspace for terminals and coding agents.
   file in your Downloads folder
 - Git branch badge in each panel's title bar, with a dot when the repo is dirty (drawn only
   when it fits without covering the title)
+- Resume past agent conversations: the app does not store them, it reads the history the CLI
+  already wrote (Claude Code keeps one JSONL per session under `~/.claude/projects/<cwd-slug>/`)
+  and relaunches the one you pick with `--resume <id>`. A restored panel also re-enters its
+  agent with the provider's continue flag, so a restart no longer orphans the conversation
 - Toast notices confirming actions that have no other visible feedback
 - Project file explorer (sidebar "Files" tab): lazy tree of the active workspace, click a file
   to read it in the built-in viewer, heavy directories (`.git`, `node_modules`, `target`) skipped
@@ -76,6 +80,7 @@ The `MI_TERMINAL_ALLOW_OSC52` environment variable still overrides `allow_osc52`
 | Settings | `Ctrl+,` |
 | Export terminal output | `Ctrl+Shift+E` |
 | Broadcast command to terminals | `Ctrl+Shift+Enter` |
+| Resume a past agent conversation | `Ctrl+Shift+R` |
 | Launch agent | `Ctrl+Shift+A` |
 | Focus next / prev | `Ctrl+Shift+]` / `Ctrl+Shift+[` |
 | Toggle sidebar | `Ctrl+B` |
