@@ -18,6 +18,7 @@ pub fn shortcut_command(modifiers: &Modifiers, key: Key) -> Option<Command> {
         (true, true, F) => Some(SearchTerminal),
         (true, true, D) => Some(ReviewChanges),
         (true, true, E) => Some(ExportScrollback),
+        (true, true, R) => Some(ResumeConversation),
         (true, true, Enter) => Some(BroadcastCommand),
         (true, true, OpenBracket) => Some(FocusPrev),
         (true, true, CloseBracket) => Some(FocusNext),

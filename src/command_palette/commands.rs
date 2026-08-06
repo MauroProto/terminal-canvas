@@ -13,6 +13,7 @@ pub enum Command {
     OpenSettings,
     ExportScrollback,
     BroadcastCommand,
+    ResumeConversation,
     SharePanelPrivate,
     SharePanelVisibleOnly,
     SharePanelVisibleAndHistory,
@@ -99,6 +100,11 @@ pub const COMMANDS: &[CommandEntry] = &[
         command: Command::BroadcastCommand,
         label: "Broadcast Command To Terminals",
         shortcut: "Ctrl+Shift+Enter",
+    },
+    CommandEntry {
+        command: Command::ResumeConversation,
+        label: "Resume Agent Conversation",
+        shortcut: "Ctrl+Shift+R",
     },
     CommandEntry {
         command: Command::SharePanelPrivate,

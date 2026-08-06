@@ -37,6 +37,7 @@ mod file_viewer_ui;
 mod orchestration_ui;
 mod perf;
 mod quick_open_ui;
+mod resume_ui;
 mod settings_ui;
 mod taskbar;
 #[cfg(test)]
@@ -96,6 +97,7 @@ pub struct TerminalApp {
     settings_open: bool,
     settings_draft: Option<settings_ui::SettingsDraft>,
     broadcast: Option<broadcast_ui::BroadcastState>,
+    resume_picker: Option<resume_ui::ResumeState>,
     file_tree: crate::sidebar::file_tree::FileTreeState,
     /// Paneles cuyo scrollback persistido ya se reinyectó en esta corrida.
     scrollback_restored: HashSet<Uuid>,
@@ -185,6 +187,7 @@ impl TerminalApp {
                 settings_open: false,
                 settings_draft: None,
                 broadcast: None,
+                resume_picker: None,
                 file_tree: Default::default(),
                 scrollback_restored: HashSet::new(),
                 highlighter: code_highlight::Highlighter::new(),
@@ -257,6 +260,7 @@ impl TerminalApp {
                 settings_open: false,
                 settings_draft: None,
                 broadcast: None,
+                resume_picker: None,
                 file_tree: Default::default(),
                 scrollback_restored: HashSet::new(),
                 highlighter: code_highlight::Highlighter::new(),
@@ -466,6 +470,7 @@ impl TerminalApp {
             Command::OpenSettings => self.open_settings(),
             Command::ExportScrollback => self.export_focused_scrollback(),
             Command::BroadcastCommand => self.open_broadcast(),
+            Command::ResumeConversation => self.open_resume_picker(),
             Command::SharePanelPrivate => {
                 self.set_focused_panel_share_scope(PanelShareScope::Private)
             }
@@ -781,6 +786,7 @@ impl TerminalApp {
             && self.file_viewer.is_none()
             && !self.settings_open
             && self.broadcast.is_none()
+            && self.resume_picker.is_none()
             && !matches!(self.collab.mode(), CollabMode::Guest)
         {
             let focused_panel_id = self.ws().focused_panel().map(|panel| panel.id());
@@ -1175,6 +1181,7 @@ impl TerminalApp {
         self.restore_pending_scrollbacks();
         self.show_settings(ctx);
         self.show_broadcast(ctx);
+        self.show_resume_picker(ctx);
         // Los toasts van último: se dibujan por encima de cualquier overlay.
         self.show_toasts(ctx);
         self.maybe_persist_state(ctx);
