@@ -49,7 +49,7 @@ path = "tests/runtime/perf_scenarios.rs"
 eframe = { version = "0.30", features = ["wgpu"] }
 egui = "0.30"
 alacritty_terminal = "0.25.1"
-libghostty-vt = { version = "0.1.1", optional = true }
+libghostty-vt = { version = "0.2.1", optional = true }
 portable-pty = "0.9"
 axum = { version = "0.7", features = ["ws", "json"] }
 axum-server = { version = "0.7", features = ["tls-rustls"] }
