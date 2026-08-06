@@ -230,7 +230,9 @@ pub fn load_state() -> Option<AppState> {
 }
 
 pub fn load_state_from_path(path: &Path) -> Option<AppState> {
-    read_state_file(path).or_else(|| read_state_file(&backup_file_path(path)))
+    // Si el principal está corrupto (crash a mitad de escritura), se prueba el
+    // ring de backups slot por slot hasta encontrar uno que parsee.
+    crate::state::durable_write::load_first_valid(path, parse_state_bytes)
 }
 
 pub fn save_state(state: &AppState) {
@@ -246,33 +248,19 @@ pub fn try_save_state(state: &AppState) -> anyhow::Result<()> {
     save_state_to_path(&path, state)
 }
 
+/// Serializa y escribe con el patrón durable (tmp → fsync → rename → fsync
+/// del directorio, ring de backups y no-op si nada cambió).
 pub fn save_state_to_path(path: &Path, state: &AppState) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    let tmp_path = temp_file_path(path);
-    let backup_path = backup_file_path(path);
-
-    write_json_file(&tmp_path, state)?;
-
-    // Refresh the backup from the current file before replacing it, so the
-    // main state file is never absent: a crash before the rename leaves the
-    // old state intact, and the rename itself replaces it atomically.
-    if path.exists() {
-        if let Err(err) = std::fs::copy(path, &backup_path) {
-            log::warn!("Failed to refresh state backup: {err}");
-        }
-    }
-
-    std::fs::rename(&tmp_path, path)?;
-
+    let mut bytes = serde_json::to_vec_pretty(state)?;
+    bytes.push(b'\n');
+    crate::state::durable_write::write_durable(path, &bytes)?;
     Ok(())
 }
 
-fn read_state_file(path: &Path) -> Option<AppState> {
-    let data = std::fs::read_to_string(path).ok()?;
-    let json: serde_json::Value = serde_json::from_str(&data).ok()?;
+/// Parsea un snapshot de estado (esquema actual o legado). Es la función de
+/// validez del load con fallback: un archivo que no parsea se salta.
+fn parse_state_bytes(bytes: &[u8]) -> Option<AppState> {
+    let json: serde_json::Value = serde_json::from_slice(bytes).ok()?;
     let has_schema_version = json
         .as_object()
         .map(|object| object.contains_key("schema_version"))
@@ -287,27 +275,6 @@ fn read_state_file(path: &Path) -> Option<AppState> {
     }
 }
 
-fn write_json_file(path: &Path, state: &AppState) -> anyhow::Result<()> {
-    use std::io::Write as _;
-
-    let file = std::fs::File::create(path)?;
-    let mut writer = std::io::BufWriter::new(file);
-    serde_json::to_writer_pretty(&mut writer, state)?;
-    writer.write_all(b"\n")?;
-    writer.flush()?;
-    let file = writer.into_inner().map_err(|err| err.into_error())?;
-    file.sync_all()?;
-    Ok(())
-}
-
-fn backup_file_path(path: &Path) -> PathBuf {
-    path.with_extension("json.bak")
-}
-
-fn temp_file_path(path: &Path) -> PathBuf {
-    path.with_extension("json.tmp")
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -318,9 +285,9 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        backup_file_path, load_state_from_path, save_state_to_path, temp_file_path, AppState,
-        AutosaveController, AutosaveDecision, LegacyCanvasState, LegacyCanvasUiState,
-        WorkspaceDesktopState, WorkspaceState, APP_STATE_SCHEMA_VERSION,
+        load_state_from_path, save_state_to_path, AppState, AutosaveController, AutosaveDecision,
+        LegacyCanvasState, LegacyCanvasUiState, WorkspaceDesktopState, WorkspaceState,
+        APP_STATE_SCHEMA_VERSION,
     };
     use crate::collab::{PanelShareScope, TrustedDevice};
     use crate::orchestration::OrchestrationState;
@@ -387,7 +354,7 @@ mod tests {
 
         save_state_to_path(&path, &sample_state("cleanup")).unwrap();
 
-        assert!(!temp_file_path(&path).exists());
+        assert!(!crate::state::durable_write::tmp_path(&path).exists());
     }
 
     fn sample_state(label: &str) -> AppState {
@@ -446,11 +413,15 @@ mod tests {
     }
 
     #[test]
-    fn backup_path_uses_expected_suffix() {
+    fn backup_ring_paths_use_expected_suffixes() {
         let path = PathBuf::from("/tmp/layout.json");
         assert_eq!(
-            backup_file_path(&path),
-            PathBuf::from("/tmp/layout.json.bak")
+            crate::state::durable_write::backup_path(&path, 0),
+            PathBuf::from("/tmp/layout.json.bak.0")
+        );
+        assert_eq!(
+            crate::state::durable_write::backup_path(&path, 4),
+            PathBuf::from("/tmp/layout.json.bak.4")
         );
     }
 

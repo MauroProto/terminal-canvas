@@ -18,6 +18,15 @@ mod terminal {
     pub mod pty;
 }
 
+#[path = "../../src/state/durable_write.rs"]
+pub mod durable_write_impl;
+
+mod state {
+    #![allow(dead_code)]
+
+    pub use super::durable_write_impl as durable_write;
+}
+
 #[allow(dead_code)]
 #[path = "../../src/config.rs"]
 mod config;

@@ -86,42 +86,48 @@ pub fn load() -> AppConfig {
 }
 
 /// Carga la config desde un path específico (testeable).
+///
+/// Carga durable: si el principal no parsea (crash a mitad de escritura), se
+/// prueba el ring de backups slot por slot antes de caer a defaults.
 pub fn load_from_path(path: &std::path::Path) -> AppConfig {
     let mut config = AppConfig::default();
-    let Ok(raw) = std::fs::read_to_string(path) else {
-        return config;
-    };
-    match toml::from_str::<ConfigFile>(&raw) {
-        Ok(file) => {
-            let terminal = file.terminal;
-            if let Some(size) = terminal.font_size {
-                config.font_size = clamp_font_size(size);
-            }
-            if let Some(lines) = terminal.scrollback_lines {
-                config.scrollback_lines = lines.clamp(100, 1_000_000);
-            }
-            if let Some(allow) = terminal.allow_osc52 {
-                config.allow_osc52 = allow;
-            }
-            if let Some(audio) = terminal.audio_bell {
-                config.audio_bell = audio;
-            }
-            if let Some(copy_on_select) = terminal.copy_on_select {
-                config.copy_on_select = copy_on_select;
-            }
-            if let Some(agent_notifications) = terminal.agent_notifications {
-                config.agent_notifications = agent_notifications;
-            }
-            if let Some(shell) = terminal.shell {
-                let shell = shell.trim().to_owned();
-                config.shell = if shell.is_empty() { None } else { Some(shell) };
-            }
+    let parsed = crate::state::durable_write::load_first_valid(path, |bytes| {
+        let raw = std::str::from_utf8(bytes).ok()?;
+        toml::from_str::<ConfigFile>(raw).ok()
+    });
+    match parsed {
+        Some(file) => apply_terminal_section(&mut config, file.terminal),
+        None if path.exists() => {
+            log::warn!("config.toml inválido (ni backups parsean): se usan defaults");
         }
-        Err(err) => {
-            log::warn!("config.toml inválido ({}): se usan defaults", err);
-        }
+        None => {}
     }
     config
+}
+
+fn apply_terminal_section(config: &mut AppConfig, terminal: TerminalSection) {
+    if let Some(size) = terminal.font_size {
+        config.font_size = clamp_font_size(size);
+    }
+    if let Some(lines) = terminal.scrollback_lines {
+        config.scrollback_lines = lines.clamp(100, 1_000_000);
+    }
+    if let Some(allow) = terminal.allow_osc52 {
+        config.allow_osc52 = allow;
+    }
+    if let Some(audio) = terminal.audio_bell {
+        config.audio_bell = audio;
+    }
+    if let Some(copy_on_select) = terminal.copy_on_select {
+        config.copy_on_select = copy_on_select;
+    }
+    if let Some(agent_notifications) = terminal.agent_notifications {
+        config.agent_notifications = agent_notifications;
+    }
+    if let Some(shell) = terminal.shell {
+        let shell = shell.trim().to_owned();
+        config.shell = if shell.is_empty() { None } else { Some(shell) };
+    }
 }
 
 /// Instala la config runtime (arranque). Solo la primera llamada importa.
@@ -172,7 +178,7 @@ pub fn save_to_path(config: &AppConfig, path: &std::path::Path) -> anyhow::Resul
         },
     };
     let raw = toml::to_string_pretty(&file)?;
-    std::fs::write(path, raw)?;
+    crate::state::durable_write::write_durable(path, raw.as_bytes())?;
     Ok(())
 }
 

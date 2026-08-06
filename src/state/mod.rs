@@ -1,3 +1,4 @@
+pub mod durable_write;
 pub mod panel_state;
 pub mod persistence;
 pub mod run_marker;
