@@ -64,6 +64,10 @@ pub struct PanelState {
     /// huérfana en el historial del CLI.
     #[serde(default)]
     pub agent_command: Option<String>,
+    /// El panel produjo atención (bell / agente esperando) mientras no estaba
+    /// enfocado y nadie lo interactuó todavía (P1.8). Se limpia al interactuar.
+    #[serde(default)]
+    pub unread: bool,
 }
 
 #[cfg(test)]
@@ -89,6 +93,7 @@ mod tests {
             restore_bounds: Some(SavedPanelBounds::new([40.0, 72.0], [920.0, 640.0])),
             share_scope: PanelShareScope::VisibleOnly,
             agent_command: None,
+            unread: false,
         }
     }
 

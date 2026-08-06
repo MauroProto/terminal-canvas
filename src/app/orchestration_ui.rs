@@ -85,9 +85,6 @@ impl TerminalApp {
     /// (esperando aprobación, input, o falló). Solo en la transición, no se
     /// repite mientras siga en el mismo estado.
     fn notify_agent_attention_transitions(&mut self) {
-        if !crate::config::runtime_config().agent_notifications {
-            return;
-        }
         let sessions: Vec<(
             Uuid,
             crate::orchestration::AgentStatus,
@@ -106,8 +103,51 @@ impl TerminalApp {
                 )
             })
             .collect();
-        for (title, body) in attention_transitions(&mut self.agent_status_seen, &sessions) {
-            crate::utils::platform::notify(&title, &body);
+        let transitions = attention_transitions(&mut self.agent_status_seen, &sessions);
+        if transitions.is_empty() {
+            return;
+        }
+
+        // Marca unread en los paneles que pasan a atención sin estar
+        // enfocados (o con la ventana sin foco), y descarta paneles muertos
+        // (timers stale) antes de despachar al SO.
+        let mut to_notify: Vec<(String, String)> = Vec::new();
+        for (session_id, title, body) in transitions {
+            let panel_state = self
+                .workspaces
+                .iter()
+                .flat_map(|workspace| workspace.panels.iter())
+                .find(|panel| panel.runtime_session_id() == Some(session_id))
+                .map(|panel| (panel.focused(), panel.is_alive()));
+            let Some((focused, alive)) = panel_state else {
+                continue;
+            };
+            if !alive {
+                continue; // panel muerto: no notificar
+            }
+            if !focused || !self.window_focused {
+                for workspace in &mut self.workspaces {
+                    for panel in &mut workspace.panels {
+                        if panel.runtime_session_id() == Some(session_id) {
+                            panel.set_unread(true);
+                        }
+                    }
+                }
+            }
+            to_notify.push((title, body));
+        }
+
+        if !crate::config::runtime_config().agent_notifications {
+            return;
+        }
+        let workspace_id = self.ws().id;
+        for (title, body) in to_notify {
+            if self
+                .notification_gate
+                .allow(workspace_id, std::time::Instant::now())
+            {
+                crate::utils::platform::notify(&title, &body);
+            }
         }
     }
 
@@ -269,7 +309,7 @@ fn attention_transitions(
         &'static str,
         String,
     )],
-) -> Vec<(String, String)> {
+) -> Vec<(Uuid, String, String)> {
     use crate::orchestration::AgentStatus;
     let mut out = Vec::new();
     for (session_id, status, provider_label, label) in sessions {
@@ -291,7 +331,7 @@ fn attention_transitions(
         } else {
             format!("{} — {}", label, status.label())
         };
-        out.push((title, body));
+        out.push((*session_id, title, body));
     }
     out
 }
@@ -322,8 +362,8 @@ mod attention_tests {
             &[session(id, AgentStatus::WaitingApproval, "Fix bug")],
         );
         assert_eq!(notifications.len(), 1);
-        assert_eq!(notifications[0].0, "Agente: Claude Code");
-        assert!(notifications[0].1.contains("Fix bug"));
+        assert_eq!(notifications[0].1, "Agente: Claude Code");
+        assert!(notifications[0].2.contains("Fix bug"));
     }
 
     #[test]

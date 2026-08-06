@@ -341,6 +341,7 @@ impl TerminalApp {
                         panel.minimized(),
                         panel.focused(),
                         provider,
+                        panel.unread(),
                     )
                 })
                 .collect();
@@ -358,7 +359,7 @@ impl TerminalApp {
             let mut title_seen: HashMap<String, usize> = HashMap::with_capacity(panel_count);
             let taskbar_panels: Vec<_> = taskbar_panels
                 .into_iter()
-                .map(|(id, title, minimized, focused, provider)| {
+                .map(|(id, title, minimized, focused, provider, unread)| {
                     let total = title_counts.get(&title).copied().unwrap_or(1);
                     let display = if total > 1 {
                         let n = if let Some(n) = title_seen.get_mut(title.as_str()) {
@@ -372,7 +373,7 @@ impl TerminalApp {
                     } else {
                         title
                     };
-                    (id, display, minimized, focused, provider)
+                    (id, display, minimized, focused, provider, unread)
                 })
                 .collect();
             TopBottomPanel::bottom("window-taskbar")
@@ -387,7 +388,9 @@ impl TerminalApp {
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
                         ui.style_mut().spacing.item_spacing.x = 6.0;
-                        for (panel_id, title, minimized, focused, provider) in &taskbar_panels {
+                        for (panel_id, title, minimized, focused, provider, unread) in
+                            &taskbar_panels
+                        {
                             let truncated = truncate_taskbar_title(title);
                             let font = egui::FontId::proportional(11.5);
                             let text_w = ui.fonts(|f| {
@@ -398,7 +401,10 @@ impl TerminalApp {
                             let dot_size = 7.0;
                             let dot_pad = 8.0;
                             let pad_x = 10.0;
-                            let item_w = text_w + dot_size + dot_pad + pad_x * 2.0;
+                            // El punto naranja de unread (P1.8) suma ancho a la
+                            // derecha del título cuando está activo.
+                            let unread_w = if *unread { dot_size + 6.0 } else { 0.0 };
+                            let item_w = text_w + dot_size + dot_pad + pad_x * 2.0 + unread_w;
                             let (rect, response) = ui.allocate_exact_size(
                                 egui::vec2(item_w, 26.0),
                                 egui::Sense::click(),
@@ -435,6 +441,17 @@ impl TerminalApp {
                                 font,
                                 text_color,
                             );
+                            if *unread {
+                                // Punto naranja de atención pendiente (P1.8).
+                                ui.painter().circle_filled(
+                                    egui::pos2(
+                                        text_x + text_w + 6.0 + dot_size * 0.5,
+                                        rect.center().y,
+                                    ),
+                                    dot_size * 0.5,
+                                    egui::Color32::from_rgb(255, 140, 40),
+                                );
+                            }
                             if *focused {
                                 let underline_y = rect.bottom() - 3.0;
                                 ui.painter().line_segment(

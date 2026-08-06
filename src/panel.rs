@@ -367,6 +367,18 @@ impl WorkspacePanel {
         }
     }
 
+    pub fn unread(&self) -> bool {
+        match self {
+            Self::Terminal(panel) => panel.unread(),
+        }
+    }
+
+    pub fn set_unread(&mut self, unread: bool) {
+        match self {
+            Self::Terminal(panel) => panel.set_unread(unread),
+        }
+    }
+
     pub fn restore_session(
         &mut self,
         checkpoint: &str,

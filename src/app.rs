@@ -34,6 +34,7 @@ mod desktop;
 mod dialogs;
 mod export_action;
 mod file_viewer_ui;
+mod notify_policy;
 mod orchestration_ui;
 mod perf;
 mod quick_open_ui;
@@ -109,6 +110,10 @@ pub struct TerminalApp {
     /// Último estado de agente por sesión que vimos, para notificar solo en la
     /// transición hacia un estado de atención (no repetirlo cada refresh).
     agent_status_seen: HashMap<Uuid, crate::orchestration::AgentStatus>,
+    /// Gate de notificaciones del SO por workspace (cooldown, P1.8).
+    notification_gate: notify_policy::NotificationGate,
+    /// ¿La ventana tiene foco del SO? (P1.8) Se refresca cada frame.
+    window_focused: bool,
     brand_texture: Option<egui::TextureHandle>,
     sidebar: Sidebar,
     update_checker: UpdateChecker,
@@ -197,6 +202,10 @@ impl TerminalApp {
                 highlighter: code_highlight::Highlighter::new(),
                 toasts: Default::default(),
                 agent_status_seen: HashMap::new(),
+                notification_gate: notify_policy::NotificationGate::new(
+                    notify_policy::NOTIFICATION_COOLDOWN,
+                ),
+                window_focused: false,
                 brand_texture,
                 sidebar: Sidebar::default(),
                 update_checker,
@@ -271,6 +280,10 @@ impl TerminalApp {
                 highlighter: code_highlight::Highlighter::new(),
                 toasts: Default::default(),
                 agent_status_seen: HashMap::new(),
+                notification_gate: notify_policy::NotificationGate::new(
+                    notify_policy::NOTIFICATION_COOLDOWN,
+                ),
+                window_focused: false,
                 brand_texture,
                 sidebar: Sidebar::default(),
                 update_checker,
@@ -727,6 +740,7 @@ impl TerminalApp {
     /// refresh de orquestación y atajos globales.
     fn begin_frame(&mut self, ctx: &egui::Context) {
         self.ctx = Some(ctx.clone());
+        self.window_focused = ctx.input(|input| input.focused);
         self.handle_collab_events();
         self.sync_window_transitions(ctx);
         self.maybe_refresh_orchestration();
@@ -814,8 +828,24 @@ impl TerminalApp {
                     self.collab.revoke_control(panel_id, "Host took control");
                 }
             }
+            // ¿Hubo un keystroke/click real este frame? (P1.8) La mera
+            // selección no limpia el unread; la interacción sí.
+            let interacted = ctx.input(|input| {
+                input.events.iter().any(|event| {
+                    matches!(
+                        event,
+                        egui::Event::Key { pressed: true, .. }
+                            | egui::Event::PointerButton { pressed: true, .. }
+                            | egui::Event::Text(_)
+                            | egui::Event::Paste(_)
+                    )
+                })
+            });
             if let Some(panel) = self.ws_mut().focused_panel_mut() {
                 panel.handle_input(ctx);
+                if interacted && panel.unread() {
+                    panel.set_unread(false);
+                }
             }
         }
     }

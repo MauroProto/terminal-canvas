@@ -10,7 +10,7 @@
 ## P1 — Completar flujos
 - [x] P1.6 Anotaciones por línea en diff → agente
 - [x] P1.7 Scrollback ANSI + log incremental
-- [ ] P1.8 Unread persistente + cooldown de notificaciones
+- [x] P1.8 Unread persistente + cooldown de notificaciones
 - [ ] P1.9 Trash diferido + salvaguardas de borrado
 - [x] P1.10 Tabla de providers + resume por id
 

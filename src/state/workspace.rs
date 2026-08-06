@@ -733,6 +733,7 @@ mod tests {
                 restore_bounds: Some(SavedPanelBounds::new([20.0, 30.0], [420.0, 260.0])),
                 share_scope: PanelShareScope::VisibleOnly,
                 agent_command: None,
+                unread: false,
             }],
             desktop: WorkspaceDesktopState {
                 next_z: 2,
@@ -777,6 +778,7 @@ mod tests {
                 restore_bounds: Some(SavedPanelBounds::new([20.0, 30.0], [420.0, 260.0])),
                 share_scope: PanelShareScope::VisibleOnly,
                 agent_command: None,
+                unread: false,
             }],
             desktop: WorkspaceDesktopState {
                 next_z: 2,
@@ -822,6 +824,7 @@ mod tests {
                 )),
                 share_scope: PanelShareScope::VisibleOnly,
                 agent_command: None,
+                unread: false,
             })
             .collect();
         let state = WorkspaceState {

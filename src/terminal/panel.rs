@@ -169,6 +169,9 @@ pub struct TerminalPanel {
     share_scope: PanelShareScope,
     /// Comando de agente con el que se lanzó el panel, para poder reanudarlo.
     agent_command: Option<String>,
+    /// Atención pendiente de ver (P1.8): bell / agente esperando mientras el
+    /// panel no estaba enfocado. Se limpia al interactuar con el panel.
+    unread: bool,
     render_cache: TerminalGridCache,
     #[cfg(feature = "ghostty-vt")]
     ghostty_render_cache: GhosttyGridCache,
@@ -205,6 +208,7 @@ impl TerminalPanel {
             last_activity_scan_at: 0.0,
             share_scope: PanelShareScope::VisibleOnly,
             agent_command: None,
+            unread: false,
             render_cache: TerminalGridCache::default(),
             #[cfg(feature = "ghostty-vt")]
             ghostty_render_cache: GhosttyGridCache::default(),
@@ -234,6 +238,7 @@ impl TerminalPanel {
             .clone()
             .unwrap_or_else(|| saved.title.clone());
         panel.agent_command = saved.agent_command.clone();
+        panel.unread = saved.unread;
         panel.focused = saved.focused && !saved.minimized;
         panel.minimized = saved.minimized;
         panel.placement = saved.placement.clone();
@@ -351,11 +356,22 @@ impl TerminalPanel {
             )),
             share_scope: self.share_scope,
             agent_command: self.agent_command.clone(),
+            unread: self.unread,
         }
     }
 
     pub fn focused(&self) -> bool {
         self.focused
+    }
+
+    /// Marca o limpia el flag de atención pendiente (P1.8).
+    pub fn set_unread(&mut self, unread: bool) {
+        self.unread = unread;
+    }
+
+    /// ¿Hay atención pendiente de ver en este panel? (P1.8)
+    pub fn unread(&self) -> bool {
+        self.unread
     }
 
     /// Único punto de escritura del foco desde afuera del panel. Lo llama el
