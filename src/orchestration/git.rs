@@ -224,6 +224,11 @@ pub(super) fn parse_diff_stats(raw: Option<String>) -> DiffStats {
     stats
 }
 
+/// Tope para `git worktree add`: un stall del filesystem (OneDrive/NFS) no
+/// puede dejar el lanzamiento colgado para siempre. Vencido el plazo se mata
+/// el child. Why: Orca (`WORKTREE_ADD_TIMEOUT_MS`) usa 180 s con la misma idea.
+const WORKTREE_ADD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+
 pub(super) fn create_git_worktree(
     repo_root: &Path,
     worktree_path: &Path,
@@ -235,12 +240,17 @@ pub(super) fn create_git_worktree(
     if let Some(parent) = worktree_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let output = Command::new("git")
+    ensure_push_auto_setup_remote(repo_root);
+    // `--no-track`: sin esto la rama nueva hereda el upstream de la base y
+    // `git status` miente "behind by N" antes del primer push. El upstream
+    // correcto lo crea `push.autoSetupRemote` recién al primer push.
+    let mut command = Command::new("git");
+    command
         .arg("-C")
         .arg(repo_root)
-        .args(["worktree", "add", "-b", branch])
-        .arg(worktree_path)
-        .output()?;
+        .args(["worktree", "add", "--no-track", "-b", branch])
+        .arg(worktree_path);
+    let output = run_with_timeout(&mut command, WORKTREE_ADD_TIMEOUT)?;
     if !output.status.success() {
         anyhow::bail!(
             "git worktree add failed: {}",
@@ -248,6 +258,89 @@ pub(super) fn create_git_worktree(
         );
     }
     Ok(())
+}
+
+/// Configura `push.autoSetupRemote=true` solo si el usuario no lo configuró en
+/// ningún scope (exit 1 de `git config --get`). Combinado con `--no-track`
+/// evita heredar upstreams ajenos y hace que el primer push cree el upstream.
+fn ensure_push_auto_setup_remote(repo_root: &Path) {
+    let already = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["config", "--get", "push.autoSetupRemote"])
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false);
+    if already {
+        return;
+    }
+    let _ = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["config", "push.autoSetupRemote", "true"])
+        .output();
+}
+
+/// Corre un comando con timeout, drenando stdout/stderr en hilos aparte para
+/// que los pipes nunca bloqueen al hijo. Vencido el plazo mata al child y
+/// devuelve un error `TimedOut`; un proceso colgado jamás deja la llamada
+/// colgando.
+fn run_with_timeout(
+    command: &mut Command,
+    timeout: std::time::Duration,
+) -> anyhow::Result<std::process::Output> {
+    use std::process::{Output, Stdio};
+
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    // Drenar en hilos: si el hijo escribe más que el buffer del pipe y nadie
+    // lee, se bloquea en write() y el timeout nunca lo vería terminado.
+    let stdout_handle = child.stdout.take().map(drain_pipe);
+    let stderr_handle = child.stderr.take().map(drain_pipe);
+
+    let started = std::time::Instant::now();
+    loop {
+        match child.try_wait()? {
+            Some(status) => {
+                let stdout = stdout_handle.map(join_drain).unwrap_or_default();
+                let stderr = stderr_handle.map(join_drain).unwrap_or_default();
+                return Ok(Output {
+                    status,
+                    stdout,
+                    stderr,
+                });
+            }
+            None => {
+                if started.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    anyhow::bail!("git worktree add timed out after {timeout:?}");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+        }
+    }
+}
+
+fn drain_pipe<R: std::io::Read + Send + 'static>(
+    mut reader: R,
+) -> std::thread::JoinHandle<Vec<u8>> {
+    // El unwrap es de spawn: si no se puede crear el hilo de drenaje el
+    // fallback es leer nada, pero worktree add sigue funcionando.
+    std::thread::Builder::new()
+        .name("git-pipe-drain".to_owned())
+        .spawn(move || {
+            let mut buffer = Vec::new();
+            let _ = reader.read_to_end(&mut buffer);
+            buffer
+        })
+        .expect("spawn pipe drain thread")
+}
+
+fn join_drain(handle: std::thread::JoinHandle<Vec<u8>>) -> Vec<u8> {
+    handle.join().unwrap_or_default()
 }
 
 fn git_stdout(path: &Path, args: &[&str]) -> Option<String> {
@@ -267,11 +360,14 @@ fn git_stdout(path: &Path, args: &[&str]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::process::Command;
+    use std::time::{Duration, Instant};
 
     use uuid::Uuid;
 
-    use super::{GitInspector, WorktreeCreateJob, WorktreeCreator};
+    use super::{
+        create_git_worktree, run_with_timeout, GitInspector, WorktreeCreateJob, WorktreeCreator,
+    };
 
     #[test]
     fn worktree_creator_reports_failure_outside_a_repo() {
@@ -302,6 +398,103 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].session_id, session_id);
         assert!(results[0].error.is_some());
+    }
+
+    #[test]
+    fn a_stalled_command_is_killed_by_the_timeout() {
+        // Regresión: un `git worktree add` colgado en un filesystem lento
+        // (OneDrive/NFS) no puede dejar el lanzamiento esperando para siempre.
+        let mut command = Command::new("sleep");
+        command.arg("30");
+
+        let started = Instant::now();
+        let result = run_with_timeout(&mut command, Duration::from_millis(200));
+        let elapsed = started.elapsed();
+
+        assert!(result.is_err(), "el timeout debe abortar el comando");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "tardó {elapsed:?}: el kill no funcionó"
+        );
+    }
+
+    #[test]
+    fn a_fast_command_returns_its_captured_output() {
+        let mut command = Command::new("echo");
+        command.arg("hola");
+        let output = run_with_timeout(&mut command, Duration::from_secs(5)).expect("run echo");
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "hola");
+    }
+
+    fn git(dir: &std::path::Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .expect("git disponible");
+        assert!(
+            output.status.success(),
+            "git {args:?} falló: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    #[test]
+    fn worktree_branches_are_created_without_upstream_tracking() {
+        // End-to-end con git real: la rama base tiene upstream (como pasa con
+        // un clone); la rama del worktree NO debe heredarlo (`--no-track`), y
+        // push.autoSetupRemote queda habilitado para el primer push.
+        let id = Uuid::new_v4();
+        let base = std::env::temp_dir().join(format!("worktree-notrack-{id}"));
+        let origin = base.join("origin");
+        let clone = base.join("clone");
+        std::fs::create_dir_all(&origin).unwrap();
+
+        git(&origin, &["init", "-q", "-b", "main"]);
+        std::fs::write(origin.join("file.txt"), "base").unwrap();
+        git(&origin, &["add", "."]);
+        git(
+            &origin,
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-qm",
+                "init",
+            ],
+        );
+        git(
+            &base,
+            &[
+                "clone",
+                "-q",
+                &origin.display().to_string(),
+                &clone.display().to_string(),
+            ],
+        );
+        git(&clone, &["push", "-q", "-u", "origin", "main"]);
+        assert!(!git(&clone, &["config", "branch.main.merge"]).is_empty());
+
+        let worktree_path = clone.join("..").join(format!("wt-{id}"));
+        create_git_worktree(&clone, &worktree_path, "feature").expect("crear worktree");
+
+        // Sin upstream: ni merge ni remote para la rama nueva.
+        let probe = Command::new("git")
+            .arg("-C")
+            .arg(&worktree_path)
+            .args(["config", "branch.feature.merge"])
+            .output()
+            .unwrap();
+        assert!(!probe.status.success(), "la rama heredó upstream");
+        assert_eq!(git(&clone, &["config", "push.autoSetupRemote"]), "true");
+
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&worktree_path);
     }
 
     #[test]
