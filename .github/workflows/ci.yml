@@ -47,6 +47,28 @@ jobs:
       - name: Run test suite
         run: cargo test --all-targets --locked --quiet
 
+  bench:
+    # Presupuesto de performance (Ship-it 7.3): compara las rutas calientes
+    # contra el commit anterior y falla si algo se degrada más de 15%.
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # El script necesita el commit base para armar el worktree.
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Compare hot-path benchmarks
+        run: scripts/bench-compare.sh "origin/${{ github.base_ref }}" 15
+
   audit:
     runs-on: ubuntu-latest
 

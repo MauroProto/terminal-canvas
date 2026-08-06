@@ -54,6 +54,7 @@ mod runtime;
 mod fixtures;
 
 use fixtures::RuntimeHarness;
+use std::time::{Duration, Instant};
 
 #[test]
 fn smoke_budget_single_visible_terminal_stays_focused_and_stable() {
@@ -92,4 +93,77 @@ fn smoke_budget_twenty_open_six_visible_three_streaming_hits_target_shape() {
     assert!(harness.no_deadlocks());
     assert!(harness.snapshot_is_consistent());
     assert_eq!(harness.render_tier_counts(), (1, 2, 3, 14));
+}
+
+// --- Presupuestos duros (Ship-it 7.3, T1) ---
+
+/// Tope del p95 de un "frame" simulado con 20 sesiones. Es el costo de la
+/// coordinación (scheduler + registry + snapshots), no del render con GPU.
+const FRAME_P95_BUDGET: Duration = Duration::from_millis(8);
+
+fn percentile(mut samples: Vec<Duration>, percentile: f64) -> Duration {
+    samples.sort();
+    let index = ((samples.len() as f64 - 1.0) * percentile).round() as usize;
+    samples[index.min(samples.len() - 1)]
+}
+
+#[test]
+fn frame_p95_stays_under_budget_with_twenty_sessions() {
+    let mut harness = RuntimeHarness::new();
+    harness.seed_budget(20, 6, 3);
+
+    // Calentamiento: la primera pasada paga allocs que no representan el
+    // estado estable.
+    for _ in 0..10 {
+        harness.emit_output_bursts();
+        harness.step();
+    }
+
+    let mut samples = Vec::with_capacity(200);
+    for _ in 0..200 {
+        let started = Instant::now();
+        harness.emit_output_bursts();
+        harness.step();
+        samples.push(started.elapsed());
+    }
+
+    let p95 = percentile(samples, 0.95);
+    assert!(
+        p95 < FRAME_P95_BUDGET,
+        "frame p95 {p95:?} supera el presupuesto de {FRAME_P95_BUDGET:?}"
+    );
+}
+
+#[test]
+fn an_idle_scheduler_asks_for_no_repaints() {
+    // Sin output nuevo, el scheduler no puede pedir repaints: si los pidiera,
+    // la app estaría dibujando para siempre sin motivo.
+    let mut harness = RuntimeHarness::new();
+    harness.seed_budget(20, 6, 3);
+    harness.emit_output_bursts();
+    harness.step();
+
+    // Un step sin emitir nada tiene que quedar idle en la primera vuelta.
+    harness.step();
+    assert!(
+        harness.is_idle_after_step(),
+        "el scheduler pide repaints sin tener nada pendiente"
+    );
+}
+
+#[test]
+fn draining_is_bounded_per_frame() {
+    // Aunque llueva output, el drenado por frame está acotado: nunca puede
+    // convertirse en un loop que se coma el frame entero.
+    let mut harness = RuntimeHarness::new();
+    harness.seed_budget(20, 20, 19);
+    for _ in 0..50 {
+        harness.emit_output_bursts();
+    }
+    harness.step();
+    assert!(
+        harness.drained_batches() <= 8,
+        "el drenado no está acotado: {} batches",
+        harness.drained_batches()
+    );
 }

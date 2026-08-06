@@ -194,6 +194,18 @@ impl RuntimeHarness {
         }
     }
 
+    /// ¿El scheduler quedó sin nada pendiente tras el último `step`?
+    #[allow(dead_code)]
+    pub fn is_idle_after_step(&self) -> bool {
+        self.idle_after_step
+    }
+
+    /// Batches drenados en el último `step` (tope del drenado por frame).
+    #[allow(dead_code)]
+    pub fn drained_batches(&self) -> usize {
+        self.drained_batches
+    }
+
     pub fn session_count(&self) -> usize {
         self.registry.snapshot().sessions.len()
     }

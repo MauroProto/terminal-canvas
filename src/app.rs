@@ -27,7 +27,7 @@ use crate::update::{RepaintPolicy, UpdateChecker};
 use crate::utils::platform::home_dir;
 
 mod broadcast_ui;
-mod code_highlight;
+pub mod code_highlight;
 mod code_review_ui;
 mod collab_ui;
 mod desktop;
