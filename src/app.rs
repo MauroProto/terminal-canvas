@@ -317,6 +317,14 @@ impl TerminalApp {
         app.reconcile_orchestration();
         app.refresh_orchestration();
         app.share_workspace_draft.broker_url = app.collab.broker_url().to_owned();
+        // Marcador de corrida: si la anterior murió sin cierre limpio (kill,
+        // crash nativo, OOM), avisamos que el estado igual se restauró. Sin
+        // esto, una muerte súbita y un cierre normal eran indistinguibles.
+        if crate::state::run_marker::begin_run().is_some() {
+            app.toast_error(
+                "La sesión anterior terminó de golpe; se restauró el último estado guardado",
+            );
+        }
         if let Some(invite_code) = pending_join_invite {
             app.join_session_open = true;
             app.join_session_draft.invite_code = invite_code;
@@ -1240,6 +1248,7 @@ impl eframe::App for TerminalApp {
         // El autosave puede tener hasta AUTOSAVE_INTERVAL de atraso: al salir
         // guardamos el scrollback definitivo para no perder las últimas líneas.
         self.persist_scrollbacks();
+        crate::state::run_marker::end_run_clean();
     }
 }
 

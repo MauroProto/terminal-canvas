@@ -1,5 +1,6 @@
 pub mod panel_state;
 pub mod persistence;
+pub mod run_marker;
 pub mod scrollback_store;
 pub mod workspace;
 
