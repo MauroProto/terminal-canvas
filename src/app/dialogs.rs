@@ -343,6 +343,7 @@ impl TerminalApp {
         let Some(mut draft) = self.launch_agent.clone() else {
             return;
         };
+        let installed = self.installed_agents.clone();
         dialog_backdrop(ctx);
         let mut cancel = false;
         let mut submit = false;
@@ -358,12 +359,38 @@ impl TerminalApp {
                         .selected_text(draft.provider.label())
                         .width(ui.available_width())
                         .show_ui(ui, |ui| {
+                            // Onboarding (7.2): el combo lista lo que está
+                            // instalado; el resto va abajo, deshabilitado y
+                            // con el comando para instalarlo.
                             for provider in crate::orchestration::launch_presets() {
-                                ui.selectable_value(
-                                    &mut draft.provider,
-                                    provider,
-                                    provider.label(),
-                                );
+                                if installed.is_available(provider) {
+                                    ui.selectable_value(
+                                        &mut draft.provider,
+                                        provider,
+                                        provider.label(),
+                                    );
+                                }
+                            }
+                            let missing: Vec<_> = crate::orchestration::launch_presets()
+                                .into_iter()
+                                .filter(|provider| !installed.is_available(*provider))
+                                .collect();
+                            if !missing.is_empty() {
+                                ui.separator();
+                                for provider in missing {
+                                    let hint = crate::orchestration::install_hint(provider)
+                                        .unwrap_or("no instalado");
+                                    ui.add_enabled(
+                                        false,
+                                        egui::Label::new(
+                                            egui::RichText::new(format!(
+                                                "{} — {hint}",
+                                                provider.label()
+                                            ))
+                                            .size(10.5),
+                                        ),
+                                    );
+                                }
                             }
                         });
                     dialog_field_label(ui, "Task");

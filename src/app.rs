@@ -35,6 +35,7 @@ mod dialogs;
 mod export_action;
 mod file_viewer_ui;
 mod notify_policy;
+mod onboarding;
 mod orchestration_ui;
 mod perf;
 mod quick_open_ui;
@@ -118,6 +119,11 @@ pub struct TerminalApp {
     gh_client: crate::orchestration::GhClient,
     /// Worker de la API de Linear (P3.17).
     linear_client: crate::orchestration::LinearClient,
+    /// Detección de agentes instalados y su resultado (Ship-it 7.2).
+    agent_detector: crate::orchestration::AgentDetector,
+    installed_agents: crate::orchestration::InstalledAgents,
+    /// El overlay de primeros pasos ya se cerró (Ship-it 7.2).
+    onboarding_dismissed: bool,
     tasks_state: crate::sidebar::tasks::TasksState,
     /// Issues que esperan a que su worktree termine para pegarse al panel.
     pending_issue_links: HashMap<Uuid, u64>,
@@ -217,6 +223,9 @@ impl TerminalApp {
                 hook_server: start_hook_server(),
                 gh_client: Default::default(),
                 linear_client: Default::default(),
+                agent_detector: crate::orchestration::AgentDetector::start(),
+                installed_agents: Default::default(),
+                onboarding_dismissed: crate::config::runtime_config().onboarding_dismissed,
                 tasks_state: Default::default(),
                 pending_issue_links: HashMap::new(),
                 window_focused: false,
@@ -300,6 +309,9 @@ impl TerminalApp {
                 hook_server: start_hook_server(),
                 gh_client: Default::default(),
                 linear_client: Default::default(),
+                agent_detector: crate::orchestration::AgentDetector::start(),
+                installed_agents: Default::default(),
+                onboarding_dismissed: crate::config::runtime_config().onboarding_dismissed,
                 tasks_state: Default::default(),
                 pending_issue_links: HashMap::new(),
                 window_focused: false,
@@ -791,6 +803,9 @@ impl TerminalApp {
         self.poll_hook_events();
         self.poll_gh_client();
         self.poll_design_captures();
+        if let Some(installed) = self.agent_detector.poll() {
+            self.installed_agents = installed;
+        }
         self.poll_screenshot_capture(ctx);
         if self.code_review.as_ref().is_some_and(|state| state.loading) {
             ctx.request_repaint_after(std::time::Duration::from_millis(80));
@@ -1493,6 +1508,7 @@ impl TerminalApp {
         self.show_search_bar(ctx);
         self.show_code_review(ctx);
         self.show_quick_open(ctx);
+        self.show_onboarding(ctx);
         self.restore_pending_scrollbacks();
         self.show_settings(ctx);
         self.show_broadcast(ctx);

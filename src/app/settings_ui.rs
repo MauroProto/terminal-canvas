@@ -48,6 +48,7 @@ impl SettingsDraft {
             // El token de Linear no se edita acá (vive en config.toml):
             // se conserva tal cual para que guardar Settings no lo borre.
             linear_token: crate::config::runtime_config().linear_token,
+            onboarding_dismissed: crate::config::runtime_config().onboarding_dismissed,
         }
     }
 }
@@ -288,6 +289,7 @@ mod tests {
             agent_notifications: false,
             shell: Some("/opt/homebrew/bin/fish".to_owned()),
             linear_token: None,
+            onboarding_dismissed: false,
         }
     }
 

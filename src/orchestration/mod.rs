@@ -1,3 +1,4 @@
+mod agent_detect;
 mod agent_sessions;
 mod claude_hooks;
 mod code_diff;
@@ -11,6 +12,8 @@ mod matching;
 mod worktree_removal_safety;
 mod worktree_trash;
 
+#[allow(unused_imports)]
+pub use agent_detect::{install_hint, AgentDetector, InstalledAgents};
 #[allow(unused_imports)]
 pub use agent_sessions::{list_claude_sessions, sanitize_session_id, AgentSessionEntry};
 #[allow(unused_imports)]

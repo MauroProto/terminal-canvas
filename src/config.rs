@@ -31,6 +31,9 @@ pub struct AppConfig {
     /// Token de API de Linear (`[integrations] linear_token`), para la fuente
     /// de issues de la pestaña Tasks (P3.17). `None` = integración apagada.
     pub linear_token: Option<String>,
+    /// El overlay de onboarding ya se cerró (Ship-it 7.2). Se persiste para no
+    /// mostrarlo en cada arranque.
+    pub onboarding_dismissed: bool,
 }
 
 impl Default for AppConfig {
@@ -46,6 +49,7 @@ impl Default for AppConfig {
             agent_notifications: true,
             shell: None,
             linear_token: None,
+            onboarding_dismissed: false,
         }
     }
 }
@@ -56,12 +60,20 @@ struct ConfigFile {
     terminal: TerminalSection,
     #[serde(default)]
     integrations: IntegrationsSection,
+    #[serde(default)]
+    onboarding: OnboardingSection,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
 struct IntegrationsSection {
     #[serde(default)]
     linear_token: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+struct OnboardingSection {
+    #[serde(default)]
+    dismissed: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -113,6 +125,9 @@ pub fn load_from_path(path: &std::path::Path) -> AppConfig {
             if let Some(token) = file.integrations.linear_token {
                 let token = token.trim().to_owned();
                 config.linear_token = if token.is_empty() { None } else { Some(token) };
+            }
+            if let Some(dismissed) = file.onboarding.dismissed {
+                config.onboarding_dismissed = dismissed;
             }
         }
         None if path.exists() => {
@@ -197,6 +212,9 @@ pub fn save_to_path(config: &AppConfig, path: &std::path::Path) -> anyhow::Resul
         integrations: IntegrationsSection {
             linear_token: config.linear_token.clone(),
         },
+        onboarding: OnboardingSection {
+            dismissed: Some(config.onboarding_dismissed),
+        },
     };
     let raw = toml::to_string_pretty(&file)?;
     crate::state::durable_write::write_durable(path, raw.as_bytes())?;
@@ -271,6 +289,7 @@ mod tests {
             agent_notifications: false,
             shell: Some("/bin/zsh".to_owned()),
             linear_token: Some("lin_api_test".to_owned()),
+            onboarding_dismissed: true,
         };
         assert_ne!(config, AppConfig::default());
 

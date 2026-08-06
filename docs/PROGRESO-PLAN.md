@@ -27,7 +27,7 @@
 - [x] P3.18 Design Mode (extensión browser)
 
 ## Ship-it
-- [ ] 7.2 Onboarding (detección de agentes + empty states)
+- [x] 7.2 Onboarding (detección de agentes + empty states)
 - [ ] 7.3 Perf budgets
 - [ ] 7.4 Smoke E2E
 - [x] 7.5 Diagnóstico exportable
