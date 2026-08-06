@@ -1,4 +1,6 @@
-# Playbook: qué traer de Orca a terminalcanvas, y cómo
+# Plan maestro de terminalcanvas
+
+> Qué construir, en qué orden, con qué diseño — con lo mejor de Orca como referencia estudiada.
 
 > Documento de trabajo. Fuente: clon completo de `stablyai/orca` (12.422 archivos,
 > Electron/TypeScript) explorado a fondo el 2026-08-05, más el análisis de nuestro
@@ -24,6 +26,7 @@
 - [3. Mejoras medianas, listas para ejecutar](#3-mejoras-medianas-listas-para-ejecutar)
 - [4. Cosas chicas de código (quick wins)](#4-cosas-chicas-de-código-quick-wins)
 - [5. Roadmap priorizado](#5-roadmap-priorizado)
+- [6. Estimación de tiempo y costo](#6-estimación-de-tiempo-y-costo)
 
 ---
 
@@ -541,6 +544,49 @@ potencia a 10 (resume por id exacto) y a 8 (estados sin heurística). 6 reusa el
 selector de 10/broadcast.
 
 ---
+
+---
+
+## 6. Estimación de tiempo y costo
+
+**Base de la estimación** (no inventada): la velocidad real observada en las
+sesiones que produjeron los últimos 38 commits de este repo. Una "tanda" =
+una unidad de trabajo con el estándar completo: implementación + tests +
+clippy en cero + verificación + commit. Una tanda real tarda entre 20 y 60
+minutos de reloj y cuesta entre USD 3 y 8 de uso de API (las tandas con
+exploración o depuración visual son las caras; las de código puro, las
+baratas). Si el agente corre con suscripción (Max/Team) en vez de API por
+token, el costo marginal es ~0 y solo cuenta el tiempo.
+
+| Fase | Contenido | Tandas | Tiempo de agente | Costo API (USD) |
+|---|---|---|---|---|
+| **P0** | 5 quick wins (drag&drop, screenshot→agente, sanitización, worktree add robusto, fsync+backups) | 5 | 2–4 h | 20–40 |
+| **P1** | Anotaciones en diff, scrollback ANSI+log, unread+notifs, trash de worktrees, providers | 9–11 | 5–9 h | 40–80 |
+| **P2** | Splits, hooks de agente, GitHub vía gh, quick open unificado | 11–15 | 7–12 h | 55–110 |
+| **P3** | Daemon de PTYs, flow control, Linear, Design Mode (ext. browser) | 12–17 | 8–14 h | 70–130 |
+| **Total** | Todo el plan | **37–48** | **22–39 h** | **185–360** |
+
+**En calendario**: el tiempo de agente no es tiempo corrido — hay revisión
+humana entre tandas. A un ritmo sostenible de 2–4 tandas por día:
+
+- **P0 completo: 1–2 días.**
+- **P0+P1 (la app se siente otra): ~1 semana.**
+- **Todo el plan: 3–5 semanas.**
+
+**Dónde está el riesgo de desvío** (los números pueden crecer acá y solo acá):
+
+1. **El daemon (P3.15)** es la única pieza con incertidumbre real de diseño en
+   Rust nativo; presupuestado 5–8 tandas, podría ser 10 si el reattach caliente
+   pelea con alacritty. Mitigación: su dependencia (checkpoint+log) se hace
+   antes y ya deja el cold restore funcionando sin daemon.
+2. **Hooks de agente (P2.12)**: depende del formato de `~/.claude/settings.json`
+   y equivalentes; si un CLI cambia su esquema, hay una tanda extra de ajuste.
+3. **Verificación visual**: cuando haga falta mirar la pantalla (splits, diff
+   notes), las tandas cuestan ~30% más por el ciclo compilar-lanzar-capturar.
+
+Lo que NO puede pasar con este plan: quedar a mitad de camino con algo roto.
+Cada fila de la tabla deja la app en un estado mejor y estable — el orden está
+elegido para que cortar en cualquier punto sea seguro.
 
 ## Apéndice: archivos de Orca consultados
 
