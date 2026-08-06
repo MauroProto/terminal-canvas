@@ -789,6 +789,7 @@ impl TerminalApp {
         self.poll_quick_open();
         self.poll_hook_events();
         self.poll_gh_client();
+        self.poll_design_captures();
         self.poll_screenshot_capture(ctx);
         if self.code_review.as_ref().is_some_and(|state| state.loading) {
             ctx.request_repaint_after(std::time::Duration::from_millis(80));

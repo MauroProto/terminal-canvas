@@ -132,10 +132,137 @@ pub fn endpoint_script(url: &str, token: &str) -> String {
     format!("export TC_HOOK_URL={url}\nexport TC_HOOK_TOKEN={token}\n")
 }
 
+/// Captura de un elemento del navegador mandada por la extensión (P3.18).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DesignCapture {
+    /// Selector legible del elemento (`div.card > button`).
+    pub selector: String,
+    pub html: String,
+    pub css: String,
+    /// Rect en la página, como lo reportó `getBoundingClientRect`.
+    pub rect: String,
+    /// Screenshot recortado ya escrito a disco, si vino.
+    pub screenshot_path: Option<std::path::PathBuf>,
+}
+
+/// Payload crudo que manda la extensión.
+#[derive(Debug, Default, Deserialize)]
+pub struct DesignPayload {
+    #[serde(default)]
+    pub selector: String,
+    #[serde(default)]
+    pub html: String,
+    #[serde(default)]
+    pub css: String,
+    #[serde(default)]
+    pub rect: serde_json::Value,
+    /// PNG en base64 (con o sin el prefijo `data:image/png;base64,`).
+    #[serde(default)]
+    pub screenshot_b64: Option<String>,
+}
+
+/// Tope del HTML/CSS que aceptamos: una página entera no entra en un prompt y
+/// tampoco queremos que un `outerHTML` de 20 MB nos coma la memoria.
+pub const MAX_CAPTURE_FIELD: usize = 32 * 1024;
+
+fn clamp_field(text: &str) -> String {
+    if text.len() <= MAX_CAPTURE_FIELD {
+        return text.to_owned();
+    }
+    let mut end = MAX_CAPTURE_FIELD;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &text[..end])
+}
+
+/// Rect como texto compacto; si no vino con la forma esperada, queda vacío.
+fn rect_summary(rect: &serde_json::Value) -> String {
+    let number = |key: &str| rect.get(key).and_then(serde_json::Value::as_f64);
+    match (number("x"), number("y"), number("width"), number("height")) {
+        (Some(x), Some(y), Some(width), Some(height)) => {
+            format!("x={x:.0} y={y:.0} w={width:.0} h={height:.0}")
+        }
+        _ => String::new(),
+    }
+}
+
+/// Decodifica el screenshot y lo escribe a disco. `None` si no vino o si el
+/// base64 es inválido (la captura sigue siendo útil sin imagen).
+pub fn write_screenshot(base64_png: &str, dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    use base64::Engine;
+    let payload = base64_png
+        .split_once("base64,")
+        .map(|(_, rest)| rest)
+        .unwrap_or(base64_png);
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(payload.trim())
+        .ok()?;
+    if bytes.is_empty() {
+        return None;
+    }
+    std::fs::create_dir_all(dir).ok()?;
+    let path = dir.join(format!("design-{}.png", Uuid::new_v4().simple()));
+    std::fs::write(&path, bytes).ok()?;
+    Some(path)
+}
+
+/// Arma la captura desde el payload, recortando campos gigantes.
+pub fn build_design_capture(
+    payload: DesignPayload,
+    screenshot_path: Option<std::path::PathBuf>,
+) -> DesignCapture {
+    DesignCapture {
+        selector: clamp_field(payload.selector.trim()),
+        html: clamp_field(payload.html.trim()),
+        css: clamp_field(payload.css.trim()),
+        rect: rect_summary(&payload.rect),
+        screenshot_path,
+    }
+}
+
+/// Formato determinístico del prompt que se le manda al agente (P3.18, T3).
+/// Byte-exacto: el agente puede parsearlo sin ambigüedad.
+pub fn format_design_capture(capture: &DesignCapture) -> String {
+    let mut out = String::with_capacity(capture.html.len() + capture.css.len() + 128);
+    out.push_str(&format!(
+        "Element: {}
+",
+        capture.selector
+    ));
+    if !capture.rect.is_empty() {
+        out.push_str(&format!(
+            "Rect: {}
+",
+            capture.rect
+        ));
+    }
+    out.push_str(&format!(
+        "HTML: {}
+",
+        capture.html
+    ));
+    out.push_str(&format!(
+        "CSS: {}
+",
+        capture.css
+    ));
+    if let Some(path) = capture.screenshot_path.as_ref() {
+        out.push_str(&format!(
+            "Screenshot: {}
+",
+            path.display()
+        ));
+    }
+    out
+}
+
 #[derive(Clone)]
 struct HookState {
     token: String,
     sender: Arc<Mutex<Sender<HookEvent>>>,
+    design_sender: Arc<Mutex<Sender<DesignCapture>>>,
+    design_dir: std::path::PathBuf,
 }
 
 async fn hook_handler(
@@ -164,12 +291,38 @@ async fn hook_handler(
     StatusCode::OK
 }
 
+async fn design_handler(
+    State(state): State<HookState>,
+    headers: HeaderMap,
+    body: String,
+) -> StatusCode {
+    let provided = headers
+        .get(TOKEN_HEADER)
+        .and_then(|value| value.to_str().ok());
+    if !token_matches(&state.token, provided) {
+        return StatusCode::UNAUTHORIZED;
+    }
+    let Ok(payload) = serde_json::from_str::<DesignPayload>(&body) else {
+        return StatusCode::BAD_REQUEST;
+    };
+    let screenshot = payload
+        .screenshot_b64
+        .as_deref()
+        .and_then(|encoded| write_screenshot(encoded, &state.design_dir));
+    let capture = build_design_capture(payload, screenshot);
+    if let Ok(sender) = state.design_sender.lock() {
+        let _ = sender.send(capture);
+    }
+    StatusCode::OK
+}
+
 /// Servidor de hooks vivo. Al dropearse, el hilo queda cerrado por el cierre
 /// del listener del runtime.
 pub struct HookServer {
     url: String,
     token: String,
     receiver: Receiver<HookEvent>,
+    design_receiver: Receiver<DesignCapture>,
     _thread: thread::JoinHandle<()>,
 }
 
@@ -184,12 +337,19 @@ impl HookServer {
         let token = Uuid::new_v4().simple().to_string();
 
         let (sender, receiver) = std::sync::mpsc::channel::<HookEvent>();
+        let (design_sender, design_receiver) = std::sync::mpsc::channel::<DesignCapture>();
+        let design_dir = hooks_dir()
+            .map(|dir| dir.join("captures"))
+            .unwrap_or_else(std::env::temp_dir);
         let state = HookState {
             token: token.clone(),
             sender: Arc::new(Mutex::new(sender)),
+            design_sender: Arc::new(Mutex::new(design_sender)),
+            design_dir,
         };
         let router = Router::new()
             .route("/hook/:provider", post(hook_handler))
+            .route("/design/capture", post(design_handler))
             .with_state(state);
 
         // Nada de unwrap acá: un fallo del server de hooks no puede tirar la app.
@@ -219,6 +379,7 @@ impl HookServer {
             url,
             token,
             receiver,
+            design_receiver,
             _thread: thread_handle,
         };
         server.write_endpoint_file();
@@ -252,6 +413,15 @@ impl HookServer {
         let mut out = Vec::new();
         while let Ok(event) = self.receiver.try_recv() {
             out.push(event);
+        }
+        out
+    }
+
+    /// Drena las capturas de Design Mode recibidas desde el último frame.
+    pub fn poll_design(&self) -> Vec<DesignCapture> {
+        let mut out = Vec::new();
+        while let Ok(capture) = self.design_receiver.try_recv() {
+            out.push(capture);
         }
         out
     }
@@ -361,5 +531,102 @@ mod tests {
         assert!(!server.token().is_empty());
         // Sin eventos todavía.
         assert!(server.poll().is_empty());
+    }
+
+    #[test]
+    fn the_design_prompt_is_byte_exact() {
+        let capture = super::DesignCapture {
+            selector: "div.card > button".to_owned(),
+            html: "<button>Ok</button>".to_owned(),
+            css: "color: red;".to_owned(),
+            rect: "x=10 y=20 w=100 h=40".to_owned(),
+            screenshot_path: Some(std::path::PathBuf::from("/tmp/design-1.png")),
+        };
+        assert_eq!(
+            super::format_design_capture(&capture),
+            "Element: div.card > button\nRect: x=10 y=20 w=100 h=40\nHTML: <button>Ok</button>\nCSS: color: red;\nScreenshot: /tmp/design-1.png\n"
+        );
+    }
+
+    #[test]
+    fn the_prompt_omits_missing_optional_lines() {
+        let capture = super::DesignCapture {
+            selector: "button".to_owned(),
+            html: "<button/>".to_owned(),
+            css: String::new(),
+            rect: String::new(),
+            screenshot_path: None,
+        };
+        let prompt = super::format_design_capture(&capture);
+        assert!(!prompt.contains("Rect:"), "got {prompt:?}");
+        assert!(!prompt.contains("Screenshot:"), "got {prompt:?}");
+        assert!(prompt.starts_with("Element: button\n"));
+    }
+
+    #[test]
+    fn giant_fields_are_clamped_without_splitting_a_character() {
+        let payload = super::DesignPayload {
+            selector: "div".to_owned(),
+            html: "ñ".repeat(super::MAX_CAPTURE_FIELD),
+            css: String::new(),
+            rect: serde_json::Value::Null,
+            screenshot_b64: None,
+        };
+        let capture = super::build_design_capture(payload, None);
+        assert!(capture.html.len() <= super::MAX_CAPTURE_FIELD + 4);
+        assert!(capture.html.ends_with('…'), "se marca el recorte");
+    }
+
+    #[test]
+    fn the_rect_summary_survives_a_payload_without_it() {
+        let payload = super::DesignPayload {
+            selector: "div".to_owned(),
+            html: "<div/>".to_owned(),
+            css: String::new(),
+            rect: serde_json::json!({"nope": 1}),
+            screenshot_b64: None,
+        };
+        assert_eq!(super::build_design_capture(payload, None).rect, "");
+    }
+
+    #[test]
+    fn the_rect_summary_formats_the_expected_shape() {
+        let payload = super::DesignPayload {
+            selector: "div".to_owned(),
+            html: String::new(),
+            css: String::new(),
+            rect: serde_json::json!({"x": 10.4, "y": 20.6, "width": 100.0, "height": 40.0}),
+            screenshot_b64: None,
+        };
+        assert_eq!(
+            super::build_design_capture(payload, None).rect,
+            "x=10 y=21 w=100 h=40"
+        );
+    }
+
+    #[test]
+    fn a_screenshot_is_written_with_or_without_the_data_url_prefix() {
+        use base64::Engine;
+        let dir = std::env::temp_dir().join(format!("design-{}", Uuid::new_v4()));
+        let png = b"\x89PNG\r\n\x1a\nfake";
+        let encoded = base64::engine::general_purpose::STANDARD.encode(png);
+
+        let plain = super::write_screenshot(&encoded, &dir).expect("escribe");
+        assert_eq!(std::fs::read(&plain).unwrap(), png);
+
+        let with_prefix =
+            super::write_screenshot(&format!("data:image/png;base64,{encoded}"), &dir)
+                .expect("escribe");
+        assert_eq!(std::fs::read(&with_prefix).unwrap(), png);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_broken_screenshot_does_not_kill_the_capture() {
+        let dir = std::env::temp_dir().join(format!("design-bad-{}", Uuid::new_v4()));
+        assert_eq!(super::write_screenshot("no-es-base64!!!", &dir), None);
+        assert_eq!(super::write_screenshot("", &dir), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

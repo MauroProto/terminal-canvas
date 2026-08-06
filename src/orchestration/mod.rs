@@ -30,7 +30,7 @@ pub use gh_client::{
     PullRequest,
 };
 #[allow(unused_imports)]
-pub use hook_server::{HookEvent, HookKind, HookServer};
+pub use hook_server::{format_design_capture, DesignCapture, HookEvent, HookKind, HookServer};
 #[allow(unused_imports)]
 pub use linear_client::{
     linear_branch_name, linear_prompt, LinearAvailability, LinearClient, LinearIssue,

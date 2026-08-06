@@ -1,0 +1,32 @@
+{
+  "manifest_version": 3,
+  "name": "TerminalCanvas Design Mode",
+  "version": "1.0.0",
+  "description": "Alt+click en cualquier elemento y lo manda al agente de TerminalCanvas.",
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "storage"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "TerminalCanvas Design Mode"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}

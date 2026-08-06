@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      body { font: 12px system-ui; width: 300px; padding: 12px; background: #121212; color: #d0d0d0; }
+      label { display: block; margin-top: 8px; }
+      input { width: 100%; box-sizing: border-box; padding: 5px; margin-top: 3px;
+              background: #1a1a1a; color: #f4f4f4; border: 1px solid #383838; border-radius: 4px; }
+      button { margin-top: 10px; width: 100%; padding: 6px; cursor: pointer;
+               background: #2c2c2c; color: #f4f4f4; border: 1px solid #383838; border-radius: 4px; }
+      p { color: #6e6e6e; line-height: 1.4; }
+    </style>
+  </head>
+  <body>
+    <p>Pegá acá lo que imprime <code>endpoint.sh</code> de TerminalCanvas.</p>
+    <label>TC_HOOK_URL<input id="url" placeholder="http://127.0.0.1:54321" /></label>
+    <label>TC_HOOK_TOKEN<input id="token" placeholder="c08b36fe…" /></label>
+    <button id="save">Guardar</button>
+    <p id="status"></p>
+    <p>Después: <b>Alt+click</b> en cualquier elemento de la página.</p>
+    <script src="popup.js"></script>
+  </body>
+</html>

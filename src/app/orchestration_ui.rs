@@ -329,6 +329,45 @@ impl TerminalApp {
         }
     }
 
+    /// Drena las capturas de Design Mode (P3.18, T3) y las manda al agente
+    /// enfocado con el formato determinístico.
+    pub(super) fn poll_design_captures(&mut self) {
+        let Some(server) = self.hook_server.as_ref() else {
+            return;
+        };
+        let captures = server.poll_design();
+        if captures.is_empty() {
+            return;
+        }
+        let Some(panel_id) = self
+            .ws()
+            .panels
+            .iter()
+            .find(|panel| panel.focused() && panel.is_alive())
+            .map(|panel| panel.id())
+        else {
+            self.toast_error("Elemento capturado, pero no hay agente enfocado");
+            return;
+        };
+        let mut delivered = 0usize;
+        for capture in captures {
+            let prompt = crate::orchestration::format_design_capture(&capture);
+            for workspace in &mut self.workspaces {
+                if workspace.send_prompt_to_panel(panel_id, &prompt) {
+                    delivered += 1;
+                    break;
+                }
+            }
+        }
+        if delivered > 0 {
+            self.toast_success(if delivered == 1 {
+                "Elemento capturado".to_owned()
+            } else {
+                format!("{delivered} elementos capturados")
+            });
+        }
+    }
+
     pub(super) fn maybe_refresh_orchestration(&mut self) {
         if self.panel_gesture.is_some() {
             return;

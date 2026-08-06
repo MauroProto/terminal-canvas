@@ -24,7 +24,7 @@
 - [ ] P3.15 Daemon de PTYs
 - [x] P3.16 Flow control
 - [x] P3.17 Linear
-- [ ] P3.18 Design Mode (extensión browser)
+- [x] P3.18 Design Mode (extensión browser)
 
 ## Ship-it
 - [ ] 7.2 Onboarding (detección de agentes + empty states)
