@@ -4,6 +4,8 @@ mod diff_notes;
 mod git;
 mod manager;
 mod matching;
+mod worktree_removal_safety;
+mod worktree_trash;
 
 #[allow(unused_imports)]
 pub use agent_sessions::{list_claude_sessions, sanitize_session_id, AgentSessionEntry};
@@ -22,3 +24,7 @@ pub use manager::{
     Orchestrator, PanelOverlay, PanelRuntimeObservation, ReviewSummary, SceneTemplate,
     SceneTemplateKind, SessionListItem, TaskCard, TaskState, TestStatus, WorktreeMode,
 };
+#[allow(unused_imports)]
+pub use worktree_removal_safety::{check_recursive_delete, RemovalGuard};
+#[allow(unused_imports)]
+pub use worktree_trash::{move_to_trash, sweep_stale_trash, trash_dir};

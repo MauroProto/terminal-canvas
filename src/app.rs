@@ -609,8 +609,11 @@ impl TerminalApp {
             .workspaces
             .iter()
             .any(|workspace| workspace.matches_cwd(&path));
-        let index = upsert_workspace_for_folder(&mut self.workspaces, path);
+        let index = upsert_workspace_for_folder(&mut self.workspaces, path.clone());
         self.switch_workspace(index);
+        // Trash diferido (P1.9): al abrir el workspace se barren las entradas
+        // stale del trash de este repo.
+        crate::orchestration::sweep_stale_trash(&path);
         if !already_open || self.ws().panels.is_empty() {
             self.ws_mut().spawn_terminal(ctx);
         }

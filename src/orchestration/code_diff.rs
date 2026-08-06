@@ -867,7 +867,7 @@ fn run_worktree_job(job: WorktreeJob) -> WorktreeOutcome {
             repo_root,
             worktree_path,
         } => {
-            let error = remove_git_worktree(&repo_root, &worktree_path)
+            let error = remove_worktree_with_trash(&repo_root, &worktree_path)
                 .err()
                 .map(|err| err.to_string());
             // Se re-lista siempre, incluso si el borrado falló: el estado en
@@ -877,5 +877,29 @@ fn run_worktree_job(job: WorktreeJob) -> WorktreeOutcome {
                 error,
             }
         }
+    }
+}
+
+/// Borrado de worktree con trash diferido y salvaguardas (P1.9): primero las
+/// guards, luego rename al trash, `git worktree prune` para desregistrar, y al
+/// final el borrado recursivo del trash (ya en el worker, serializado). Si el
+/// rename falla (cross-volume) se cae al `git worktree remove` directo.
+fn remove_worktree_with_trash(repo_root: &Path, worktree_path: &Path) -> anyhow::Result<()> {
+    let registered: Vec<PathBuf> = list_git_worktrees(repo_root)
+        .into_iter()
+        .map(|info| info.path)
+        .collect();
+    super::worktree_removal_safety::check_recursive_delete(worktree_path, repo_root, &registered)
+        .map_err(|guard| anyhow::anyhow!("borrado rechazado: {}", guard.0))?;
+
+    match super::worktree_trash::move_to_trash(repo_root, worktree_path) {
+        Some(trash_path) => {
+            // El rename ya sacó el dir del registro de git en la práctica;
+            // prune limpia el metadata de worktrees que quede colgando.
+            let _ = git_string(repo_root, &["worktree", "prune"]);
+            std::fs::remove_dir_all(&trash_path)
+                .map_err(|err| anyhow::anyhow!("no se pudo borrar el trash: {err}"))
+        }
+        None => remove_git_worktree(repo_root, worktree_path),
     }
 }
