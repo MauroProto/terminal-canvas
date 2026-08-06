@@ -43,6 +43,9 @@ pub struct LeafLayout {
 pub struct DividerHit {
     pub axis: Axis,
     pub rect: Rect,
+    /// Rect del split que posee este divisor (para calcular el ratio al
+    /// arrastrar).
+    pub parent: Rect,
     /// Camino para actualizar el ratio al arrastrar.
     pub path: Vec<usize>,
 }
@@ -190,7 +193,11 @@ impl SplitNode {
         for &index in path {
             match node {
                 Self::Split { first, second, .. } => {
-                    node = if index == 0 { first.as_mut() } else { second.as_mut() };
+                    node = if index == 0 {
+                        first.as_mut()
+                    } else {
+                        second.as_mut()
+                    };
                 }
                 _ => return,
             }
@@ -253,6 +260,7 @@ impl SplitNode {
                 dividers.push(DividerHit {
                     axis: *axis,
                     rect: divider_rect,
+                    parent: rect,
                     path: path.clone(),
                 });
                 let mut p0 = path.clone();

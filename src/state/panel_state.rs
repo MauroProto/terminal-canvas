@@ -68,6 +68,12 @@ pub struct PanelState {
     /// enfocado y nadie lo interactuó todavía (P1.8). Se limpia al interactuar.
     #[serde(default)]
     pub unread: bool,
+    /// Árbol de splits del panel (P2.11), serializado como JSON opaco.
+    #[serde(default)]
+    pub split_tree: Option<serde_json::Value>,
+    /// Hoja con el foco de teclado dentro del split (P2.11).
+    #[serde(default)]
+    pub focused_leaf: Option<String>,
 }
 
 #[cfg(test)]
@@ -94,6 +100,8 @@ mod tests {
             share_scope: PanelShareScope::VisibleOnly,
             agent_command: None,
             unread: false,
+            split_tree: None,
+            focused_leaf: None,
         }
     }
 

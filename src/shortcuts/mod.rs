@@ -8,6 +8,16 @@ pub fn shortcut_command(modifiers: &Modifiers, key: Key) -> Option<Command> {
     use Command::*;
     use Key::*;
 
+    // Splits (P2.11) con la tecla Cmd (no chocan con los atajos Ctrl+Shift).
+    if modifiers.command && !modifiers.ctrl {
+        match (modifiers.shift, key) {
+            (false, D) => return Some(SplitRight),
+            (true, D) => return Some(SplitDown),
+            (_, W) => return Some(CloseLeaf),
+            _ => {}
+        }
+    }
+
     match (modifiers.ctrl, modifiers.shift, key) {
         (true, true, T) => Some(NewTerminal),
         (true, true, A) => Some(LaunchAgent),

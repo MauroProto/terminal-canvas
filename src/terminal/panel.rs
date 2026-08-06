@@ -61,6 +61,7 @@ use crate::terminal::search::{
     display_offset_for_match, find_next, SearchQuery, MAX_HIGHLIGHT_LINES,
 };
 use crate::terminal::session_controller::{session_spec, SessionController};
+use crate::theme::colors as palette;
 use crate::utils::platform::default_shell;
 
 pub const TITLE_BAR_HEIGHT: f32 = 28.0;
@@ -172,6 +173,16 @@ pub struct TerminalPanel {
     /// Atención pendiente de ver (P1.8): bell / agente esperando mientras el
     /// panel no estaba enfocado. Se limpia al interactuar con el panel.
     unread: bool,
+    /// Árbol de splits (P2.11). `None` = una sola sesión (comportamiento
+    /// clásico). Cuando existe, cada hoja tiene su propia sesión.
+    split_tree: Option<crate::terminal::split_tree::SplitNode>,
+    /// Id de la hoja raíz (la sesión clásica `self.session`).
+    root_leaf: crate::terminal::split_tree::LeafId,
+    /// Sesiones de las hojas no raíz.
+    leaf_sessions:
+        std::collections::HashMap<crate::terminal::split_tree::LeafId, SessionController>,
+    /// Hoja con el foco de teclado dentro del panel.
+    focused_leaf: crate::terminal::split_tree::LeafId,
     render_cache: TerminalGridCache,
     #[cfg(feature = "ghostty-vt")]
     ghostty_render_cache: GhosttyGridCache,
@@ -183,7 +194,7 @@ pub struct TerminalPanel {
 
 impl TerminalPanel {
     pub fn new(position: Pos2, size: Vec2, color: Color32, z_index: u32) -> Self {
-        Self {
+        let mut this = Self {
             id: Uuid::new_v4(),
             title: "Terminal".to_owned(),
             shell_title: "Terminal".to_owned(),
@@ -209,6 +220,10 @@ impl TerminalPanel {
             share_scope: PanelShareScope::VisibleOnly,
             agent_command: None,
             unread: false,
+            split_tree: None,
+            root_leaf: uuid::Uuid::new_v4(),
+            leaf_sessions: std::collections::HashMap::new(),
+            focused_leaf: uuid::Uuid::nil(),
             render_cache: TerminalGridCache::default(),
             #[cfg(feature = "ghostty-vt")]
             ghostty_render_cache: GhosttyGridCache::default(),
@@ -216,7 +231,9 @@ impl TerminalPanel {
             scroll_accumulator: ScrollAccumulator::default(),
             last_mouse_cell: None,
             search: None,
-        }
+        };
+        this.focused_leaf = this.root_leaf;
+        this
     }
 
     pub fn from_saved(
@@ -239,6 +256,11 @@ impl TerminalPanel {
             .unwrap_or_else(|| saved.title.clone());
         panel.agent_command = saved.agent_command.clone();
         panel.unread = saved.unread;
+        panel.restore_split_tree(
+            saved.split_tree.as_ref(),
+            saved.focused_leaf.as_deref(),
+            &pty_manager,
+        );
         panel.focused = saved.focused && !saved.minimized;
         panel.minimized = saved.minimized;
         panel.placement = saved.placement.clone();
@@ -322,7 +344,9 @@ impl TerminalPanel {
     }
 
     fn with_pty<R>(&self, f: impl FnOnce(&PtyHandle) -> R) -> Option<R> {
-        self.session.with_pty(f)
+        // En un split, las operaciones de input/scroll/scrollback van a la
+        // hoja enfocada; sin splits, focused_leaf == root_leaf.
+        self.leaf_session(self.focused_leaf).with_pty(f)
     }
 
     pub fn apply_resize(&mut self, rect: Rect) {
@@ -357,6 +381,11 @@ impl TerminalPanel {
             share_scope: self.share_scope,
             agent_command: self.agent_command.clone(),
             unread: self.unread,
+            split_tree: self
+                .split_tree
+                .as_ref()
+                .and_then(|tree| serde_json::to_value(tree).ok()),
+            focused_leaf: Some(self.focused_leaf.to_string()),
         }
     }
 
@@ -372,6 +401,198 @@ impl TerminalPanel {
     /// ¿Hay atención pendiente de ver en este panel? (P1.8)
     pub fn unread(&self) -> bool {
         self.unread
+    }
+
+    // ----- Splits (P2.11) -----
+
+    /// ¿El panel tiene más de una hoja (split activo)?
+    pub fn is_split(&self) -> bool {
+        self.split_tree.is_some()
+    }
+
+    /// Cantidad de hojas del panel.
+    pub fn leaf_count(&self) -> usize {
+        self.split_tree
+            .as_ref()
+            .map(|tree| tree.leaf_count())
+            .unwrap_or(1)
+    }
+
+    fn leaf_session(&self, id: crate::terminal::split_tree::LeafId) -> &SessionController {
+        if id == self.root_leaf {
+            &self.session
+        } else {
+            self.leaf_sessions.get(&id).unwrap_or(&self.session)
+        }
+    }
+
+    /// Sesión de la hoja con foco de teclado.
+    pub fn focused_session(&self) -> &SessionController {
+        self.leaf_session(self.focused_leaf)
+    }
+
+    fn focused_session_mut(&mut self) -> &mut SessionController {
+        if self.focused_leaf == self.root_leaf {
+            &mut self.session
+        } else {
+            self.leaf_sessions.entry(self.focused_leaf).or_default()
+        }
+    }
+
+    /// Divide la hoja enfocada en `axis`. Espawnea una sesión nueva para la
+    /// hoja resultante y le da el foco.
+    pub fn split_focused(
+        &mut self,
+        axis: crate::terminal::split_tree::Axis,
+        pty_manager: Arc<Mutex<PtyManager>>,
+        cwd: Option<&Path>,
+        cols: u16,
+        rows: u16,
+    ) {
+        let tree = self
+            .split_tree
+            .get_or_insert_with(|| crate::terminal::split_tree::SplitNode::leaf(self.root_leaf));
+        let Some(new_leaf) = tree.split(self.focused_leaf, axis) else {
+            return;
+        };
+        let mut controller = SessionController::default();
+        controller.attach_new_with_spec(
+            pty_manager,
+            session_spec(
+                "Terminal".to_owned(),
+                cwd.map(Path::to_path_buf),
+                None,
+                None,
+            ),
+            cwd,
+            cols.max(1) / 2,
+            rows,
+        );
+        self.leaf_sessions.insert(new_leaf, controller);
+        self.focused_leaf = new_leaf;
+    }
+
+    /// Cierra la hoja enfocada. Si era la única, el panel queda sin splits.
+    /// Devuelve `true` si el panel entero debe cerrarse (se vació).
+    pub fn close_focused_leaf(&mut self) -> bool {
+        let Some(mut tree) = self.split_tree.take() else {
+            // Sin splits: cerrar el panel completo lo decide quien llama.
+            return true;
+        };
+        match tree.close(self.focused_leaf) {
+            crate::terminal::split_tree::CloseResult::Emptied => {
+                // Se cerró la última hoja: el panel se va.
+                self.close_runtime_session();
+                true
+            }
+            crate::terminal::split_tree::CloseResult::Closed { next_focus } => {
+                // Sacamos la sesión cerrada (si no era la raíz).
+                if self.focused_leaf != self.root_leaf {
+                    if let Some(mut closed_session) = self.leaf_sessions.remove(&self.focused_leaf)
+                    {
+                        closed_session.close();
+                    }
+                } else {
+                    self.close_runtime_session();
+                }
+                if let Some(next) = next_focus {
+                    self.focused_leaf = next;
+                }
+                // Si quedó una sola hoja, volvemos al modo sin splits.
+                if tree.leaf_count() <= 1 {
+                    self.split_tree = None;
+                    self.focused_leaf = self.root_leaf;
+                } else {
+                    self.split_tree = Some(tree);
+                }
+                false
+            }
+            crate::terminal::split_tree::CloseResult::NotFound => {
+                self.split_tree = Some(tree);
+                false
+            }
+        }
+    }
+
+    /// Rota el foco de teclado a la siguiente hoja (orden DFS).
+    pub fn focus_next_leaf(&mut self) {
+        let Some(tree) = self.split_tree.as_ref() else {
+            return;
+        };
+        if let Some(next) = tree.focus_next(self.focused_leaf) {
+            self.focused_leaf = next;
+        }
+    }
+
+    /// Hojas con sus rects para el render tiling (si hay splits).
+    pub fn split_layout(
+        &self,
+        rect: Rect,
+    ) -> Option<(
+        Vec<crate::terminal::split_tree::LeafLayout>,
+        Vec<crate::terminal::split_tree::DividerHit>,
+    )> {
+        self.split_tree.as_ref().map(|tree| tree.layout(rect))
+    }
+
+    /// Sesión y foco de cada hoja, para el render tiling.
+    pub fn leaf_session_handle(
+        &self,
+        id: crate::terminal::split_tree::LeafId,
+    ) -> Option<SharedPtyHandle> {
+        self.leaf_session(id).session_handle()
+    }
+
+    pub fn focused_leaf_id(&self) -> crate::terminal::split_tree::LeafId {
+        self.focused_leaf
+    }
+
+    /// Restaura el árbol de splits persistido y respawnea una sesión por hoja
+    /// no raíz (P2.11, T4). Si el árbol es inválido o tiene una sola hoja, el
+    /// panel queda sin splits.
+    fn restore_split_tree(
+        &mut self,
+        saved_tree: Option<&serde_json::Value>,
+        saved_focused: Option<&str>,
+        pty_manager: &Arc<Mutex<PtyManager>>,
+    ) {
+        let Some(value) = saved_tree else {
+            return;
+        };
+        let Ok(tree) =
+            serde_json::from_value::<crate::terminal::split_tree::SplitNode>(value.clone())
+        else {
+            return;
+        };
+        // El árbol restaurado debe contener la hoja raíz; si no, lo ignoramos.
+        if !tree.contains(self.root_leaf) || tree.leaf_count() <= 1 {
+            return;
+        }
+        for leaf in tree.leaves() {
+            if leaf == self.root_leaf {
+                continue;
+            }
+            let mut controller = SessionController::default();
+            controller.attach_new_with_spec(
+                Arc::clone(pty_manager),
+                session_spec("Terminal".to_owned(), None, None, None),
+                None,
+                40,
+                24,
+            );
+            self.leaf_sessions.insert(leaf, controller);
+        }
+        self.split_tree = Some(tree);
+        if let Some(focused) = saved_focused
+            .and_then(|text| uuid::Uuid::parse_str(text).ok())
+            .filter(|id| {
+                self.split_tree
+                    .as_ref()
+                    .is_some_and(|tree| tree.contains(*id))
+            })
+        {
+            self.focused_leaf = focused;
+        }
     }
 
     /// Único punto de escritura del foco desde afuera del panel. Lo llama el
@@ -528,8 +749,8 @@ impl TerminalPanel {
         }
 
         let _ = ctx;
-        self.session.ensure_attached();
-        let mode = self.session.input_mode();
+        self.focused_session_mut().ensure_attached();
+        let mode = self.focused_session().input_mode();
         let has_selection = self
             .with_pty(|pty| pty.with_term(|term| term.selection.is_some()))
             .flatten()
@@ -1086,7 +1307,20 @@ impl TerminalPanel {
         let mut interaction = PanelInteraction::default();
         let zoom = viewport.zoom;
         let (screen_rect, title_rect, body_rect) = self.screen_geometry(viewport, canvas_rect);
-        let content_rect = terminal_body_rect(body_rect);
+        let full_content_rect = terminal_body_rect(body_rect);
+        // En un split, el pipeline clásico dibuja/interactúa con la hoja
+        // enfocada; su rect es el sub-rect que le asigna el layout (P2.11).
+        let split_layout = self.split_layout(full_content_rect);
+        let mut content_rect = full_content_rect;
+        if let Some((leaves, _)) = split_layout.as_ref() {
+            if let Some(focused_rect) = leaves
+                .iter()
+                .find(|leaf| leaf.id == self.focused_leaf)
+                .map(|leaf| leaf.rect)
+            {
+                content_rect = focused_rect;
+            }
+        }
         let scrollbar_rect = terminal_scrollbar_rect(body_rect);
         let lod = panel_lod(screen_rect, title_rect);
         let painter = ui.painter().with_clip_rect(canvas_rect);
@@ -1578,7 +1812,93 @@ impl TerminalPanel {
         // del auto-tile, no se redimensionan manualmente desde la esquina.
         let _ = lod;
 
+        if let Some((leaves, dividers)) = split_layout {
+            self.draw_split_leaves(ui, &painter, &leaves, &dividers, zoom, content_rounding);
+        }
+
         interaction
+    }
+
+    /// Dibuja las hojas no enfocadas (render live), los divisores arrastrables
+    /// y el borde de foco de la hoja activa (P2.11).
+    fn draw_split_leaves(
+        &mut self,
+        ui: &mut egui::Ui,
+        painter: &egui::Painter,
+        leaves: &[crate::terminal::split_tree::LeafLayout],
+        dividers: &[crate::terminal::split_tree::DividerHit],
+        zoom: f32,
+        content_rounding: Rounding,
+    ) {
+        let now = ui.ctx().input(|input| input.time);
+        for leaf in leaves {
+            if leaf.id == self.focused_leaf {
+                continue;
+            }
+            if let Some(handle) = self.leaf_session_handle(leaf.id) {
+                if let Ok(pty) = handle.lock() {
+                    if let Ok(mut term) = pty.term.try_lock() {
+                        term.is_focused = false;
+                        let _ = render_terminal(
+                            painter,
+                            leaf.rect,
+                            &term,
+                            false,
+                            now,
+                            zoom,
+                            content_rounding,
+                            None,
+                            pty.render_revision(),
+                        );
+                    }
+                }
+            }
+        }
+        // Borde de foco sobre la hoja activa.
+        if let Some(focused) = leaves.iter().find(|leaf| leaf.id == self.focused_leaf) {
+            painter.rect_stroke(focused.rect, 0.0, Stroke::new(1.5, palette::FOCUS));
+        }
+        // Divisores: arrastrar actualiza el ratio del split padre.
+        for divider in dividers {
+            painter.rect_filled(divider.rect, 0.0, palette::LINE);
+            let response = ui.interact(
+                divider.rect,
+                ui.id().with(("split-div", divider.path.clone())),
+                Sense::click_and_drag(),
+            );
+            if response.dragged() {
+                if let Some(pos) = ui.ctx().input(|input| input.pointer.latest_pos()) {
+                    let ratio = match divider.axis {
+                        crate::terminal::split_tree::Axis::Horizontal => {
+                            (pos.x - divider.parent.left()) / divider.parent.width().max(1.0)
+                        }
+                        crate::terminal::split_tree::Axis::Vertical => {
+                            (pos.y - divider.parent.top()) / divider.parent.height().max(1.0)
+                        }
+                    };
+                    if let Some(tree) = self.split_tree.as_mut() {
+                        tree.set_ratio(&divider.path, ratio);
+                    }
+                }
+            }
+        }
+        // Click en una hoja no enfocada le da el foco de teclado.
+        let pressed_pos = ui.ctx().input(|input| {
+            if input.pointer.any_pressed() {
+                input.pointer.latest_pos()
+            } else {
+                None
+            }
+        });
+        if let Some(pos) = pressed_pos {
+            if let Some(leaf) = leaves
+                .iter()
+                .filter(|leaf| leaf.id != self.focused_leaf)
+                .find(|leaf| leaf.rect.contains(pos))
+            {
+                self.focused_leaf = leaf.id;
+            }
+        }
     }
 
     pub fn rename_title(&mut self, title: String) {

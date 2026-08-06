@@ -1,3 +1,5 @@
+use std::sync::{Arc, Mutex};
+
 use egui::{Color32, Pos2, Rect, Vec2};
 use uuid::Uuid;
 
@@ -377,6 +379,35 @@ impl WorkspacePanel {
         match self {
             Self::Terminal(panel) => panel.set_unread(unread),
         }
+    }
+
+    pub fn is_split(&self) -> bool {
+        match self {
+            Self::Terminal(panel) => panel.is_split(),
+        }
+    }
+
+    pub fn split_focused(
+        &mut self,
+        axis: crate::terminal::split_tree::Axis,
+        pty_manager: Arc<Mutex<crate::runtime::PtyManager>>,
+        cwd: Option<&std::path::Path>,
+        cols: u16,
+        rows: u16,
+    ) {
+        let Self::Terminal(panel) = self;
+        panel.split_focused(axis, pty_manager, cwd, cols, rows);
+    }
+
+    pub fn close_focused_leaf(&mut self) -> bool {
+        match self {
+            Self::Terminal(panel) => panel.close_focused_leaf(),
+        }
+    }
+
+    pub fn focus_next_leaf(&mut self) {
+        let Self::Terminal(panel) = self;
+        panel.focus_next_leaf();
     }
 
     pub fn restore_session(

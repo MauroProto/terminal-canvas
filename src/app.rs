@@ -512,6 +512,18 @@ impl TerminalApp {
             }
             Command::FocusNext => self.focus_relative(1),
             Command::FocusPrev => self.focus_relative(-1),
+            Command::SplitRight => {
+                self.ws_mut()
+                    .split_focused_panel(crate::terminal::split_tree::Axis::Horizontal);
+            }
+            Command::SplitDown => {
+                self.ws_mut()
+                    .split_focused_panel(crate::terminal::split_tree::Axis::Vertical);
+            }
+            Command::CloseLeaf => {
+                self.ws_mut().close_focused_leaf();
+                self.reconcile_orchestration();
+            }
             Command::ZoomToFitAll => self.zoom_to_fit_all(canvas_rect),
             Command::ToggleSidebar => self.sidebar_visible = !self.sidebar_visible,
             Command::ZoomIn => {

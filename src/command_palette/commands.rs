@@ -21,6 +21,9 @@ pub enum Command {
     SharePanelControllable,
     FocusNext,
     FocusPrev,
+    SplitRight,
+    SplitDown,
+    CloseLeaf,
     ZoomToFitAll,
     ToggleSidebar,
     ZoomIn,
@@ -141,6 +144,21 @@ pub const COMMANDS: &[CommandEntry] = &[
         command: Command::FocusPrev,
         label: "Focus Prev",
         shortcut: "Ctrl+Shift+[",
+    },
+    CommandEntry {
+        command: Command::SplitRight,
+        label: "Split Right",
+        shortcut: "Cmd+D",
+    },
+    CommandEntry {
+        command: Command::SplitDown,
+        label: "Split Down",
+        shortcut: "Cmd+Shift+D",
+    },
+    CommandEntry {
+        command: Command::CloseLeaf,
+        label: "Close Split",
+        shortcut: "Cmd+W",
     },
     CommandEntry {
         command: Command::ZoomToFitAll,

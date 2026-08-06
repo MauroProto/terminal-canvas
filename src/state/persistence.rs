@@ -380,6 +380,8 @@ mod tests {
                     share_scope: PanelShareScope::VisibleOnly,
                     agent_command: None,
                     unread: false,
+                    split_tree: None,
+                    focused_leaf: None,
                 }],
                 desktop: WorkspaceDesktopState {
                     next_z: 2,

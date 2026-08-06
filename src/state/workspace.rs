@@ -276,6 +276,39 @@ impl Workspace {
         self.focus_topmost_visible_panel();
     }
 
+    /// Handle al manager de PTYs (para espawnear hojas de split, P2.11).
+    pub fn pty_manager(&self) -> Arc<Mutex<PtyManager>> {
+        Arc::clone(&self.pty_manager)
+    }
+
+    /// Divide la hoja enfocada del panel enfocado (P2.11).
+    pub fn split_focused_panel(&mut self, axis: crate::terminal::split_tree::Axis) {
+        let pty_manager = Arc::clone(&self.pty_manager);
+        if let Some(panel) = self.focused_panel_mut() {
+            panel.split_focused(axis, pty_manager, None, 80, 24);
+        }
+    }
+
+    /// Cierra la hoja enfocada; si el panel se vacía, lo cierra entero.
+    pub fn close_focused_leaf(&mut self) {
+        let Some(panel_id) = self.focused_panel().map(|panel| panel.id()) else {
+            return;
+        };
+        let should_close = self
+            .focused_panel_mut()
+            .map(|panel| panel.close_focused_leaf())
+            .unwrap_or(false);
+        if should_close {
+            self.close_panel(panel_id);
+        }
+    }
+
+    pub fn focus_next_leaf(&mut self) {
+        if let Some(panel) = self.focused_panel_mut() {
+            panel.focus_next_leaf();
+        }
+    }
+
     pub fn focused_panel_mut(&mut self) -> Option<&mut CanvasPanel> {
         self.panels
             .iter_mut()
@@ -734,6 +767,8 @@ mod tests {
                 share_scope: PanelShareScope::VisibleOnly,
                 agent_command: None,
                 unread: false,
+                split_tree: None,
+                focused_leaf: None,
             }],
             desktop: WorkspaceDesktopState {
                 next_z: 2,
@@ -779,6 +814,8 @@ mod tests {
                 share_scope: PanelShareScope::VisibleOnly,
                 agent_command: None,
                 unread: false,
+                split_tree: None,
+                focused_leaf: None,
             }],
             desktop: WorkspaceDesktopState {
                 next_z: 2,
@@ -825,6 +862,8 @@ mod tests {
                 share_scope: PanelShareScope::VisibleOnly,
                 agent_command: None,
                 unread: false,
+                split_tree: None,
+                focused_leaf: None,
             })
             .collect();
         let state = WorkspaceState {
