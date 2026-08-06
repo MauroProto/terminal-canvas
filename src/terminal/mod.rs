@@ -13,6 +13,7 @@ pub mod renderer;
 pub mod scrollbar;
 pub mod search;
 pub mod session_controller;
+pub mod shell_quote;
 
 #[cfg(test)]
 mod tests {

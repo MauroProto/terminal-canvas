@@ -343,6 +343,12 @@ impl WorkspacePanel {
         }
     }
 
+    pub fn insert_text(&mut self, text: &str) {
+        match self {
+            Self::Terminal(panel) => panel.insert_text(text),
+        }
+    }
+
     pub fn scrollback_text(&self) -> Option<String> {
         match self {
             Self::Terminal(panel) => panel.scrollback_text(),

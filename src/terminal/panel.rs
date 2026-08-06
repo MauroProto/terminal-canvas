@@ -748,6 +748,17 @@ impl TerminalPanel {
     /// submits con Enter. Si el panel estaba detached (recién spawneado),
     /// difiere la inyección hasta que el TUI renderice algo, para no mandar el
     /// texto a un agente que todavía arranca.
+    /// Inserta texto crudo en la línea de comandos (sin Enter ni bracketed
+    /// paste): es lo que necesita el drag & drop de archivos, igual que
+    /// Terminal.app tipea el path donde está el cursor.
+    pub fn insert_text(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        self.session.ensure_attached();
+        let _ = self.with_pty(|pty| pty.write_all(text.as_bytes()));
+    }
+
     pub fn send_prompt(&mut self, text: &str) {
         if text.trim().is_empty() {
             return;

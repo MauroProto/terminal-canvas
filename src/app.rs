@@ -1026,6 +1026,11 @@ impl TerminalApp {
             primary_down,
         );
 
+        // Drag & drop de archivos del SO: mientras el puntero está sobre un
+        // panel se resalta el destino; al soltar se tipea el path
+        // shell-escapado (como Terminal.app).
+        let drop_highlight_index = self.handle_file_drop(ctx, pointer_pos, canvas_rect);
+
         let hovered_hit = pointer_pos
             .filter(|pos| desktop_screen.contains(*pos))
             .filter(|_| !sash_active)
@@ -1145,6 +1150,22 @@ impl TerminalApp {
             guides.extend(interaction.guides);
         }
 
+        // Ring sobre el panel que recibiría los archivos soltados.
+        if let Some(index) = drop_highlight_index {
+            if let Some(panel) = self.ws().panels.get(index) {
+                let rect = panel.rect();
+                let screen_rect = Rect::from_min_max(
+                    self.viewport.canvas_to_screen(rect.min, canvas_rect),
+                    self.viewport.canvas_to_screen(rect.max, canvas_rect),
+                );
+                ui.painter().rect_stroke(
+                    screen_rect.expand(2.0),
+                    10.0,
+                    Stroke::new(2.0, palette::TEXT_STRONG),
+                );
+            }
+        }
+
         self.draw_desktop_overlays(
             ui,
             canvas_rect,
@@ -1156,6 +1177,64 @@ impl TerminalApp {
         if needs_interaction_repaint {
             ui.ctx().request_repaint();
         }
+    }
+
+    /// Drag & drop de archivos del SO sobre el canvas.
+    ///
+    /// Mientras hay archivos en vuelo (`hovered_files`) se pide repaint y se
+    /// devuelve el índice del panel bajo el puntero para resaltarlo. Al soltar
+    /// (`dropped_files`) se tipean los paths shell-escapados en ese panel,
+    /// precedidos de espacio, igual que Terminal.app: varios archivos quedan
+    /// en una sola línea listos para Enter.
+    fn handle_file_drop(
+        &mut self,
+        ctx: &egui::Context,
+        pointer_pos: Option<Pos2>,
+        canvas_rect: Rect,
+    ) -> Option<usize> {
+        let (hovering, dropped_files) = ctx.input(|input| {
+            (
+                !input.raw.hovered_files.is_empty(),
+                input.raw.dropped_files.clone(),
+            )
+        });
+        if !hovering && dropped_files.is_empty() {
+            return None;
+        }
+        // Mantener el highlight mientras el drag sigue vivo.
+        ctx.request_repaint();
+        let hit = pointer_pos
+            .and_then(|pos| top_panel_hit(self.ws(), pos, &self.viewport, canvas_rect))?;
+        let panel_id = self.ws().panels[hit.index].id();
+
+        // Los dropped_files sin path local (drag entre apps sin archivo real)
+        // no tienen nada que tipear.
+        let paths: Vec<_> = dropped_files
+            .iter()
+            .filter_map(|file| file.path.clone())
+            .collect();
+        if !paths.is_empty() {
+            let mut text = String::new();
+            for path in &paths {
+                text.push(' ');
+                text.push_str(&crate::terminal::shell_quote::quote_path(
+                    &path.to_string_lossy(),
+                ));
+            }
+            if let Some(panel) = self.ws_mut().panel_mut(panel_id) {
+                panel.insert_text(&text);
+            }
+            let count_label = if paths.len() == 1 { "" } else { "s" };
+            self.toast_success(format!(
+                "{}: path{count_label} pegado{count_label} en el terminal",
+                paths
+                    .first()
+                    .and_then(|path| path.file_name())
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "archivo".to_owned()),
+            ));
+        }
+        Some(hit.index)
     }
 
     /// Fase final: paleta de comandos, diálogos, autosave y programación del

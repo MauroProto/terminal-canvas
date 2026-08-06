@@ -118,6 +118,7 @@ impl TerminalApp {
 
         let mut close = false;
         let mut open_external: Option<PathBuf> = None;
+        let mut open_dropped: Option<PathBuf> = None;
 
         egui::SidePanel::right("code-viewer")
             .resizable(true)
@@ -134,6 +135,24 @@ impl TerminalApp {
                 };
                 // Borde izquierdo que separa el código del canvas.
                 let panel_rect = ui.max_rect();
+
+                // Soltar un archivo sobre el visor lo abre (si el puntero
+                // está dentro de la región del panel).
+                let (dropped, pointer) = ui.ctx().input(|input| {
+                    (
+                        input
+                            .raw
+                            .dropped_files
+                            .first()
+                            .and_then(|file| file.path.clone()),
+                        input.pointer.hover_pos(),
+                    )
+                });
+                if let (Some(path), Some(pointer)) = (dropped, pointer) {
+                    if panel_rect.contains(pointer) {
+                        open_dropped = Some(path);
+                    }
+                }
                 ui.painter().rect_filled(
                     egui::Rect::from_min_size(panel_rect.min, vec2(1.0, panel_rect.height())),
                     0.0,
@@ -158,6 +177,9 @@ impl TerminalApp {
 
         if close {
             self.file_viewer = None;
+        }
+        if let Some(path) = open_dropped {
+            self.open_file_viewer(path);
         }
         if let Some(path) = open_external {
             if let Err(err) = crate::utils::platform::open_path_external(&path) {
