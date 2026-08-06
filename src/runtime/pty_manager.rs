@@ -33,6 +33,40 @@ pub struct RuntimeScheduler {
     pending: HashMap<Uuid, RuntimeSessionUpdate>,
     repaint_queued: bool,
     max_batch_size: usize,
+    /// Sesión del panel enfocado (P3.16, T2): tiene carril propio y se drena
+    /// antes que el resto, para que tipear nunca se sienta atrás de un panel
+    /// de fondo escupiendo salida.
+    priority_session: Option<Uuid>,
+}
+
+/// Orden de drenado del frame: primero la sesión prioritaria (si tiene algo
+/// pendiente), después el resto hasta completar el presupuesto. Puro para
+/// poder testear la política sin montar PTYs.
+pub fn drain_order(pending: &[Uuid], priority: Option<Uuid>, max_batch: usize) -> Vec<Uuid> {
+    if max_batch == 0 {
+        return Vec::new();
+    }
+    let mut out: Vec<Uuid> = Vec::with_capacity(max_batch.min(pending.len()));
+    if let Some(priority) = priority {
+        if pending.contains(&priority) {
+            out.push(priority);
+        }
+    }
+    let mut rest: Vec<Uuid> = pending
+        .iter()
+        .copied()
+        .filter(|id| Some(*id) != priority)
+        .collect();
+    // Orden estable: sin esto el batch cambia de composición entre frames por
+    // el orden aleatorio del HashMap.
+    rest.sort_by_key(Uuid::as_u128);
+    for id in rest {
+        if out.len() >= max_batch {
+            break;
+        }
+        out.push(id);
+    }
+    out
 }
 
 #[derive(Default)]
@@ -117,6 +151,7 @@ impl RuntimeScheduler {
             pending: HashMap::new(),
             repaint_queued: false,
             max_batch_size: DEFAULT_UI_BATCH_LIMIT,
+            priority_session: None,
         }
     }
 
@@ -163,19 +198,19 @@ impl RuntimeScheduler {
         self.mark_session(session_id, SchedulerUpdateKind::Render);
     }
 
+    /// Declara qué sesión tiene el foco, para darle carril propio (P3.16).
+    pub fn set_priority_session(&mut self, session_id: Option<Uuid>) {
+        self.priority_session = session_id;
+    }
+
     pub fn drain_ui_updates(&mut self) -> UiUpdateBatch {
         let repaint_requested = self.repaint_queued || !self.pending.is_empty();
-        let keys = self
-            .pending
-            .keys()
-            .copied()
-            .take(self.max_batch_size)
-            .collect::<Vec<_>>();
-        let mut session_updates = keys
+        let pending_ids = self.pending.keys().copied().collect::<Vec<_>>();
+        let keys = drain_order(&pending_ids, self.priority_session, self.max_batch_size);
+        let session_updates = keys
             .into_iter()
             .filter_map(|session_id| self.pending.remove(&session_id))
             .collect::<Vec<_>>();
-        session_updates.sort_by_key(|update| update.session_id.as_u128());
         self.repaint_queued = !self.pending.is_empty();
         UiUpdateBatch {
             session_updates,
@@ -369,6 +404,13 @@ impl PtyManager {
             .values()
             .filter(|session| !session.is_attached() && session.is_alive())
             .count()
+    }
+
+    /// Declara la sesión del panel enfocado para el carril interactivo.
+    pub fn set_priority_session(&mut self, session_id: Option<Uuid>) {
+        if let Ok(mut scheduler) = self.scheduler.lock() {
+            scheduler.set_priority_session(session_id);
+        }
     }
 
     pub fn drain_ui_updates(&mut self) -> UiUpdateBatch {

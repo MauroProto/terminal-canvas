@@ -7,6 +7,8 @@ mod terminal {
     pub mod backend;
     #[path = "../../../src/terminal/colors.rs"]
     pub mod colors;
+    #[path = "../../../src/terminal/flow_control.rs"]
+    pub mod flow_control;
     #[cfg(feature = "ghostty-vt")]
     #[path = "../../../src/terminal/ghostty_backend.rs"]
     pub mod ghostty_backend;

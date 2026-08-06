@@ -190,7 +190,22 @@ impl PtyHandle {
                 let mut buf = vec![0_u8; 65_536];
                 let mut processor = Processor::<StdSyncHandler>::new();
                 let mut agent_stream = AgentStatusStream::new();
+                // Flow control (P3.16): si el buffer pendiente de log crece
+                // más rápido de lo que la app lo drena, dejamos de leer del fd
+                // y el kernel bloquea al hijo.
+                let mut gate = crate::terminal::flow_control::FlowGate::new();
                 loop {
+                    let pending_len = pending_log_for_reader
+                        .lock()
+                        .map(|pending| pending.len())
+                        .unwrap_or(0);
+                    if matches!(
+                        gate.update(pending_len, std::time::Instant::now()),
+                        crate::terminal::flow_control::FlowState::Pause
+                    ) {
+                        thread::sleep(Duration::from_millis(20));
+                        continue;
+                    }
                     match reader.read(&mut buf) {
                         Ok(0) => break,
                         Ok(read) => {

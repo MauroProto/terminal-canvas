@@ -2,6 +2,7 @@ pub mod agent_status;
 pub mod backend;
 pub mod colors;
 pub mod export;
+pub mod flow_control;
 #[cfg(feature = "ghostty-vt")]
 pub mod ghostty_backend;
 pub mod input;

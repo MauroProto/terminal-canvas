@@ -22,7 +22,7 @@
 
 ## P3 — Arquitectura
 - [ ] P3.15 Daemon de PTYs
-- [ ] P3.16 Flow control
+- [x] P3.16 Flow control
 - [ ] P3.17 Linear
 - [ ] P3.18 Design Mode (extensión browser)
 

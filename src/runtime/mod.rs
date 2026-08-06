@@ -10,8 +10,8 @@ mod workspace;
 
 #[allow(unused_imports)]
 pub use pty_manager::{
-    PtyManager, RuntimeScheduler, RuntimeSessionUpdate, SharedPtyHandle, SharedRuntimeScheduler,
-    UiUpdateBatch,
+    drain_order, PtyManager, RuntimeScheduler, RuntimeSessionUpdate, SharedPtyHandle,
+    SharedRuntimeScheduler, UiUpdateBatch,
 };
 #[allow(unused_imports)]
 pub use registry::{RuntimeRegistry, RuntimeSnapshot};

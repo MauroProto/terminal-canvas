@@ -433,10 +433,18 @@ impl Workspace {
     }
 
     pub fn drain_runtime_updates(&self) -> UiUpdateBatch {
+        // Carril interactivo (P3.16): la sesión del panel enfocado se drena
+        // antes que el resto del batch.
+        let focused_session = self
+            .focused_panel()
+            .and_then(|panel| panel.runtime_session_id());
         self.pty_manager
             .lock()
             .ok()
-            .map(|mut manager| manager.drain_ui_updates())
+            .map(|mut manager| {
+                manager.set_priority_session(focused_session);
+                manager.drain_ui_updates()
+            })
             .unwrap_or_default()
     }
 
