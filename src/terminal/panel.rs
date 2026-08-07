@@ -298,6 +298,12 @@ impl TerminalPanel {
                 None => crate::orchestration::resume_command(provider, command),
             }
         });
+        // El id de la corrida anterior: con daemon, el panel se reengancha a
+        // su PTY vivo en vez de arrancar uno nuevo (P3.15, T4).
+        let existing_session_id = saved
+            .runtime_session_id
+            .as_deref()
+            .and_then(|id| Uuid::parse_str(id).ok());
         panel.session.restore_detached_with_spec(
             pty_manager,
             session_spec(
@@ -309,6 +315,7 @@ impl TerminalPanel {
             ),
             cols,
             rows,
+            existing_session_id,
         );
         panel
     }
@@ -359,8 +366,19 @@ impl TerminalPanel {
         self.session.session_handle()
     }
 
+    /// Suelta la sesión (no mata la del daemon): es lo que corre al dropear el
+    /// panel, incluido el cierre de la app.
     fn close_runtime_session(&mut self) {
         self.session.close();
+    }
+
+    /// Cierra el panel **para siempre** (lo cerró el usuario): mata también la
+    /// sesión del daemon y las de todas las hojas.
+    pub fn close_for_good(&mut self) {
+        self.session.close_for_good();
+        for session in self.leaf_sessions.values_mut() {
+            session.close_for_good();
+        }
     }
 
     fn with_pty<R>(&self, f: impl FnOnce(&PtyHandle) -> R) -> Option<R> {
@@ -403,6 +421,7 @@ impl TerminalPanel {
             unread: self.unread,
             linked_issue: self.linked_issue,
             agent_session_id: self.agent_session_id.clone(),
+            runtime_session_id: self.runtime_session_id().map(|id| id.to_string()),
             split_tree: self
                 .split_tree
                 .as_ref()
@@ -523,7 +542,7 @@ impl TerminalPanel {
         match tree.close(self.focused_leaf) {
             crate::terminal::split_tree::CloseResult::Emptied => {
                 // Se cerró la última hoja: el panel se va.
-                self.close_runtime_session();
+                self.session.close_for_good();
                 true
             }
             crate::terminal::split_tree::CloseResult::Closed { next_focus } => {
@@ -531,10 +550,10 @@ impl TerminalPanel {
                 if self.focused_leaf != self.root_leaf {
                     if let Some(mut closed_session) = self.leaf_sessions.remove(&self.focused_leaf)
                     {
-                        closed_session.close();
+                        closed_session.close_for_good();
                     }
                 } else {
-                    self.close_runtime_session();
+                    self.session.close_for_good();
                 }
                 if let Some(next) = next_focus {
                     self.focused_leaf = next;

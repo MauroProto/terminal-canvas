@@ -274,6 +274,12 @@ impl Workspace {
     }
 
     pub fn close_panel(&mut self, panel_id: Uuid) {
+        // El usuario cerró el panel: su sesión se mata para siempre, incluida
+        // la del daemon. Dropear el panel sola no la mata, justamente para que
+        // sobreviva al cierre de la app (P3.15).
+        if let Some(panel) = self.panels.iter_mut().find(|panel| panel.id() == panel_id) {
+            panel.close_for_good();
+        }
         self.panels.retain(|panel| panel.id() != panel_id);
         self.focus_topmost_visible_panel();
     }
@@ -781,6 +787,7 @@ mod tests {
                 focused_leaf: None,
                 linked_issue: None,
                 agent_session_id: None,
+                runtime_session_id: None,
             }],
             desktop: WorkspaceDesktopState {
                 next_z: 2,
@@ -830,6 +837,7 @@ mod tests {
                 focused_leaf: None,
                 linked_issue: None,
                 agent_session_id: None,
+                runtime_session_id: None,
             }],
             desktop: WorkspaceDesktopState {
                 next_z: 2,
@@ -880,6 +888,7 @@ mod tests {
                 focused_leaf: None,
                 linked_issue: None,
                 agent_session_id: None,
+                runtime_session_id: None,
             })
             .collect();
         let state = WorkspaceState {

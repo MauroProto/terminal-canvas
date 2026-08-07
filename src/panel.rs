@@ -408,6 +408,13 @@ impl WorkspacePanel {
         panel.set_linked_issue(issue);
     }
 
+    /// Cierra el panel para siempre (lo cerró el usuario): mata la sesión del
+    /// daemon si la tiene.
+    pub fn close_for_good(&mut self) {
+        let Self::Terminal(panel) = self;
+        panel.close_for_good();
+    }
+
     pub fn set_unread(&mut self, unread: bool) {
         match self {
             Self::Terminal(panel) => panel.set_unread(unread),

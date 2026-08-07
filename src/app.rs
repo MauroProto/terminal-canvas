@@ -128,9 +128,6 @@ pub struct TerminalApp {
     /// corre siempre in-process.
     #[cfg(all(unix, feature = "daemon"))]
     daemon: crate::daemon::backend::DaemonBackend,
-    /// El spawner del daemon ya se instaló en los PtyManager (P3.15, T3).
-    #[cfg(all(unix, feature = "daemon"))]
-    daemon_spawner_installed: bool,
     tasks_state: crate::sidebar::tasks::TasksState,
     /// Issues que esperan a que su worktree termine para pegarse al panel.
     pending_issue_links: HashMap<Uuid, u64>,
@@ -195,6 +192,20 @@ impl TerminalApp {
         let update_checker = UpdateChecker::new(egui_ctx);
         let has_saved_state = loaded_state.is_some();
 
+        // El daemon se adopta **antes** de que exista cualquier workspace
+        // (P3.15, T3): si se adoptara después, los PTYs ya estarían creados
+        // in-process y el daemon no hostearía nada.
+        #[cfg(all(unix, feature = "daemon"))]
+        let daemon = if side_effects {
+            crate::daemon::backend::DaemonBackend::adopt()
+        } else {
+            crate::daemon::backend::DaemonBackend::Fallback {
+                reason: "modo test".to_owned(),
+            }
+        };
+        #[cfg(all(unix, feature = "daemon"))]
+        let daemon_endpoint = daemon.endpoint();
+
         let mut app = if let Some(saved) = loaded_state {
             let collab = CollabManager::new();
             let broker_url = collab.broker_url().to_owned();
@@ -208,7 +219,15 @@ impl TerminalApp {
             let local_device_id = saved.local_device_id.clone();
             let mut workspaces = Vec::new();
             for workspace in saved.workspaces {
-                workspaces.push(Workspace::from_saved(workspace, egui_ctx));
+                let workspace = Workspace::from_saved(workspace, egui_ctx);
+                // Las sesiones restauradas vienen detached: se atachean recién
+                // al primer frame, así que instalar el spawner acá alcanza
+                // para que se enganchen contra el daemon.
+                #[cfg(all(unix, feature = "daemon"))]
+                if let Some(endpoint) = daemon_endpoint.as_ref() {
+                    install_daemon_spawner_on(&workspace, endpoint);
+                }
+                workspaces.push(workspace);
             }
             let active_ws = saved.active_ws.min(workspaces.len().saturating_sub(1));
             let viewport = workspaces
@@ -260,15 +279,7 @@ impl TerminalApp {
                 installed_agents: Default::default(),
                 onboarding_dismissed: crate::config::runtime_config().onboarding_dismissed,
                 #[cfg(all(unix, feature = "daemon"))]
-                daemon_spawner_installed: false,
-                #[cfg(all(unix, feature = "daemon"))]
-                daemon: if side_effects {
-                    crate::daemon::backend::DaemonBackend::adopt()
-                } else {
-                    crate::daemon::backend::DaemonBackend::Fallback {
-                        reason: "modo test".to_owned(),
-                    }
-                },
+                daemon,
                 tasks_state: Default::default(),
                 pending_issue_links: HashMap::new(),
                 window_focused: false,
@@ -313,6 +324,10 @@ impl TerminalApp {
             let collab = CollabManager::new();
             let broker_url = collab.broker_url().to_owned();
             let mut workspace = Workspace::new("Default", None);
+            #[cfg(all(unix, feature = "daemon"))]
+            if let Some(endpoint) = daemon_endpoint.as_ref() {
+                install_daemon_spawner_on(&workspace, endpoint);
+            }
             workspace.spawn_terminal(egui_ctx);
             Self {
                 workspaces: vec![workspace],
@@ -356,15 +371,7 @@ impl TerminalApp {
                 installed_agents: Default::default(),
                 onboarding_dismissed: crate::config::runtime_config().onboarding_dismissed,
                 #[cfg(all(unix, feature = "daemon"))]
-                daemon_spawner_installed: false,
-                #[cfg(all(unix, feature = "daemon"))]
-                daemon: if side_effects {
-                    crate::daemon::backend::DaemonBackend::adopt()
-                } else {
-                    crate::daemon::backend::DaemonBackend::Fallback {
-                        reason: "modo test".to_owned(),
-                    }
-                },
+                daemon,
                 tasks_state: Default::default(),
                 pending_issue_links: HashMap::new(),
                 window_focused: false,
@@ -708,9 +715,13 @@ impl TerminalApp {
             .any(|workspace| workspace.matches_cwd(&path));
         let index = upsert_workspace_for_folder(&mut self.workspaces, path.clone());
         // Un workspace nuevo tiene su propio PtyManager: hay que decirle que
-        // las sesiones van al daemon (P3.15, T3).
+        // las sesiones van al daemon antes de que spawnee su terminal.
         #[cfg(all(unix, feature = "daemon"))]
-        self.install_daemon_spawner();
+        if let Some(endpoint) = self.daemon.endpoint() {
+            if let Some(workspace) = self.workspaces.get(index) {
+                install_daemon_spawner_on(workspace, &endpoint);
+            }
+        }
         self.switch_workspace(index);
         // Trash diferido (P1.9): al abrir el workspace se barren las entradas
         // stale del trash de este repo.
@@ -867,12 +878,6 @@ impl TerminalApp {
         self.poll_hook_events();
         self.poll_gh_client();
         self.poll_design_captures();
-        // El spawner se instala una vez, cuando el daemon ya está adoptado.
-        #[cfg(all(unix, feature = "daemon"))]
-        if !self.daemon_spawner_installed && self.daemon.is_connected() {
-            self.install_daemon_spawner();
-            self.daemon_spawner_installed = true;
-        }
         if let Some(installed) = self.agent_detector.poll() {
             self.installed_agents = installed;
         }
@@ -1051,28 +1056,6 @@ impl TerminalApp {
         Some(Duration::from_secs_f64(
             crate::terminal::renderer::time_until_blink_change(now),
         ))
-    }
-
-    /// Hace que las sesiones nuevas de todos los workspaces se creen en el
-    /// daemon (P3.15, T3). Sin el feature `daemon`, o si no se adoptó, no hace
-    /// nada y todo sigue in-process.
-    #[cfg(all(unix, feature = "daemon"))]
-    fn install_daemon_spawner(&mut self) {
-        let Some(endpoint) = self.daemon.endpoint() else {
-            return;
-        };
-        for workspace in &self.workspaces {
-            let endpoint = endpoint.clone();
-            if let Ok(mut manager) = workspace.pty_manager().lock() {
-                manager.set_remote_spawner(Box::new(
-                    move |spec, cols, rows, scheduler, desired_id| {
-                        crate::daemon::sessions::spawn_remote(
-                            &endpoint, spec, cols, rows, scheduler, desired_id,
-                        )
-                    },
-                ));
-            }
-        }
     }
 
     /// Le dice al daemon qué sesiones siguen vivas, para que mate las
@@ -1716,6 +1699,24 @@ impl eframe::App for TerminalApp {
         #[cfg(all(unix, feature = "daemon"))]
         self.daemon.shutdown_if_idle();
         crate::state::run_marker::end_run_clean();
+    }
+}
+
+/// Hace que las sesiones nuevas de este workspace se creen en el daemon
+/// (P3.15, T3). Se aplica al crear el workspace, antes de que exista cualquier
+/// terminal: instalarlo después no sirve, porque los PTYs ya estarían locales.
+#[cfg(all(unix, feature = "daemon"))]
+fn install_daemon_spawner_on(
+    workspace: &Workspace,
+    endpoint: &crate::daemon::sessions::DaemonEndpoint,
+) {
+    let endpoint = endpoint.clone();
+    if let Ok(mut manager) = workspace.pty_manager().lock() {
+        manager.set_remote_spawner(Box::new(move |spec, cols, rows, scheduler, desired_id| {
+            crate::daemon::sessions::spawn_remote(
+                &endpoint, spec, cols, rows, scheduler, desired_id,
+            )
+        }));
     }
 }
 

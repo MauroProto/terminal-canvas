@@ -321,3 +321,123 @@ fn shutdown_if_idle_is_refused_while_a_session_lives() {
     );
     assert_eq!(conn.list(), vec![id], "y la sesión sigue ahí");
 }
+
+#[cfg(feature = "daemon")]
+#[test]
+fn a_desired_id_reattaches_instead_of_creating_a_second_session() {
+    // Éste es el corazón de la supervivencia (T4): al reabrir la app, el panel
+    // pide **su** sesión de la corrida anterior. Si en vez de engancharse
+    // creara otra, el usuario perdería su shell y quedaría un PTY huérfano.
+    use mi_terminal::daemon::sessions::{spawn_remote, DaemonEndpoint};
+    use mi_terminal::runtime::{RuntimeScheduler, SessionSpec};
+    use std::sync::{Arc, Mutex};
+
+    let (daemon, token) = start_daemon();
+    let endpoint = DaemonEndpoint::new(daemon.dir.clone(), token.clone());
+    let scheduler = Arc::new(Mutex::new(RuntimeScheduler::new()));
+    let spec = SessionSpec::default();
+
+    // Primera corrida: se crea la sesión.
+    let (first_id, first_handle) =
+        spawn_remote(&endpoint, &spec, 80, 24, Arc::clone(&scheduler), None)
+            .expect("crea la sesión");
+
+    // "Se cierra la app": el handle local se va, la sesión del daemon queda.
+    drop(first_handle);
+    let mut conn = DaemonConn::try_connect(&daemon.dir, &token).expect("conecta");
+    assert_eq!(conn.list(), vec![first_id], "la sesión sobrevive al handle");
+
+    // Segunda corrida: pidiendo el mismo id tiene que reengancharse.
+    let (second_id, _second_handle) =
+        spawn_remote(&endpoint, &spec, 80, 24, scheduler, Some(first_id)).expect("se reengancha");
+
+    assert_eq!(second_id, first_id, "tiene que ser la MISMA sesión");
+    assert_eq!(
+        conn.list(),
+        vec![first_id],
+        "y no puede haber quedado una segunda"
+    );
+}
+
+#[cfg(feature = "daemon")]
+#[test]
+fn an_unknown_desired_id_creates_the_session_with_that_id() {
+    // Primera corrida de un panel restaurado: el daemon no tiene su sesión
+    // (por ejemplo porque se reinició la máquina), así que la crea con el id
+    // que pidió la app para que el mapeo panel ↔ sesión siga valiendo.
+    use mi_terminal::daemon::sessions::{spawn_remote, DaemonEndpoint};
+    use mi_terminal::runtime::{RuntimeScheduler, SessionSpec};
+    use std::sync::{Arc, Mutex};
+
+    let (daemon, token) = start_daemon();
+    let endpoint = DaemonEndpoint::new(daemon.dir.clone(), token.clone());
+    let wanted = uuid::Uuid::new_v4();
+
+    let (id, _handle) = spawn_remote(
+        &endpoint,
+        &SessionSpec::default(),
+        80,
+        24,
+        Arc::new(Mutex::new(RuntimeScheduler::new())),
+        Some(wanted),
+    )
+    .expect("crea la sesión");
+
+    assert_eq!(id, wanted, "el daemon tiene que respetar el id pedido");
+    let mut conn = DaemonConn::try_connect(&daemon.dir, &token).expect("conecta");
+    assert_eq!(conn.list(), vec![wanted]);
+}
+
+#[cfg(feature = "daemon")]
+#[test]
+fn closing_the_app_keeps_the_session_but_closing_the_panel_kills_it() {
+    // La distinción que importa: soltar la sesión (lo que pasa al cerrar la
+    // app, porque los paneles se dropean) NO puede matar el PTY del daemon;
+    // cerrar el panel a mano SÍ. Antes de este arreglo, un Cmd+Q mataba las
+    // cuatro sesiones y el daemon no servía para nada.
+    use mi_terminal::daemon::sessions::DaemonEndpoint;
+    use mi_terminal::runtime::{PtyManager, SessionSpec};
+
+    let (daemon, token) = start_daemon();
+    let endpoint = DaemonEndpoint::new(daemon.dir.clone(), token.clone());
+
+    let mut manager = PtyManager::new_for_tests();
+    let spawner_endpoint = endpoint.clone();
+    manager.set_remote_spawner(Box::new(move |spec, cols, rows, scheduler, desired| {
+        mi_terminal::daemon::sessions::spawn_remote(
+            &spawner_endpoint,
+            spec,
+            cols,
+            rows,
+            scheduler,
+            desired,
+        )
+    }));
+    assert!(manager.hosts_out_of_process());
+
+    let id = manager
+        .spawn(SessionSpec::default(), None, 80, 24)
+        .expect("crea la sesión en el daemon");
+
+    let mut conn = DaemonConn::try_connect(&daemon.dir, &token).expect("conecta");
+    assert_eq!(conn.list(), vec![id], "la sesión vive en el daemon");
+
+    // Cierre de la app: se suelta la sesión, no se mata.
+    assert!(manager.close(id));
+    assert_eq!(
+        conn.list(),
+        vec![id],
+        "cerrar la app NO puede matar la sesión del daemon"
+    );
+
+    // Cierre de panel a mano: ahora sí se va.
+    let id2 = manager
+        .spawn(SessionSpec::default(), None, 80, 24)
+        .expect("otra sesión");
+    assert!(manager.close_and_kill_remote(id2));
+    let remaining = conn.list();
+    assert!(
+        !remaining.contains(&id2),
+        "cerrar el panel tiene que matar su sesión; quedan {remaining:?}"
+    );
+}

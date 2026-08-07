@@ -286,7 +286,16 @@ impl PtyManager {
     }
 
     pub fn create_detached(&mut self, spec: SessionSpec) -> Uuid {
-        let session_id = Uuid::new_v4();
+        self.create_detached_with_id(spec, None)
+    }
+
+    /// Crea una sesión detached con un id preexistente si se da (P3.15, T4):
+    /// así un panel restaurado puede pedirle al daemon **su** sesión de la
+    /// corrida anterior en vez de una nueva.
+    pub fn create_detached_with_id(&mut self, spec: SessionSpec, existing: Option<Uuid>) -> Uuid {
+        let session_id = existing
+            .filter(|id| !self.sessions.contains_key(id))
+            .unwrap_or_else(Uuid::new_v4);
         self.sessions
             .insert(session_id, ManagedSession::detached(spec));
         session_id
@@ -367,24 +376,59 @@ impl PtyManager {
         }
 
         let spec = session.spec.clone();
-        let handle = PtyHandle::spawn(
-            spec.cwd.as_deref(),
-            cols,
-            rows,
-            session_id,
-            Arc::clone(&self.scheduler),
-            crate::terminal::pty::HookIdentity {
-                panel_id: spec.panel_id,
-                workspace_id: spec.workspace_id,
-            },
-        )?;
-        if let Some(command) = spec
-            .startup_command
-            .as_deref()
-            .map(str::trim)
-            .filter(|command| !command.is_empty())
-        {
-            handle.write_all(format!("{command}\n").as_bytes());
+        // Con daemon adoptado, una sesión detached se engancha **allá** con su
+        // mismo id (P3.15, T3): es el camino que toman los paneles restaurados,
+        // y sin esto se atacheaban in-process aunque el daemon estuviera vivo.
+        let remote = self.remote_spawner.as_ref().and_then(|spawner| {
+            match spawner(
+                &spec,
+                cols,
+                rows,
+                Arc::clone(&self.scheduler),
+                Some(session_id),
+            ) {
+                Ok((id, handle)) if id == session_id => Some(handle),
+                Ok((id, _)) => {
+                    // El daemon dio otro id: no se puede mapear panel ↔ sesión,
+                    // así que se cae a in-process en vez de perder el panel.
+                    log::warn!("el daemon devolvió {id} en vez de {session_id}");
+                    None
+                }
+                Err(err) => {
+                    log::warn!("el daemon no pudo enganchar {session_id} ({err})");
+                    None
+                }
+            }
+        });
+
+        let (handle, was_remote) = match remote {
+            Some(handle) => (handle, true),
+            None => (
+                PtyHandle::spawn(
+                    spec.cwd.as_deref(),
+                    cols,
+                    rows,
+                    session_id,
+                    Arc::clone(&self.scheduler),
+                    crate::terminal::pty::HookIdentity {
+                        panel_id: spec.panel_id,
+                        workspace_id: spec.workspace_id,
+                    },
+                )?,
+                false,
+            ),
+        };
+        // El daemon ya corrió el startup_command al crear la sesión: repetirlo
+        // acá lanzaría el agente dos veces.
+        if !was_remote {
+            if let Some(command) = spec
+                .startup_command
+                .as_deref()
+                .map(str::trim)
+                .filter(|command| !command.is_empty())
+            {
+                handle.write_all(format!("{command}\n").as_bytes());
+            }
         }
         let shared_handle = Arc::new(Mutex::new(handle));
         if let Some(input) = spec
@@ -479,8 +523,28 @@ impl PtyManager {
             .unwrap_or_default()
     }
 
+    /// Suelta la sesión de este proceso. Si vive en el daemon **no** la mata:
+    /// este es el camino que corre también al cerrar la app, y matar acá sería
+    /// exactamente lo contrario de lo que el daemon promete (P3.15).
     pub fn close(&mut self, session_id: Uuid) -> bool {
         self.sessions.remove(&session_id).is_some()
+    }
+
+    /// Cierra la sesión **para siempre**: la suelta y, si vive en el daemon,
+    /// la mata. Es el camino del usuario cerrando un panel.
+    pub fn close_and_kill_remote(&mut self, session_id: Uuid) -> bool {
+        let Some(session) = self.sessions.remove(&session_id) else {
+            return false;
+        };
+        #[cfg(not(all(unix, feature = "daemon")))]
+        let _ = session;
+        #[cfg(all(unix, feature = "daemon"))]
+        if let Some(handle) = session.handle.as_ref() {
+            if let Ok(pty) = handle.lock() {
+                pty.kill_remote_session();
+            }
+        }
+        true
     }
 
     /// Encola un prompt interactivo diferido: se escribe recién cuando el

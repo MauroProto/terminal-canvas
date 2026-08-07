@@ -384,6 +384,7 @@ mod tests {
                     focused_leaf: None,
                     linked_issue: None,
                     agent_session_id: None,
+                    runtime_session_id: None,
                 }],
                 desktop: WorkspaceDesktopState {
                     next_z: 2,
@@ -484,7 +485,7 @@ mod tests {
     }
 
     #[test]
-    fn saved_state_omits_runtime_session_metadata() {
+    fn saved_state_omits_the_runtime_session_registry() {
         let dir = unique_temp_dir();
         let path = dir.join("layout.json");
         let state = sample_state("ui-only");
@@ -495,7 +496,16 @@ mod tests {
         assert!(serialized.contains("\"schema_version\": 2"));
         assert!(serialized.contains("\"legacy_canvas_ui\""));
         assert!(serialized.contains("\"desktop\""));
-        assert!(!serialized.contains("runtime_session_id"));
+        // El registro entero de sesiones de runtime sigue fuera del layout: es
+        // estado del proceso, no del usuario.
         assert!(!serialized.contains("runtime_sessions"));
+        // El `runtime_session_id` **por panel** sí se persiste desde P3.15:
+        // con el daemon hosteando los PTYs, ese id es la llave para que al
+        // reabrir la app el panel se reengancha a su shell vivo en vez de
+        // arrancar uno nuevo. Sin daemon es inocuo (se reusa como id local).
+        assert!(
+            serialized.contains("runtime_session_id"),
+            "el id de sesión es la llave del reattach: no puede faltar"
+        );
     }
 }

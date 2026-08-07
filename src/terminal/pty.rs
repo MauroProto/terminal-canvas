@@ -492,6 +492,27 @@ impl PtyHandle {
         self.mark_render_dirty();
     }
 
+    /// Mata la sesión **en el daemon** (P3.15). Se llama al cerrar un panel,
+    /// no al cerrar la app: si no, la sesión no sobreviviría a un cierre limpio.
+    #[cfg(all(unix, feature = "daemon"))]
+    pub fn kill_remote_session(&self) {
+        if let Some(remote) = self.remote.as_ref() {
+            remote.kill();
+        }
+    }
+
+    /// ¿Esta sesión vive en el daemon?
+    pub fn is_remote(&self) -> bool {
+        #[cfg(all(unix, feature = "daemon"))]
+        {
+            self.remote.is_some()
+        }
+        #[cfg(not(all(unix, feature = "daemon")))]
+        {
+            false
+        }
+    }
+
     pub fn write_all(&self, bytes: &[u8]) {
         if let Ok(mut writer) = self.writer.lock() {
             if writer.write_all(bytes).is_ok() {
@@ -868,12 +889,10 @@ impl Drop for PtyHandle {
         if let Some(killer) = self.killer.as_mut() {
             let _ = killer.kill();
         }
-        // Sesión remota: matar el handle local no puede dejar el PTY del
-        // daemon corriendo para siempre.
-        #[cfg(all(unix, feature = "daemon"))]
-        if let Some(remote) = self.remote.as_ref() {
-            remote.kill();
-        }
+        // Ojo: una sesión remota **no** se mata al dropear el handle. Cerrar la
+        // app dropea todos los handles, y matar ahí sería justo lo contrario de
+        // lo que el daemon promete. Matarla es explícito (`kill_remote_session`,
+        // que usa el cierre de panel) y los huérfanos los limpia ReconcileLive.
         // Reap the child off-thread: without a wait() every closed terminal
         // leaves a zombie process, and long sessions with many terminals
         // eventually exhaust the process table.

@@ -402,9 +402,17 @@ pub fn handle_request(
         Request::List => Response::Sessions {
             ids: state.session_ids(),
         },
-        Request::ReconcileLive { ids } => Response::Reconciled {
-            killed: state.reconcile_live(&ids),
-        },
+        Request::ReconcileLive { ids } => {
+            let killed = state.reconcile_live(&ids);
+            if !killed.is_empty() {
+                log::info!(
+                    "reconcile mató {} sesiones (vivas: {})",
+                    killed.len(),
+                    ids.len()
+                );
+            }
+            Response::Reconciled { killed }
+        }
         Request::ShutdownIfIdle => Response::ShuttingDown,
     }
 }

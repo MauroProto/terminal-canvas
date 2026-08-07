@@ -51,6 +51,7 @@ impl SessionController {
         spec: SessionSpec,
         cols: u16,
         rows: u16,
+        existing_session_id: Option<Uuid>,
     ) {
         self.close();
         self.last_cols = cols.max(1);
@@ -58,7 +59,7 @@ impl SessionController {
         self.pty_manager = Some(Arc::clone(&pty_manager));
         match pty_manager.lock() {
             Ok(mut manager) => {
-                let session_id = manager.create_detached(spec);
+                let session_id = manager.create_detached_with_id(spec, existing_session_id);
                 self.session_id = Some(session_id);
                 self.spawn_error = None;
             }
@@ -227,13 +228,28 @@ impl SessionController {
         self.handle()
     }
 
+    /// Suelta la sesión de este proceso (no mata la del daemon).
     pub fn close(&mut self) {
+        self.close_inner(false);
+    }
+
+    /// Cierra la sesión para siempre: también mata la del daemon si es remota.
+    /// Es el camino del usuario cerrando el panel, no el del cierre de la app.
+    pub fn close_for_good(&mut self) {
+        self.close_inner(true);
+    }
+
+    fn close_inner(&mut self, kill_remote: bool) {
         let Some(session_id) = self.session_id.take() else {
             return;
         };
         if let Some(manager) = &self.pty_manager {
             if let Ok(mut manager) = manager.lock() {
-                manager.close(session_id);
+                if kill_remote {
+                    manager.close_and_kill_remote(session_id);
+                } else {
+                    manager.close(session_id);
+                }
             }
         }
     }

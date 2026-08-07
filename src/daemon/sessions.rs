@@ -67,7 +67,35 @@ pub fn spawn_remote(
             .map_err(|err| anyhow::anyhow!("no se pudo clonar el socket: {err}"))?,
     );
 
-    // Crear la sesión.
+    // Si nos dieron un id, primero se prueba **engancharse**: puede ser una
+    // sesión de una corrida anterior que sobrevivió al cierre de la app, y en
+    // ese caso hay que reusarla en vez de crear otra encima (P3.15, T4).
+    let mut existing = None;
+    if let Some(id) = desired_id {
+        if let Ok(Response::Attached { snapshot, seq, .. }) =
+            request(&mut writer, &mut reader, &Request::Attach { id })
+        {
+            existing = Some((id, snapshot, seq));
+        }
+    }
+    if let Some((session_id, snapshot, seq)) = existing {
+        let control = stream
+            .try_clone()
+            .map_err(|err| anyhow::anyhow!("no se pudo clonar el socket: {err}"))?;
+        let handle = PtyHandle::attach_remote(
+            session_id,
+            control,
+            stream,
+            &snapshot,
+            seq,
+            cols.max(1),
+            rows.max(1),
+            scheduler,
+        )?;
+        return Ok((session_id, handle));
+    }
+
+    // No existía: se crea.
     let wire = wire_spec_from(spec, cols, rows);
     let session_id = match request(
         &mut writer,

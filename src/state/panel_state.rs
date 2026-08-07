@@ -81,6 +81,11 @@ pub struct PanelState {
     /// restore reanuda con `--resume <id>` exacto en vez de `--continue`.
     #[serde(default)]
     pub agent_session_id: Option<String>,
+    /// Id de la sesión de runtime (P3.15, T4). Con el daemon hosteando, esto
+    /// deja que al reabrir la app el panel se **reengancha** a su PTY vivo en
+    /// vez de arrancar uno nuevo.
+    #[serde(default)]
+    pub runtime_session_id: Option<String>,
 }
 
 #[cfg(test)]
@@ -111,6 +116,7 @@ mod tests {
             focused_leaf: None,
             linked_issue: None,
             agent_session_id: None,
+            runtime_session_id: None,
         }
     }
 
