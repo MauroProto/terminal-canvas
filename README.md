@@ -121,6 +121,22 @@ cargo build --release
 ./target/release/mi-terminal
 ```
 
+### PTY daemon (opt-in)
+
+With the `daemon` feature the terminals live in a separate process, so closing
+(or crashing) the app no longer kills the agents that are working:
+
+```bash
+cargo build --features daemon --bins
+./target/debug/mi-terminal
+```
+
+The app spawns the daemon on first run (`fork+setsid`), reattaches to its own
+sessions on restart — same shell, same history, same running processes — and
+asks it to shut down once the last app closes and no sessions are left. If the
+daemon cannot start, the app falls back to in-process terminals and says why in
+the log. It is off by default on purpose: the migration is gradual.
+
 On macOS you can also launch the bundled helper:
 
 ```bash
