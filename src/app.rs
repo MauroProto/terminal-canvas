@@ -124,6 +124,10 @@ pub struct TerminalApp {
     installed_agents: crate::orchestration::InstalledAgents,
     /// El overlay de primeros pasos ya se cerró (Ship-it 7.2).
     onboarding_dismissed: bool,
+    /// Adopción del daemon de PTYs (P3.15, T3). Sin el feature `daemon` la app
+    /// corre siempre in-process.
+    #[cfg(all(unix, feature = "daemon"))]
+    daemon: crate::daemon::backend::DaemonBackend,
     tasks_state: crate::sidebar::tasks::TasksState,
     /// Issues que esperan a que su worktree termine para pegarse al panel.
     pending_issue_links: HashMap<Uuid, u64>,
@@ -252,6 +256,14 @@ impl TerminalApp {
                 agent_detector: crate::orchestration::AgentDetector::start(),
                 installed_agents: Default::default(),
                 onboarding_dismissed: crate::config::runtime_config().onboarding_dismissed,
+                #[cfg(all(unix, feature = "daemon"))]
+                daemon: if side_effects {
+                    crate::daemon::backend::DaemonBackend::adopt()
+                } else {
+                    crate::daemon::backend::DaemonBackend::Fallback {
+                        reason: "modo test".to_owned(),
+                    }
+                },
                 tasks_state: Default::default(),
                 pending_issue_links: HashMap::new(),
                 window_focused: false,
@@ -338,6 +350,14 @@ impl TerminalApp {
                 agent_detector: crate::orchestration::AgentDetector::start(),
                 installed_agents: Default::default(),
                 onboarding_dismissed: crate::config::runtime_config().onboarding_dismissed,
+                #[cfg(all(unix, feature = "daemon"))]
+                daemon: if side_effects {
+                    crate::daemon::backend::DaemonBackend::adopt()
+                } else {
+                    crate::daemon::backend::DaemonBackend::Fallback {
+                        reason: "modo test".to_owned(),
+                    }
+                },
                 tasks_state: Default::default(),
                 pending_issue_links: HashMap::new(),
                 window_focused: false,
@@ -770,6 +790,7 @@ impl TerminalApp {
                         // el otro, al restaurar el historial no matchea.
                         // Autosave de 2 s → solo log incremental (P1.7).
                         self.persist_scrollbacks(false);
+                        self.reconcile_daemon_sessions();
                     }
                     Err(err) => {
                         log::warn!("Autosave failed: {err}");
@@ -1013,6 +1034,27 @@ impl TerminalApp {
         Some(Duration::from_secs_f64(
             crate::terminal::renderer::time_until_blink_change(now),
         ))
+    }
+
+    /// Le dice al daemon qué sesiones siguen vivas, para que mate las
+    /// huérfanas (P3.15, T5). Sin el feature `daemon` es un no-op.
+    fn reconcile_daemon_sessions(&mut self) {
+        #[cfg(all(unix, feature = "daemon"))]
+        {
+            if !self.daemon.is_connected() {
+                return;
+            }
+            let live: Vec<Uuid> = self
+                .workspaces
+                .iter()
+                .flat_map(|workspace| workspace.panels.iter())
+                .filter_map(|panel| panel.runtime_session_id())
+                .collect();
+            let killed = self.daemon.reconcile_live(live);
+            if !killed.is_empty() {
+                log::info!("el daemon mató {} sesiones huérfanas", killed.len());
+            }
+        }
     }
 
     /// Exporta el diagnóstico a Descargas (Ship-it 7.5). Sin secretos: los
@@ -1603,6 +1645,9 @@ impl eframe::App for TerminalApp {
         // El autosave puede tener hasta AUTOSAVE_INTERVAL de atraso: al salir
         // guardamos el scrollback definitivo para no perder las últimas líneas.
         self.persist_scrollbacks(true);
+        // El daemon se apaga solo si no le quedan sesiones (P3.15, T5).
+        #[cfg(all(unix, feature = "daemon"))]
+        self.daemon.shutdown_if_idle();
         crate::state::run_marker::end_run_clean();
     }
 }

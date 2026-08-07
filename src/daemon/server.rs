@@ -14,6 +14,8 @@ use uuid::Uuid;
 use super::protocol::{
     decode_line, encode_line, handshake_ok, Request, Response, WireSpec, PROTOCOL_VERSION,
 };
+use crate::runtime::{RuntimeScheduler, SharedPtyHandle};
+use crate::terminal::pty::{HookIdentity, PtyHandle};
 
 /// Cuánto espera el daemon sin ninguna app conectada antes de apagarse si
 /// además no le quedan sesiones (adoption timeout).
@@ -31,6 +33,9 @@ pub struct DaemonSession {
     /// Último `seq` emitido.
     pub seq: u64,
     pub alive: bool,
+    /// El PTY real (T2). `None` en los tests del registro, que no montan
+    /// procesos: la lógica de sesiones se testea sin spawnear nada.
+    pub handle: Option<SharedPtyHandle>,
 }
 
 impl DaemonSession {
@@ -40,6 +45,7 @@ impl DaemonSession {
             snapshot: String::new(),
             seq: 0,
             alive: true,
+            handle: None,
         }
     }
 
@@ -72,6 +78,8 @@ pub struct DaemonState {
     pub clients: usize,
     /// Desde cuándo no hay ninguna app conectada.
     idle_since: Option<Instant>,
+    /// Canales de las apps conectadas, para empujarles los eventos de salida.
+    subscribers: Vec<std::sync::mpsc::Sender<Response>>,
 }
 
 impl DaemonState {
@@ -79,10 +87,151 @@ impl DaemonState {
         Self::default()
     }
 
+    /// Registra una sesión **sin** PTY (para tests del registro).
     pub fn spawn(&mut self, spec: WireSpec) -> Uuid {
         let id = Uuid::new_v4();
         self.sessions.insert(id, DaemonSession::new(spec));
         id
+    }
+
+    /// Registra una sesión y le espawnea el PTY real (T2): a partir de acá el
+    /// dueño del proceso hijo es el daemon, no la app.
+    pub fn spawn_with_pty(
+        &mut self,
+        spec: WireSpec,
+        scheduler: &Arc<Mutex<RuntimeScheduler>>,
+    ) -> Uuid {
+        let id = self.spawn(spec.clone());
+        let cwd = spec.cwd.as_deref().map(std::path::Path::new);
+        match PtyHandle::spawn(
+            cwd,
+            spec.cols.max(1),
+            spec.rows.max(1),
+            id,
+            Arc::clone(scheduler),
+            HookIdentity {
+                panel_id: spec.panel_id,
+                workspace_id: spec.workspace_id,
+            },
+        ) {
+            Ok(handle) => {
+                if let Some(command) = spec.startup_command.as_deref().map(str::trim) {
+                    if !command.is_empty() {
+                        handle.write_all(format!("{command}\n").as_bytes());
+                    }
+                }
+                if let Some(session) = self.sessions.get_mut(&id) {
+                    session.handle = Some(Arc::new(Mutex::new(handle)));
+                }
+            }
+            Err(err) => {
+                log::warn!("no se pudo espawnear el PTY de {id}: {err}");
+                if let Some(session) = self.sessions.get_mut(&id) {
+                    session.alive = false;
+                }
+            }
+        }
+        id
+    }
+
+    /// Escribe bytes en el PTY de la sesión. `false` si no existe.
+    pub fn write_to(&self, id: Uuid, data: &str) -> bool {
+        let Some(session) = self.sessions.get(&id) else {
+            return false;
+        };
+        if let Some(handle) = session.handle.as_ref() {
+            if let Ok(pty) = handle.lock() {
+                pty.write_all(data.as_bytes());
+            }
+        }
+        true
+    }
+
+    /// Reenvía el resize al PTY además de guardar la geometría.
+    pub fn resize(&mut self, id: Uuid, cols: u16, rows: u16) -> bool {
+        let Some(session) = self.sessions.get_mut(&id) else {
+            return false;
+        };
+        session.spec.cols = cols;
+        session.spec.rows = rows;
+        if let Some(handle) = session.handle.as_ref() {
+            if let Ok(mut pty) = handle.lock() {
+                pty.resize(cols.max(1), rows.max(1));
+            }
+        }
+        true
+    }
+
+    /// Drena la salida nueva de cada PTY, la numera y devuelve los eventos a
+    /// difundir. También marca las sesiones cuyo proceso murió.
+    pub fn pump_output(&mut self) -> Vec<Response> {
+        let mut events = Vec::new();
+        let ids: Vec<Uuid> = self.sessions.keys().copied().collect();
+        for id in ids {
+            let Some(session) = self.sessions.get_mut(&id) else {
+                continue;
+            };
+            let Some(handle) = session.handle.clone() else {
+                continue;
+            };
+            let (frames, alive) = match handle.lock() {
+                Ok(pty) => (
+                    pty.drain_pending_log(),
+                    pty.alive.load(std::sync::atomic::Ordering::Relaxed),
+                ),
+                Err(_) => (Vec::new(), false),
+            };
+            if !frames.is_empty() {
+                // Los frames son los del log incremental (P1.7): se decodifican
+                // para quedarnos solo con la salida.
+                if let Some((_, decoded)) = crate::state::scrollback_log::read_frames(
+                    &[crate::state::scrollback_log::encode_header(0), frames].concat(),
+                ) {
+                    let mut data = String::new();
+                    for frame in decoded {
+                        if frame.kind == crate::state::scrollback_log::FrameKind::Output {
+                            data.push_str(&String::from_utf8_lossy(&frame.payload));
+                        }
+                    }
+                    if !data.is_empty() {
+                        let seq = session.push_output(&data);
+                        events.push(Response::Output { id, seq, data });
+                    }
+                }
+            }
+            if !alive && session.alive {
+                session.alive = false;
+                events.push(Response::Exit { id });
+            }
+        }
+        events
+    }
+
+    /// Persiste el scrollback de cada sesión (T2: el checkpoint lo escribe el
+    /// daemon, no la app, porque el grid vive acá).
+    pub fn persist_scrollbacks(&self) {
+        let Some(dir) = crate::state::scrollback_store::scrollback_dir() else {
+            return;
+        };
+        for session in self.sessions.values() {
+            let Some(panel_id) = session.spec.panel_id else {
+                continue;
+            };
+            let Some(handle) = session.handle.as_ref() else {
+                continue;
+            };
+            let ansi = match handle.lock() {
+                Ok(pty) => pty.with_term(|term| crate::terminal::export::scrollback_to_ansi(term)),
+                Err(_) => None,
+            };
+            if let Some(text) = ansi {
+                if let Err(err) =
+                    crate::state::scrollback_store::save_scrollback(&dir, panel_id, &text)
+                {
+                    log::warn!("el daemon no pudo guardar el scrollback: {err}");
+                }
+            }
+        }
     }
 
     pub fn session_ids(&self) -> Vec<Uuid> {
@@ -100,7 +249,14 @@ impl DaemonState {
     }
 
     pub fn kill(&mut self, id: Uuid) -> bool {
-        self.sessions.remove(&id).is_some()
+        match self.sessions.remove(&id) {
+            Some(session) => {
+                // Cerrar el handle mata al hijo: si no, queda huérfano.
+                drop(session.handle);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Mata las sesiones que la app ya no reconoce (T5): si un panel se fue,
@@ -125,6 +281,25 @@ impl DaemonState {
         self.idle_since = None;
     }
 
+    /// Registra el canal por el que esta app recibe eventos.
+    pub fn subscribe(&mut self, sender: std::sync::mpsc::Sender<Response>) {
+        self.subscribers.push(sender);
+    }
+
+    /// Empuja los eventos a las apps conectadas y descarta los canales muertos
+    /// (una app que se cerró): sin esto la lista crecería para siempre.
+    pub fn broadcast(&mut self, events: &[Response]) {
+        self.subscribers.retain(|sender| {
+            events
+                .iter()
+                .all(|event| sender.send(event.clone()).is_ok())
+        });
+    }
+
+    pub fn subscriber_count(&self) -> usize {
+        self.subscribers.len()
+    }
+
     pub fn client_disconnected(&mut self, now: Instant) {
         self.clients = self.clients.saturating_sub(1);
         if self.clients == 0 {
@@ -147,13 +322,21 @@ impl DaemonState {
 
 /// Aplica un pedido ya autenticado y devuelve la respuesta. Puro respecto del
 /// socket: toda la lógica del daemon se testea por acá.
-pub fn handle_request(state: &mut DaemonState, request: Request) -> Response {
+pub fn handle_request(
+    state: &mut DaemonState,
+    request: Request,
+    scheduler: Option<&Arc<Mutex<RuntimeScheduler>>>,
+) -> Response {
     match request {
         Request::Hello { .. } => Response::Error {
             message: "handshake repetido".to_owned(),
         },
         Request::Spawn { spec } => Response::Spawned {
-            id: state.spawn(spec),
+            id: match scheduler {
+                Some(scheduler) => state.spawn_with_pty(spec, scheduler),
+                // Sin scheduler (tests del registro) no se espawnea nada.
+                None => state.spawn(spec),
+            },
         },
         Request::Attach { id } => match state.session(id) {
             Some(session) => Response::Attached {
@@ -165,30 +348,28 @@ pub fn handle_request(state: &mut DaemonState, request: Request) -> Response {
                 message: format!("sesión desconocida: {id}"),
             },
         },
-        Request::Write { id, data } => match state.session_mut(id) {
-            // El eco real lo produce el PTY; acá solo se valida que exista.
-            Some(_) => {
-                let _ = data;
+        Request::Write { id, data } => {
+            if state.write_to(id, &data) {
                 Response::Sessions {
                     ids: state.session_ids(),
                 }
+            } else {
+                Response::Error {
+                    message: format!("sesión desconocida: {id}"),
+                }
             }
-            None => Response::Error {
-                message: format!("sesión desconocida: {id}"),
-            },
-        },
-        Request::Resize { id, cols, rows } => match state.session_mut(id) {
-            Some(session) => {
-                session.spec.cols = cols;
-                session.spec.rows = rows;
+        }
+        Request::Resize { id, cols, rows } => {
+            if state.resize(id, cols, rows) {
                 Response::Sessions {
                     ids: state.session_ids(),
                 }
+            } else {
+                Response::Error {
+                    message: format!("sesión desconocida: {id}"),
+                }
             }
-            None => Response::Error {
-                message: format!("sesión desconocida: {id}"),
-            },
-        },
+        }
         Request::Kill { id } => {
             if state.kill(id) {
                 Response::Killed { id }
@@ -232,6 +413,29 @@ pub fn serve(dir: &Path, token: String) -> std::io::Result<()> {
 
     let state = Arc::new(Mutex::new(DaemonState::new()));
     let shutdown = Arc::new(Mutex::new(false));
+    let scheduler = Arc::new(Mutex::new(RuntimeScheduler::new()));
+
+    // Pump de salida + persistencia (T2): el daemon es el dueño del grid, así
+    // que el checkpoint del scrollback lo escribe él.
+    {
+        let state = Arc::clone(&state);
+        std::thread::spawn(move || {
+            let mut last_persist = Instant::now();
+            loop {
+                std::thread::sleep(Duration::from_millis(50));
+                if let Ok(mut state) = state.lock() {
+                    let events = state.pump_output();
+                    if !events.is_empty() {
+                        state.broadcast(&events);
+                    }
+                    if last_persist.elapsed() >= Duration::from_secs(2) {
+                        state.persist_scrollbacks();
+                        last_persist = Instant::now();
+                    }
+                }
+            }
+        });
+    }
 
     // Vigía del apagado por inactividad (T5).
     {
@@ -256,9 +460,10 @@ pub fn serve(dir: &Path, token: String) -> std::io::Result<()> {
         let Ok(stream) = stream else { continue };
         let state = Arc::clone(&state);
         let shutdown = Arc::clone(&shutdown);
+        let scheduler = Arc::clone(&scheduler);
         let token = token.clone();
         std::thread::spawn(move || {
-            serve_connection(stream, state, shutdown, token);
+            serve_connection(stream, state, shutdown, scheduler, token);
         });
     }
     Ok(())
@@ -268,6 +473,7 @@ fn serve_connection(
     stream: UnixStream,
     state: Arc<Mutex<DaemonState>>,
     shutdown: Arc<Mutex<bool>>,
+    scheduler: Arc<Mutex<RuntimeScheduler>>,
     token: String,
 ) {
     let Ok(write_half) = stream.try_clone() else {
@@ -298,8 +504,25 @@ fn serve_connection(
                 } => {
                     if handshake_ok(version, &provided, &token) {
                         authenticated = true;
+                        // Canal de eventos: un hilo escritor los empuja a esta
+                        // app sin bloquear el loop de pedidos.
+                        let (event_tx, event_rx) = std::sync::mpsc::channel::<Response>();
                         if let Ok(mut state) = state.lock() {
                             state.client_connected();
+                            state.subscribe(event_tx);
+                        }
+                        if let Ok(mut event_writer) = writer.try_clone() {
+                            std::thread::spawn(move || {
+                                while let Ok(event) = event_rx.recv() {
+                                    if event_writer
+                                        .write_all(encode_line(&event).as_bytes())
+                                        .is_err()
+                                        || event_writer.flush().is_err()
+                                    {
+                                        break;
+                                    }
+                                }
+                            });
                         }
                         let _ = writer.write_all(
                             encode_line(&Response::Welcome {
@@ -332,7 +555,7 @@ fn serve_connection(
 
         let asked_shutdown = matches!(request, Request::ShutdownIfIdle);
         let response = match state.lock() {
-            Ok(mut state) => handle_request(&mut state, request),
+            Ok(mut state) => handle_request(&mut state, request, Some(&scheduler)),
             Err(_) => Response::Error {
                 message: "estado del daemon envenenado".to_owned(),
             },
@@ -387,6 +610,7 @@ mod tests {
             Request::Spawn {
                 spec: WireSpec::default(),
             },
+            None,
         ) {
             Response::Spawned { id } => id,
             other => panic!("esperaba Spawned, got {other:?}"),
@@ -407,7 +631,7 @@ mod tests {
         let seq = state.session_mut(id).unwrap().push_output("hola\n");
         state.session_mut(id).unwrap().push_output("chau\n");
 
-        match handle_request(&mut state, Request::Attach { id }) {
+        match handle_request(&mut state, Request::Attach { id }, None) {
             Response::Attached {
                 snapshot, seq: at, ..
             } => {
@@ -432,7 +656,7 @@ mod tests {
     #[test]
     fn attaching_an_unknown_session_is_an_error_not_a_panic() {
         let mut state = DaemonState::new();
-        match handle_request(&mut state, Request::Attach { id: Uuid::new_v4() }) {
+        match handle_request(&mut state, Request::Attach { id: Uuid::new_v4() }, None) {
             Response::Error { message } => assert!(message.contains("desconocida")),
             other => panic!("esperaba Error, got {other:?}"),
         }
@@ -443,13 +667,13 @@ mod tests {
         let mut state = DaemonState::new();
         let id = spawn_one(&mut state);
         assert!(matches!(
-            handle_request(&mut state, Request::Kill { id }),
+            handle_request(&mut state, Request::Kill { id }, None),
             Response::Killed { .. }
         ));
         assert!(state.session_ids().is_empty());
         // Matarla de nuevo es un error, no un panic.
         assert!(matches!(
-            handle_request(&mut state, Request::Kill { id }),
+            handle_request(&mut state, Request::Kill { id }, None),
             Response::Error { .. }
         ));
     }
@@ -465,6 +689,7 @@ mod tests {
                 cols: 200,
                 rows: 60,
             },
+            None,
         );
         let session = state.session(id).unwrap();
         assert_eq!((session.spec.cols, session.spec.rows), (200, 60));
@@ -475,7 +700,7 @@ mod tests {
         let mut state = DaemonState::new();
         let keep = spawn_one(&mut state);
         let orphan = spawn_one(&mut state);
-        match handle_request(&mut state, Request::ReconcileLive { ids: vec![keep] }) {
+        match handle_request(&mut state, Request::ReconcileLive { ids: vec![keep] }, None) {
             Response::Reconciled { killed } => assert_eq!(killed, vec![orphan]),
             other => panic!("esperaba Reconciled, got {other:?}"),
         }
@@ -489,7 +714,11 @@ mod tests {
         let b = spawn_one(&mut state);
         let mut live = vec![a, b];
         live.sort_by_key(Uuid::as_u128);
-        match handle_request(&mut state, Request::ReconcileLive { ids: live.clone() }) {
+        match handle_request(
+            &mut state,
+            Request::ReconcileLive { ids: live.clone() },
+            None,
+        ) {
             Response::Reconciled { killed } => assert!(killed.is_empty()),
             other => panic!("got {other:?}"),
         }
@@ -585,7 +814,49 @@ mod tests {
                 version: 1,
                 token: "x".to_owned(),
             },
+            None,
         );
         assert!(matches!(response, Response::Error { .. }));
+    }
+
+    #[test]
+    fn broadcast_drops_the_channels_of_apps_that_closed() {
+        let mut state = DaemonState::new();
+        let (alive_tx, alive_rx) = std::sync::mpsc::channel();
+        let (dead_tx, dead_rx) = std::sync::mpsc::channel();
+        state.subscribe(alive_tx);
+        state.subscribe(dead_tx);
+        assert_eq!(state.subscriber_count(), 2);
+
+        // La segunda "app" se cerró: su receiver ya no existe.
+        drop(dead_rx);
+        state.broadcast(&[Response::ShuttingDown]);
+
+        assert_eq!(
+            state.subscriber_count(),
+            1,
+            "el canal muerto tiene que salir de la lista"
+        );
+        assert_eq!(alive_rx.try_recv(), Ok(Response::ShuttingDown));
+    }
+
+    #[test]
+    fn a_session_without_a_pty_pumps_nothing() {
+        // El registro sin PTY (tests) no puede inventar salida.
+        let mut state = DaemonState::new();
+        spawn_one(&mut state);
+        assert!(state.pump_output().is_empty());
+    }
+
+    #[test]
+    fn writing_to_an_unknown_session_is_reported() {
+        let state = DaemonState::new();
+        assert!(!state.write_to(Uuid::new_v4(), "hola"));
+    }
+
+    #[test]
+    fn resizing_an_unknown_session_is_reported() {
+        let mut state = DaemonState::new();
+        assert!(!state.resize(Uuid::new_v4(), 80, 24));
     }
 }

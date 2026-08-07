@@ -8,6 +8,9 @@ license = "MIT"
 [features]
 default = []
 ghostty-vt = ["dep:libghostty-vt"]
+# Adopción del daemon de PTYs (P3.15). Off por defecto: la app funciona
+# in-process y el daemon se activa de forma gradual.
+daemon = []
 
 [[bin]]
 name = "mi-terminal"

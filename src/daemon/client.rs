@@ -26,9 +26,20 @@ pub fn is_duplicate_after_attach(event_seq: u64, attached_seq: u64) -> bool {
     event_seq <= attached_seq
 }
 
+/// ¿Esta respuesta es un **evento empujado** por el daemon (y no la respuesta
+/// a un pedido)? El daemon manda `Output`/`Exit` cuando quiere, así que se
+/// mezclan con las respuestas en el mismo socket.
+pub fn is_pushed_event(response: &Response) -> bool {
+    matches!(response, Response::Output { .. } | Response::Exit { .. })
+}
+
 pub struct DaemonConn {
     reader: BufReader<UnixStream>,
     writer: UnixStream,
+    /// Eventos que llegaron mientras se esperaba la respuesta a un pedido.
+    /// Sin esta cola, un `Output` en el momento equivocado se leía como si
+    /// fuera la respuesta y el pedido devolvía basura.
+    pending_events: std::collections::VecDeque<Response>,
 }
 
 impl DaemonConn {
@@ -60,6 +71,7 @@ impl DaemonConn {
         let mut conn = Self {
             reader: BufReader::new(stream),
             writer,
+            pending_events: std::collections::VecDeque::new(),
         };
         match conn.request(&Request::Hello {
             version: PROTOCOL_VERSION,
@@ -76,9 +88,27 @@ impl DaemonConn {
             .write_all(encode_line(request).as_bytes())
             .ok()?;
         self.writer.flush().ok()?;
-        let mut line = String::new();
-        self.reader.read_line(&mut line).ok()?;
-        decode_line(&line)
+        loop {
+            let mut line = String::new();
+            if self.reader.read_line(&mut line).ok()? == 0 {
+                return None; // el daemon cerró la conexión
+            }
+            let Some(response) = decode_line::<Response>(&line) else {
+                continue; // línea corrupta: se ignora, no tumba la conexión
+            };
+            if is_pushed_event(&response) {
+                // Llegó un evento mientras esperábamos la respuesta: se encola
+                // en vez de devolverlo como si fuera la respuesta al pedido.
+                self.pending_events.push_back(response);
+                continue;
+            }
+            return Some(response);
+        }
+    }
+
+    /// Eventos que llegaron mientras se atendían pedidos.
+    pub fn drain_events(&mut self) -> Vec<Response> {
+        self.pending_events.drain(..).collect()
     }
 
     pub fn spawn_session(&mut self, spec: super::protocol::WireSpec) -> Option<Uuid> {
@@ -156,6 +186,10 @@ mod tests {
     use super::{daemon_binary_path, is_duplicate_after_attach, DaemonConn};
     use std::path::Path;
 
+    use crate::daemon::protocol::Response as WireResponse;
+    #[allow(unused_imports)]
+    use WireResponse as _;
+
     #[test]
     fn events_already_in_the_snapshot_are_dropped() {
         // El attach devolvió hasta el seq 10: todo lo ≤ 10 ya se vio.
@@ -195,5 +229,26 @@ mod tests {
         let missing = Path::new("/definitivamente/no/existe/mi-terminal-daemon");
         let dir = std::env::temp_dir();
         assert!(super::spawn_daemon(missing, &dir).is_err());
+    }
+
+    #[test]
+    fn pushed_events_are_told_apart_from_responses() {
+        use crate::daemon::protocol::Response;
+        use uuid::Uuid;
+        let id = Uuid::new_v4();
+        // Lo que el daemon empuja cuando quiere.
+        assert!(super::is_pushed_event(&Response::Output {
+            id,
+            seq: 1,
+            data: "x".to_owned()
+        }));
+        assert!(super::is_pushed_event(&Response::Exit { id }));
+        // Lo que contesta a un pedido.
+        assert!(!super::is_pushed_event(&Response::Sessions {
+            ids: vec![id]
+        }));
+        assert!(!super::is_pushed_event(&Response::Spawned { id }));
+        assert!(!super::is_pushed_event(&Response::ShuttingDown));
+        assert!(!super::is_pushed_event(&Response::Welcome { version: 1 }));
     }
 }

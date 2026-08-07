@@ -21,7 +21,7 @@
 - [x] P2.14 Quick open unificado
 
 ## P3 — Arquitectura
-- [ ] P3.15 Daemon de PTYs
+- [x] P3.15 Daemon de PTYs (app-side: ciclo de vida; el render sigue in-process)
 - [x] P3.16 Flow control
 - [x] P3.17 Linear
 - [x] P3.18 Design Mode (extensión browser)
