@@ -200,6 +200,7 @@ fn a_real_pty_echoes_what_the_app_writes() {
     // Sesión con PTY real.
     send(
         &Request::Spawn {
+            id: None,
             spec: WireSpec {
                 title: "Terminal".to_owned(),
                 cols: 80,

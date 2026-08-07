@@ -87,6 +87,11 @@ impl DaemonState {
         Self::default()
     }
 
+    /// Registra una sesión con un id dado (sin PTY).
+    pub fn insert_session(&mut self, id: Uuid, spec: WireSpec) {
+        self.sessions.insert(id, DaemonSession::new(spec));
+    }
+
     /// Registra una sesión **sin** PTY (para tests del registro).
     pub fn spawn(&mut self, spec: WireSpec) -> Uuid {
         let id = Uuid::new_v4();
@@ -100,8 +105,17 @@ impl DaemonState {
         &mut self,
         spec: WireSpec,
         scheduler: &Arc<Mutex<RuntimeScheduler>>,
+        desired_id: Option<Uuid>,
     ) -> Uuid {
-        let id = self.spawn(spec.clone());
+        // Se respeta el id que propone el cliente para que el id de la app y
+        // el del daemon coincidan; si ya está tomado, se genera uno nuevo.
+        let id = match desired_id.filter(|id| !self.sessions.contains_key(id)) {
+            Some(id) => {
+                self.insert_session(id, spec.clone());
+                id
+            }
+            None => self.spawn(spec.clone()),
+        };
         let cwd = spec.cwd.as_deref().map(std::path::Path::new);
         match PtyHandle::spawn(
             cwd,
@@ -331,11 +345,17 @@ pub fn handle_request(
         Request::Hello { .. } => Response::Error {
             message: "handshake repetido".to_owned(),
         },
-        Request::Spawn { spec } => Response::Spawned {
+        Request::Spawn { spec, id } => Response::Spawned {
             id: match scheduler {
-                Some(scheduler) => state.spawn_with_pty(spec, scheduler),
+                Some(scheduler) => state.spawn_with_pty(spec, scheduler, id),
                 // Sin scheduler (tests del registro) no se espawnea nada.
-                None => state.spawn(spec),
+                None => match id.filter(|id| state.session(*id).is_none()) {
+                    Some(id) => {
+                        state.insert_session(id, spec);
+                        id
+                    }
+                    None => state.spawn(spec),
+                },
             },
         },
         Request::Attach { id } => match state.session(id) {
@@ -609,6 +629,7 @@ mod tests {
             state,
             Request::Spawn {
                 spec: WireSpec::default(),
+                id: None,
             },
             None,
         ) {

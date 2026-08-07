@@ -128,6 +128,9 @@ pub struct TerminalApp {
     /// corre siempre in-process.
     #[cfg(all(unix, feature = "daemon"))]
     daemon: crate::daemon::backend::DaemonBackend,
+    /// El spawner del daemon ya se instaló en los PtyManager (P3.15, T3).
+    #[cfg(all(unix, feature = "daemon"))]
+    daemon_spawner_installed: bool,
     tasks_state: crate::sidebar::tasks::TasksState,
     /// Issues que esperan a que su worktree termine para pegarse al panel.
     pending_issue_links: HashMap<Uuid, u64>,
@@ -257,6 +260,8 @@ impl TerminalApp {
                 installed_agents: Default::default(),
                 onboarding_dismissed: crate::config::runtime_config().onboarding_dismissed,
                 #[cfg(all(unix, feature = "daemon"))]
+                daemon_spawner_installed: false,
+                #[cfg(all(unix, feature = "daemon"))]
                 daemon: if side_effects {
                     crate::daemon::backend::DaemonBackend::adopt()
                 } else {
@@ -350,6 +355,8 @@ impl TerminalApp {
                 agent_detector: crate::orchestration::AgentDetector::start(),
                 installed_agents: Default::default(),
                 onboarding_dismissed: crate::config::runtime_config().onboarding_dismissed,
+                #[cfg(all(unix, feature = "daemon"))]
+                daemon_spawner_installed: false,
                 #[cfg(all(unix, feature = "daemon"))]
                 daemon: if side_effects {
                     crate::daemon::backend::DaemonBackend::adopt()
@@ -700,6 +707,10 @@ impl TerminalApp {
             .iter()
             .any(|workspace| workspace.matches_cwd(&path));
         let index = upsert_workspace_for_folder(&mut self.workspaces, path.clone());
+        // Un workspace nuevo tiene su propio PtyManager: hay que decirle que
+        // las sesiones van al daemon (P3.15, T3).
+        #[cfg(all(unix, feature = "daemon"))]
+        self.install_daemon_spawner();
         self.switch_workspace(index);
         // Trash diferido (P1.9): al abrir el workspace se barren las entradas
         // stale del trash de este repo.
@@ -856,6 +867,12 @@ impl TerminalApp {
         self.poll_hook_events();
         self.poll_gh_client();
         self.poll_design_captures();
+        // El spawner se instala una vez, cuando el daemon ya está adoptado.
+        #[cfg(all(unix, feature = "daemon"))]
+        if !self.daemon_spawner_installed && self.daemon.is_connected() {
+            self.install_daemon_spawner();
+            self.daemon_spawner_installed = true;
+        }
         if let Some(installed) = self.agent_detector.poll() {
             self.installed_agents = installed;
         }
@@ -1034,6 +1051,28 @@ impl TerminalApp {
         Some(Duration::from_secs_f64(
             crate::terminal::renderer::time_until_blink_change(now),
         ))
+    }
+
+    /// Hace que las sesiones nuevas de todos los workspaces se creen en el
+    /// daemon (P3.15, T3). Sin el feature `daemon`, o si no se adoptó, no hace
+    /// nada y todo sigue in-process.
+    #[cfg(all(unix, feature = "daemon"))]
+    fn install_daemon_spawner(&mut self) {
+        let Some(endpoint) = self.daemon.endpoint() else {
+            return;
+        };
+        for workspace in &self.workspaces {
+            let endpoint = endpoint.clone();
+            if let Ok(mut manager) = workspace.pty_manager().lock() {
+                manager.set_remote_spawner(Box::new(
+                    move |spec, cols, rows, scheduler, desired_id| {
+                        crate::daemon::sessions::spawn_remote(
+                            &endpoint, spec, cols, rows, scheduler, desired_id,
+                        )
+                    },
+                ));
+            }
+        }
     }
 
     /// Le dice al daemon qué sesiones siguen vivas, para que mate las

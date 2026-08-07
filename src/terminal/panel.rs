@@ -924,22 +924,61 @@ impl TerminalPanel {
         viewport: &Viewport,
         canvas_rect: Rect,
     ) {
-        self.session.ensure_attached();
-        if !self.session.is_attached() {
-            return;
+        // Con splits, la rueda va a la hoja que está **bajo el puntero**, no a
+        // la enfocada: si no, scrollear sobre una hoja movía otra (P2.11).
+        let leaf = pointer
+            .and_then(|pointer| self.leaf_at_pointer(pointer, viewport, canvas_rect))
+            .unwrap_or(self.focused_leaf);
+
+        {
+            let session = self.leaf_session_mut_by_id(leaf);
+            session.ensure_attached();
+            if !session.is_attached() {
+                return;
+            }
         }
-        let mode = self.session.input_mode();
+        let mode = self.leaf_session(leaf).input_mode();
         let point = pointer
             .and_then(|pointer| self.mouse_cell_from_pointer(pointer, viewport, canvas_rect));
 
         match wheel_action(delta, &mode, point, &mut self.scroll_accumulator) {
             Some(WheelAction::Pty(bytes)) => {
-                let _ = self.with_pty(|pty| pty.write_all(&bytes));
+                let _ = self
+                    .leaf_session(leaf)
+                    .with_pty(|pty| pty.write_all(&bytes));
             }
             Some(WheelAction::Scrollback(lines)) => {
-                let _ = self.with_pty(|pty| pty.scroll_display(Scroll::Delta(lines)));
+                let _ = self
+                    .leaf_session(leaf)
+                    .with_pty(|pty| pty.scroll_display(Scroll::Delta(lines)));
             }
             None => {}
+        }
+    }
+
+    /// Hoja cuyo rect contiene el puntero, si hay splits (P2.11).
+    fn leaf_at_pointer(
+        &self,
+        pointer: Pos2,
+        viewport: &Viewport,
+        canvas_rect: Rect,
+    ) -> Option<crate::terminal::split_tree::LeafId> {
+        let (_, _, body_rect) = self.screen_geometry(viewport, canvas_rect);
+        let (leaves, _) = self.split_layout(terminal_body_rect(body_rect))?;
+        leaves
+            .into_iter()
+            .find(|leaf| leaf.rect.contains(pointer))
+            .map(|leaf| leaf.id)
+    }
+
+    fn leaf_session_mut_by_id(
+        &mut self,
+        id: crate::terminal::split_tree::LeafId,
+    ) -> &mut SessionController {
+        if id == self.root_leaf {
+            &mut self.session
+        } else {
+            self.leaf_sessions.entry(id).or_default()
         }
     }
 

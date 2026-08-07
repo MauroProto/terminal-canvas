@@ -10,6 +10,8 @@ pub mod layout;
 pub mod metrics;
 pub mod panel;
 pub mod pty;
+#[cfg(all(unix, feature = "daemon"))]
+pub mod remote_session;
 pub mod renderer;
 pub mod scrollbar;
 pub mod search;

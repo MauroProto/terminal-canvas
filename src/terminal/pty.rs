@@ -24,6 +24,8 @@ use crate::terminal::colors::indexed_to_egui;
 #[cfg(feature = "ghostty-vt")]
 use crate::terminal::ghostty_backend::{GhosttyRuntimeHandle, GhosttyTextSnapshot};
 use crate::terminal::input::InputMode;
+#[cfg(all(unix, feature = "daemon"))]
+use crate::terminal::remote_session::RemoteLink;
 
 #[derive(Clone)]
 pub struct EventProxy {
@@ -83,9 +85,14 @@ pub struct PtyHandle {
     backend_kind: TerminalBackendKind,
     #[cfg(feature = "ghostty-vt")]
     ghostty_runtime: Option<GhosttyRuntimeHandle>,
-    master: Box<dyn MasterPty + Send>,
-    killer: Box<dyn ChildKiller + Send + Sync>,
+    /// `None` en una sesión hosteada por el daemon: el PTY real vive allá y
+    /// el resize se manda por el socket (P3.15, T3).
+    master: Option<Box<dyn MasterPty + Send>>,
+    killer: Option<Box<dyn ChildKiller + Send + Sync>>,
     child: Option<Box<dyn Child + Send + Sync>>,
+    /// Sesión del daemon a la que este handle está atado, si es remota.
+    #[cfg(all(unix, feature = "daemon"))]
+    remote: Option<RemoteLink>,
     _reader_thread: thread::JoinHandle<()>,
 }
 
@@ -293,20 +300,166 @@ impl PtyHandle {
             backend_kind,
             #[cfg(feature = "ghostty-vt")]
             ghostty_runtime,
-            master: pair.master,
-            killer,
+            master: Some(pair.master),
+            killer: Some(killer),
             child: Some(child),
+            #[cfg(all(unix, feature = "daemon"))]
+            remote: None,
+            _reader_thread: reader_thread,
+        })
+    }
+
+    /// Handle atado a una sesión **del daemon** (P3.15, T3).
+    ///
+    /// El grid se parsea acá igual que con un PTY local; lo único distinto es
+    /// que los bytes llegan del socket y las escrituras salen como `Write`.
+    /// El snapshot del attach se replaya antes de escuchar eventos nuevos, y
+    /// los eventos con `seq` ≤ el del attach se descartan (dedup, T4).
+    #[cfg(all(unix, feature = "daemon"))]
+    pub fn attach_remote(
+        session_id: Uuid,
+        control: std::os::unix::net::UnixStream,
+        events: std::os::unix::net::UnixStream,
+        snapshot: &str,
+        attached_seq: u64,
+        cols: u16,
+        rows: u16,
+        scheduler: SharedRuntimeScheduler,
+    ) -> anyhow::Result<Self> {
+        use crate::terminal::remote_session::{RemoteReader, RemoteWriter};
+
+        let link = RemoteLink::new(session_id, control);
+        let title = Arc::new(ArcSwap::from_pointee("Terminal".to_owned()));
+        let alive = Arc::new(AtomicBool::new(true));
+        let bell_fired = Arc::new(AtomicBool::new(false));
+        let last_output_at = Arc::new(AtomicI64::new(pty_clock_now_ms()));
+        let window_size = Arc::new(Mutex::new(WindowSize {
+            num_lines: rows,
+            num_cols: cols,
+            cell_width: 0,
+            cell_height: 0,
+        }));
+        let render_revision = Arc::new(AtomicU64::new(0));
+        let agent_status = Arc::new(ArcSwap::from_pointee(None));
+        let cwd = Arc::new(ArcSwap::from_pointee(None));
+        let pending_log = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let (event_tx, event_rx) = mpsc::channel::<Event>();
+        let term_config = TermConfig {
+            scrolling_history: crate::config::runtime_config().scrollback_lines,
+            ..TermConfig::default()
+        };
+        let scrollback_limit = term_config.scrolling_history;
+        let term = Arc::new(Mutex::new(Term::new(
+            term_config,
+            &TermSize::new(cols.max(1) as usize, rows.max(1) as usize),
+            EventProxy::new(event_tx),
+        )));
+
+        // El historial que el daemon ya tenía se replaya antes de escuchar:
+        // así el panel no aparece vacío al reengancharse.
+        if !snapshot.is_empty() {
+            if let Ok(mut term) = term.lock() {
+                let mut processor = Processor::<StdSyncHandler>::new();
+                processor.advance(&mut *term, snapshot.as_bytes());
+            }
+        }
+
+        let writer: Box<dyn Write + Send> = Box::new(RemoteWriter::new(link.clone()));
+        let writer_for_reader = Arc::new(Mutex::new(writer));
+        let writer_for_thread = Arc::clone(&writer_for_reader);
+        let title_for_reader = Arc::clone(&title);
+        let alive_for_reader = Arc::clone(&alive);
+        let bell_for_reader = Arc::clone(&bell_fired);
+        let output_for_reader = Arc::clone(&last_output_at);
+        let term_for_reader = Arc::clone(&term);
+        let window_size_for_reader = Arc::clone(&window_size);
+        let render_revision_for_reader = Arc::clone(&render_revision);
+        let agent_status_for_reader = Arc::clone(&agent_status);
+        let cwd_for_reader = Arc::clone(&cwd);
+        let scheduler_for_reader = Arc::clone(&scheduler);
+
+        let reader_thread = thread::spawn(move || {
+            let loop_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut processor = Processor::<StdSyncHandler>::new();
+                let mut agent_stream = AgentStatusStream::new();
+                let mut reader = RemoteReader::new(events, session_id, attached_seq);
+                while let Some(bytes) = reader.next_output() {
+                    let now_ms = pty_clock_now_ms();
+                    let (clean, agent_reports, cwd_reports) = agent_stream.process(&bytes, now_ms);
+                    if let Some(report) = agent_reports.into_iter().next_back() {
+                        agent_status_for_reader.store(Arc::new(Some(report)));
+                    }
+                    if let Some(new_cwd) = cwd_reports.into_iter().next_back() {
+                        cwd_for_reader.store(Arc::new(Some(new_cwd)));
+                    }
+                    if let Ok(mut term) = term_for_reader.lock() {
+                        processor.advance(&mut *term, &clean);
+                    }
+                    render_revision_for_reader.fetch_add(1, Ordering::Relaxed);
+                    output_for_reader.store(now_ms, Ordering::Relaxed);
+                    if let Ok(mut scheduler) = scheduler_for_reader.lock() {
+                        scheduler.record_output(session_id);
+                    }
+                    drain_terminal_events(
+                        &event_rx,
+                        &writer_for_thread,
+                        &title_for_reader,
+                        &alive_for_reader,
+                        &bell_for_reader,
+                        &window_size_for_reader,
+                        &scheduler_for_reader,
+                        session_id,
+                    );
+                }
+            }));
+            if loop_result.is_err() {
+                log::error!("el lector remoto de la sesión {session_id} paniqueó");
+            }
+            alive_for_reader.store(false, Ordering::Relaxed);
+            if let Ok(mut scheduler) = scheduler_for_reader.lock() {
+                scheduler.record_exit(session_id);
+            }
+        });
+
+        Ok(Self {
+            term,
+            title,
+            alive,
+            bell_fired,
+            writer: writer_for_reader,
+            last_output_at,
+            window_size,
+            render_revision,
+            agent_status,
+            cwd,
+            pending_log,
+            scrollback_limit,
+            #[cfg(feature = "ghostty-vt")]
+            backend_kind: TerminalBackendKind::Alacritty,
+            #[cfg(feature = "ghostty-vt")]
+            ghostty_runtime: None,
+            master: None,
+            killer: None,
+            child: None,
+            remote: Some(link),
             _reader_thread: reader_thread,
         })
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16) {
-        let _ = self.master.resize(PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        });
+        if let Some(master) = self.master.as_ref() {
+            let _ = master.resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            });
+        }
+        // Sesión remota: el resize viaja al daemon, que lo aplica al PTY real.
+        #[cfg(all(unix, feature = "daemon"))]
+        if let Some(remote) = self.remote.as_ref() {
+            remote.resize(cols, rows);
+        }
         let size_changed = if let Ok(mut window_size) = self.window_size.lock() {
             let changed = window_size.num_lines != rows || window_size.num_cols != cols;
             *window_size = WindowSize {
@@ -712,7 +865,15 @@ impl SchedulerEventFlags {
 impl Drop for PtyHandle {
     fn drop(&mut self) {
         self.alive.store(false, Ordering::Relaxed);
-        let _ = self.killer.kill();
+        if let Some(killer) = self.killer.as_mut() {
+            let _ = killer.kill();
+        }
+        // Sesión remota: matar el handle local no puede dejar el PTY del
+        // daemon corriendo para siempre.
+        #[cfg(all(unix, feature = "daemon"))]
+        if let Some(remote) = self.remote.as_ref() {
+            remote.kill();
+        }
         // Reap the child off-thread: without a wait() every closed terminal
         // leaves a zombie process, and long sessions with many terminals
         // eventually exhaust the process table.

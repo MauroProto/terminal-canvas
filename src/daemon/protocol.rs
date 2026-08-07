@@ -90,6 +90,10 @@ pub enum Request {
     },
     Spawn {
         spec: WireSpec,
+        /// Id que propone el cliente, para que el id de la app y el del daemon
+        /// sean el mismo (si no, la app no puede mapear panel ↔ sesión).
+        #[serde(default)]
+        id: Option<Uuid>,
     },
     /// Reengancharse a una sesión viva; devuelve snapshot + seq actual.
     Attach {
@@ -280,6 +284,7 @@ mod tests {
                 token: "abc".to_owned(),
             },
             Request::Spawn {
+                id: None,
                 spec: WireSpec {
                     title: "Terminal".to_owned(),
                     cwd: Some("/tmp".to_owned()),

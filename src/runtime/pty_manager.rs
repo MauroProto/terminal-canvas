@@ -73,7 +73,27 @@ pub fn drain_order(pending: &[Uuid], priority: Option<Uuid>, max_batch: usize) -
 pub struct PtyManager {
     sessions: HashMap<Uuid, ManagedSession>,
     scheduler: SharedRuntimeScheduler,
+    /// Crea la sesión en el daemon en vez de in-process (P3.15, T3).
+    ///
+    /// Se inyecta desde afuera a propósito: así el runtime no depende del
+    /// módulo del daemon (que es unix-only y va detrás de un feature), y los
+    /// harness de tests que montan este archivo por `#[path]` no necesitan
+    /// arrastrar todo el árbol del daemon.
+    remote_spawner: Option<RemoteSpawner>,
 }
+
+/// Crea una sesión fuera del proceso y devuelve su id y su handle.
+pub type RemoteSpawner = Box<
+    dyn Fn(
+            &SessionSpec,
+            u16,
+            u16,
+            SharedRuntimeScheduler,
+            Option<Uuid>,
+        ) -> anyhow::Result<(Uuid, PtyHandle)>
+        + Send
+        + Sync,
+>;
 
 struct ManagedSession {
     spec: SessionSpec,
@@ -256,6 +276,7 @@ impl PtyManager {
         Self {
             sessions: HashMap::new(),
             scheduler: Arc::new(Mutex::new(RuntimeScheduler::new())),
+            remote_spawner: None,
         }
     }
 
@@ -271,6 +292,16 @@ impl PtyManager {
         session_id
     }
 
+    /// Instala el creador de sesiones fuera del proceso (P3.15, T3).
+    pub fn set_remote_spawner(&mut self, spawner: RemoteSpawner) {
+        self.remote_spawner = Some(spawner);
+    }
+
+    /// ¿Las sesiones nuevas se crean fuera del proceso?
+    pub fn hosts_out_of_process(&self) -> bool {
+        self.remote_spawner.is_some()
+    }
+
     pub fn spawn(
         &mut self,
         spec: SessionSpec,
@@ -278,6 +309,32 @@ impl PtyManager {
         cols: u16,
         rows: u16,
     ) -> anyhow::Result<Uuid> {
+        // Con el daemon adoptado el PTY se crea allá: cerrar la app no lo mata.
+        if let Some(spawner) = self.remote_spawner.as_ref() {
+            let mut spec_with_cwd = spec.clone();
+            if spec_with_cwd.cwd.is_none() {
+                spec_with_cwd.cwd = cwd.map(Path::to_path_buf);
+            }
+            match spawner(
+                &spec_with_cwd,
+                cols,
+                rows,
+                Arc::clone(&self.scheduler),
+                None,
+            ) {
+                Ok((session_id, handle)) => {
+                    let mut managed = ManagedSession::detached(spec_with_cwd);
+                    managed.handle = Some(Arc::new(Mutex::new(handle)));
+                    self.sessions.insert(session_id, managed);
+                    return Ok(session_id);
+                }
+                Err(err) => {
+                    // Fallback in-process: mejor un terminal que muere con la
+                    // app que ningún terminal.
+                    log::warn!("el daemon no pudo hostear la sesión ({err}); se usa in-process");
+                }
+            }
+        }
         let session_id = Uuid::new_v4();
         let detached_spec = SessionSpec {
             title: spec.title.clone(),

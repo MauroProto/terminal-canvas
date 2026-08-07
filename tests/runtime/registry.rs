@@ -18,8 +18,20 @@ mod terminal {
     pub mod metrics;
     #[path = "../../../src/terminal/pty.rs"]
     pub mod pty;
+    #[cfg(all(unix, feature = "daemon"))]
+    #[path = "../../../src/terminal/remote_session.rs"]
+    pub mod remote_session;
 }
 
+#[cfg(all(unix, feature = "daemon"))]
+#[path = "../../src/daemon/protocol.rs"]
+pub mod daemon_protocol_impl;
+#[cfg(all(unix, feature = "daemon"))]
+mod daemon {
+    #![allow(dead_code)]
+
+    pub use super::daemon_protocol_impl as protocol;
+}
 #[path = "../../src/state/durable_write.rs"]
 pub mod durable_write_impl;
 #[path = "../../src/state/scrollback_log.rs"]

@@ -53,6 +53,16 @@ impl DaemonBackend {
         matches!(self, Self::Connected { .. })
     }
 
+    /// Endpoint para abrir conexiones nuevas (una por sesión remota).
+    pub fn endpoint(&self) -> Option<super::sessions::DaemonEndpoint> {
+        match self {
+            Self::Connected { dir, .. } => super::protocol::ensure_token(dir)
+                .ok()
+                .map(|token| super::sessions::DaemonEndpoint::new(dir.clone(), token)),
+            Self::Fallback { .. } => None,
+        }
+    }
+
     /// Motivo del fallback, si aplica (para el diagnóstico exportable).
     pub fn fallback_reason(&self) -> Option<&str> {
         match self {

@@ -61,6 +61,33 @@ impl DaemonConn {
         None
     }
 
+    /// Conexión cruda ya autenticada, para atar una sesión remota (T3).
+    ///
+    /// Se devuelve el stream pelado a propósito: el `PtyHandle` remoto usa el
+    /// **mismo** socket para escribir input y para leer sus eventos `Output`,
+    /// así no hace falta multiplexar ni drenar una segunda conexión.
+    pub fn connect_raw(dir: &Path, token: &str) -> Option<UnixStream> {
+        let stream = UnixStream::connect(socket_path(dir)).ok()?;
+        let mut writer = stream.try_clone().ok()?;
+        let mut reader = BufReader::new(stream.try_clone().ok()?);
+        writer
+            .write_all(
+                encode_line(&Request::Hello {
+                    version: PROTOCOL_VERSION,
+                    token: token.to_owned(),
+                })
+                .as_bytes(),
+            )
+            .ok()?;
+        writer.flush().ok()?;
+        let mut line = String::new();
+        reader.read_line(&mut line).ok()?;
+        match decode_line::<Response>(&line) {
+            Some(Response::Welcome { version }) if version == PROTOCOL_VERSION => Some(stream),
+            _ => None,
+        }
+    }
+
     /// Conecta sin levantar nada.
     pub fn try_connect(dir: &Path, token: &str) -> Option<Self> {
         let stream = UnixStream::connect(socket_path(dir)).ok()?;
@@ -112,7 +139,7 @@ impl DaemonConn {
     }
 
     pub fn spawn_session(&mut self, spec: super::protocol::WireSpec) -> Option<Uuid> {
-        match self.request(&Request::Spawn { spec })? {
+        match self.request(&Request::Spawn { spec, id: None })? {
             Response::Spawned { id } => Some(id),
             _ => None,
         }
