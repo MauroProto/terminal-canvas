@@ -285,6 +285,24 @@ impl TerminalApp {
             if !repo_root.is_empty() {
                 ui.label(RichText::new(repo_root).size(10.5).color(palette::DIM));
             }
+            // PR asociado a la branch del review (P2.13, T4): sale del
+            // snapshot de `gh` que ya trajo la pestaña Tasks.
+            if let Some(number) = self
+                .tasks_state
+                .snapshot
+                .pull_requests
+                .iter()
+                .find(|pr| !branch.is_empty() && pr.head_ref_name == branch)
+                .map(|pr| pr.number)
+            {
+                ui.add_space(8.0);
+                if ui
+                    .small_button(RichText::new(format!("PR #{number}")).size(10.5))
+                    .clicked()
+                {
+                    self.open_github_task(number);
+                }
+            }
             if !branch.is_empty() {
                 ui.add_space(8.0);
                 branch_badge(ui, &branch);

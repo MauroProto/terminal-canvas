@@ -178,6 +178,8 @@ pub struct TerminalPanel {
     /// Issue de GitHub que este panel está trabajando (P2.13), para el badge
     /// `#N` clickeable del título.
     linked_issue: Option<u64>,
+    /// Id de sesión del agente reportado por su hook (P2.12, T3).
+    agent_session_id: Option<String>,
     /// Árbol de splits (P2.11). `None` = una sola sesión (comportamiento
     /// clásico). Cuando existe, cada hoja tiene su propia sesión.
     split_tree: Option<crate::terminal::split_tree::SplitNode>,
@@ -226,6 +228,7 @@ impl TerminalPanel {
             agent_command: None,
             unread: false,
             linked_issue: None,
+            agent_session_id: None,
             split_tree: None,
             root_leaf: uuid::Uuid::new_v4(),
             leaf_sessions: std::collections::HashMap::new(),
@@ -263,6 +266,7 @@ impl TerminalPanel {
         panel.agent_command = saved.agent_command.clone();
         panel.unread = saved.unread;
         panel.linked_issue = saved.linked_issue;
+        panel.agent_session_id = saved.agent_session_id.clone();
         panel.restore_split_tree(
             saved.split_tree.as_ref(),
             saved.focused_leaf.as_deref(),
@@ -284,7 +288,15 @@ impl TerminalPanel {
         // anterior quedaba huérfana en el historial del CLI.
         let startup_command = panel.agent_command.as_deref().map(|command| {
             let provider = AgentProvider::detect(command).unwrap_or_default();
-            crate::orchestration::resume_command(provider, command)
+            // Con el id que reportó el hook se reanuda la conversación exacta
+            // (`--resume <id>`); sin él solo queda `--continue` (P2.12, T3).
+            match panel.agent_session_id.as_deref() {
+                Some(session_id) => {
+                    crate::orchestration::resume_invocation(provider, command, session_id)
+                        .unwrap_or_else(|| crate::orchestration::resume_command(provider, command))
+                }
+                None => crate::orchestration::resume_command(provider, command),
+            }
         });
         panel.session.restore_detached_with_spec(
             pty_manager,
@@ -390,6 +402,7 @@ impl TerminalPanel {
             agent_command: self.agent_command.clone(),
             unread: self.unread,
             linked_issue: self.linked_issue,
+            agent_session_id: self.agent_session_id.clone(),
             split_tree: self
                 .split_tree
                 .as_ref()
@@ -410,6 +423,15 @@ impl TerminalPanel {
     /// ¿Hay atención pendiente de ver en este panel? (P1.8)
     pub fn unread(&self) -> bool {
         self.unread
+    }
+
+    /// Id de sesión del agente (P2.12, T3), para el resume exacto.
+    pub fn agent_session_id(&self) -> Option<&str> {
+        self.agent_session_id.as_deref()
+    }
+
+    pub fn set_agent_session_id(&mut self, session_id: Option<String>) {
+        self.agent_session_id = session_id;
     }
 
     /// Issue de GitHub vinculado a este panel (P2.13).
@@ -564,6 +586,19 @@ impl TerminalPanel {
 
     pub fn focused_leaf_id(&self) -> crate::terminal::split_tree::LeafId {
         self.focused_leaf
+    }
+
+    /// Posición (0-based) de la hoja enfocada en el orden DFS, para mostrar
+    /// "hoja 2/3" en el título y en los destinos del broadcast (P2.11, T5).
+    pub fn focused_leaf_index(&self) -> usize {
+        self.split_tree
+            .as_ref()
+            .and_then(|tree| {
+                tree.leaves()
+                    .iter()
+                    .position(|leaf| *leaf == self.focused_leaf)
+            })
+            .unwrap_or(0)
     }
 
     /// Restaura el árbol de splits persistido y respawnea una sesión por hoja
@@ -1132,6 +1167,50 @@ impl TerminalPanel {
             .flatten()
     }
 
+    /// Historial ANSI de **cada hoja** (P2.11, T4). La hoja raíz se reporta
+    /// como `None` para que use el nombre de archivo histórico.
+    pub fn leaf_scrollbacks(&self) -> Vec<(Option<crate::terminal::split_tree::LeafId>, String)> {
+        let mut out = Vec::new();
+        let leaves = match self.split_tree.as_ref() {
+            Some(tree) => tree.leaves(),
+            None => vec![self.root_leaf],
+        };
+        for leaf in leaves {
+            let key = (leaf != self.root_leaf).then_some(leaf);
+            let ansi = self
+                .leaf_session(leaf)
+                .with_pty(|pty| {
+                    pty.with_term(|term| crate::terminal::export::scrollback_to_ansi(term))
+                })
+                .flatten();
+            if let Some(text) = ansi {
+                out.push((key, text));
+            }
+        }
+        out
+    }
+
+    /// Restaura el historial de cada hoja (P2.11, T4). Devuelve `false` si el
+    /// panel todavía no tiene terminal.
+    pub fn restore_leaf_histories(
+        &mut self,
+        histories: &[(Option<crate::terminal::split_tree::LeafId>, String)],
+    ) -> bool {
+        let mut restored_any = false;
+        for (key, text) in histories {
+            let leaf = key.unwrap_or(self.root_leaf);
+            let bytes = crate::state::scrollback_store::replay_bytes(text);
+            if self
+                .leaf_session(leaf)
+                .with_pty(|pty| pty.replay_history(&bytes))
+                .is_some()
+            {
+                restored_any = true;
+            }
+        }
+        restored_any
+    }
+
     /// Historial completo con colores ANSI (SGR mínimo), para persistir y
     /// restaurar con estilo. `None` si la sesión está detached.
     pub fn scrollback_ansi(&self) -> Option<String> {
@@ -1652,6 +1731,37 @@ impl TerminalPanel {
                             overlay.dirty,
                             chrome_zoom,
                         );
+                    }
+                }
+                // Badge de la hoja activa cuando hay splits (P2.11, T5): sin
+                // esto no se sabe a qué hoja va el teclado.
+                if let Some(tree) = self.split_tree.as_ref() {
+                    let total = tree.leaf_count();
+                    if total > 1 {
+                        let label = format!("{}/{}", self.focused_leaf_index() + 1, total);
+                        let font = FontId::proportional((10.0 * chrome_zoom).clamp(7.0, 10.0));
+                        let galley = chrome_painter.layout_no_wrap(label, font, DIM_FG);
+                        let padding = vec2(6.0, 2.0);
+                        let size = vec2(
+                            galley.size().x + padding.x * 2.0,
+                            galley.size().y + padding.y * 2.0,
+                        );
+                        let left = title_rect.left() + 10.0;
+                        let rect = Rect::from_min_size(
+                            pos2(left, title_rect.center().y - size.y * 0.5),
+                            size,
+                        );
+                        if rect.right() < title_galley_rect.left() - 4.0 {
+                            chrome_painter.rect_filled(rect, 4.0, BRANCH_BADGE_BG);
+                            chrome_painter.galley(
+                                pos2(
+                                    rect.left() + padding.x,
+                                    rect.center().y - galley.size().y * 0.5,
+                                ),
+                                galley,
+                                DIM_FG,
+                            );
+                        }
                     }
                 }
                 // Badge `#N` del issue de GitHub que trabaja este panel

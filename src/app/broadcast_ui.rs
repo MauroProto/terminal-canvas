@@ -65,12 +65,27 @@ impl TerminalApp {
             .ws()
             .panels
             .iter()
-            .map(|panel| BroadcastTarget {
-                panel_id: panel.id(),
-                title: panel.title().to_owned(),
-                alive: panel.is_alive(),
-                // Por defecto todos los vivos: el caso común es "a todos".
-                selected: panel.is_alive(),
+            .map(|panel| {
+                // Con splits el título dice a qué hoja va (P2.11, T5): sin
+                // esto, cuatro hojas del mismo panel se ven idénticas.
+                let title = match panel.leaf_count() {
+                    count if count > 1 => {
+                        format!(
+                            "{} · hoja {}/{}",
+                            panel.title(),
+                            panel.focused_leaf_index() + 1,
+                            count
+                        )
+                    }
+                    _ => panel.title().to_owned(),
+                };
+                BroadcastTarget {
+                    panel_id: panel.id(),
+                    title,
+                    alive: panel.is_alive(),
+                    // Por defecto todos los vivos: el caso común es "a todos".
+                    selected: panel.is_alive(),
+                }
             })
             .collect();
 

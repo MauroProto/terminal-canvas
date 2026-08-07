@@ -25,6 +25,18 @@ pub fn scrollback_file_name(panel_id: Uuid) -> String {
     format!("{}.txt", panel_id.simple())
 }
 
+/// Nombre de archivo de una **hoja** de un panel con splits (P2.11, T4).
+///
+/// La migración es implícita: la hoja raíz usa el nombre viejo (sin sufijo),
+/// así los archivos de antes de los splits siguen siendo el historial de la
+/// hoja raíz sin tener que mover nada en disco.
+pub fn scrollback_leaf_file_name(panel_id: Uuid, leaf_id: Option<Uuid>) -> String {
+    match leaf_id {
+        Some(leaf) => format!("{}-{}.txt", panel_id.simple(), leaf.simple()),
+        None => scrollback_file_name(panel_id),
+    }
+}
+
 /// Nombre del log incremental de un panel (P1.7).
 pub fn scrollback_log_file_name(panel_id: Uuid) -> String {
     format!("{}.mtlg", panel_id.simple())
@@ -70,6 +82,36 @@ pub fn clamp_scrollback(text: &str, max_bytes: usize) -> &str {
     }
 }
 
+/// Guarda el scrollback de una hoja concreta (P2.11, T4). `leaf_id: None` es
+/// la hoja raíz, que usa el nombre histórico.
+pub fn save_leaf_scrollback(
+    dir: &Path,
+    panel_id: Uuid,
+    leaf_id: Option<Uuid>,
+    text: &str,
+) -> anyhow::Result<()> {
+    let name = scrollback_leaf_file_name(panel_id, leaf_id);
+    if text.trim().is_empty() {
+        let _ = std::fs::remove_file(dir.join(&name));
+        return Ok(());
+    }
+    std::fs::create_dir_all(dir)?;
+    let clamped = clamp_scrollback(text, MAX_PERSISTED_BYTES);
+    std::fs::write(dir.join(&name), clamped.as_bytes())?;
+    Ok(())
+}
+
+/// Carga el scrollback de una hoja concreta.
+pub fn load_leaf_scrollback(dir: &Path, panel_id: Uuid, leaf_id: Option<Uuid>) -> Option<String> {
+    let bytes = std::fs::read(dir.join(scrollback_leaf_file_name(panel_id, leaf_id))).ok()?;
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    if text.trim().is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
 pub fn save_scrollback(dir: &Path, panel_id: Uuid, text: &str) -> anyhow::Result<()> {
     if text.trim().is_empty() {
         // Nada que guardar: si había un archivo viejo, lo sacamos para no
@@ -109,7 +151,7 @@ pub fn prune_scrollback(dir: &Path, live_panel_ids: &[Uuid]) -> usize {
         let name = entry.file_name().to_string_lossy().to_string();
         // Sólo tocamos nuestros propios archivos (checkpoint, log, generation).
         let ours = name.ends_with(".txt") || name.ends_with(".mtlg") || name.ends_with(".gen");
-        if !ours || live_stems.iter().any(|stem| stem == stem_of(&name)) {
+        if !ours || live_stems.iter().any(|stem| stem == panel_stem_of(&name)) {
             continue;
         }
         if std::fs::remove_file(entry.path()).is_ok() {
@@ -120,7 +162,7 @@ pub fn prune_scrollback(dir: &Path, live_panel_ids: &[Uuid]) -> usize {
 }
 
 /// Stem de un archivo de scrollback sin la extensión, para comparar paneles
-/// vivos contra sus tres tipos de archivo (.txt/.mtlg/.gen).
+/// vivos contra sus tipos de archivo (.txt/.mtlg/.gen).
 fn stem_of(name: &str) -> &str {
     if let Some(stem) = name.strip_suffix(".txt") {
         stem
@@ -130,6 +172,17 @@ fn stem_of(name: &str) -> &str {
         stem
     } else {
         name
+    }
+}
+
+/// Parte del stem que identifica el **panel**: los archivos de hoja son
+/// `{panel}-{leaf}`, así que el panel es lo que va antes del primer guión.
+/// Sin esto, el prune borraba el historial de las hojas de paneles vivos.
+fn panel_stem_of(name: &str) -> &str {
+    let stem = stem_of(name);
+    match stem.split_once('-') {
+        Some((panel, _leaf)) => panel,
+        None => stem,
     }
 }
 
@@ -353,5 +406,86 @@ mod tests {
         let text = String::from_utf8_lossy(&replay_bytes("")).into_owned();
         assert!(text.contains("sesión anterior"));
         assert!(!text.contains("\r\n\r\n"), "no blank padding: {text:?}");
+    }
+
+    #[test]
+    fn the_root_leaf_keeps_the_historic_file_name() {
+        // Ésta es la migración: los archivos de antes de los splits son el
+        // historial de la hoja raíz, sin mover nada en disco.
+        let panel = Uuid::new_v4();
+        assert_eq!(
+            super::scrollback_leaf_file_name(panel, None),
+            scrollback_file_name(panel)
+        );
+    }
+
+    #[test]
+    fn each_leaf_gets_its_own_file() {
+        let panel = Uuid::new_v4();
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let name_a = super::scrollback_leaf_file_name(panel, Some(a));
+        let name_b = super::scrollback_leaf_file_name(panel, Some(b));
+        assert_ne!(name_a, name_b);
+        assert!(name_a.starts_with(&panel.simple().to_string()));
+        assert!(name_a.ends_with(".txt"));
+        assert!(!name_a.contains('/'), "got {name_a}");
+    }
+
+    #[test]
+    fn leaf_scrollbacks_round_trip_independently() {
+        let dir = temp_dir("leaves");
+        let panel = Uuid::new_v4();
+        let leaf = Uuid::new_v4();
+        super::save_leaf_scrollback(&dir, panel, None, "raiz\n").expect("save raíz");
+        super::save_leaf_scrollback(&dir, panel, Some(leaf), "hoja\n").expect("save hoja");
+
+        assert_eq!(
+            super::load_leaf_scrollback(&dir, panel, None).as_deref(),
+            Some("raiz\n")
+        );
+        assert_eq!(
+            super::load_leaf_scrollback(&dir, panel, Some(leaf)).as_deref(),
+            Some("hoja\n")
+        );
+        // La hoja raíz se lee igual por el camino histórico.
+        assert_eq!(load_scrollback(&dir, panel).as_deref(), Some("raiz\n"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pruning_keeps_the_leaf_files_of_live_panels() {
+        // La regresión concreta: el prune comparaba el stem completo, así que
+        // `{panel}-{leaf}.txt` no matcheaba con el panel vivo y se borraba.
+        let dir = temp_dir("prune-leaves");
+        let live = Uuid::new_v4();
+        let dead = Uuid::new_v4();
+        let leaf = Uuid::new_v4();
+        super::save_leaf_scrollback(&dir, live, None, "raiz viva\n").unwrap();
+        super::save_leaf_scrollback(&dir, live, Some(leaf), "hoja viva\n").unwrap();
+        super::save_leaf_scrollback(&dir, dead, Some(leaf), "hoja muerta\n").unwrap();
+
+        let removed = prune_scrollback(&dir, &[live]);
+        let leaf_alive = super::load_leaf_scrollback(&dir, live, Some(leaf));
+        let root_alive = super::load_leaf_scrollback(&dir, live, None);
+        let leaf_dead = super::load_leaf_scrollback(&dir, dead, Some(leaf));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(removed, 1, "solo el archivo del panel muerto");
+        assert_eq!(leaf_alive.as_deref(), Some("hoja viva\n"));
+        assert_eq!(root_alive.as_deref(), Some("raiz viva\n"));
+        assert_eq!(leaf_dead, None);
+    }
+
+    #[test]
+    fn saving_blank_leaf_text_removes_its_file() {
+        let dir = temp_dir("blank-leaf");
+        let panel = Uuid::new_v4();
+        let leaf = Uuid::new_v4();
+        super::save_leaf_scrollback(&dir, panel, Some(leaf), "algo\n").unwrap();
+        super::save_leaf_scrollback(&dir, panel, Some(leaf), "  \n").unwrap();
+        let after = super::load_leaf_scrollback(&dir, panel, Some(leaf));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(after, None, "historial viejo no puede sobrevivir");
     }
 }

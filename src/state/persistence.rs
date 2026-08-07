@@ -383,6 +383,7 @@ mod tests {
                     split_tree: None,
                     focused_leaf: None,
                     linked_issue: None,
+                    agent_session_id: None,
                 }],
                 desktop: WorkspaceDesktopState {
                     next_z: 2,

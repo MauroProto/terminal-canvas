@@ -357,6 +357,17 @@ impl WorkspacePanel {
         }
     }
 
+    pub fn leaf_scrollbacks(&self) -> Vec<(Option<uuid::Uuid>, String)> {
+        match self {
+            Self::Terminal(panel) => panel.leaf_scrollbacks(),
+        }
+    }
+
+    pub fn restore_leaf_histories(&mut self, histories: &[(Option<uuid::Uuid>, String)]) -> bool {
+        let Self::Terminal(panel) = self;
+        panel.restore_leaf_histories(histories)
+    }
+
     pub fn scrollback_ansi(&self) -> Option<String> {
         match self {
             Self::Terminal(panel) => panel.scrollback_ansi(),
@@ -375,6 +386,17 @@ impl WorkspacePanel {
         }
     }
 
+    pub fn set_agent_session_id(&mut self, session_id: Option<String>) {
+        let Self::Terminal(panel) = self;
+        panel.set_agent_session_id(session_id);
+    }
+
+    pub fn agent_session_id(&self) -> Option<&str> {
+        match self {
+            Self::Terminal(panel) => panel.agent_session_id(),
+        }
+    }
+
     pub fn linked_issue(&self) -> Option<u64> {
         match self {
             Self::Terminal(panel) => panel.linked_issue(),
@@ -389,6 +411,18 @@ impl WorkspacePanel {
     pub fn set_unread(&mut self, unread: bool) {
         match self {
             Self::Terminal(panel) => panel.set_unread(unread),
+        }
+    }
+
+    pub fn leaf_count(&self) -> usize {
+        match self {
+            Self::Terminal(panel) => panel.leaf_count(),
+        }
+    }
+
+    pub fn focused_leaf_index(&self) -> usize {
+        match self {
+            Self::Terminal(panel) => panel.focused_leaf_index(),
         }
     }
 

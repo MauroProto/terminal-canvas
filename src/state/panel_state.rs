@@ -77,6 +77,10 @@ pub struct PanelState {
     /// Issue de GitHub que este panel está trabajando (P2.13).
     #[serde(default)]
     pub linked_issue: Option<u64>,
+    /// Id de sesión que reportó el hook del agente (P2.12, T3). Con esto el
+    /// restore reanuda con `--resume <id>` exacto en vez de `--continue`.
+    #[serde(default)]
+    pub agent_session_id: Option<String>,
 }
 
 #[cfg(test)]
@@ -106,6 +110,7 @@ mod tests {
             split_tree: None,
             focused_leaf: None,
             linked_issue: None,
+            agent_session_id: None,
         }
     }
 

@@ -1092,8 +1092,21 @@ impl TerminalApp {
     }
 
     /// Checkpoint completo ANSI + sube la generation y descarta el log (P1.7).
+    ///
+    /// Con splits se guarda una hoja por archivo (P2.11, T4); la raíz mantiene
+    /// el nombre histórico.
     fn persist_full_checkpoint(&self, dir: &std::path::Path, panel: &crate::panel::CanvasPanel) {
         let panel_id = panel.id();
+        if panel.leaf_count() > 1 {
+            for (leaf, text) in panel.leaf_scrollbacks() {
+                if let Err(err) =
+                    crate::state::scrollback_store::save_leaf_scrollback(dir, panel_id, leaf, &text)
+                {
+                    log::warn!("no se pudo guardar el scrollback de una hoja: {err}");
+                }
+            }
+            return;
+        }
         // Un panel detached no tiene texto que leer; su archivo previo se
         // conserva tal cual (es justo el historial a restaurar).
         let Some(text) = panel.scrollback_ansi() else {
@@ -1163,6 +1176,21 @@ impl TerminalApp {
                 self.scrollback_restored.insert(panel_id);
                 continue;
             };
+            // Con splits, cada hoja tiene su propio archivo (P2.11, T4).
+            let leaf_histories = collect_leaf_histories(&dir, panel_id);
+            if !leaf_histories.is_empty() {
+                let restored = self
+                    .workspaces
+                    .iter_mut()
+                    .flat_map(|workspace| workspace.panels.iter_mut())
+                    .find(|panel| panel.id() == panel_id)
+                    .map(|panel| panel.restore_leaf_histories(&leaf_histories))
+                    .unwrap_or(true);
+                if restored {
+                    self.scrollback_restored.insert(panel_id);
+                }
+                continue;
+            }
             // Log incremental (P1.7): solo se replaya si la generation coincide
             // con la del checkpoint; si no, se ignora (mismatch o cola rota).
             let frames = load_session_frames(&dir, panel_id);
@@ -1687,6 +1715,42 @@ fn write_generation(dir: &std::path::Path, panel_id: Uuid, generation: u32) -> s
         panel_id,
     ));
     std::fs::write(path, generation.to_le_bytes())
+}
+
+/// Historiales por hoja de un panel con splits (P2.11, T4). Vacío si el panel
+/// no tiene archivos de hoja (o sea: no estaba spliteado).
+fn collect_leaf_histories(dir: &std::path::Path, panel_id: Uuid) -> Vec<(Option<Uuid>, String)> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let prefix = format!("{}-", panel_id.simple());
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let Some(rest) = name
+            .strip_prefix(&prefix)
+            .and_then(|r| r.strip_suffix(".txt"))
+        else {
+            continue;
+        };
+        let Ok(leaf) = Uuid::parse_str(rest) else {
+            continue;
+        };
+        if let Some(text) =
+            crate::state::scrollback_store::load_leaf_scrollback(dir, panel_id, Some(leaf))
+        {
+            out.push((Some(leaf), text));
+        }
+    }
+    if out.is_empty() {
+        return Vec::new();
+    }
+    // La raíz usa el nombre histórico: va primero para que el orden de replay
+    // sea estable.
+    if let Some(root) = crate::state::scrollback_store::load_leaf_scrollback(dir, panel_id, None) {
+        out.insert(0, (None, root));
+    }
+    out
 }
 
 /// Frames del log incremental que corresponden al checkpoint actual (P1.7).

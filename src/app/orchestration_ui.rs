@@ -177,6 +177,19 @@ impl TerminalApp {
             else {
                 continue;
             };
+            // El id de sesión que trae el hook se guarda en el panel: con eso
+            // el próximo arranque reanuda la conversación exacta (P2.12, T3).
+            if let Some(session_id) = event.session_id.clone() {
+                for workspace in &mut self.workspaces {
+                    for panel in &mut workspace.panels {
+                        if panel.id() == panel_id
+                            && panel.agent_session_id() != Some(session_id.as_str())
+                        {
+                            panel.set_agent_session_id(Some(session_id.clone()));
+                        }
+                    }
+                }
+            }
             self.orchestrator.apply_hook_event(&event, alive, now);
         }
         self.repaint_policy.note_runtime_event();
