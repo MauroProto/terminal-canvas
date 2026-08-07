@@ -127,3 +127,6 @@ mem_forget = "deny"
 [[bench]]
 name = "hot_paths"
 harness = false
+
+[target."cfg(unix)".dependencies]
+libc = "0.2.189"
