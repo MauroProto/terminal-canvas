@@ -65,7 +65,11 @@ use crate::theme::colors as palette;
 use crate::utils::platform::default_shell;
 
 pub const TITLE_BAR_HEIGHT: f32 = 28.0;
-pub const BORDER_RADIUS: f32 = 0.0;
+/// Radio base de las ventanas de terminal. Es el `--radius` de Orca (10px):
+/// con esquinas rectas y el canvas casi del mismo tono que el cuerpo, los
+/// paneles se leían como una sola superficie cortada por rayas negras, no como
+/// ventanas apoyadas sobre un escritorio.
+pub const BORDER_RADIUS: f32 = 10.0;
 pub const MIN_WIDTH: f32 = 260.0;
 pub const MIN_HEIGHT: f32 = 180.0;
 #[allow(dead_code)]
@@ -73,19 +77,24 @@ pub const RESIZE_GRIP_SIZE: f32 = 32.0;
 pub const RESIZE_HIT_THICKNESS: f32 = 12.0;
 #[allow(dead_code)]
 pub const RESIZE_CORNER_SIZE: f32 = 28.0;
-pub const PANEL_BG: Color32 = Color32::from_rgb(18, 18, 18);
-pub const TITLE_BG: Color32 = Color32::from_rgb(26, 26, 26);
-pub const BORDER_DEFAULT: Color32 = Color32::from_rgb(56, 56, 56);
-pub const BORDER_FOCUS: Color32 = Color32::from_rgb(110, 110, 110);
-pub const FG: Color32 = Color32::from_rgb(244, 244, 244);
-pub const DIM_FG: Color32 = Color32::from_rgb(110, 110, 110);
-/// Fondo del badge de branch: apenas más claro que la barra de título.
-const BRANCH_BADGE_BG: Color32 = Color32::from_rgb(38, 38, 38);
+pub const PANEL_BG: Color32 = palette::SURFACE;
+pub const TITLE_BG: Color32 = palette::RAISED;
+pub const BORDER_DEFAULT: Color32 = palette::LINE;
+pub const BORDER_FOCUS: Color32 = palette::RING;
+pub const FG: Color32 = palette::TEXT_STRONG;
+pub const DIM_FG: Color32 = palette::DIM;
+/// Fondo del badge de branch: un escalón por encima de la barra de título,
+/// porque apoyado sobre `RAISED` con el mismo tono el badge desaparecía.
+const BRANCH_BADGE_BG: Color32 = palette::HOVER;
 /// Punto que marca "hay cambios sin commitear" (ámbar, no rojo: no es error).
 const BRANCH_DIRTY_DOT: Color32 = Color32::from_rgb(226, 178, 96);
-pub const MAC_RED: Color32 = Color32::from_rgb(244, 244, 244);
-pub const MAC_YELLOW: Color32 = Color32::from_rgb(170, 170, 170);
-pub const MAC_GREEN: Color32 = Color32::from_rgb(208, 208, 208);
+/// Controles de ventana del panel en reposo. Son monocromos a propósito: el
+/// color queda reservado para estado, y un semáforo de colores acá compite
+/// con la salida del terminal, que es lo que el usuario mira.
+pub const CONTROL_IDLE: Color32 = palette::DIM;
+/// Bajo el puntero. Sin esto los controles no se distinguían de una
+/// decoración: se veían igual apuntados que no apuntados.
+pub const CONTROL_HOVER: Color32 = palette::TEXT_STRONG;
 pub const CHROME_ZOOM_MAX: f32 = 1.0;
 pub const MIN_CONTROL_STRIP_WIDTH: f32 = 72.0;
 pub const MIN_TITLE_TEXT_WIDTH: f32 = 132.0;
@@ -115,6 +124,7 @@ pub enum ResizeHandle {
 pub enum PanelHitArea {
     CloseButton,
     MinimizeButton,
+    MaximizeButton,
     TitleBar,
     Body,
     #[allow(dead_code)]
@@ -1436,6 +1446,13 @@ impl TerminalPanel {
         {
             return Some(PanelHitArea::MinimizeButton);
         }
+        if should_draw_window_controls(screen_rect, title_rect)
+            && maximize_rect(title_rect)
+                .intersect(canvas_rect)
+                .contains(pos)
+        {
+            return Some(PanelHitArea::MaximizeButton);
+        }
 
         // Resize from corners/edges is intentionally disabled: panels are
         // always auto-tiled into one of the fixed slots, never freely resized.
@@ -1739,27 +1756,37 @@ impl TerminalPanel {
             chrome_painter.rect_filled(title_rect, title_rounding, TITLE_BG);
         }
         if show_controls {
-            let controls_y = title_rect.center().y;
             let button_radius = (6.5 * chrome_zoom).clamp(2.0, 6.5);
-            let button_spacing = (20.0 * chrome_zoom).clamp(7.0, 20.0);
-            let button_offset = (26.0 * chrome_zoom).clamp(12.0, 26.0);
-            let red_center = pos2(title_rect.left() + button_offset, controls_y);
-            let yellow_center = pos2(
-                title_rect.left() + button_offset + button_spacing,
-                controls_y,
-            );
-            let green_center = pos2(
-                title_rect.left() + button_offset + button_spacing * 2.0,
-                controls_y,
-            );
-            chrome_painter.circle_filled(red_center, button_radius, MAC_RED);
-            chrome_painter.circle_filled(yellow_center, button_radius, MAC_YELLOW);
-            chrome_painter.circle_filled(green_center, button_radius, MAC_GREEN);
+            // Los centros salen de los mismos rects que usa `hit_test`, así el
+            // punto que se ve y el área que responde no pueden separarse.
+            let pointer = ui.ctx().pointer_latest_pos();
+            for (rect, glyph) in [
+                (close_rect(title_rect), "\u{00d7}"),
+                (minimize_rect(title_rect), "\u{2212}"),
+                (maximize_rect(title_rect), "\u{002b}"),
+            ] {
+                let hovered = pointer.is_some_and(|pos| rect.contains(pos));
+                let color = if hovered { CONTROL_HOVER } else { CONTROL_IDLE };
+                chrome_painter.circle_filled(rect.center(), button_radius, color);
+                // El glifo sólo aparece bajo el puntero: tres puntos iguales no
+                // dicen cuál cierra y cuál minimiza, pero dibujarlos siempre
+                // mete ruido en cada panel. Sale sobre el color de hover, así
+                // que va en tinta oscura.
+                if hovered {
+                    chrome_painter.text(
+                        rect.center(),
+                        Align2::CENTER_CENTER,
+                        glyph,
+                        FontId::proportional(button_radius * 1.5),
+                        palette::INK,
+                    );
+                }
+            }
         }
         if show_title {
             let title_text = self.window_title(screen_rect.width());
             let title_offset = if show_controls {
-                (96.0 * chrome_zoom).clamp(42.0, 96.0)
+                (84.0 * chrome_zoom).clamp(42.0, 84.0)
             } else {
                 match lod {
                     PanelLod::Compact => 10.0,
@@ -1771,7 +1798,7 @@ impl TerminalPanel {
                 title_rect.left_center() + vec2(title_offset, 0.0),
                 Align2::LEFT_CENTER,
                 title_text,
-                FontId::proportional((15.5 * chrome_zoom).clamp(7.0, 15.5)),
+                FontId::proportional((13.0 * chrome_zoom).clamp(7.0, 13.0)),
                 if self.is_alive() { FG } else { DIM_FG },
             );
             // Badge de branch a la derecha, sólo en LOD Full y sólo si entra

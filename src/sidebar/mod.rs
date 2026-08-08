@@ -145,8 +145,10 @@ impl Sidebar {
         ui.visuals_mut().widgets.noninteractive.bg_fill = SIDEBAR_BG;
         let area = ui.max_rect();
         ui.painter().rect_filled(area, 0.0, SIDEBAR_BG);
-        let divider_color = egui::Color32::from_rgb(72, 72, 72);
-        let divider_width = 1.5;
+        // Hairline, no una barra: el divisor separa el sidebar del canvas, no
+        // compite con él (regla de bordes del style guide).
+        let divider_color = SIDEBAR_BORDER;
+        let divider_width = 1.0;
         ui.painter().rect_filled(
             egui::Rect::from_min_max(
                 egui::pos2(area.right() - divider_width, area.top()),

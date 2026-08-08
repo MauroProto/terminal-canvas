@@ -52,14 +52,14 @@ pub fn draw_workspace_tree(
                 egui::pos2(label_x, header_rect.top() + 9.0),
                 Align2::LEFT_TOP,
                 truncate(&workspace.name, 20),
-                FontId::proportional(12.0),
+                FontId::proportional(13.0),
                 TEXT_PRIMARY,
             );
             ui.painter().text(
                 egui::pos2(label_x, header_rect.bottom() - 9.0),
                 Align2::LEFT_BOTTOM,
                 truncate_middle(path, 32),
-                FontId::proportional(9.5),
+                FontId::proportional(11.0),
                 TEXT_MUTED,
             );
         } else {
@@ -67,7 +67,7 @@ pub fn draw_workspace_tree(
                 egui::pos2(label_x, header_rect.center().y),
                 Align2::LEFT_CENTER,
                 truncate(&workspace.name, 22),
-                FontId::proportional(12.0),
+                FontId::proportional(13.0),
                 TEXT_PRIMARY,
             );
         }

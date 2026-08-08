@@ -391,7 +391,8 @@ impl TerminalApp {
                         }
                         PanelHitArea::Body
                         | PanelHitArea::CloseButton
-                        | PanelHitArea::MinimizeButton => {
+                        | PanelHitArea::MinimizeButton
+                        | PanelHitArea::MaximizeButton => {
                             self.panel_gesture = None;
                         }
                     }
@@ -658,6 +659,12 @@ impl TerminalApp {
                                 );
                             }
                         }
+                    }
+                } else if matches!(hit.area, PanelHitArea::MaximizeButton) {
+                    // Mismo destino que el doble click en la titlebar: alterna
+                    // entre maximizado y el tamaño anterior.
+                    if let Some(panel_id) = panel_id_for_hit(self.ws(), &hit) {
+                        self.ws_mut().maximize_panel(panel_id, desktop_rect);
                     }
                 }
             }

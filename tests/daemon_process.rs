@@ -435,9 +435,21 @@ fn closing_the_app_keeps_the_session_but_closing_the_panel_kills_it() {
         .spawn(SessionSpec::default(), None, 80, 24)
         .expect("otra sesión");
     assert!(manager.close_and_kill_remote(id2));
-    let remaining = conn.list();
+    // El kill viaja por la conexión del manager y el list por esta otra, así
+    // que no hay orden garantizado entre las dos: bajo carga el list llegaba
+    // primero y el test fallaba sin que hubiera nada roto. Se espera al efecto.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut remaining = conn.list();
+    while remaining.contains(&id2) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(25));
+        remaining = conn.list();
+    }
     assert!(
         !remaining.contains(&id2),
         "cerrar el panel tiene que matar su sesión; quedan {remaining:?}"
+    );
+    assert!(
+        remaining.contains(&id),
+        "y no puede llevarse puesta la sesión que sólo se soltó"
     );
 }

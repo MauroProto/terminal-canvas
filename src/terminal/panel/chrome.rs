@@ -170,6 +170,19 @@ pub(super) fn minimize_rect(title_rect: Rect) -> Rect {
     )
 }
 
+/// Tercer control de la barra. Existe porque el chrome ya venía dibujando tres
+/// puntos, pero sólo dos tenían área de click: el tercero era un botón falso.
+pub(super) fn maximize_rect(title_rect: Rect) -> Rect {
+    let chrome_zoom = chrome_zoom_from_title_rect(title_rect);
+    Rect::from_center_size(
+        pos2(
+            title_rect.left() + 66.0 * chrome_zoom,
+            title_rect.center().y,
+        ),
+        vec2(18.0, 18.0) * chrome_zoom,
+    )
+}
+
 #[allow(dead_code)]
 pub(super) fn resize_handle_rect(screen_rect: Rect) -> Rect {
     Rect::from_min_size(

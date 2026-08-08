@@ -10,7 +10,7 @@ use crate::terminal::scrollbar::{
 use egui::{pos2, vec2, Color32};
 
 use super::{
-    branch_badge_rect, chrome_zoom, close_rect, infer_activity_label, minimize_rect,
+    branch_badge_rect, chrome_zoom, close_rect, infer_activity_label, maximize_rect, minimize_rect,
     panel_corner_radius, panel_lod, panel_roundings, preview_label_text, render_tier_for_panel,
     resize_target_from_origin, shell_label, should_defer_terminal_resize, should_draw_resize_grip,
     should_draw_title_text, should_draw_window_controls, should_render_live_terminal,
@@ -361,6 +361,36 @@ fn hit_test_detects_minimize_button() {
     let hit = panel.hit_test(minimize_rect(title_rect).center(), &viewport, canvas_rect);
 
     assert_eq!(hit, Some(PanelHitArea::MinimizeButton));
+}
+
+#[test]
+fn every_drawn_window_control_has_a_hit_area() {
+    // El chrome dibujaba tres puntos pero sólo dos respondían al click: el
+    // tercero era un botón falso. Los centros salen de los mismos rects que
+    // usa el dibujo, así que este test se rompe si vuelven a separarse.
+    let panel = TerminalPanel::new(pos2(0.0, 0.0), vec2(400.0, 300.0), Color32::WHITE, 0);
+    let viewport = Viewport::default();
+    let canvas_rect = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0));
+    let title_rect = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(400.0, 42.0));
+
+    for (rect, expected) in [
+        (close_rect(title_rect), PanelHitArea::CloseButton),
+        (minimize_rect(title_rect), PanelHitArea::MinimizeButton),
+        (maximize_rect(title_rect), PanelHitArea::MaximizeButton),
+    ] {
+        assert_eq!(
+            panel.hit_test(rect.center(), &viewport, canvas_rect),
+            Some(expected)
+        );
+    }
+}
+
+#[test]
+fn window_controls_do_not_overlap_each_other() {
+    let title_rect = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(400.0, 42.0));
+
+    assert!(close_rect(title_rect).right() <= minimize_rect(title_rect).left());
+    assert!(minimize_rect(title_rect).right() <= maximize_rect(title_rect).left());
 }
 
 #[test]

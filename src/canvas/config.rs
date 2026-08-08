@@ -1,16 +1,18 @@
 use egui::{vec2, Color32, Vec2};
 
+use crate::theme::colors as palette;
+
 pub const ZOOM_MIN: f32 = 0.125;
 pub const ZOOM_MAX: f32 = 4.0;
 pub const ZOOM_KEYBOARD_FACTOR: f32 = 1.15;
 pub const GRID_SPACING: f32 = 40.0;
-pub const GRID_COLOR: Color32 = Color32::from_rgb(18, 18, 18);
+pub const GRID_COLOR: Color32 = palette::SURFACE;
 pub const SNAP_THRESHOLD: f32 = 8.0;
 pub const MINIMAP_WIDTH: f32 = 200.0;
 pub const MINIMAP_HEIGHT: f32 = 150.0;
 pub const MINIMAP_PADDING: f32 = 10.0;
 pub const MINIMAP_BG: Color32 = Color32::from_rgba_premultiplied(10, 10, 10, 200);
-pub const MINIMAP_VIEWPORT_BORDER: Color32 = Color32::from_rgb(110, 110, 110);
+pub const MINIMAP_VIEWPORT_BORDER: Color32 = palette::RING;
 pub const DEFAULT_PANEL_WIDTH: f32 = 760.0;
 pub const DEFAULT_PANEL_HEIGHT: f32 = 460.0;
 pub const LEGACY_DEFAULT_PANEL_WIDTH: f32 = 1904.0;
@@ -20,7 +22,10 @@ pub const PREVIOUS_DEFAULT_PANEL_HEIGHT: f32 = 620.0;
 pub const CURRENT_OLD_PANEL_WIDTH: f32 = 900.0;
 pub const CURRENT_OLD_PANEL_HEIGHT: f32 = 520.0;
 pub const PANEL_GAP: f32 = 30.0;
-pub const CANVAS_BG: Color32 = Color32::from_rgb(0, 0, 0);
+/// Fondo del escritorio. No es negro puro: sobre negro absoluto los huecos
+/// entre paneles se leían como agujeros y el contraste con el cuerpo de las
+/// terminales quedaba más duro que el de cualquier superficie de la app.
+pub const CANVAS_BG: Color32 = palette::INK;
 pub const SNAP_GUIDE_COLOR: Color32 = Color32::from_rgba_premultiplied(244, 244, 244, 130);
 
 pub fn normalize_panel_size(size: Vec2) -> Vec2 {
