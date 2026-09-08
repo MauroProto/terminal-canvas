@@ -21,17 +21,14 @@ const SECRET_KEY_HINTS: &[&str] = &[
     "credentials",
 ];
 
-/// ¿La línea de un TOML asigna una clave sensible?
+/// ¿Una clave TOML contiene un segmento sensible?
 ///
 /// El match es por **segmento** del nombre (separado por `_`, `-` o `.`), no
 /// por substring: así `linear_token` y `api_key` se redactan pero `tokenizer`
 /// o `keybindings` no. Ante la duda se prefiere redactar de más: un falso
 /// positivo cuesta un poco de debuggabilidad, uno negativo filtra un secreto.
-fn is_secret_line(line: &str) -> bool {
-    let Some((key, _)) = line.split_once('=') else {
-        return false;
-    };
-    let key = key.trim().trim_matches('"').to_ascii_lowercase();
+fn is_secret_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
     key.split(['_', '-', '.'])
         .any(|segment| SECRET_KEY_HINTS.contains(&segment))
 }
@@ -39,17 +36,28 @@ fn is_secret_line(line: &str) -> bool {
 /// Redacta los valores sensibles de un TOML, conservando la estructura para
 /// que el archivo siga siendo legible y parseable.
 pub fn redact_config(toml: &str) -> String {
-    toml.lines()
-        .map(|line| {
-            if is_secret_line(line) {
-                let key = line.split_once('=').map(|(key, _)| key).unwrap_or(line);
-                format!("{key}= \"<redacted>\"")
-            } else {
-                line.to_owned()
+    fn redact(value: &mut toml::Value) {
+        match value {
+            toml::Value::Table(table) => {
+                for (key, value) in table {
+                    if is_secret_key(key) {
+                        *value = toml::Value::String("<redacted>".to_owned());
+                    } else {
+                        redact(value);
+                    }
+                }
             }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+            toml::Value::Array(values) => values.iter_mut().for_each(redact),
+            _ => {}
+        }
+    }
+    // A malformed file cannot be safely redacted line by line: quoted keys,
+    // inline tables and multiline strings can carry secrets across lines.
+    let Ok(mut value) = toml::from_str::<toml::Value>(toml) else {
+        return "# Configuration omitted: invalid TOML.\n".to_owned();
+    };
+    redact(&mut value);
+    toml::to_string_pretty(&value).unwrap_or_default()
 }
 
 /// Hash corto y estable de un texto, para reemplazar nombres sin perder la
@@ -79,6 +87,9 @@ fn anonymize_value(value: &mut serde_json::Value) {
         "custom_title",
         "cwd",
         "agent_command",
+        "leaf_agent_commands",
+        "agent_session_id",
+        "leaf_agent_session_ids",
         "name",
         "label",
         "brief",
@@ -92,11 +103,7 @@ fn anonymize_value(value: &mut serde_json::Value) {
         serde_json::Value::Object(map) => {
             for (key, entry) in map.iter_mut() {
                 if SENSITIVE.contains(&key.as_str()) {
-                    if let Some(text) = entry.as_str() {
-                        if !text.is_empty() {
-                            *entry = serde_json::Value::String(format!("#{}", stable_hash(text)));
-                        }
-                    }
+                    anonymize_strings(entry);
                     continue;
                 }
                 anonymize_value(entry);
@@ -107,6 +114,17 @@ fn anonymize_value(value: &mut serde_json::Value) {
                 anonymize_value(item);
             }
         }
+        _ => {}
+    }
+}
+
+fn anonymize_strings(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(text) if !text.is_empty() => {
+            *text = format!("#{}", stable_hash(text));
+        }
+        serde_json::Value::Object(map) => map.values_mut().for_each(anonymize_strings),
+        serde_json::Value::Array(items) => items.iter_mut().for_each(anonymize_strings),
         _ => {}
     }
 }
@@ -242,6 +260,31 @@ mod tests {
         assert!(!redact_config("tokenizer = 5").contains("<redacted>"));
         assert!(!redact_config("keybindings = 3").contains("<redacted>"));
         assert!(!redact_config("monkey = 1").contains("<redacted>"));
+    }
+
+    #[test]
+    fn nested_and_multiline_secrets_never_reach_the_archive() {
+        let raw = "token = '''\nsecret line one\nsecret line two\n'''\nitems = [{ name = 'ok', password = 'hidden' }]\n[integrations.credentials]\nvalue = 'private'\n";
+        let redacted = redact_config(raw);
+        for secret in ["secret line", "hidden", "private"] {
+            assert!(!redacted.contains(secret), "leaked {secret}: {redacted}");
+        }
+        let parsed: toml::Value = toml::from_str(&redacted).unwrap();
+        assert_eq!(parsed["items"][0]["name"].as_str(), Some("ok"));
+        assert!(!redact_config("token = '''\nsecret").contains("secret"));
+    }
+
+    #[test]
+    fn split_leaf_commands_and_sensitive_containers_are_anonymized() {
+        let raw = r#"{"leaf_agent_commands":{"leaf-a":"agent --prompt private-task"},"cwd":["/private/path"],"z_index":3}"#;
+        let anonymized = anonymize_layout(raw);
+        assert!(!anonymized.contains("private"));
+        let parsed: serde_json::Value = serde_json::from_str(&anonymized).unwrap();
+        assert_eq!(parsed["z_index"], 3);
+        assert!(parsed["leaf_agent_commands"]["leaf-a"]
+            .as_str()
+            .unwrap()
+            .starts_with('#'));
     }
 
     #[test]
