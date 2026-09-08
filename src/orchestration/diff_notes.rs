@@ -139,8 +139,7 @@ fn notes_dir() -> Option<PathBuf> {
     Some(dirs.data_dir().join("diff-notes"))
 }
 
-/// Slug del repo para usarlo de nombre de archivo: separadores → `-`
-/// (mismo criterio que los slugs de `agent_sessions`).
+/// Identity of the canonical repository path, without separator collisions.
 fn repo_slug(repo_root: &Path) -> String {
     use sha2::{Digest, Sha256};
     let identity = std::fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
@@ -154,6 +153,23 @@ fn notes_file(repo_root: &Path) -> Option<PathBuf> {
     Some(notes_dir()?.join(format!("{}.json", repo_slug(repo_root))))
 }
 
+fn legacy_notes_file(repo_root: &Path) -> Option<PathBuf> {
+    let slug = repo_root.to_string_lossy().replace(['/', '\\', ':'], "-");
+    Some(notes_dir()?.join(format!("{slug}.json")))
+}
+
+/// Legacy files have no reliable repository identity. Only load after the
+/// user explicitly chooses to import into the currently reviewed repository.
+pub fn load_legacy_notes(repo_root: &Path) -> anyhow::Result<DiffNotes> {
+    let path = legacy_notes_file(repo_root)
+        .ok_or_else(|| anyhow::anyhow!("No se pudo resolver el directorio de notas"))?;
+    Ok(serde_json::from_slice(&std::fs::read(path)?)?)
+}
+
+pub fn legacy_notes_available(repo_root: &Path) -> bool {
+    legacy_notes_file(repo_root).is_some_and(|path| path.is_file())
+}
+
 /// Persiste las notas del repo (escritura durable: tmp+fsync+rename+ring).
 pub fn save_notes(repo_root: &Path, notes: &DiffNotes) -> anyhow::Result<()> {
     let Some(path) = notes_file(repo_root) else {
@@ -161,7 +177,11 @@ pub fn save_notes(repo_root: &Path, notes: &DiffNotes) -> anyhow::Result<()> {
     };
     if notes.notes.is_empty() {
         // Sin notas no queda archivo: un repo limpio no arrastra notas viejas.
-        let _ = std::fs::remove_file(&path);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
+        }
         return Ok(());
     }
     let bytes = serde_json::to_vec_pretty(notes)?;
@@ -338,14 +358,6 @@ mod tests {
     }
 
     fn notes_file_for(repo_root: &std::path::Path) -> std::path::PathBuf {
-        let slug = repo_root
-            .to_string_lossy()
-            .replace(['/', '\\'], "-")
-            .replace(':', "-");
-        directories::ProjectDirs::from("", "", "terminal-app")
-            .unwrap()
-            .data_dir()
-            .join("diff-notes")
-            .join(format!("{slug}.json"))
+        super::notes_file(repo_root).unwrap()
     }
 }

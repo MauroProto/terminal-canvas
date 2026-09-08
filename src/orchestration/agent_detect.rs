@@ -174,8 +174,9 @@ mod tests {
             let binary = dir.join(format!("{name}.{extension}"));
             std::fs::write(&binary, b"fixture").unwrap();
             assert_eq!(
-                super::resolve_windows_extensions(&dir.join(name), ".EXE;.CMD"),
-                Some(binary)
+                super::resolve_windows_extensions(&dir.join(name), ".EXE;.CMD")
+                    .map(|path| std::fs::canonicalize(path).unwrap()),
+                Some(std::fs::canonicalize(binary).unwrap())
             );
         }
         std::fs::remove_dir_all(dir).unwrap();
