@@ -45,6 +45,7 @@ pub(super) struct CodeReviewState {
     pub(super) notes_loading: bool,
     pub(super) legacy_notes_available: bool,
     pub(super) importing_notes: bool,
+    pub(super) show_all_notes: bool,
     /// Editor de nota activo: `note_id == None` = creando una nueva.
     pub(super) editing_note: Option<NoteEditState>,
     /// Selector de destinos abierto para mandar las notas pendientes.
@@ -117,6 +118,7 @@ impl TerminalApp {
             notes_loading: true,
             legacy_notes_available: false,
             importing_notes: false,
+            show_all_notes: false,
             editing_note: None,
             note_target_picker: false,
         });
@@ -345,6 +347,12 @@ impl TerminalApp {
                     *close = true;
                 }
                 if let Some(state) = self.code_review.as_mut() {
+                    let label = if state.show_all_notes { "Volver al diff".to_owned() } else { format!("Notas ({})", state.notes.notes.len()) };
+                    if ui.small_button(label).clicked() {
+                        state.show_all_notes = !state.show_all_notes;
+                    }
+                }
+                if let Some(state) = self.code_review.as_mut() {
                     if state.legacy_notes_available && !state.importing_notes
                         && ui.small_button("Importar notas anteriores")
                             .on_hover_text("Importa al repositorio actual. El formato anterior podía mezclar carpetas con nombres parecidos; revisá las notas antes de enviarlas.")
@@ -393,6 +401,14 @@ impl TerminalApp {
 
     fn code_review_body(&mut self, ui: &mut egui::Ui, size: egui::Vec2, body_height: f32) {
         let body_height = body_height.max(120.0);
+        if self
+            .code_review
+            .as_ref()
+            .is_some_and(|state| state.show_all_notes)
+        {
+            self.code_review_notes_list(ui, body_height);
+            return;
+        }
         let (loading, failed, file_count) = self
             .code_review
             .as_ref()
@@ -431,6 +447,81 @@ impl TerminalApp {
             ui.separator();
             self.code_review_diff_view(ui, body_height);
         });
+    }
+
+    /// Notes remain reviewable even when their files leave the current diff.
+    fn code_review_notes_list(&mut self, ui: &mut egui::Ui, height: f32) {
+        let Some(state) = self.code_review.as_ref() else {
+            return;
+        };
+        let notes = state.notes.notes.clone();
+        let mut actions = Vec::new();
+        ScrollArea::vertical()
+            .id_salt("review-all-notes")
+            .max_height(height)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                if notes.is_empty() {
+                    ui.label("No hay notas guardadas para este repositorio.");
+                }
+                for note in &notes {
+                    let stale = self.code_review.as_ref().is_some_and(|state| {
+                        note_is_stale(
+                            note,
+                            state.files.iter().find(|file| file.path == note.file_path),
+                        )
+                    });
+                    ui.group(|ui| {
+                        ui.label(
+                            RichText::new(format!(
+                                "{} · {}L{}{}",
+                                note.file_path,
+                                if note.old_side { "−" } else { "" },
+                                note.line,
+                                if stale { " · revisión anterior" } else { "" }
+                            ))
+                            .monospace(),
+                        );
+                        let editing = self
+                            .code_review
+                            .as_mut()
+                            .and_then(|state| state.editing_note.as_mut())
+                            .filter(|edit| edit.note_id == Some(note.id));
+                        if let Some(edit) = editing {
+                            ui.add(
+                                egui::TextEdit::multiline(&mut edit.body)
+                                    .desired_width(f32::INFINITY)
+                                    .desired_rows(3),
+                            );
+                            ui.horizontal(|ui| {
+                                if ui.button("Guardar nota").clicked() {
+                                    actions.push(NoteAction::SaveEditor);
+                                }
+                                if ui.button("Cancelar edición").clicked() {
+                                    actions.push(NoteAction::CancelEditor);
+                                }
+                            });
+                        } else {
+                            ui.label(&note.body);
+                            ui.horizontal(|ui| {
+                                if ui.small_button("Editar nota").clicked() {
+                                    actions.push(NoteAction::Edit(note.id));
+                                }
+                                if ui.small_button("Eliminar nota").clicked() {
+                                    actions.push(NoteAction::Delete(note.id));
+                                }
+                                if note.sent_at.is_some() {
+                                    ui.label("Enviada ✓");
+                                }
+                            });
+                        }
+                    });
+                }
+            });
+        for action in actions {
+            self.apply_note_action(action);
+        }
     }
 
     fn code_review_file_list(&mut self, ui: &mut egui::Ui, height: f32) {
