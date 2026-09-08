@@ -16,6 +16,48 @@ fn store_in(root: &std::path::Path) -> MemoryStore {
 }
 
 #[test]
+fn mcp_proposal_conflict_does_not_disclose_another_pending_memory() {
+    let root = temp_dir();
+    let repo = root.join("repo");
+    init_git_repo(&repo);
+    let store = store_in(&root);
+    let pending = store
+        .propose(RememberRequest::agent(
+            repo.clone(),
+            "pending/decision",
+            "unreviewed content from another session",
+        ))
+        .unwrap();
+    let response = crate::memory::handle_message_json(
+        &store,
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "memory_propose",
+                "arguments": {
+                    "cwd": repo,
+                    "key": "pending/decision",
+                    "content": "a different proposal"
+                }
+            }
+        }),
+    )
+    .unwrap();
+    let text = response["result"]["content"][0]["text"].as_str().unwrap();
+    let reply: serde_json::Value = serde_json::from_str(text).unwrap();
+    assert_eq!(reply["result"], "conflict");
+    assert!(reply["candidate_id"].is_string());
+    assert!(!text.contains(&pending.memory().content));
+    assert!(!text.contains(&pending.memory().id));
+    assert!(store
+        .get_visible(&repo, &pending.memory().id)
+        .unwrap()
+        .is_none());
+}
+
+#[test]
 fn worktrees_share_project_memory_but_not_task_memory() {
     let root = temp_dir();
     let repo = root.join("repo");

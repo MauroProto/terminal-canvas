@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 
 use super::context::{build_context_pack, format_context_pack};
 use super::identity::resolve_location;
-use super::model::{Actor, HandoffRequest, MemoryKind, RememberRequest, ScopeKind};
+use super::model::{Actor, HandoffRequest, MemoryKind, RememberRequest, ScopeKind, WriteResult};
 use super::store::MemoryStore;
 
 const MAX_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
@@ -287,7 +287,7 @@ fn call_tool(store: &MemoryStore, params: &Value, scope: Option<&McpScope>) -> R
                 orchestrator_task_id: None,
                 workspace_id: None,
             })?;
-            serde_json::to_string_pretty(&result)?
+            serde_json::to_string_pretty(&proposal_response(&result))?
         }
         "handoff_create" => {
             let cwd = arg_path(&args, "cwd", scope)?;
@@ -335,6 +335,27 @@ fn proposed_scope(args: &Value) -> Result<ScopeKind> {
             .filter(|scope| !matches!(scope, ScopeKind::User))
             .ok_or_else(|| anyhow::anyhow!("scope inválido para una propuesta MCP")),
         Some(_) => anyhow::bail!("scope debe ser un string"),
+    }
+}
+
+/// MCP mutation replies describe the submitted proposal, never another
+/// session's pending content. Operator-facing WriteResult remains richer.
+fn proposal_response(result: &WriteResult) -> Value {
+    match result {
+        WriteResult::Committed(write) | WriteResult::Deduped(write) => json!({
+            "result": if matches!(result, WriteResult::Committed(_)) {
+                "committed"
+            } else {
+                "deduped"
+            },
+            "memory_id": write.memory.id,
+            "status": write.memory.status.as_str(),
+            "revision": write.committed_revision,
+        }),
+        WriteResult::Conflict(conflict) => json!({
+            "result": "conflict",
+            "candidate_id": conflict.candidate_id,
+        }),
     }
 }
 
