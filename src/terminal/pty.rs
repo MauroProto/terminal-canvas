@@ -196,7 +196,11 @@ impl PtyHandle {
             pixel_height: 0,
         })?;
 
-        let cmd = shell_command(cwd, hooks);
+        let mut cmd = shell_command(cwd, hooks);
+        cmd.env(
+            "TC_MEMORY_TASK_ID",
+            hooks.memory_task_id(session_id).to_string(),
+        );
 
         let child = pair.slave.spawn_command(cmd).context("spawn PTY child")?;
         let killer = child.clone_killer();
@@ -1124,6 +1128,9 @@ fn shell_command(cwd: Option<&Path>, hooks: HookIdentity) -> CommandBuilder {
     if let Some(leaf_id) = hooks.leaf_id {
         cmd.env("TC_LEAF_ID", leaf_id.to_string());
     }
+    if let Some(task_id) = hooks.leaf_id.or(hooks.panel_id) {
+        cmd.env("TC_MEMORY_TASK_ID", task_id.to_string());
+    }
     cmd
 }
 
@@ -1134,6 +1141,12 @@ pub struct HookIdentity {
     pub panel_id: Option<Uuid>,
     pub workspace_id: Option<Uuid>,
     pub leaf_id: Option<Uuid>,
+}
+
+impl HookIdentity {
+    pub fn memory_task_id(self, session_id: Uuid) -> Uuid {
+        self.leaf_id.or(self.panel_id).unwrap_or(session_id)
+    }
 }
 
 fn drain_terminal_events(
@@ -1337,6 +1350,31 @@ mod tests {
 
         assert_eq!(super::next_log_sequence(&sequence), None);
         assert_eq!(sequence.load(Ordering::Relaxed), u64::MAX);
+    }
+
+    #[test]
+    fn shell_memory_identity_is_stable_and_distinct_between_leaves() {
+        let panel = uuid::Uuid::new_v4();
+        let leaf = uuid::Uuid::new_v4();
+        let hooks = super::HookIdentity {
+            panel_id: Some(panel),
+            leaf_id: Some(leaf),
+            ..Default::default()
+        };
+        let command = shell_command(None, hooks);
+        assert_eq!(
+            command.get_env("TC_MEMORY_TASK_ID"),
+            Some(std::ffi::OsStr::new(&leaf.to_string()))
+        );
+        assert_eq!(hooks.memory_task_id(uuid::Uuid::new_v4()), leaf);
+        assert_ne!(
+            super::HookIdentity {
+                leaf_id: Some(uuid::Uuid::new_v4()),
+                ..hooks
+            }
+            .memory_task_id(leaf),
+            leaf
+        );
     }
 
     #[cfg(unix)]
