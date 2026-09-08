@@ -212,7 +212,7 @@ impl RuntimeHarness {
         self.registry.snapshot().sessions.len()
     }
 
-    pub fn no_deadlocks(&self) -> bool {
+    pub fn scheduler_drained_all_updates(&self) -> bool {
         self.idle_after_step && self.drained_batches > 0 && self.drained_batches <= 8
     }
 
