@@ -317,7 +317,7 @@ impl TerminalApp {
             } else if failed {
                 ui.add_space(10.0);
                 ui.label(
-                    RichText::new("No es un repositorio git o no hay cambios")
+                    RichText::new("No se pudo cargar la revisión")
                         .size(11.5)
                         .color(DEL_FG),
                 );
@@ -563,6 +563,11 @@ impl TerminalApp {
                 });
             });
             ui.separator();
+            if let Some(reason) = &file.unavailable_reason {
+                ui.label(RichText::new(reason).color(palette::DIM));
+            } else if file.is_binary {
+                ui.label(RichText::new("Cambios en archivo binario").color(palette::DIM));
+            }
             // Virtualizado a mano (alturas variables: línea de diff, fila de
             // nota, fila de editor): un diff de miles de líneas solo renderiza
             // lo visible.

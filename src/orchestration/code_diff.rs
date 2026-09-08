@@ -38,6 +38,7 @@ pub struct FileDiff {
     pub additions: usize,
     pub deletions: usize,
     pub lines: Vec<DiffLine>,
+    pub unavailable_reason: Option<String>,
 }
 
 /// Resultado completo de revisar un repo.
@@ -243,21 +244,21 @@ pub fn load_repo_diff(repo_root: &Path) -> Option<RepoDiff> {
         .filter(|branch| !branch.is_empty())
         .unwrap_or_else(|| "detached".to_owned());
 
-    let mut diff_text = git_string(&root, &["diff", "HEAD"]).unwrap_or_default();
-    let untracked = list_untracked(&root);
+    let has_head = git_string(&root, &["rev-parse", "--verify", "HEAD"]).is_some();
+    let mut files = if has_head {
+        let text = git_string(&root, &["diff", "--no-ext-diff", "--no-textconv", "HEAD"])?;
+        parse_unified_diff(&text)
+    } else {
+        // An unborn branch has no HEAD. Every indexed file is new, and the
+        // current filesystem content includes staged + unstaged edits.
+        nul_paths(&git_string(&root, &["ls-files", "-z"])?)
+            .iter()
+            .map(|path| new_file_diff(&root, path))
+            .collect()
+    };
+    let untracked = list_untracked(&root)?;
     let has_untracked = !untracked.is_empty();
-    for path in &untracked {
-        if let Some(synthetic) = synthetic_new_file_diff(&root, path) {
-            // git_string recorta el newline final: sin separador la última
-            // línea del diff real se fusiona con el `diff --git` sintético.
-            if !diff_text.is_empty() && !diff_text.ends_with('\n') {
-                diff_text.push('\n');
-            }
-            diff_text.push_str(&synthetic);
-        }
-    }
-
-    let files = parse_unified_diff(&diff_text);
+    files.extend(untracked.iter().map(|path| new_file_diff(&root, path)));
     Some(RepoDiff {
         repo_root: root,
         branch,
@@ -266,59 +267,72 @@ pub fn load_repo_diff(repo_root: &Path) -> Option<RepoDiff> {
     })
 }
 
-/// Genera un diff "todo agregado" para un archivo nuevo sin trackear. Solo
-/// incluye archivos de texto chicos (los binarios/grandes se listan pero no
-/// se expanden).
-fn synthetic_new_file_diff(root: &Path, rel: &Path) -> Option<String> {
+fn new_file_diff(root: &Path, rel: &Path) -> FileDiff {
+    use std::io::Read;
     const MAX_BYTES: u64 = 256 * 1024;
-    let full = root.join(rel);
-    let meta = std::fs::metadata(&full).ok()?;
-    if !meta.is_file() || meta.len() > MAX_BYTES {
-        return None;
+    let mut file = FileDiff {
+        path: rel.to_string_lossy().replace('\\', "/"),
+        is_new: true,
+        ..FileDiff::default()
+    };
+    let content = (|| -> std::io::Result<Vec<u8>> {
+        let metadata = std::fs::symlink_metadata(root.join(rel))?;
+        if metadata.file_type().is_symlink() {
+            return Ok(std::fs::read_link(root.join(rel))?
+                .to_string_lossy()
+                .as_bytes()
+                .to_vec());
+        }
+        let mut bytes = Vec::new();
+        std::fs::File::open(root.join(rel))?
+            .take(MAX_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        Ok(bytes)
+    })();
+    let bytes = match content {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            file.unavailable_reason = Some(format!("No se pudo leer el archivo: {error}"));
+            return file;
+        }
+    };
+    if bytes.len() as u64 > MAX_BYTES {
+        file.unavailable_reason = Some("Archivo nuevo mayor a 256 KiB; contenido omitido".into());
+        return file;
     }
-    let content = std::fs::read(&full).ok()?;
-    if content.contains(&0) {
-        return None; // binario
+    if bytes.contains(&0) {
+        file.is_binary = true;
+        file.unavailable_reason = Some("Archivo binario nuevo".into());
+        return file;
     }
-    let text = String::from_utf8_lossy(&content);
-    let rel_str = rel.to_string_lossy().replace('\\', "/");
-    let lines: Vec<&str> = text.lines().collect();
-    let count = lines.len();
-    let mut out = String::new();
-    out.push_str(&format!("diff --git a/{rel_str} b/{rel_str}\n"));
-    out.push_str("new file mode 100644\n");
-    out.push_str("--- /dev/null\n");
-    out.push_str(&format!("+++ b/{rel_str}\n"));
-    out.push_str(&format!("@@ -0,0 +1,{count} @@\n"));
-    for line in lines {
-        out.push('+');
-        out.push_str(line);
-        out.push('\n');
-    }
-    Some(out)
+    file.lines = String::from_utf8_lossy(&bytes)
+        .lines()
+        .enumerate()
+        .map(|(index, text)| DiffLine {
+            kind: DiffLineKind::Added,
+            old_ln: None,
+            new_ln: Some(index + 1),
+            text: text.to_owned(),
+        })
+        .collect();
+    file.additions = file.lines.len();
+    file
 }
 
-fn list_untracked(root: &Path) -> Vec<PathBuf> {
-    // --untracked-files=all lista cada archivo nuevo, incluso dentro de
-    // directorios nuevos (sin el flag, git solo muestra "dir/").
-    let status = match git_string(root, &["status", "--porcelain", "--untracked-files=all"]) {
-        Some(status) => status,
-        None => return Vec::new(),
-    };
-    status
-        .lines()
-        .filter_map(|line| {
-            let code = line.get(0..2)?;
-            if code != "??" {
-                return None;
-            }
-            let path = line.get(3..)?.trim();
-            if path.is_empty() || path.ends_with('/') {
-                return None;
-            }
-            Some(PathBuf::from(path))
-        })
+fn nul_paths(text: &str) -> Vec<PathBuf> {
+    text.split('\0')
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
         .collect()
+}
+
+fn list_untracked(root: &Path) -> Option<Vec<PathBuf>> {
+    // NUL records preserve spaces, Unicode, tabs and newlines without Git's
+    // textual C quoting. A failed query must never look like a clean repo.
+    Some(nul_paths(&git_string(
+        root,
+        &["ls-files", "--others", "--exclude-standard", "-z"],
+    )?))
 }
 
 fn git_toplevel(path: &Path) -> Option<PathBuf> {
@@ -426,7 +440,7 @@ fn git_string(path: &Path, args: &[&str]) -> Option<String> {
     command.arg("-C").arg(path).args(args);
     let output =
         super::git::run_with_timeout(&mut command, std::time::Duration::from_secs(15)).ok()?;
-    if !output.status.success() {
+    if !output.status.success() || output.stdout.len() >= 8 * 1024 * 1024 {
         return None;
     }
     String::from_utf8(output.stdout)
@@ -550,6 +564,29 @@ index 1111111..2222222 100644
         );
         assert_eq!(super::strip_ab_prefix(r#""b/a\tb.txt""#), "a\tb.txt");
         assert_eq!(super::strip_ab_prefix("b/ leading.txt"), " leading.txt");
+    }
+
+    #[test]
+    fn untracked_records_preserve_whitespace_and_unicode() {
+        assert_eq!(
+            super::nul_paths(" leading.txt\0español.txt\0a\nb.txt\0"),
+            [" leading.txt", "español.txt", "a\nb.txt"].map(std::path::PathBuf::from)
+        );
+    }
+
+    #[test]
+    fn new_binary_large_and_unreadable_files_are_still_changes() {
+        let dir = std::env::temp_dir().join(format!("review-new-files-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("binary.png"), b"image\0bytes").unwrap();
+        std::fs::write(dir.join("large.txt"), vec![b'x'; 256 * 1024 + 1]).unwrap();
+        for name in ["binary.png", "large.txt", "gone.txt"] {
+            let file = super::new_file_diff(&dir, std::path::Path::new(name));
+            assert_eq!(file.path, name);
+            assert!(file.is_new);
+            assert!(file.unavailable_reason.is_some());
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
