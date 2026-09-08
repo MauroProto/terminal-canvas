@@ -1178,6 +1178,10 @@ fn serve_connection(
     let Ok(write_half) = stream.try_clone() else {
         return;
     };
+    let Ok(disconnect) = stream.try_clone() else {
+        return;
+    };
+    let _ = write_half.set_write_timeout(Some(Duration::from_secs(5)));
     // Respuestas síncronas y eventos comparten un único escritor serializado.
     // Dos clones de UnixStream escribiendo NDJSON a la vez pueden intercalar
     // bytes y producir líneas imposibles de decodificar.
@@ -1271,7 +1275,7 @@ fn serve_connection(
             Request::Attach { id } => Some(*id),
             _ => None,
         };
-        let mut response_written = false;
+        let mut response_queued = false;
         let response = match state.lock() {
             Ok(mut state) => {
                 let response = handle_request_for_client(
@@ -1281,16 +1285,19 @@ fn serve_connection(
                     authenticated_client_id.unwrap_or_default(),
                 );
                 if matches!(response, Response::Attached { .. }) {
-                    // Escribir snapshot y registrar la suscripción mientras el
-                    // pump está excluido evita tanto un evento adelantado como
-                    // un hueco de salida entre attach y suscripción.
-                    response_written = write_response(&writer, &response).is_ok();
+                    // Enqueue snapshot and subscribe under the same registry
+                    // boundary. The sole connection writer performs all socket
+                    // I/O later; a stalled client cannot block other sessions.
                     if let (Some(session_id), Some(sender)) = (attach_id, &event_sender) {
-                        let disconnect = writer
-                            .lock()
-                            .ok()
-                            .and_then(|stream| stream.try_clone().ok());
-                        state.subscribe(connection_id, session_id, sender.clone(), disconnect);
+                        response_queued = sender.try_send(response.clone()).is_ok();
+                        if response_queued {
+                            state.subscribe(
+                                connection_id,
+                                session_id,
+                                sender.clone(),
+                                disconnect.try_clone().ok(),
+                            );
+                        }
                     }
                 }
                 response
@@ -1299,8 +1306,13 @@ fn serve_connection(
                 message: "estado del daemon envenenado".to_owned(),
             },
         };
-        if !response_written {
-            let _ = write_response(&writer, &response);
+        if !response_queued
+            && !event_sender
+                .as_ref()
+                .is_some_and(|sender| sender.try_send(response).is_ok())
+        {
+            let _ = disconnect.shutdown(std::net::Shutdown::Both);
+            break;
         }
 
         if asked_shutdown {
