@@ -30,13 +30,16 @@ directorios pueden ser distintos. `TC_MEMORY_DB` permite cambiar la ubicación
 de la base de memoria. El log de panic está en `~/.mi-terminal/logs/panic.log`.
 
 Para hacer una copia antes de investigar un problema de persistencia, cerrá
-las instancias de la app y guardá una copia completa de sus directorios de
-datos y configuración. Si copiás SQLite, incluí también sus archivos `-wal`
+las instancias de la app y los procesos que escriben sus datos. En Unix,
+cerrar la ventana no detiene el daemon: finalizá sus sesiones y detenelo
+también antes de copiar el historial. Guardá una copia completa de los
+directorios de datos y configuración. Si copiás SQLite, incluí sus archivos `-wal`
 y `-shm` cuando existan. Conservá la copia original para comparar resultados.
 
 Si aparece un aviso de que otra instancia tiene la persistencia, cerrá la
-instancia anterior y reabrí la que vas a usar. La propiedad de escritura evita
-que una ventana anterior sobrescriba el estado más reciente.
+instancia anterior y reabrí la que vas a usar. La propiedad de escritura protege
+el layout y el historial guardado por la UI frente a una instancia anterior;
+la configuración, notas y SQLite tienen sus propios mecanismos de escritura.
 
 ## Diagnósticos
 
