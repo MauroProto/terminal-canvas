@@ -21,6 +21,13 @@ DIST_DIR="dist"
 APP_DIR="$DIST_DIR/$APP_NAME.app"
 MAKE_DMG=false
 [[ "${1:-}" == "--dmg" ]] && MAKE_DMG=true
+TARGET="${TC_BUNDLE_TARGET:-$(rustc -vV | awk '/^host:/ {print $2}')}"
+case "$TARGET" in
+  x86_64-apple-darwin) ARCH="x86_64"; MACH_ARCH="x86_64" ;;
+  aarch64-apple-darwin) ARCH="aarch64"; MACH_ARCH="arm64" ;;
+  *) echo "Target macOS no soportado: $TARGET" >&2; exit 1 ;;
+esac
+BIN_DIR="target/$TARGET/release"
 
 VERSION="$(awk -F'"' '/^version[[:space:]]*=/ {print $2; exit}' Cargo.toml)"
 if [[ -z "$VERSION" ]]; then
@@ -30,16 +37,20 @@ fi
 echo "== $APP_NAME $VERSION =="
 
 echo "-- build release"
-cargo build --release --locked --features daemon --bins
+MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-11.0}" \
+  cargo build --release --locked --features daemon --bins --target "$TARGET"
+for binary in "$BINARY_NAME" "$DAEMON_BINARY_NAME" tc-memory tc-memory-mcp; do
+  lipo "$BIN_DIR/$binary" -verify_arch "$MACH_ARCH"
+done
 
 echo "-- estructura del bundle"
 rm -rf "$APP_DIR"
 mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
-cp "target/release/$BINARY_NAME" "$APP_DIR/Contents/MacOS/$APP_NAME"
-cp "target/release/$DAEMON_BINARY_NAME" \
+cp "$BIN_DIR/$BINARY_NAME" "$APP_DIR/Contents/MacOS/$APP_NAME"
+cp "$BIN_DIR/$DAEMON_BINARY_NAME" \
   "$APP_DIR/Contents/MacOS/$DAEMON_BINARY_NAME"
-cp "target/release/tc-memory" "$APP_DIR/Contents/MacOS/tc-memory"
-cp "target/release/tc-memory-mcp" "$APP_DIR/Contents/MacOS/tc-memory-mcp"
+cp "$BIN_DIR/tc-memory" "$APP_DIR/Contents/MacOS/tc-memory"
+cp "$BIN_DIR/tc-memory-mcp" "$APP_DIR/Contents/MacOS/tc-memory-mcp"
 chmod +x \
   "$APP_DIR/Contents/MacOS/$APP_NAME" \
   "$APP_DIR/Contents/MacOS/$DAEMON_BINARY_NAME" \
@@ -99,14 +110,14 @@ fi
 
 if $MAKE_DMG; then
   echo "-- dmg"
-  DMG="$DIST_DIR/$APP_NAME-$VERSION.dmg"
+  DMG="$DIST_DIR/$APP_NAME-$VERSION-macos-$ARCH.dmg"
   rm -f "$DMG"
   STAGE="$(mktemp -d)"
   cp -R "$APP_DIR" "$STAGE/"
   ln -s /Applications "$STAGE/Applications"
   hdiutil create -volname "$APP_NAME" -srcfolder "$STAGE" -ov -format UDZO "$DMG" >/dev/null
   rm -rf "$STAGE"
-  shasum -a 256 "$DMG" | tee "$DMG.sha256"
+  (cd "$DIST_DIR" && shasum -a 256 "$(basename "$DMG")") | tee "$DMG.sha256"
   echo "dmg: $DMG"
 fi
 
@@ -116,8 +127,9 @@ cat <<'NOTES'
 
 Notarización (T2, requiere tu Developer ID):
 
-  xcrun notarytool submit dist/TerminalCanvas-<version>.dmg \
+  xcrun notarytool submit dist/TerminalCanvas-<version>-macos-<arch>.dmg \
     --apple-id "tu@correo" --team-id "TEAMID" --password "app-specific-password" \
     --wait
-  xcrun stapler staple dist/TerminalCanvas-<version>.dmg
+  xcrun stapler staple dist/TerminalCanvas-<version>-macos-<arch>.dmg
+  # Stapling changes the DMG: regenerate its .sha256 before publication.
 NOTES
