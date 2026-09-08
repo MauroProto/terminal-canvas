@@ -2,12 +2,17 @@
 
 ## Estado actual
 
-El repositorio puede producir una `.app` y un DMG locales. El bundle de macOS
+El repositorio puede producir paquetes portables Windows/Linux y `.app`/DMG
+para ambas arquitecturas macOS. El bundle de macOS
 activa el feature `daemon`, incluye `mi-terminal-daemon`, `tc-memory` y
 `tc-memory-mcp` junto a la app y firma primero esos helpers cuando se configura
 una identidad. Un tag `v*` activa
-`.github/workflows/release.yml`, que exige firma, notariza, verifica y publica
-el DMG y su checksum.
+`.github/workflows/release.yml`, que compila con Rust 1.98.0, exige firma y
+notarización para macOS y verifica los cuatro paquetes antes de publicar juntos
+sus artefactos y checksums. Los runners macOS son `macos-15-intel` y `macos-15`
+(ARM64), con targets explícitos; Windows y Linux se publican para x86_64.
+Las etiquetas de runners están documentadas por
+[GitHub Actions](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).
 
 Esto **no equivale a un release público completo**. Siguen pendientes:
 
@@ -25,11 +30,22 @@ Esto **no equivale a un release público completo**. Siguen pendientes:
 scripts/bundle.sh --dmg
 ```
 
-Ejecuta `cargo build --release --locked --features daemon --bins` y arma
-`dist/TerminalCanvas.app` y `dist/TerminalCanvas-<version>.dmg`. La app contiene
+Ejecuta `cargo build --release --locked --features daemon --bins --target <target>`
+y arma `dist/TerminalCanvas.app` y
+`dist/TerminalCanvas-<version>-macos-<arch>.dmg`. El target predeterminado es
+el host de rustc; `TC_BUNDLE_TARGET` acepta `x86_64-apple-darwin` o
+`aarch64-apple-darwin` y `lipo` verifica la arquitectura de cada ejecutable.
+No produce un bundle universal. La app contiene
 el ejecutable principal y los tres helpers en `Contents/MacOS`, además del `.icns`
 generado desde `assets/icon.png` y un `Info.plist` con `CFBundleIdentifier`,
 `NSHighResolutionCapable` y la versión leída de `Cargo.toml`.
+
+En Windows, `./scripts/package-portable.ps1` genera el ZIP x86_64; en Linux,
+`scripts/package-portable.sh` genera el tar.gz del host. Ambos incluyen la app,
+los helpers de memoria, licencia e instrucciones, y generan un checksum con
+nombre de archivo relativo a la carpeta de descarga. El paquete Linux incluye
+también el daemon; Windows usa ConPTY sin servicio separado. Ver
+[PORTABLE.md](PORTABLE.md) para requisitos y actualización manual.
 
 ## 2. Firmar y notarizar (requiere Developer ID)
 
@@ -37,10 +53,12 @@ generado desde `assets/icon.png` y un `Info.plist` con `CFBundleIdentifier`,
 export CODESIGN_IDENTITY="Developer ID Application: Tu Nombre (TEAMID)"
 scripts/bundle.sh --dmg
 
-xcrun notarytool submit dist/TerminalCanvas-<version>.dmg \
+xcrun notarytool submit dist/TerminalCanvas-<version>-macos-<arch>.dmg \
   --apple-id "tu@correo" --team-id "TEAMID" \
   --password "app-specific-password" --wait
-xcrun stapler staple dist/TerminalCanvas-<version>.dmg
+xcrun stapler staple dist/TerminalCanvas-<version>-macos-<arch>.dmg
+# Regenerar el checksum después de staple, que modifica el DMG:
+(cd dist && shasum -a 256 TerminalCanvas-<version>-macos-<arch>.dmg > TerminalCanvas-<version>-macos-<arch>.dmg.sha256)
 ```
 
 Sin firma, Gatekeeper bloquea la app en cualquier máquina que no sea la que la
@@ -52,7 +70,8 @@ autoactualización operativa.
 
 ## 3. Publicar (pendiente; requiere accesos externos)
 
-1. Subir el `.dmg` y su `.sha256` al release de GitHub.
+1. Usar el workflow de release para generar y verificar los cuatro paquetes
+   antes de publicarlos. Ningún job publica parcialmente si falla otra plataforma.
 2. Actualizar `version` y `sha256` en `packaging/terminalcanvas.rb` y pushear
    el cask al tap.
 

@@ -6,11 +6,23 @@ on:
       - "v*"
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   macos-dmg:
-    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            arch: x86_64
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    env:
+      TC_BUNDLE_TARGET: ${{ matrix.target }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -20,6 +32,7 @@ jobs:
         with:
           toolchain: "1.98.0"
           components: rustfmt, clippy
+          targets: ${{ matrix.target }}
 
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
@@ -77,11 +90,11 @@ jobs:
             exit 1
           fi
           version="${GITHUB_REF_NAME#v}"
-          dmg="dist/TerminalCanvas-${version}.dmg"
+          dmg="dist/TerminalCanvas-${version}-macos-${{ matrix.arch }}.dmg"
           xcrun notarytool submit "$dmg" --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait
           xcrun stapler staple "$dmg"
           xcrun stapler validate "$dmg"
-          shasum -a 256 "$dmg" | tee "$dmg.sha256"
+          (cd dist && shasum -a 256 "$(basename "$dmg")") | tee "$dmg.sha256"
 
       - name: Verify bundle and checksum
         run: |
@@ -89,13 +102,133 @@ jobs:
           test -x dist/TerminalCanvas.app/Contents/MacOS/mi-terminal-daemon
           test -x dist/TerminalCanvas.app/Contents/MacOS/tc-memory
           test -x dist/TerminalCanvas.app/Contents/MacOS/tc-memory-mcp
-          shasum -a 256 -c "dist/TerminalCanvas-${version}.dmg.sha256"
+          (cd dist && shasum -a 256 -c "TerminalCanvas-${version}-macos-${{ matrix.arch }}.dmg.sha256")
           codesign --verify --deep --strict --verbose=2 dist/TerminalCanvas.app
+
+      - name: Upload verified macOS artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-macos-${{ matrix.arch }}
+          if-no-files-found: error
+          path: |
+            dist/TerminalCanvas-*.dmg
+            dist/TerminalCanvas-*.dmg.sha256
+
+      - name: Remove temporary signing material
+        if: always()
+        run: |
+          security delete-keychain "$RUNNER_TEMP/terminalcanvas.keychain-db" || true
+          rm -f "$RUNNER_TEMP/terminalcanvas.p12"
+
+  portable:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            platform: windows
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            platform: linux
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          components: rustfmt, clippy
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Verify tag matches Cargo version
+        shell: bash
+        run: |
+          version="$(awk -F'"' '/^version[[:space:]]*=/ {print $2; exit}' Cargo.toml)"
+          test "${GITHUB_REF_NAME}" = "v${version}"
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --all-targets --locked --quiet
+
+      - name: Linux daemon preflight
+        if: runner.os == 'Linux'
+        run: |
+          cargo clippy --all-targets --locked --features daemon -- -D warnings
+          cargo test --all-targets --locked --features daemon --quiet
+
+      - name: Build Windows portable ZIP
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/package-portable.ps1 -Target '${{ matrix.target }}'
+
+      - name: Verify Windows checksum and helper
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $archives = @(Get-ChildItem -LiteralPath dist -Filter '*.zip')
+          if ($archives.Count -ne 1) { throw 'Se esperaba exactamente un ZIP' }
+          $archive = $archives[0]
+          $expected = (Get-Content -LiteralPath ($archive.FullName + '.sha256')).Split(' ')[0]
+          if ((Get-FileHash -LiteralPath $archive.FullName -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) {
+            throw 'Checksum del paquete no coincide'
+          }
+          & './target/${{ matrix.target }}/release/tc-memory.exe' --help
+          if ($LASTEXITCODE -ne 0) { throw 'Helper de memoria no ejecutable' }
+
+      - name: Build Linux portable tarball
+        if: runner.os == 'Linux'
+        env:
+          TC_PORTABLE_TARGET: ${{ matrix.target }}
+        run: scripts/package-portable.sh
+
+      - name: Verify Linux checksum and helper
+        if: runner.os == 'Linux'
+        run: |
+          (cd dist && sha256sum -c *.sha256)
+          target/${{ matrix.target }}/release/tc-memory --help
+
+      - name: Upload verified portable artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.platform }}-x86_64
+          if-no-files-found: error
+          path: |
+            dist/TerminalCanvas-*.zip
+            dist/TerminalCanvas-*.zip.sha256
+            dist/TerminalCanvas-*.tar.gz
+            dist/TerminalCanvas-*.tar.gz.sha256
+
+  publish:
+    needs: [macos-dmg, portable]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download all verified packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+
+      - name: Verify complete release checksums
+        run: |
+          cd dist
+          test "$(find . -maxdepth 1 -name '*.sha256' | wc -l)" -eq 4
+          sha256sum -c *.sha256
 
       - name: Publish GitHub release assets
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
-          files: |
-            dist/TerminalCanvas-*.dmg
-            dist/TerminalCanvas-*.dmg.sha256
+          files: dist/TerminalCanvas-*
