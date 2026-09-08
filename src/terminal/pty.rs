@@ -878,6 +878,32 @@ impl PtyHandle {
         Some((snapshot, frames))
     }
 
+    /// Returning from a TUI needs the hidden primary grid for clients that
+    /// attached inside the alternate screen. Snapshot and drain share a boundary.
+    pub fn output_update(
+        &self,
+        max_bytes: usize,
+        was_alternate: bool,
+        export: impl FnOnce(&Term<EventProxy>) -> String,
+    ) -> Option<(Vec<u8>, bool, Option<String>)> {
+        if self.restoring_history.load(Ordering::Acquire) {
+            return None;
+        }
+        let term = self.term.lock().ok()?;
+        let alternate = term.mode().contains(TermMode::ALT_SCREEN);
+        let snapshot = (was_alternate && !alternate).then(|| export(&term));
+        let mut pending = self.pending_log.lock().ok()?;
+        let frames = drain_log_prefix(
+            &mut pending,
+            if snapshot.is_some() {
+                usize::MAX
+            } else {
+                max_bytes
+            },
+        );
+        Some((frames, alternate, snapshot))
+    }
+
     /// Restaura checkpoint + frames del log incremental en orden (P1.7).
     /// Los resize se aplican como `term.resize` antes de seguir el replay del
     /// output posterior, para que el grid tenga el tamaño correcto.

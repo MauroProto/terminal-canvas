@@ -157,6 +157,68 @@ fn sessions_survive_the_app_and_can_be_reattached() {
 }
 
 #[test]
+fn attaching_inside_a_tui_recovers_primary_history_when_it_exits() {
+    use alacritty_terminal::term::test::TermSize;
+    use alacritty_terminal::term::{Config, Term};
+    use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
+    use mi_terminal::daemon::protocol::{Request, Response};
+    let (daemon, token) = start_daemon();
+    let mut conn = DaemonConn::try_connect(&daemon.dir, &token).expect("connect");
+    let id = conn.spawn_session(WireSpec {
+        startup_command: Some("printf 'TC_PRIMARY_HISTORY\\r\\n\\033[?1049hTC_TUI_SCREEN'; read tc_done; printf '\\033[?1049lTC_RETURNED\\r\\n'".to_owned()),
+        ..Default::default()
+    }).expect("spawn");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let (snapshot, attached_seq) = loop {
+        let attached = conn.attach(id).expect("attach");
+        if attached
+            .0
+            .windows(b"TC_TUI_SCREEN".len())
+            .any(|bytes| bytes == b"TC_TUI_SCREEN")
+        {
+            break attached;
+        }
+        assert!(Instant::now() < deadline, "TUI did not start");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut term = Term::new(
+        Config::default(),
+        &TermSize::new(80, 24),
+        mi_terminal::terminal::pty::EventProxy::new(tx),
+    );
+    let mut parser = Processor::<StdSyncHandler>::new();
+    parser.advance(&mut term, &snapshot);
+    assert!(
+        !mi_terminal::terminal::export::scrollback_to_text(&term).contains("TC_PRIMARY_HISTORY")
+    );
+    conn.request(&Request::Write {
+        id,
+        data: b"\n".to_vec(),
+    })
+    .expect("resume TUI");
+    loop {
+        conn.list();
+        for event in conn.drain_events() {
+            if let Response::Output { seq, data, .. } = event {
+                if seq > attached_seq {
+                    parser.advance(&mut term, &data);
+                }
+            }
+        }
+        let text = mi_terminal::terminal::export::scrollback_to_text(&term);
+        if text.contains("TC_RETURNED") && text.contains("TC_PRIMARY_HISTORY") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "primary screen was lost: {text:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
 fn reattach_snapshot_preserves_scrollback_beyond_the_raw_tail_cap() {
     use mi_terminal::daemon::protocol::Request;
 

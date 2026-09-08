@@ -46,6 +46,7 @@ pub struct DaemonSession {
     persist_pending: Vec<u8>,
     persist_seq: u64,
     last_metadata: Vec<u8>,
+    was_alternate: bool,
     /// El PTY real (T2). `None` en los tests del registro, que no montan
     /// procesos: la lógica de sesiones se testea sin spawnear nada.
     pub handle: Option<SharedPtyHandle>,
@@ -62,6 +63,7 @@ impl DaemonSession {
             persist_pending: Vec::new(),
             persist_seq: 0,
             last_metadata: Vec::new(),
+            was_alternate: false,
             handle: None,
         }
     }
@@ -142,16 +144,23 @@ impl DaemonSession {
     fn attach_boundary(&mut self) -> (Vec<u8>, Option<(u64, Vec<u8>)>) {
         let boundary = self.handle.clone().and_then(|handle| {
             handle.lock().ok().and_then(|pty| {
-                let (mut snapshot, frames) =
-                    pty.attach_snapshot_and_drain(crate::terminal::export::live_snapshot_to_ansi)?;
+                let ((mut snapshot, alternate), frames) =
+                    pty.attach_snapshot_and_drain(|term| {
+                        (
+                            crate::terminal::export::live_snapshot_to_ansi(term),
+                            term.mode()
+                                .contains(alacritty_terminal::term::TermMode::ALT_SCREEN),
+                        )
+                    })?;
                 snapshot.push_str(&String::from_utf8_lossy(&pty.metadata_osc(true)));
-                Some((snapshot, frames))
+                Some((snapshot, frames, alternate))
             })
         });
-        let Some((snapshot, frames)) = boundary else {
+        let Some((snapshot, frames, alternate)) = boundary else {
             // Fallback de tests/sesiones sin PTY.
             return (self.snapshot.clone(), None);
         };
+        self.was_alternate = alternate;
         let event = self.ingest_pty_frames(&frames);
         (snapshot.into_bytes(), event)
     }
@@ -378,31 +387,42 @@ impl DaemonState {
                 continue;
             };
             let is_priority = self.priority_session == Some(id);
-            let (frames, alive) = match handle.lock() {
+            let (frames, alive, alternate, replacement) = match handle.lock() {
                 Ok(pty) => {
-                    if is_priority && interactive_budget > 0 {
-                        // La sesión enfocada drena hasta 32 KB con prioridad.
-                        let drained = pty.drain_pending_log_capped(interactive_budget);
-                        interactive_budget = interactive_budget.saturating_sub(drained.len());
-                        (
-                            drained,
-                            pty.alive.load(std::sync::atomic::Ordering::Relaxed),
-                        )
+                    let budget = if is_priority && interactive_budget > 0 {
+                        interactive_budget
                     } else {
-                        (
-                            pty.drain_pending_log(),
-                            pty.alive.load(std::sync::atomic::Ordering::Relaxed),
-                        )
+                        usize::MAX
+                    };
+                    let Some((frames, alternate, replacement)) = pty.output_update(
+                        budget,
+                        session.was_alternate,
+                        crate::terminal::export::live_snapshot_to_ansi,
+                    ) else {
+                        continue;
+                    };
+                    if is_priority {
+                        interactive_budget = interactive_budget.saturating_sub(frames.len());
                     }
+                    (
+                        frames,
+                        pty.alive.load(std::sync::atomic::Ordering::Relaxed),
+                        alternate,
+                        replacement,
+                    )
                 }
-                Err(_) => (Vec::new(), false),
+                Err(_) => (Vec::new(), false, session.was_alternate, None),
             };
-            if !frames.is_empty() {
-                // Se preservan todos los frames para durabilidad; sólo Output
-                // se difunde a los clientes.
-                if let Some((seq, data)) = session.ingest_pty_frames(&frames) {
-                    events.push(Response::Output { id, seq, data });
-                }
+            session.was_alternate = alternate;
+            let output = session.ingest_pty_frames(&frames);
+            if let Some(snapshot) = replacement {
+                let data = snapshot.into_bytes();
+                let seq = output
+                    .map(|(seq, _)| seq)
+                    .unwrap_or_else(|| session.push_output_event(&data));
+                events.push(Response::Output { id, seq, data });
+            } else if let Some((seq, data)) = output {
+                events.push(Response::Output { id, seq, data });
             }
             if let Ok(pty) = handle.lock() {
                 let metadata = pty.metadata_osc(false);
@@ -438,10 +458,12 @@ impl DaemonState {
                 continue;
             };
             let boundary = session.handle.as_ref().and_then(|handle| {
-                handle
-                    .lock()
-                    .ok()?
-                    .attach_snapshot_and_drain(crate::terminal::export::scrollback_to_ansi)
+                handle.lock().ok()?.attach_snapshot_and_drain(|term| {
+                    (!term
+                        .mode()
+                        .contains(alacritty_terminal::term::TermMode::ALT_SCREEN))
+                    .then(|| crate::terminal::export::scrollback_to_ansi(term))
+                })
             });
             let Some((text, frames)) = boundary else {
                 continue;
@@ -456,6 +478,11 @@ impl DaemonState {
                     data,
                 });
             }
+            // Keep the primary checkpoint and incremental transitions while
+            // an alternate-screen application is active.
+            let Some(text) = text else {
+                continue;
+            };
             session.scrollback_dirty = false;
             targets.push(ScrollbackTarget {
                 session_id: *session_id,
