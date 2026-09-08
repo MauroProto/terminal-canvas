@@ -1671,7 +1671,7 @@ impl TerminalApp {
         ui.painter().rect_stroke(
             desktop_screen,
             0.0,
-            Stroke::new(0.0, palette::LINE),
+            Stroke::new(0.0_f32, palette::LINE),
             egui::StrokeKind::Middle,
         );
         let pointer_pos = gesture_pointer_pos(latest_pos, interact_pos, hover_pos);
@@ -1826,7 +1826,7 @@ impl TerminalApp {
                 ui.painter().rect_stroke(
                     screen_rect.expand(2.0),
                     10.0,
-                    Stroke::new(2.0, palette::TEXT_STRONG),
+                    Stroke::new(2.0_f32, palette::TEXT_STRONG),
                     egui::StrokeKind::Middle,
                 );
             }

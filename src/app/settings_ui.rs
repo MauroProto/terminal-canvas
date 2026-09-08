@@ -91,7 +91,7 @@ impl TerminalApp {
             .show(ctx, |ui| {
                 egui::Frame::default()
                     .fill(palette::SURFACE)
-                    .stroke(egui::Stroke::new(1.0, palette::LINE))
+                    .stroke(egui::Stroke::new(1.0_f32, palette::LINE))
                     .corner_radius(10.0)
                     .inner_margin(egui::Margin::same(22))
                     .show(ui, |ui| {

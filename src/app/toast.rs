@@ -167,7 +167,7 @@ impl TerminalApp {
                     painter.rect_stroke(
                         rect,
                         10.0,
-                        egui::Stroke::new(1.0, fade(palette::LINE)),
+                        egui::Stroke::new(1.0_f32, fade(palette::LINE)),
                         egui::StrokeKind::Middle,
                     );
                     // Barra de acento a la izquierda: color según el tipo.

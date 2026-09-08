@@ -6,7 +6,7 @@ const DIALOG_INPUT_BG: Color32 = palette::SURFACE;
 fn dialog_frame() -> egui::Frame {
     egui::Frame::default()
         .fill(palette::INK)
-        .stroke(egui::Stroke::new(1.0, palette::LINE))
+        .stroke(egui::Stroke::new(1.0_f32, palette::LINE))
         .corner_radius(10.0)
         .inner_margin(egui::Margin::same(22))
 }
@@ -55,14 +55,14 @@ fn dialog_input_visuals(ui: &mut egui::Ui) {
     visuals.widgets.inactive.bg_fill = DIALOG_INPUT_BG;
     visuals.widgets.hovered.bg_fill = DIALOG_INPUT_BG;
     visuals.widgets.active.bg_fill = DIALOG_INPUT_BG;
-    visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, palette::LINE);
-    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, palette::DIM);
-    visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, palette::TEXT);
+    visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, palette::LINE);
+    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, palette::DIM);
+    visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0_f32, palette::TEXT);
     visuals.widgets.inactive.fg_stroke.color = palette::TEXT;
     visuals.widgets.hovered.fg_stroke.color = palette::TEXT_STRONG;
     visuals.widgets.active.fg_stroke.color = palette::TEXT_STRONG;
     visuals.selection.bg_fill = palette::FOCUS;
-    visuals.selection.stroke = egui::Stroke::new(1.0, palette::TEXT_STRONG);
+    visuals.selection.stroke = egui::Stroke::new(1.0_f32, palette::TEXT_STRONG);
 }
 
 fn dialog_singleline(ui: &mut egui::Ui, value: &mut String, password: bool) -> Response {
@@ -101,17 +101,17 @@ pub(super) fn dialog_action_button(ui: &mut egui::Ui, label: &str, primary: bool
         } else {
             palette::INK
         };
-        widgets.inactive.bg_stroke = egui::Stroke::new(1.0, palette::LINE);
+        widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, palette::LINE);
         widgets.inactive.fg_stroke.color = if primary {
             palette::TEXT_STRONG
         } else {
             palette::TEXT
         };
         widgets.hovered.bg_fill = palette::HOVER;
-        widgets.hovered.bg_stroke = egui::Stroke::new(1.0, palette::RING);
+        widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, palette::RING);
         widgets.hovered.fg_stroke.color = palette::TEXT_STRONG;
         widgets.active.bg_fill = palette::FOCUS;
-        widgets.active.bg_stroke = egui::Stroke::new(1.0, palette::TEXT_STRONG);
+        widgets.active.bg_stroke = egui::Stroke::new(1.0_f32, palette::TEXT_STRONG);
         widgets.active.fg_stroke.color = palette::TEXT_STRONG;
 
         ui.add_sized(
@@ -322,7 +322,7 @@ impl TerminalApp {
             .show(ctx, |ui| {
                 egui::Frame::default()
                     .fill(palette::INK)
-                    .stroke(egui::Stroke::new(1.0, palette::LINE))
+                    .stroke(egui::Stroke::new(1.0_f32, palette::LINE))
                     .corner_radius(8.0)
                     .inner_margin(egui::Margin::symmetric(12, 8))
                     .show(ui, |ui| {

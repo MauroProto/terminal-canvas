@@ -201,7 +201,7 @@ impl TerminalApp {
                 let size = vec2(screen.width() * 0.92, screen.height() * 0.88);
                 egui::Frame::default()
                     .fill(palette::INK)
-                    .stroke(Stroke::new(1.0, palette::LINE))
+                    .stroke(Stroke::new(1.0_f32, palette::LINE))
                     .corner_radius(10.0)
                     .inner_margin(egui::Margin::same(0))
                     .show(ui, |ui| {
@@ -1175,7 +1175,7 @@ impl TerminalApp {
             ui.painter().rect_stroke(
                 rect,
                 0.0,
-                Stroke::new(1.0, NOTE_ACCENT),
+                Stroke::new(1.0_f32, NOTE_ACCENT),
                 egui::StrokeKind::Middle,
             );
             ui.horizontal_centered(|ui| {
@@ -1532,7 +1532,7 @@ fn draw_note_row(
     ui.painter().vline(
         rect.left() + GUTTER_W * 2.0 + 12.0,
         rect.y_range(),
-        Stroke::new(2.0, NOTE_ACCENT),
+        Stroke::new(2.0_f32, NOTE_ACCENT),
     );
     let mut label = match note.start_line {
         Some(start) if start != note.line => format!("L{start}-{} · {}", note.line, note.body),

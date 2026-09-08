@@ -164,7 +164,7 @@ impl TerminalApp {
             .show(ctx, |ui| {
                 egui::Frame::NONE
                     .fill(palette::SURFACE)
-                    .stroke(egui::Stroke::new(1.0, palette::LINE))
+                    .stroke(egui::Stroke::new(1.0_f32, palette::LINE))
                     .corner_radius(12.0)
                     .inner_margin(18.0)
                     .show(ui, |ui| {

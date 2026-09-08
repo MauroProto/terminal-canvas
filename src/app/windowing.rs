@@ -258,7 +258,7 @@ impl TerminalApp {
                 rect,
                 14.0,
                 Stroke::new(
-                    1.0,
+                    1.0_f32,
                     Color32::from_rgba_premultiplied(244, 244, 244, stroke_alpha),
                 ),
                 egui::StrokeKind::Middle,
@@ -706,7 +706,7 @@ impl TerminalApp {
             ui.painter().rect_stroke(
                 preview_screen,
                 14.0,
-                Stroke::new(1.0, palette::TEXT_STRONG),
+                Stroke::new(1.0_f32, palette::TEXT_STRONG),
                 egui::StrokeKind::Middle,
             );
         }
@@ -728,7 +728,7 @@ impl TerminalApp {
             let start = self.viewport.canvas_to_screen(start, canvas_rect);
             let end = self.viewport.canvas_to_screen(end, canvas_rect);
             ui.painter()
-                .line_segment([start, end], egui::Stroke::new(1.0, SNAP_GUIDE_COLOR));
+                .line_segment([start, end], egui::Stroke::new(1.0_f32, SNAP_GUIDE_COLOR));
         }
 
         self.draw_window_transitions(ui);

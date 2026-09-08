@@ -486,7 +486,7 @@ impl TerminalApp {
                                                 egui::pos2(text_x, underline_y),
                                                 egui::pos2(text_x + text_w, underline_y),
                                             ],
-                                            Stroke::new(1.0, palette::TEXT_STRONG),
+                                            Stroke::new(1.0_f32, palette::TEXT_STRONG),
                                         );
                                     }
                                     taskbar_button_rects.insert(*panel_id, rect);
