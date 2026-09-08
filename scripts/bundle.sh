@@ -12,6 +12,8 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
+source "$REPO_ROOT/scripts/rust-toolchain.sh"
+tc_select_rust_toolchain "$REPO_ROOT"
 
 APP_NAME="TerminalCanvas"
 BUNDLE_ID="com.terminalcanvas.app"
@@ -21,7 +23,7 @@ DIST_DIR="dist"
 APP_DIR="$DIST_DIR/$APP_NAME.app"
 MAKE_DMG=false
 [[ "${1:-}" == "--dmg" ]] && MAKE_DMG=true
-TARGET="${TC_BUNDLE_TARGET:-$(rustc -vV | awk '/^host:/ {print $2}')}"
+TARGET="${TC_BUNDLE_TARGET:-$("$TC_RUSTC" -vV | awk '/^host:/ {print $2}')}"
 case "$TARGET" in
   x86_64-apple-darwin) ARCH="x86_64"; MACH_ARCH="x86_64" ;;
   aarch64-apple-darwin) ARCH="aarch64"; MACH_ARCH="arm64" ;;
@@ -38,7 +40,7 @@ echo "== $APP_NAME $VERSION =="
 
 echo "-- build release"
 MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-11.0}" \
-  cargo build --release --locked --features daemon --bins --target "$TARGET"
+  "$TC_CARGO" build --release --locked --features daemon --bins --target "$TARGET"
 for binary in "$BINARY_NAME" "$DAEMON_BINARY_NAME" tc-memory tc-memory-mcp; do
   lipo "$BIN_DIR/$binary" -verify_arch "$MACH_ARCH"
 done
