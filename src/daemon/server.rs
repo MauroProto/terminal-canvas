@@ -152,7 +152,7 @@ impl DaemonSession {
                 let ((mut snapshot, alternate), frames) =
                     pty.attach_snapshot_and_drain(|term| {
                         (
-                            crate::terminal::export::live_snapshot_to_ansi(term),
+                            crate::terminal::export::live_snapshot_with_terminal_state(term),
                             term.mode()
                                 .contains(alacritty_terminal::term::TermMode::ALT_SCREEN),
                         )
@@ -409,7 +409,7 @@ impl DaemonState {
                     let Some((frames, alternate, replacement)) = pty.output_update(
                         budget,
                         session.was_alternate,
-                        crate::terminal::export::live_snapshot_to_ansi,
+                        crate::terminal::export::live_snapshot_with_terminal_state,
                     ) else {
                         continue;
                     };
@@ -829,6 +829,7 @@ fn compact_alternate_log(
     generation: u32,
 ) -> anyhow::Result<()> {
     use crate::state::scrollback_log::{encode_header, FrameKind};
+    use alacritty_terminal::grid::Dimensions;
     use alacritty_terminal::term::test::TermSize;
     use alacritty_terminal::term::{Config, Term, TermMode};
     use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
@@ -864,14 +865,26 @@ fn compact_alternate_log(
     // This is a disposable parser, so leaving its alternate screen cannot
     // mutate the live PTY or its saved cursor, selection, or keyboard stack.
     parser.advance(&mut term, b"\x1b[?1049l");
-    let mut primary = crate::terminal::export::scrollback_to_ansi(&term);
+    let mut primary = crate::terminal::export::live_snapshot_with_terminal_state(&mut term);
+    let alternate_entry = "\x1b[?1049h";
+    while primary.len() + alternate_entry.len()
+        > crate::state::scrollback_store::MAX_SNAPSHOT_CHECKPOINT_BYTES
+        && term.grid().history_size() > 0
+    {
+        // Trim oldest history in the disposable grid, then serialize again.
+        // Slicing the resulting ANSI would discard mode/cursor state or split
+        // escape sequences. Visible rows and the saved cursor remain intact.
+        let retained = term.grid().history_size() / 2;
+        term.grid_mut().update_history(retained);
+        primary = crate::terminal::export::live_snapshot_with_terminal_state(&mut term);
+    }
     // Store the screen mode inside the same atomic checkpoint as the primary
     // text. A crash before log rotation must still confine later TUI output.
-    primary.push_str("\x1b[?1049h\n");
+    primary.push_str(alternate_entry);
     let next = generation
         .checked_add(1)
         .ok_or_else(|| anyhow::anyhow!("checkpoint generation exhausted"))?;
-    crate::state::scrollback_store::save_leaf_scrollback_versioned(
+    crate::state::scrollback_store::save_leaf_snapshot_versioned(
         dir,
         target.panel_id,
         target.leaf_id,
@@ -1660,6 +1673,61 @@ mod tests {
         assert_eq!(log_generation, 4);
         assert!(frames.is_empty());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn alternate_compaction_keeps_the_saved_primary_cursor_for_later_output() {
+        use crate::state::{scrollback_log, scrollback_store};
+        use alacritty_terminal::term::{test::TermSize, Config, Term};
+        use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
+        let dir = std::env::temp_dir().join(format!("tui-cursor-{}", Uuid::new_v4()));
+        let panel = Uuid::new_v4();
+        scrollback_store::save_leaf_scrollback_versioned(&dir, panel, None, 3, "").unwrap();
+        let log = dir.join(scrollback_store::scrollback_leaf_log_file_name(panel, None));
+        scrollback_log::reset_log(&log, 3).unwrap();
+        scrollback_log::append_frames(
+            &log,
+            &scrollback_log::encode_frame(
+                1,
+                scrollback_log::FrameKind::Output,
+                b"ABC\rX\x1b[?1049hTUI",
+            ),
+        )
+        .unwrap();
+        let target = super::IncrementalTarget {
+            session_id: Uuid::new_v4(),
+            panel_id: panel,
+            leaf_id: None,
+            frames: Vec::new(),
+            alternate: true,
+            cols: 80,
+            rows: 24,
+        };
+        super::compact_alternate_log(&dir, &target, 3).unwrap();
+        // The app leaves the TUI and overwrites the second primary character,
+        // then the daemon crashes before another full checkpoint is taken.
+        scrollback_log::append_frames(
+            &log,
+            &scrollback_log::encode_frame(1, scrollback_log::FrameKind::Output, b"\x1b[?1049lY"),
+        )
+        .unwrap();
+        let (checkpoint, frames) = scrollback_store::load_leaf_session(&dir, panel, None);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut term = Term::new(
+            Config::default(),
+            &TermSize::new(80, 24),
+            crate::terminal::pty::EventProxy::new(tx),
+        );
+        let mut parser = Processor::<StdSyncHandler>::new();
+        parser.advance(&mut term, &checkpoint);
+        for frame in frames {
+            parser.advance(&mut term, &frame.payload);
+        }
+        assert_eq!(
+            crate::terminal::export::scrollback_to_text(&term).trim(),
+            "XYC"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
