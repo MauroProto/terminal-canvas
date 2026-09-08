@@ -103,6 +103,7 @@ pub struct TerminalApp {
     /// worker porque bloquea hasta que el usuario selecciona o cancela).
     screenshot_rx: Option<std::sync::mpsc::Receiver<anyhow::Result<PathBuf>>>,
     file_viewer: Option<file_viewer_ui::FileViewerState>,
+    file_viewer_keyboard_active: bool,
     file_viewer_rx: Option<std::sync::mpsc::Receiver<file_viewer_ui::FileViewerState>>,
     settings_open: bool,
     settings_draft: Option<settings_ui::SettingsDraft>,
@@ -305,6 +306,7 @@ impl TerminalApp {
                 quick_open_rx: None,
                 screenshot_rx: None,
                 file_viewer: None,
+                file_viewer_keyboard_active: false,
                 file_viewer_rx: None,
                 settings_open: false,
                 settings_draft: None,
@@ -1231,7 +1233,9 @@ impl TerminalApp {
     /// al PTY. Toda superficie modal vive acá para que briefs, invites y
     /// passphrases nunca se escriban también en el shell detrás del diálogo.
     fn terminal_input_is_routable(&self) -> bool {
-        !self.modal_input_is_active() && !matches!(self.collab.mode(), CollabMode::Guest)
+        !self.modal_input_is_active()
+            && !(self.file_viewer.is_some() && self.file_viewer_keyboard_active)
+            && !matches!(self.collab.mode(), CollabMode::Guest)
     }
 
     fn modal_input_is_active(&self) -> bool {
@@ -1241,7 +1245,6 @@ impl TerminalApp {
             || self.search_open
             || self.code_review.is_some()
             || self.quick_open.is_some()
-            || self.file_viewer.is_some()
             || self.settings_open
             || self.broadcast.is_some()
             || self.resume_picker.is_some()

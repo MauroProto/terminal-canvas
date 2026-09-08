@@ -85,6 +85,7 @@ impl FileViewerState {
 
 impl TerminalApp {
     pub(super) fn open_file_viewer(&mut self, path: PathBuf) {
+        self.file_viewer_keyboard_active = false;
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         let worker_path = path.clone();
         let repaint = self.ctx.clone();
@@ -169,7 +170,9 @@ impl TerminalApp {
         if self.file_viewer.is_none() {
             return;
         }
-        if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+        if self.file_viewer_keyboard_active
+            && ctx.input(|input| input.key_pressed(egui::Key::Escape))
+        {
             self.file_viewer = None;
             self.file_viewer_rx = None;
             return;
@@ -194,6 +197,15 @@ impl TerminalApp {
                 };
                 // Borde izquierdo que separa el código del canvas.
                 let panel_rect = ui.max_rect();
+                if let Some(pointer) = ctx.input(|input| {
+                    input
+                        .pointer
+                        .primary_pressed()
+                        .then(|| input.pointer.interact_pos())
+                        .flatten()
+                }) {
+                    self.file_viewer_keyboard_active = panel_rect.contains(pointer);
+                }
 
                 // Soltar un archivo sobre el visor lo abre (si el puntero
                 // está dentro de la región del panel).

@@ -34,6 +34,32 @@ fn test_app_never_owns_the_users_run_marker() {
 }
 
 #[test]
+fn docked_viewer_only_captures_keyboard_when_its_content_is_active() {
+    let ctx = egui::Context::default();
+    let mut app = super::TerminalApp::new_for_tests(&ctx);
+    app.file_viewer = Some(super::file_viewer_ui::FileViewerState {
+        path: "example.rs".into(),
+        lines: vec!["fn main() {}".into()],
+        truncated: false,
+        binary: false,
+        highlighted: Vec::new(),
+        highlight_token: None,
+        language: None,
+        loading: false,
+    });
+    assert!(!app.modal_input_is_active());
+    assert!(app.terminal_input_is_routable());
+    app.file_viewer_keyboard_active = true;
+    assert!(!app.terminal_input_is_routable());
+    assert!(
+        !app.modal_input_is_active(),
+        "global commands remain available"
+    );
+    app.file_viewer_keyboard_active = false;
+    assert!(app.terminal_input_is_routable());
+}
+
+#[test]
 fn test_app_never_starts_the_network_update_checker() {
     let ctx = egui::Context::default();
     let app = super::TerminalApp::new_for_tests(&ctx);
