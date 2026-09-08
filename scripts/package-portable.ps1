@@ -6,6 +6,8 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+. (Join-Path $PSScriptRoot 'rust-toolchain.ps1')
+$toolchain = Get-TerminalCanvasRustToolchain -RepoRoot $repoRoot
 $distRoot = [IO.Path]::GetFullPath((Join-Path $repoRoot 'dist'))
 $versionMatch = Select-String -LiteralPath (Join-Path $repoRoot 'Cargo.toml') -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1
 if (-not $versionMatch) { throw 'No se pudo leer la version de Cargo.toml' }
@@ -20,9 +22,16 @@ if (-not $stageRoot.StartsWith($distRoot + [IO.Path]::DirectorySeparatorChar, [S
     throw 'Directorio temporal fuera de dist'
 }
 
+$previousPath = $env:PATH
+$previousRustc = $env:RUSTC
+$previousRustupToolchain = $env:RUSTUP_TOOLCHAIN
 Push-Location $repoRoot
 try {
-    & cargo build --release --locked --bins --target $Target
+    $env:PATH = (Split-Path -Parent $toolchain.Cargo) + [IO.Path]::PathSeparator + (Split-Path -Parent $toolchain.Rustc) + [IO.Path]::PathSeparator + $previousPath
+    $env:RUSTC = $toolchain.Rustc
+    $env:RUSTUP_TOOLCHAIN = $toolchain.Channel
+    Write-Output "Verified Rust and Cargo $($toolchain.Channel)"
+    & $toolchain.Cargo build --release --locked --bins --target $Target
     if ($LASTEXITCODE -ne 0) { throw 'Fallo cargo build' }
     $packageRoot = Join-Path $stageRoot $packageName
     New-Item -ItemType Directory -Path $packageRoot -Force | Out-Null
@@ -39,6 +48,9 @@ try {
     [IO.File]::WriteAllText("$archive.sha256", "$hash  $packageName.zip`n", [Text.UTF8Encoding]::new($false))
     Write-Output "Paquete: $archive"
 } finally {
+    $env:PATH = $previousPath
+    $env:RUSTC = $previousRustc
+    $env:RUSTUP_TOOLCHAIN = $previousRustupToolchain
     Pop-Location
     # stageRoot is an absolute, validated child of this repository's dist.
     if (Test-Path -LiteralPath $stageRoot) { Remove-Item -LiteralPath $stageRoot -Recurse -Force }
