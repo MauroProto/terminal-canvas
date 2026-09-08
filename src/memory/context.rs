@@ -59,10 +59,8 @@ pub fn build_context_pack_scoped(
                 .max(serde_json::to_string_pretty(&item)?.len()),
         );
         let core = matches!(memory.scope_kind, ScopeKind::Project | ScopeKind::User);
-        if core {
-            if core_used + cost > CORE_TOKEN_BUDGET && score < 100 {
-                continue;
-            }
+        if core && core_used + cost > CORE_TOKEN_BUDGET && score < 100 {
+            continue;
         }
         let previous_cursor = pack.revision_cursor;
         pack.revision_cursor = pack.revision_cursor.max(memory.current_revision);

@@ -264,8 +264,7 @@ pub fn should_copy_selection(modifiers: &Modifiers, key: &Key, has_selection: bo
     }
     #[cfg(not(target_os = "macos"))]
     {
-        (modifiers.ctrl && *key == Key::C && has_selection)
-            || (modifiers.ctrl && modifiers.shift && *key == Key::C)
+        modifiers.ctrl && *key == Key::C && (has_selection || modifiers.shift)
     }
 }
 
