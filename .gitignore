@@ -3,3 +3,5 @@ config/
 dist/
 .playwright-cli/
 .cursor/hooks/state/
+/.terminalcanvas-archive/
+/.terminalcanvas-trash/
