@@ -17,69 +17,6 @@ pub struct CommandPalette {
     pub desktop_mode: bool,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use egui_kittest::{kittest::Queryable, Harness};
-
-    #[test]
-    fn keyboard_selection_scrolls_beyond_the_first_ten_commands() {
-        let mut palette = CommandPalette {
-            desktop_mode: true,
-            ..Default::default()
-        };
-        palette.toggle();
-        let expected = palette.filtered_entries()[15];
-        let mut harness = Harness::builder()
-            .with_size(vec2(700.0, 580.0))
-            .build_state(
-                |ctx, state: &mut (CommandPalette, Option<Command>)| {
-                    if let Some(command) = state.0.show(ctx) {
-                        state.1 = Some(command);
-                    }
-                },
-                (palette, None),
-            );
-        for _ in 0..15 {
-            harness.key_press(Key::ArrowDown);
-            harness.run();
-        }
-        assert_eq!(harness.state().0.selected, 15);
-        let selected = harness.get_by_label(expected.label).rect();
-        assert!(
-            selected.top() >= 80.0 && selected.bottom() <= 560.0,
-            "selected row must be visible: {selected:?}"
-        );
-        harness.key_press(Key::Enter);
-        harness.run();
-        assert_eq!(harness.state().1, Some(expected.command));
-        assert!(!harness.state().0.open);
-    }
-
-    #[test]
-    fn opening_the_palette_focuses_search_and_updates_results_in_the_same_frame() {
-        let mut palette = CommandPalette::default();
-        palette.toggle();
-        let mut harness = Harness::new_state(
-            |ctx, palette: &mut CommandPalette| {
-                palette.show(ctx);
-            },
-            palette,
-        );
-        harness
-            .input_mut()
-            .events
-            .push(egui::Event::Text("Export Diagnostics".to_owned()));
-        harness.run();
-        assert_eq!(harness.state().query, "Export Diagnostics");
-        assert_eq!(
-            harness.state().filtered_entries()[0].command,
-            Command::ExportDiagnostics
-        );
-        assert!(harness.get_by_label("Export Diagnostics").rect().bottom() < 500.0);
-    }
-}
-
 impl CommandPalette {
     pub fn toggle(&mut self) {
         self.open = !self.open;
@@ -233,5 +170,68 @@ impl CommandPalette {
             .collect();
         entries.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.label.cmp(b.1.label)));
         entries.into_iter().map(|(_, entry)| entry).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egui_kittest::{kittest::Queryable, Harness};
+
+    #[test]
+    fn keyboard_selection_scrolls_beyond_the_first_ten_commands() {
+        let mut palette = CommandPalette {
+            desktop_mode: true,
+            ..Default::default()
+        };
+        palette.toggle();
+        let expected = palette.filtered_entries()[15];
+        let mut harness = Harness::builder()
+            .with_size(vec2(700.0, 580.0))
+            .build_state(
+                |ctx, state: &mut (CommandPalette, Option<Command>)| {
+                    if let Some(command) = state.0.show(ctx) {
+                        state.1 = Some(command);
+                    }
+                },
+                (palette, None),
+            );
+        for _ in 0..15 {
+            harness.key_press(Key::ArrowDown);
+            harness.run();
+        }
+        assert_eq!(harness.state().0.selected, 15);
+        let selected = harness.get_by_label(expected.label).rect();
+        assert!(
+            selected.top() >= 80.0 && selected.bottom() <= 560.0,
+            "selected row must be visible: {selected:?}"
+        );
+        harness.key_press(Key::Enter);
+        harness.run();
+        assert_eq!(harness.state().1, Some(expected.command));
+        assert!(!harness.state().0.open);
+    }
+
+    #[test]
+    fn opening_the_palette_focuses_search_and_updates_results_in_the_same_frame() {
+        let mut palette = CommandPalette::default();
+        palette.toggle();
+        let mut harness = Harness::new_state(
+            |ctx, palette: &mut CommandPalette| {
+                palette.show(ctx);
+            },
+            palette,
+        );
+        harness
+            .input_mut()
+            .events
+            .push(egui::Event::Text("Export Diagnostics".to_owned()));
+        harness.run();
+        assert_eq!(harness.state().query, "Export Diagnostics");
+        assert_eq!(
+            harness.state().filtered_entries()[0].command,
+            Command::ExportDiagnostics
+        );
+        assert!(harness.get_by_label("Export Diagnostics").rect().bottom() < 500.0);
     }
 }
