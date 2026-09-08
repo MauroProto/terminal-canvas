@@ -18,6 +18,8 @@ pub(super) struct ResumeState {
     pub(super) launch_command: String,
     pub(super) sessions: Vec<AgentSessionEntry>,
     pub(super) selected: usize,
+    receiver: Option<std::sync::mpsc::Receiver<Vec<AgentSessionEntry>>>,
+    load_error: Option<String>,
 }
 
 impl TerminalApp {
@@ -70,23 +72,45 @@ impl TerminalApp {
             return;
         };
 
-        let sessions = crate::orchestration::list_claude_sessions(&cwd);
-        if sessions.is_empty() {
-            self.toast_error(format!(
-                "No hay conversaciones guardadas para {}",
-                cwd.display()
-            ));
-            return;
-        }
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let root = cwd.clone();
+        let repaint = self.ctx.clone();
+        let started = std::thread::Builder::new()
+            .name("resume-history-reader".into())
+            .spawn(move || {
+                let _ = sender.send(crate::orchestration::list_claude_sessions(&root));
+                if let Some(ctx) = repaint {
+                    ctx.request_repaint();
+                }
+            })
+            .is_ok();
         self.resume_picker = Some(ResumeState {
             cwd,
             launch_command: claude_launch_command,
-            sessions,
+            sessions: Vec::new(),
             selected: 0,
+            receiver: started.then_some(receiver),
+            load_error: (!started).then(|| "No se pudo iniciar la lectura del historial".into()),
         });
     }
 
     pub(super) fn show_resume_picker(&mut self, ctx: &egui::Context) {
+        if let Some(state) = self.resume_picker.as_mut() {
+            match state.receiver.as_ref().map(|rx| rx.try_recv()) {
+                Some(Ok(sessions)) => {
+                    state.sessions = sessions;
+                    state.receiver = None;
+                }
+                Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+                    state.receiver = None;
+                    state.load_error = Some("No se pudo leer el historial".into());
+                }
+                Some(Err(std::sync::mpsc::TryRecvError::Empty)) => {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(50))
+                }
+                None => {}
+            }
+        }
         if self.resume_picker.is_none() {
             return;
         }
@@ -164,6 +188,14 @@ impl TerminalApp {
                         );
                         ui.add_space(10.0);
 
+                        if state.receiver.is_some() {
+                            ui.spinner();
+                            ui.label("Buscando conversaciones…");
+                        } else if let Some(error) = &state.load_error {
+                            ui.label(error);
+                        } else if state.sessions.is_empty() {
+                            ui.label("No hay conversaciones guardadas para esta carpeta");
+                        }
                         let selected = state.selected;
                         ScrollArea::vertical()
                             .id_salt("resume-list")

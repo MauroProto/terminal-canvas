@@ -116,7 +116,7 @@ fn list_sessions_in(dir: &Path) -> Vec<AgentSessionEntry> {
             continue;
         };
         let modified = entry.metadata().and_then(|meta| meta.modified()).ok();
-        let title = read_session_title(&path).unwrap_or_else(|| short_id(id));
+        let title = String::new();
         out.push(AgentSessionEntry {
             id: id.to_owned(),
             title,
@@ -126,6 +126,11 @@ fn list_sessions_in(dir: &Path) -> Vec<AgentSessionEntry> {
     // Más recientes primero: es el orden en que uno busca "la de recién".
     out.sort_by(|a, b| b.modified.cmp(&a.modified).then_with(|| a.id.cmp(&b.id)));
     out.truncate(MAX_SESSIONS);
+    // Read bodies only for the newest sessions that can actually be shown.
+    for entry in &mut out {
+        entry.title = read_session_title(&dir.join(format!("{}.jsonl", entry.id)))
+            .unwrap_or_else(|| short_id(&entry.id));
+    }
     out
 }
 
