@@ -101,6 +101,20 @@ pub fn parse_unified_diff(text: &str) -> Vec<FileDiff> {
             file.is_binary = true;
             continue;
         }
+        if let Some(path) = raw
+            .strip_prefix("rename from ")
+            .or_else(|| raw.strip_prefix("copy from "))
+        {
+            file.old_path = Some(decode_git_path(path));
+            continue;
+        }
+        if let Some(path) = raw
+            .strip_prefix("rename to ")
+            .or_else(|| raw.strip_prefix("copy to "))
+        {
+            file.path = decode_git_path(path);
+            continue;
+        }
         if let Some(rest) = raw.strip_prefix("--- ").filter(|_| !in_hunk) {
             let path = strip_ab_prefix(rest);
             if path != "/dev/null" {
@@ -172,10 +186,28 @@ pub fn parse_unified_diff(text: &str) -> Vec<FileDiff> {
 /// Extrae la ruta nueva de `diff --git a/<path> b/<path>`. Maneja rutas con
 /// espacios tomando el segmento tras el último " b/".
 fn parse_diff_git_path(rest: &str) -> String {
-    if let Some(index) = rest.rfind(" b/") {
+    if rest.starts_with('"') {
+        let mut escaped = false;
+        for (index, character) in rest.char_indices().skip(1) {
+            if character == '"' && !escaped {
+                return strip_ab_prefix(rest[index + 1..].trim_start());
+            }
+            escaped = character == '\\' && !escaped;
+        }
+    }
+    // Git leaves ordinary spaces unquoted. Prefer the unambiguous repeated
+    // path before falling back to rename/copy metadata that follows the header.
+    let split = rest
+        .match_indices(" b/")
+        .find(|(index, _)| rest[..*index].strip_prefix("a/") == Some(&rest[index + 3..]))
+        .or_else(|| rest.match_indices(" b/").next());
+    if let Some((index, _)) = split {
         return rest[index + 3..].to_owned();
     }
-    rest.to_owned()
+    if let Some(index) = rest.find(" \"b/") {
+        return strip_ab_prefix(&rest[index + 1..]);
+    }
+    strip_ab_prefix(rest)
 }
 
 fn strip_ab_prefix(path: &str) -> String {
@@ -455,7 +487,7 @@ fn git_string(path: &Path, args: &[&str]) -> Option<String> {
     }
     String::from_utf8(output.stdout)
         .ok()
-        .map(|text| text.trim_end().to_owned())
+        .map(|text| text.trim_end_matches(['\r', '\n']).to_owned())
 }
 
 #[derive(Debug)]
@@ -556,6 +588,20 @@ index 1111111..2222222 100644
 +    println!(\"new\");
  }
 ";
+
+    #[test]
+    fn binary_and_rename_headers_decode_without_text_hunks() {
+        let binary = parse_unified_diff("diff --git \"a/espa\\303\\261ol.bin\" \"b/espa\\303\\261ol.bin\"\nBinary files differ\n");
+        assert_eq!(binary[0].path, "español.bin");
+        assert!(binary[0].is_binary);
+        assert_eq!(
+            super::parse_diff_git_path("a/name b/part.bin b/name b/part.bin"),
+            "name b/part.bin"
+        );
+        let renamed = parse_unified_diff("diff --git a/old name b/new name\nsimilarity index 100%\nrename from old name\nrename to new name\n");
+        assert_eq!(renamed[0].old_path.as_deref(), Some("old name"));
+        assert_eq!(renamed[0].path, "new name");
+    }
 
     #[test]
     fn hunk_content_that_looks_like_file_headers_keeps_paths_and_counts() {
@@ -752,7 +798,7 @@ index 1..2 100644
 
         // Modificar el archivo trackeado y crear nuevos sin trackear (uno
         // suelto y otro dentro de un directorio nuevo).
-        std::fs::write(dir.join("tracked.txt"), "line1\nchanged\n").unwrap();
+        std::fs::write(dir.join("tracked.txt"), "line1\nchanged  \n").unwrap();
         std::fs::write(dir.join("new_file.txt"), "brand new\n").unwrap();
         std::fs::create_dir_all(dir.join("newdir")).unwrap();
         std::fs::write(dir.join("newdir/nested.txt"), "nested\n").unwrap();
@@ -764,6 +810,14 @@ index 1..2 100644
         assert!(diff.branch == "master" || diff.branch == "main");
         let paths: Vec<&str> = diff.files.iter().map(|f| f.path.as_str()).collect();
         assert!(paths.contains(&"tracked.txt"), "tracked change present");
+        assert!(diff
+            .files
+            .iter()
+            .find(|file| file.path == "tracked.txt")
+            .unwrap()
+            .lines
+            .iter()
+            .any(|line| line.kind == DiffLineKind::Added && line.text == "changed  "));
         assert!(paths.contains(&"new_file.txt"), "untracked file present");
         assert!(
             paths.contains(&"newdir/nested.txt"),
