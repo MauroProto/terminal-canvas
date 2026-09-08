@@ -296,21 +296,25 @@ impl PtyHandle {
                             }
                             if let Ok(mut term) = term_for_reader.lock() {
                                 processor.advance(&mut *term, &clean);
-                            }
-                            // Log incremental (P1.7): el mismo byte-stream que
-                            // alimenta el grid queda pendiente de appendear.
-                            if !clean.is_empty() {
-                                if let Ok(mut pending) = pending_log_for_reader.lock() {
-                                    if let Some(seq) = next_log_sequence(&log_seq_for_reader) {
-                                        pending.extend_from_slice(
-                                            &crate::state::scrollback_log::encode_frame(
-                                                seq,
-                                                crate::state::scrollback_log::FrameKind::Output,
-                                                &clean,
-                                            ),
-                                        );
-                                    } else {
-                                        log::error!("se agotó la secuencia incremental del PTY");
+                                // Keep the grid locked until its matching log
+                                // frame is visible. Checkpoints acquire these
+                                // same locks in this order and cannot observe
+                                // parsed bytes that are still missing a frame.
+                                if !clean.is_empty() {
+                                    if let Ok(mut pending) = pending_log_for_reader.lock() {
+                                        if let Some(seq) = next_log_sequence(&log_seq_for_reader) {
+                                            pending.extend_from_slice(
+                                                &crate::state::scrollback_log::encode_frame(
+                                                    seq,
+                                                    crate::state::scrollback_log::FrameKind::Output,
+                                                    &clean,
+                                                ),
+                                            );
+                                        } else {
+                                            log::error!(
+                                                "se agotó la secuencia incremental del PTY"
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -564,19 +568,17 @@ impl PtyHandle {
         };
         if let Ok(mut term) = self.term.lock() {
             term.resize(TermSize::new(cols as usize, rows as usize));
-        }
-        // Log incremental (P1.7): un resize real se registra para que el
-        // replay reaplique el tamaño antes de seguir con el output.
-        if size_changed {
-            if let Ok(mut pending) = self.pending_log.lock() {
-                if let Some(seq) = next_log_sequence(&self.log_seq) {
-                    pending.extend_from_slice(&crate::state::scrollback_log::encode_frame(
-                        seq,
-                        crate::state::scrollback_log::FrameKind::Resize,
-                        &crate::state::scrollback_log::resize_payload(cols, rows),
-                    ));
-                } else {
-                    log::error!("se agotó la secuencia incremental del PTY");
+            if size_changed {
+                if let Ok(mut pending) = self.pending_log.lock() {
+                    if let Some(seq) = next_log_sequence(&self.log_seq) {
+                        pending.extend_from_slice(&crate::state::scrollback_log::encode_frame(
+                            seq,
+                            crate::state::scrollback_log::FrameKind::Resize,
+                            &crate::state::scrollback_log::resize_payload(cols, rows),
+                        ));
+                    } else {
+                        log::error!("se agotó la secuencia incremental del PTY");
+                    }
                 }
             }
         }

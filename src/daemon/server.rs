@@ -397,31 +397,46 @@ impl DaemonState {
     /// lock del PTY, pero el I/O durable se hace después de soltar el registro
     /// global del daemon.
     fn take_dirty_scrollback_targets(&mut self) -> Vec<ScrollbackTarget> {
-        self.sessions
-            .iter_mut()
-            .filter_map(|(session_id, session)| {
-                if !session.scrollback_dirty {
-                    return None;
-                }
-                let panel_id = session.spec.panel_id?;
-                let (text, _) = session
-                    .handle
-                    .as_ref()?
+        let mut targets = Vec::new();
+        let mut events = Vec::new();
+        for (session_id, session) in &mut self.sessions {
+            if !session.scrollback_dirty {
+                continue;
+            }
+            let Some(panel_id) = session.spec.panel_id else {
+                continue;
+            };
+            let boundary = session.handle.as_ref().and_then(|handle| {
+                handle
                     .lock()
                     .ok()?
-                    .checkpoint_snapshot(crate::terminal::export::scrollback_to_ansi)?;
-                session.scrollback_dirty = false;
-                Some(ScrollbackTarget {
-                    session_id: *session_id,
-                    panel_id,
-                    leaf_id: session.spec.leaf_id,
-                    text,
-                    pending_bytes: session.persist_pending.len(),
-                })
-            })
-            .collect()
+                    .attach_snapshot_and_drain(crate::terminal::export::scrollback_to_ansi)
+            });
+            let Some((text, frames)) = boundary else {
+                continue;
+            };
+            // The checkpoint includes output the pump has not seen yet.
+            // Number and broadcast it now, and acknowledge that same prefix
+            // only after the checkpoint is durable.
+            if let Some((seq, data)) = session.ingest_pty_frames(&frames) {
+                events.push(Response::Output {
+                    id: *session_id,
+                    seq,
+                    data,
+                });
+            }
+            session.scrollback_dirty = false;
+            targets.push(ScrollbackTarget {
+                session_id: *session_id,
+                panel_id,
+                leaf_id: session.spec.leaf_id,
+                text,
+                pending_bytes: session.persist_pending.len(),
+            });
+        }
+        self.broadcast(&events);
+        targets
     }
-
     fn incremental_scrollback_targets(&self) -> Vec<IncrementalTarget> {
         self.sessions
             .iter()
