@@ -90,8 +90,9 @@ function captureHtml(element) {
       remaining -= text.length;
       return inert.createTextNode(text);
     }
-    if (node.nodeType !== 1 || /^(SCRIPT|STYLE|IFRAME|OBJECT|EMBED|NOSCRIPT)$/.test(node.tagName)) return null;
-    const clone = inert.createElement(node.tagName.toLowerCase());
+    const tag = (node.localName || node.tagName || "").toLowerCase();
+    if (node.nodeType !== 1 || /^(script|style|iframe|object|embed|noscript)$/.test(tag)) return null;
+    const clone = inert.createElement(tag);
     for (const attribute of Array.from(node.attributes).slice(0, 32)) {
       if (/^on|value|srcdoc|token|secret|password|credential|nonce/i.test(attribute.name)) continue;
       const value = attribute.value.slice(0, Math.min(remaining, 512));
@@ -99,7 +100,7 @@ function captureHtml(element) {
       if (remaining < 0) break;
       clone.setAttribute(attribute.name, value);
     }
-    if (!/^(INPUT|TEXTAREA|SELECT)$/.test(node.tagName) && !node.isContentEditable) {
+    if (!/^(input|textarea|select)$/.test(tag) && !node.isContentEditable) {
       for (const child of node.childNodes) {
         if (nodes >= 512 || remaining <= 0) break;
         const result = copy(child, depth + 1);
@@ -115,7 +116,7 @@ function captureHtml(element) {
 document.addEventListener(
   "click",
   async (event) => {
-    if (!armed || sending) return;
+    if (!event.isTrusted || !armed || sending) return;
     const element = event.target;
     if (!element || element.nodeType !== 1) return;
     event.preventDefault();
