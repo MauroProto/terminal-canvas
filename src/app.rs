@@ -29,6 +29,7 @@ use crate::utils::platform::home_dir;
 mod broadcast_ui;
 pub mod code_highlight;
 mod code_review_ui;
+#[allow(float_literal_f32_fallback)]
 mod collab_ui;
 mod desktop;
 mod dialogs;

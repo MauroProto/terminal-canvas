@@ -5,7 +5,9 @@
 
 pub mod app;
 pub mod canvas;
-#[allow(clippy::uninlined_format_args)]
+// Online/invitations are outside this maintenance pass. Keep their existing
+// formatting/type-inference behavior while checking the rest with Rust 1.98.
+#[allow(clippy::uninlined_format_args, float_literal_f32_fallback)]
 pub mod collab;
 pub mod command_palette;
 pub mod config;
