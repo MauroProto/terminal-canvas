@@ -89,6 +89,14 @@ fn anonymize_value(value: &mut serde_json::Value) {
         "leaf_agent_commands",
         "agent_session_id",
         "leaf_agent_session_ids",
+        "startup_command",
+        "startup_input",
+        "summary",
+        "excerpt",
+        "command_excerpt",
+        "last_error",
+        "last_success",
+        "changed_files",
         "name",
         "label",
         "brief",
@@ -321,6 +329,28 @@ mod tests {
             .as_str()
             .unwrap()
             .starts_with('#'));
+    }
+
+    #[test]
+    fn orchestration_summaries_and_paths_are_not_exported_as_plaintext() {
+        let raw = serde_json::json!({
+            "orchestration": {
+                "sessions": [{
+                    "startup_command": "agent --prompt secret-brief",
+                    "command_summary": { "excerpt": "secret-output", "failed": false },
+                    "review_summary": { "changed_files": ["/secret-project/main.rs"], "last_error": "secret-failure" }
+                }],
+                "inbox": [{ "summary": "secret-request", "resolved": true }]
+            }
+        });
+        let sanitized = anonymize_layout(&raw.to_string());
+        assert!(!sanitized.contains("secret-"));
+        let parsed: serde_json::Value = serde_json::from_str(&sanitized).unwrap();
+        assert_eq!(
+            parsed["orchestration"]["sessions"][0]["command_summary"]["failed"],
+            false
+        );
+        assert_eq!(parsed["orchestration"]["inbox"][0]["resolved"], true);
     }
 
     #[test]
