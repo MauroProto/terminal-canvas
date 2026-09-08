@@ -40,29 +40,42 @@ pub(super) struct PreferencesWorker {
 
 impl Default for PreferencesWorker {
     fn default() -> Self {
+        Self::with_processor(run_job)
+    }
+}
+
+fn run_job(job: Job) -> Completion {
+    match job {
+        Job::SaveNotes(root, notes) => {
+            Completion::NotesSaved(crate::orchestration::save_notes(&root, &notes))
+        }
+        Job::LoadNotes(key, root) => Completion::NotesLoaded {
+            key,
+            notes: crate::orchestration::load_notes(&root),
+            legacy_available: crate::orchestration::legacy_notes_available(&root),
+        },
+        Job::ImportNotes(key, root) => Completion::NotesImported {
+            key,
+            result: crate::orchestration::load_legacy_notes(&root),
+        },
+        Job::SaveSettings(config) => Completion::SettingsSaved(crate::config::save(&config)),
+    }
+}
+
+impl PreferencesWorker {
+    fn with_processor(mut process: impl FnMut(Job) -> Completion + Send + 'static) -> Self {
         let (tx, rx) = mpsc::sync_channel::<Job>(1);
         let (result_tx, results) = mpsc::channel();
         let worker = thread::Builder::new()
             .name("preferences-writer".to_owned())
             .spawn(move || {
                 while let Ok(job) = rx.recv() {
-                    let completion = match job {
-                        Job::SaveNotes(root, notes) => {
-                            Completion::NotesSaved(crate::orchestration::save_notes(&root, &notes))
-                        }
-                        Job::LoadNotes(key, root) => Completion::NotesLoaded {
-                            key,
-                            notes: crate::orchestration::load_notes(&root),
-                            legacy_available: crate::orchestration::legacy_notes_available(&root),
-                        },
-                        Job::ImportNotes(key, root) => Completion::NotesImported {
-                            key,
-                            result: crate::orchestration::load_legacy_notes(&root),
-                        },
-                        Job::SaveSettings(config) => {
-                            Completion::SettingsSaved(crate::config::save(&config))
-                        }
-                    };
+                    let completion = process(job);
+                    if let Completion::NotesSaved(Err(error))
+                    | Completion::SettingsSaved(Err(error)) = &completion
+                    {
+                        log::error!("No se pudo persistir una preferencia: {error}");
+                    }
                     // An absent UI must not abandon writes already accepted.
                     let _ = result_tx.send(completion);
                 }
@@ -158,6 +171,42 @@ impl Drop for PreferencesWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shutdown_drains_the_latest_notes_and_settings_to_real_temporary_files() {
+        let directory =
+            std::env::temp_dir().join(format!("tc-preferences-drain-{}", Uuid::new_v4()));
+        let notes_path = directory.join("notes.json");
+        let config_path = directory.join("config.toml");
+        let worker_notes = notes_path.clone();
+        let worker_config = config_path.clone();
+        let mut worker = PreferencesWorker::with_processor(move |job| match job {
+            Job::SaveNotes(_, notes) => Completion::NotesSaved(
+                crate::orchestration::save_notes_to_path(&worker_notes, &notes),
+            ),
+            Job::SaveSettings(config) => {
+                Completion::SettingsSaved(crate::config::save_to_path(&config, &worker_config))
+            }
+            _ => panic!("fixture only accepts writes"),
+        });
+        for index in 0..100 {
+            let mut notes = DiffNotes::default();
+            notes.add("a.rs", None, 1, &format!("edit {index}"));
+            worker.save_notes(PathBuf::from("synthetic-repository"), notes);
+            worker.save_settings(crate::config::AppConfig {
+                font_size: 12.0 + index as f32 / 100.0,
+                ..Default::default()
+            });
+        }
+        // No poll/wait calls: dropping is exactly what a quick app exit does.
+        drop(worker);
+        let notes: DiffNotes =
+            serde_json::from_slice(&std::fs::read(&notes_path).unwrap()).unwrap();
+        let config = crate::config::load_from_path(&config_path);
+        assert_eq!(notes.notes[0].body, "edit 99");
+        assert!((config.font_size - 12.99).abs() < 0.001);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn rapid_edits_coalesce_before_a_queued_reload() {

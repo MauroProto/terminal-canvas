@@ -175,9 +175,14 @@ pub fn save_notes(repo_root: &Path, notes: &DiffNotes) -> anyhow::Result<()> {
     let Some(path) = notes_file(repo_root) else {
         anyhow::bail!("No se pudo resolver el directorio de notas");
     };
+    save_notes_to_path(&path, notes)
+}
+
+/// An explicit destination keeps storage tests independent of the profile.
+pub fn save_notes_to_path(path: &Path, notes: &DiffNotes) -> anyhow::Result<()> {
     if notes.notes.is_empty() {
         // Sin notas no queda archivo: un repo limpio no arrastra notas viejas.
-        match std::fs::remove_file(&path) {
+        match std::fs::remove_file(path) {
             Ok(()) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => return Err(err.into()),
@@ -185,7 +190,7 @@ pub fn save_notes(repo_root: &Path, notes: &DiffNotes) -> anyhow::Result<()> {
         return Ok(());
     }
     let bytes = serde_json::to_vec_pretty(notes)?;
-    crate::state::durable_write::write_durable(&path, &bytes)?;
+    crate::state::durable_write::write_durable(path, &bytes)?;
     Ok(())
 }
 

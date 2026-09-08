@@ -28,8 +28,8 @@ pub use code_diff::{
 };
 #[allow(unused_imports)]
 pub use diff_notes::{
-    format_note, legacy_notes_available, load_legacy_notes, load_notes, save_notes, DiffNote,
-    DiffNotes,
+    format_note, legacy_notes_available, load_legacy_notes, load_notes, save_notes,
+    save_notes_to_path, DiffNote, DiffNotes,
 };
 #[allow(unused_imports)]
 pub use gh_client::{
