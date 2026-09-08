@@ -273,10 +273,8 @@ mod tests {
         let id = Uuid::new_v4();
         let mut writer = RemoteWriter::new(RemoteLink::new(id, ours));
         let payload = vec![b'x'; MAX_WIRE_INPUT_BYTES + 17];
-        let payload_for_writer = payload.clone();
-        let writer_thread = std::thread::spawn(move || {
-            writer.write_all(&payload_for_writer).expect("escribe todo");
-        });
+        // Keep the queue owner alive until every accepted chunk is observed.
+        writer.write_all(&payload).expect("escribe todo");
 
         let mut reader = BufReader::new(theirs);
         let mut rebuilt = Vec::new();
@@ -292,9 +290,6 @@ mod tests {
                 other => panic!("esperaba Write, got {other:?}"),
             }
         }
-        writer_thread
-            .join()
-            .expect("writer no debe entrar en pánico");
         assert_eq!(rebuilt, payload);
     }
 
