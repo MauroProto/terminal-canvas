@@ -176,14 +176,14 @@ mod tests {
         let wt = root.join(".terminalcanvas/worktrees/agent");
         run(&["worktree", "add", "-b", "agent", wt.to_str().unwrap()]);
         std::fs::write(wt.join("new.txt"), "uncommitted").unwrap();
-        assert!(archive(&root, &wt, &[wt.clone()]).is_err());
+        assert!(archive(&root, &wt, std::slice::from_ref(&wt)).is_err());
         let archived = archive(&root, &wt, &[]).unwrap();
         assert!(!wt.exists());
         assert_eq!(
             std::fs::read_to_string(archived.join("new.txt")).unwrap(),
             "uncommitted"
         );
-        assert!(restore(&root, &archived, &[archived.clone()]).is_err());
+        assert!(restore(&root, &archived, std::slice::from_ref(&archived)).is_err());
         restore(&root, &archived, &[]).unwrap();
         assert_eq!(
             std::fs::read_to_string(wt.join("new.txt")).unwrap(),

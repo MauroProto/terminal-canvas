@@ -263,7 +263,7 @@ impl TerminalApp {
             .iter()
             .map(|panel| (panel.id(), panel.title().to_owned(), panel.z_index()))
             .collect();
-        panels.sort_by(|a, b| b.2.cmp(&a.2));
+        panels.sort_by_key(|panel| std::cmp::Reverse(panel.2));
         panels
             .into_iter()
             .map(|(id, title, _)| (id, title))

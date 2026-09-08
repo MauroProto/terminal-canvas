@@ -1375,7 +1375,7 @@ impl Orchestrator {
             .filter(|event| event_matches_filters(self, event, provider_filter, status_filter))
             .filter(|event| inbox_matches_query(event, search_query))
             .collect::<Vec<_>>();
-        events.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+        events.sort_by_key(|event| std::cmp::Reverse(event.created_at));
         events
     }
 
