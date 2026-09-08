@@ -77,6 +77,12 @@ fn reaper() -> &'static Mutex<std::sync::mpsc::Sender<(String, Child)>> {
 /// salida se registra en el log porque para "abrir con la app default" no hay
 /// nada útil que hacer con él.
 pub fn spawn_detached(label: &str, command: &mut Command) -> anyhow::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // Helpers should not flash a console in front of the terminal window.
+        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
     let child = command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -138,8 +144,8 @@ pub fn open_path_external(path: &Path) -> anyhow::Result<()> {
 
     #[cfg(target_os = "windows")]
     let mut command = {
-        let mut command = Command::new("cmd");
-        command.args(["/C", "start", ""]);
+        let mut command = Command::new("rundll32");
+        command.arg("url.dll,FileProtocolHandler");
         command.arg(path);
         command
     };
@@ -193,13 +199,11 @@ fn validated_external_url(raw_url: &str) -> anyhow::Result<url::Url> {
 pub fn notify(title: &str, message: &str) {
     #[cfg(target_os = "macos")]
     {
-        let script = format!(
-            "display notification \"{}\" with title \"{}\"",
-            message.replace('"', "\\\""),
-            title.replace('"', "\\\"")
-        );
+        // Arguments remain data even when a terminal title contains quotes,
+        // backslashes or AppleScript fragments.
+        let script = "on run argv\ndisplay notification (item 2 of argv) with title (item 1 of argv)\nend run";
         let mut command = Command::new("osascript");
-        command.arg("-e").arg(script);
+        command.args(["-e", script, title, message]);
         let _ = spawn_detached("osascript", &mut command);
     }
     #[cfg(all(unix, not(target_os = "macos")))]
@@ -241,19 +245,15 @@ pub fn capture_interactive(dest: &Path) -> anyhow::Result<()> {
 
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        match Command::new("gnome-screenshot")
+        if let Ok(status) = Command::new("gnome-screenshot")
             .args(["-a", "-f"])
             .arg(dest)
             .status()
         {
-            Ok(status) => {
-                if status.success() && dest.exists() {
-                    return Ok(());
-                }
-                anyhow::bail!("la captura se canceló");
+            if status.success() && dest.exists() {
+                return Ok(());
             }
-            // No existe gnome-screenshot: probar slurp + grim.
-            Err(_) => {}
+            anyhow::bail!("la captura se canceló");
         }
         let region = Command::new("slurp").output().map_err(|_| {
             anyhow::anyhow!("no hay herramienta de captura (gnome-screenshot o slurp+grim)")
