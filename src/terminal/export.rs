@@ -98,6 +98,28 @@ fn live_snapshot_with_options(
     use std::fmt::Write as _;
     let grid = term.grid();
     let mut out = String::from("\x1bc");
+    for index in 0..256 {
+        if let Some(rgb) = term.colors()[index] {
+            let _ = write!(
+                out,
+                "\x1b]4;{index};rgb:{:02x}/{:02x}/{:02x}\x07",
+                rgb.r, rgb.g, rgb.b
+            );
+        }
+    }
+    for (color, osc) in [
+        (NamedColor::Foreground, 10),
+        (NamedColor::Background, 11),
+        (NamedColor::Cursor, 12),
+    ] {
+        if let Some(rgb) = term.colors()[color] {
+            let _ = write!(
+                out,
+                "\x1b]{osc};rgb:{:02x}/{:02x}/{:02x}\x07",
+                rgb.r, rgb.g, rgb.b
+            );
+        }
+    }
     if term.mode().contains(TermMode::ALT_SCREEN) {
         out.push_str("\x1b[?1049h");
     }
@@ -212,8 +234,29 @@ fn live_cell_style(cell: &Cell) -> String {
         }
     }
     for (color, foreground) in [(&cell.fg, true), (&cell.bg, false)] {
-        if let Some((r, g, b)) = color_rgb(color, foreground) {
+        let index = match color {
+            AnsiColor::Indexed(index) => Some(*index),
+            AnsiColor::Named(name) if (*name as usize) < 16 => Some(*name as u8),
+            _ => None,
+        };
+        if let Some(index) = index {
+            let _ = write!(out, ";{};5;{index}", if foreground { 38 } else { 48 });
+        } else if let Some((r, g, b)) = color_rgb(color, foreground) {
             let _ = write!(out, ";{};2;{r};{g};{b}", if foreground { 38 } else { 48 });
+        }
+    }
+    for (flag, style) in [
+        (Flags::UNDERCURL, 3),
+        (Flags::DOTTED_UNDERLINE, 4),
+        (Flags::DASHED_UNDERLINE, 5),
+    ] {
+        if cell.flags.contains(flag) {
+            let _ = write!(out, ";4:{style}");
+        }
+    }
+    if let Some(color) = cell.underline_color() {
+        if let Some((r, g, b)) = color_rgb(&color, true) {
+            let _ = write!(out, ";58;2;{r};{g};{b}");
         }
     }
     out.push('m');
@@ -323,6 +366,10 @@ fn row_to_ansi(row: &Row<Cell>) -> String {
 
         out.push(cell.c);
         emitted += 1;
+        if let Some(extra) = cell.zerowidth() {
+            out.extend(extra);
+            emitted += extra.len();
+        }
     }
     if fg.is_some() || bg.is_some() || bold {
         // Cierra el estilo de la línea: nada se derrama a la siguiente.
@@ -396,6 +443,9 @@ fn row_to_string(row: &Row<Cell>) -> String {
             continue;
         }
         text.push(cell.c);
+        if let Some(extra) = cell.zerowidth() {
+            text.extend(extra);
+        }
     }
     while text.ends_with(' ') {
         text.pop();
@@ -609,6 +659,33 @@ mod tests {
                 assert_eq!(original.grid().cursor.point, replayed.grid().cursor.point);
             }
         }
+    }
+
+    #[test]
+    fn exports_keep_combining_characters_without_adding_padding() {
+        let original = term_with("cafe\u{301}\r\n", 4, 16);
+        assert_eq!(scrollback_to_text(&original), "cafe\u{301}\n");
+        assert_eq!(super::scrollback_to_ansi(&original), "cafe\u{301}\n");
+    }
+
+    #[test]
+    fn live_snapshot_keeps_dynamic_palette_and_underline_style() {
+        let original = term_with(
+            "\x1b]4;1;rgb:12/34/56\x07\x1b]11;rgb:01/02/03\x07\x1b[31;4:3mtext",
+            4,
+            16,
+        );
+        let replayed = term_with(&super::live_snapshot_to_ansi(&original), 4, 16);
+        assert_eq!(original.colors()[1], replayed.colors()[1]);
+        assert_eq!(
+            original.colors()[alacritty_terminal::vte::ansi::NamedColor::Background],
+            replayed.colors()[alacritty_terminal::vte::ansi::NamedColor::Background]
+        );
+        assert!(
+            replayed.grid()[Line(0)][alacritty_terminal::index::Column(0)]
+                .flags
+                .contains(Flags::UNDERCURL)
+        );
     }
 
     #[test]

@@ -942,6 +942,9 @@ fn build_full_foreground_shapes(
             }
         }
         if drawable {
+            if let Some(extra) = cell.zerowidth() {
+                run.text.extend(extra);
+            }
             draw_decoration_shapes(&mut decorations, text_pos, metrics, cell.flags, fg);
         }
     }
@@ -1009,6 +1012,9 @@ fn build_reduced_foreground_shapes(
 
         if drawable && run.can_extend(fg, text_pos.x, text_pos.y, italic_offset, bold) {
             run.extend(ch, width);
+            if let Some(extra) = cell.zerowidth() {
+                run.text.extend(extra);
+            }
             continue;
         }
 
@@ -1016,6 +1022,9 @@ fn build_reduced_foreground_shapes(
 
         if drawable {
             run.start(ch, text_pos.x, text_pos.y, width, fg, italic_offset, bold);
+            if let Some(extra) = cell.zerowidth() {
+                run.text.extend(extra);
+            }
         } else {
             draw_decoration_shapes(foreground_shapes, text_pos, metrics, cell.flags, fg);
         }
