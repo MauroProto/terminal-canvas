@@ -21,6 +21,8 @@ const SKIP_DIRS: &[&str] = &[
     "target",
     "node_modules",
     ".terminalcanvas",
+    ".terminalcanvas-archive",
+    ".terminalcanvas-trash",
     "dist",
     "build",
     ".next",
@@ -38,7 +40,7 @@ pub(super) struct QuickOpenState {
 }
 
 /// Junta los archivos del workspace (relativos a `root`), salteando
-/// directorios pesados y ocultos. Limitado para no bloquear en repos enormes.
+/// directorios pesados. Los archivos de configuración ocultos son buscables.
 pub(super) fn collect_files(root: &Path) -> Vec<String> {
     let mut files = Vec::new();
     let mut visited = 0usize;
@@ -65,11 +67,11 @@ pub(super) fn collect_files(root: &Path) -> Vec<String> {
             let file_type = entry.file_type();
             let is_dir = file_type.as_ref().map(|t| t.is_dir()).unwrap_or(false);
             if is_dir {
-                if name.starts_with('.') || SKIP_DIRS.contains(&name.as_str()) {
+                if SKIP_DIRS.contains(&name.as_str()) {
                     continue;
                 }
                 stack.push(rel_child);
-            } else if !name.starts_with('.') {
+            } else {
                 let rel_str = rel_child.to_string_lossy().replace('\\', "/");
                 files.push(rel_str);
                 if files.len() >= MAX_FILES {
@@ -413,9 +415,19 @@ mod tests {
         std::fs::write(dir.join("README.md"), "# hi").unwrap();
         std::fs::write(dir.join("node_modules/pkg/index.js"), "x").unwrap();
         std::fs::write(dir.join(".git/config"), "x").unwrap();
+        std::fs::write(dir.join(".gitignore"), "target/").unwrap();
+        std::fs::create_dir_all(dir.join(".github/workflows")).unwrap();
+        std::fs::write(dir.join(".github/workflows/test.yml"), "name: test").unwrap();
+        std::fs::create_dir_all(dir.join(".terminalcanvas-archive/old")).unwrap();
+        std::fs::write(dir.join(".terminalcanvas-archive/old/main.rs"), "old").unwrap();
 
         let files = collect_files(&dir);
         let _ = std::fs::remove_dir_all(&dir);
+        assert!(files.contains(&".gitignore".to_owned()));
+        assert!(files.contains(&".github/workflows/test.yml".to_owned()));
+        assert!(!files
+            .iter()
+            .any(|path| path.starts_with(".terminalcanvas-archive/")));
 
         assert!(files.contains(&"src/main.rs".to_owned()));
         assert!(files.contains(&"README.md".to_owned()));

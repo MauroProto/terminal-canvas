@@ -413,20 +413,20 @@ pub fn list_git_worktrees(repo_root: &Path) -> Vec<WorktreeInfo> {
         Some(root) => root,
         None => return Vec::new(),
     };
-    let raw = match git_string(&root, &["worktree", "list", "--porcelain"]) {
+    let raw = match git_string(&root, &["worktree", "list", "--porcelain", "-z"]) {
         Some(raw) => raw,
         None => return Vec::new(),
     };
     let mut worktrees: Vec<WorktreeInfo> = Vec::new();
     let mut current: Option<WorktreeInfo> = None;
-    for line in raw.lines() {
+    for line in raw.split('\0') {
         if let Some(path) = line.strip_prefix("worktree ") {
             // Cierra el worktree anterior si hay uno abierto.
             if let Some(finished) = current.take() {
                 worktrees.push(finished);
             }
             current = Some(WorktreeInfo {
-                path: PathBuf::from(path.trim()),
+                path: PathBuf::from(path),
                 branch: String::new(),
                 is_main: false,
                 is_managed: false,
