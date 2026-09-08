@@ -26,6 +26,14 @@ Esto **no equivale a un release público completo**. Siguen pendientes:
 
 ## 1. Empaquetar
 
+Los tres scripts requieren `rustup` y la versión exacta fijada en
+`rust-toolchain.toml`. Resuelven las rutas de Cargo y rustc con `rustup which`,
+comprueban ambas versiones y compilan con esos ejecutables. Esto evita usar
+otra instalación de Rust que aparezca antes en `PATH`, por ejemplo un MSI
+antiguo en Windows. Los cambios de `PATH`, `RUSTC` y `RUSTUP_TOOLCHAIN` duran
+sólo la ejecución del script; no modifican el entorno persistente. El
+empaquetado no exige el componente Clippy.
+
 ```sh
 scripts/bundle.sh --dmg
 ```
