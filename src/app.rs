@@ -625,6 +625,11 @@ impl TerminalApp {
                     return None;
                 }
                 if let Some(command) = shortcut_command(&modifiers, key) {
+                    if !matches!(self.collab.mode(), CollabMode::Guest)
+                        && !command.available_on_desktop()
+                    {
+                        continue;
+                    }
                     // El atajo es de la app. Quitarlo del stream evita que la
                     // misma tecla llegue después al PTY como byte de control.
                     consume_key_event(ctx, modifiers, key);
@@ -1128,6 +1133,7 @@ impl TerminalApp {
     /// refresh de orquestación y atajos globales.
     fn begin_frame(&mut self, ctx: &egui::Context) {
         self.ctx = Some(ctx.clone());
+        self.command_palette.desktop_mode = !matches!(self.collab.mode(), CollabMode::Guest);
         self.window_focused = ctx.input(|input| input.focused);
         self.poll_persistence_worker(ctx);
         self.handle_collab_events();

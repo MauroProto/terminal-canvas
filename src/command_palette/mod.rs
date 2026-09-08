@@ -14,6 +14,7 @@ pub struct CommandPalette {
     pub query: String,
     pub selected: usize,
     request_focus: bool,
+    pub desktop_mode: bool,
 }
 
 impl CommandPalette {
@@ -164,6 +165,7 @@ impl CommandPalette {
     pub fn filtered_entries(&self) -> Vec<&'static CommandEntry> {
         let mut entries: Vec<_> = COMMANDS
             .iter()
+            .filter(|entry| !self.desktop_mode || entry.command.available_on_desktop())
             .filter_map(|entry| fuzzy_score(&self.query, entry.label).map(|score| (score, entry)))
             .collect();
         entries.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.label.cmp(b.1.label)));

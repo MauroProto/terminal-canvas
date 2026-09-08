@@ -36,6 +36,15 @@ pub enum Command {
     CreateHandoff,
 }
 
+impl Command {
+    pub fn available_on_desktop(self) -> bool {
+        !matches!(
+            self,
+            Self::ZoomToFitAll | Self::ZoomIn | Self::ZoomOut | Self::ResetZoom
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct CommandEntry {
     pub command: Command,
@@ -157,17 +166,29 @@ pub const COMMANDS: &[CommandEntry] = &[
     CommandEntry {
         command: Command::SplitRight,
         label: "Split Right",
-        shortcut: "Cmd+D",
+        shortcut: if cfg!(target_os = "macos") {
+            "Cmd+D"
+        } else {
+            "Ctrl+Alt+D"
+        },
     },
     CommandEntry {
         command: Command::SplitDown,
         label: "Split Down",
-        shortcut: "Cmd+Shift+D",
+        shortcut: if cfg!(target_os = "macos") {
+            "Cmd+Shift+D"
+        } else {
+            "Ctrl+Alt+Shift+D"
+        },
     },
     CommandEntry {
         command: Command::CloseLeaf,
         label: "Close Split",
-        shortcut: "Cmd+W",
+        shortcut: if cfg!(target_os = "macos") {
+            "Cmd+W"
+        } else {
+            "Ctrl+Alt+W"
+        },
     },
     CommandEntry {
         command: Command::ZoomToFitAll,

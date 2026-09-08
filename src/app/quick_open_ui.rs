@@ -366,6 +366,7 @@ pub(super) fn unified_results(
         return top_k(
             COMMANDS
                 .iter()
+                .filter(|entry| entry.command.available_on_desktop())
                 .filter_map(|entry| rank_command(rest, entry.label)),
             TOP_K,
         );
@@ -382,14 +383,17 @@ pub(super) fn unified_results(
 
     // Sin prefijo: archivos, más los comandos que matcheen exacto o por
     // prefijo (las reglas ordinales los ponen arriba solos).
-    let commands = COMMANDS.iter().filter_map(|entry| {
-        rank_command(query, entry.label).filter(|item| {
-            matches!(
-                item.class,
-                RankClass::ExactCommand | RankClass::CommandPrefix
-            )
-        })
-    });
+    let commands = COMMANDS
+        .iter()
+        .filter(|entry| entry.command.available_on_desktop())
+        .filter_map(|entry| {
+            rank_command(query, entry.label).filter(|item| {
+                matches!(
+                    item.class,
+                    RankClass::ExactCommand | RankClass::CommandPrefix
+                )
+            })
+        });
     let files = files.iter().filter_map(|path| rank_file(query, path));
     top_k(commands.chain(files), TOP_K)
 }
