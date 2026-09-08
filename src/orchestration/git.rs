@@ -415,18 +415,60 @@ mod tests {
         assert!(results[0].error.is_some());
     }
 
+    fn subprocess_fixture(mode: &str) -> Command {
+        let mut command = Command::new(std::env::current_exe().expect("test executable"));
+        command
+            .args([
+                "--exact",
+                "orchestration::git::tests::subprocess_fixture_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("TC_SUBPROCESS_FIXTURE", mode);
+        command
+    }
+
+    #[test]
+    #[ignore = "invoked explicitly by subprocess regression tests"]
+    fn subprocess_fixture_child() {
+        use std::io::Write;
+        match std::env::var("TC_SUBPROCESS_FIXTURE").as_deref() {
+            Ok("sleep") => std::thread::sleep(Duration::from_secs(30)),
+            Ok("large") => {
+                std::io::stdout()
+                    .write_all(&vec![b'x'; 1024 * 1024])
+                    .unwrap();
+                std::io::stderr()
+                    .write_all(&vec![b'y'; 1024 * 1024])
+                    .unwrap();
+            }
+            _ => println!("hola"),
+        }
+    }
+
+    #[test]
+    fn drains_large_stdout_and_stderr_before_waiting_for_exit() {
+        let output =
+            run_with_timeout(&mut subprocess_fixture("large"), Duration::from_secs(10)).unwrap();
+        assert!(output.status.success());
+        assert!(output.stdout.len() >= 1024 * 1024);
+        assert!(output.stderr.len() >= 1024 * 1024);
+    }
+
     #[test]
     fn a_stalled_command_is_killed_by_the_timeout() {
         // Regresión: un `git worktree add` colgado en un filesystem lento
         // (OneDrive/NFS) no puede dejar el lanzamiento esperando para siempre.
-        let mut command = Command::new("sleep");
-        command.arg("30");
+        let mut command = subprocess_fixture("sleep");
 
         let started = Instant::now();
         let result = run_with_timeout(&mut command, Duration::from_millis(200));
         let elapsed = started.elapsed();
 
-        assert!(result.is_err(), "el timeout debe abortar el comando");
+        assert!(
+            result.unwrap_err().to_string().contains("timed out"),
+            "the child must actually reach its deadline"
+        );
         assert!(
             elapsed < Duration::from_secs(5),
             "tardó {elapsed:?}: el kill no funcionó"
@@ -435,11 +477,10 @@ mod tests {
 
     #[test]
     fn a_fast_command_returns_its_captured_output() {
-        let mut command = Command::new("echo");
-        command.arg("hola");
+        let mut command = subprocess_fixture("small");
         let output = run_with_timeout(&mut command, Duration::from_secs(5)).expect("run echo");
         assert!(output.status.success());
-        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "hola");
+        assert!(String::from_utf8_lossy(&output.stdout).contains("hola"));
     }
 
     fn git(dir: &std::path::Path, args: &[&str]) -> String {

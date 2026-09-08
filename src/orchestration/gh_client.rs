@@ -123,28 +123,8 @@ pub fn issue_prompt(number: u64, title: &str, body: &str) -> String {
 /// Corre un comando con timeout duro; `None` si no arrancó o si se pasó del
 /// tiempo (en ese caso se mata el hijo para no dejar zombies).
 fn run_with_timeout(mut command: Command, timeout: Duration) -> Option<std::process::Output> {
-    let mut child = command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .ok()?;
-    let started = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) => {
-                if started.elapsed() >= timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return None;
-                }
-                std::thread::sleep(Duration::from_millis(25));
-            }
-            Err(_) => return None,
-        }
-    }
-    child.wait_with_output().ok()
+    command.stdin(Stdio::null());
+    super::git::run_with_timeout(&mut command, timeout).ok()
 }
 
 fn gh_command(repo_root: &PathBuf, args: &[&str]) -> Command {
@@ -198,16 +178,20 @@ pub fn fetch_snapshot(repo_root: &PathBuf) -> GhResult {
         GH_TIMEOUT,
     );
 
-    // Si el repo no tiene remoto de GitHub, `gh pr list` falla: lo reportamos
-    // como no disponible en vez de mostrar listas vacías mintiendo.
-    if let Some(output) = prs.as_ref() {
-        if !output.status.success() {
-            let reason = auth_failure_reason(&String::from_utf8_lossy(&output.stderr));
-            return GhResult {
-                repo_root: repo_root.clone(),
-                availability: GhAvailability::Unavailable(reason),
-                snapshot: GhSnapshot::default(),
-            };
+    for output in [prs.as_ref(), issues.as_ref()] {
+        match output {
+            Some(output) if output.status.success() => {}
+            other => {
+                return GhResult {
+                    repo_root: repo_root.clone(),
+                    availability: GhAvailability::Unavailable(
+                        other
+                            .map(|out| auth_failure_reason(&String::from_utf8_lossy(&out.stderr)))
+                            .unwrap_or_else(|| "GitHub no respondió dentro del plazo".to_owned()),
+                    ),
+                    snapshot: GhSnapshot::default(),
+                }
+            }
         }
     }
 
