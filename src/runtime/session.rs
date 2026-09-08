@@ -16,6 +16,9 @@ pub struct SessionSpec {
     /// Hoja estable dentro del panel. Permite que el daemon persista varias
     /// sesiones de un split sin sobrescribirlas bajo el mismo `panel_id`.
     pub leaf_id: Option<Uuid>,
+    /// Explicit orchestration task identity, retained across process restarts.
+    /// Ordinary shells fall back to their stable leaf identity.
+    pub memory_task_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,6 +47,7 @@ impl Default for SessionSpec {
             panel_id: None,
             workspace_id: None,
             leaf_id: None,
+            memory_task_id: None,
         }
     }
 }
