@@ -978,7 +978,7 @@ fn shell_command(cwd: Option<&Path>, hooks: HookIdentity) -> CommandBuilder {
     #[cfg(windows)]
     let mut cmd = match configured_shell {
         Some(shell) => CommandBuilder::new(shell),
-        None => CommandBuilder::new(default_shell()),
+        None => CommandBuilder::new(crate::utils::platform::default_shell()),
     };
 
     if let Some(cwd) = cwd {

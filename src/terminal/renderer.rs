@@ -1983,7 +1983,7 @@ mod tests {
     }
 
     fn distinct_text_rows(shapes: &[egui::epaint::ClippedShape]) -> usize {
-        let mut rows = Vec::new();
+        let mut rows: Vec<f32> = Vec::new();
         for clipped in shapes {
             if let egui::epaint::Shape::Text(text_shape) = &clipped.shape {
                 let y = text_shape.pos.y.round();
