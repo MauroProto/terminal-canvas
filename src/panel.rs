@@ -16,6 +16,11 @@ pub enum WorkspacePanel {
 pub type CanvasPanel = WorkspacePanel;
 
 impl WorkspacePanel {
+    pub fn set_agent_command(&mut self, command: Option<String>) {
+        match self {
+            Self::Terminal(panel) => panel.set_agent_command(command),
+        }
+    }
     pub fn id(&self) -> Uuid {
         match self {
             Self::Terminal(panel) => panel.id,

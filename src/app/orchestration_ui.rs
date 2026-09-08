@@ -34,6 +34,7 @@ struct MemoryLaunchCompletion {
     request: AgentLaunchRequest,
     repo_root: Option<std::path::PathBuf>,
     source: LaunchSource,
+    bootstrap: anyhow::Result<Option<crate::orchestration::agent_launcher::PreparedAgentLaunch>>,
 }
 
 pub(super) struct LaunchMemoryWorker {
@@ -59,11 +60,16 @@ impl LaunchMemoryWorker {
                     );
                     let repo_root =
                         crate::orchestration::Orchestrator::resolve_launch_repo(&job.request);
+                    let bootstrap = crate::orchestration::agent_launcher::prepare(
+                        job.request.provider,
+                        &job.request.brief,
+                    );
                     if completion_tx
                         .send(MemoryLaunchCompletion {
                             repo_root,
                             request: job.request,
                             source: job.source,
+                            bootstrap,
                         })
                         .is_err()
                     {
@@ -588,9 +594,13 @@ impl TerminalApp {
                 }
             }
 
-            let preparation = self
-                .orchestrator
-                .prepare_launch_with_repo(completion.request, completion.repo_root);
+            let preparation = completion.bootstrap.and_then(|bootstrap| {
+                self.orchestrator.prepare_launch_with_bootstrap(
+                    completion.request,
+                    completion.repo_root,
+                    bootstrap,
+                )
+            });
             match (completion.source, preparation) {
                 (LaunchSource::Manual(_), Ok(LaunchPreparation::Ready(plan))) => {
                     if self.spawn_agent_panel(ctx, &plan) {
@@ -670,6 +680,19 @@ impl TerminalApp {
             spawned.panel_id,
             spawned.runtime_session_id,
         );
+        if let Some(launch) = &plan.prepared_launch {
+            launch.hand_off();
+            // Resume metadata must contain the provider, never the consumed
+            // one-shot helper request. The live SessionSpec still runs it once.
+            let command = self
+                .orchestrator
+                .session_meta(plan.session_id)
+                .and_then(|session| session.provider.launch_command())
+                .map(str::to_owned);
+            if let Some(panel) = self.workspaces[workspace_index].panel_mut(spawned.panel_id) {
+                panel.set_agent_command(command);
+            }
+        }
         self.switch_workspace(workspace_index);
         self.ws_mut().bring_to_front(spawned.panel_id);
         self.reconcile_orchestration();

@@ -13,6 +13,11 @@ use utils::platform::panic_log_path;
 use anyhow::Result;
 
 fn main() -> Result<()> {
+    if let Some(code) =
+        mi_terminal::orchestration::agent_launcher::run_from_cli(std::env::args_os())?
+    {
+        std::process::exit(code);
+    }
     env_logger::init();
     install_panic_logging();
     install_config();

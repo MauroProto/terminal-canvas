@@ -1,4 +1,5 @@
 mod agent_detect;
+pub mod agent_launcher;
 mod agent_sessions;
 mod claude_hooks;
 mod code_diff;

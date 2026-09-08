@@ -401,6 +401,7 @@ pub struct AgentLaunchPlan {
     pub branch: Option<String>,
     pub worktree_path: Option<PathBuf>,
     pub shared_repo_mode: bool,
+    pub prepared_launch: Option<super::agent_launcher::PreparedAgentLaunch>,
 }
 
 /// Resultado inmediato de `prepare_launch`: el panel puede crearse ya, o hay
@@ -749,6 +750,15 @@ impl Orchestrator {
         request: AgentLaunchRequest,
         resolved_repo_root: Option<PathBuf>,
     ) -> anyhow::Result<LaunchPreparation> {
+        self.prepare_launch_with_bootstrap(request, resolved_repo_root, None)
+    }
+
+    pub fn prepare_launch_with_bootstrap(
+        &mut self,
+        request: AgentLaunchRequest,
+        resolved_repo_root: Option<PathBuf>,
+        prepared_launch: Option<super::agent_launcher::PreparedAgentLaunch>,
+    ) -> anyhow::Result<LaunchPreparation> {
         let task_title = if request.task_title.trim().is_empty() {
             request.provider.label().to_owned()
         } else {
@@ -836,7 +846,13 @@ impl Orchestrator {
         // La app enriquece el brief con memoria en un worker antes de llamar
         // acá. `prepare_launch` corre en handlers de UI y no puede abrir ni
         // consultar SQLite en el frame.
-        let bootstrap = provider_bootstrap(request.provider, &request.brief);
+        let bootstrap = prepared_launch.as_ref().map_or_else(
+            || provider_bootstrap(request.provider, &request.brief),
+            |launch| ProviderBootstrap {
+                command: Some(launch.command.clone()),
+                initial_input: None,
+            },
+        );
 
         self.state.sessions.push(AgentSessionMeta {
             session_id,
@@ -883,6 +899,7 @@ impl Orchestrator {
             branch,
             worktree_path,
             shared_repo_mode,
+            prepared_launch,
         };
         if pending_worktree.is_some() {
             self.pending_launches.insert(session_id, plan);
