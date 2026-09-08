@@ -315,6 +315,7 @@ impl ContextPack {
 pub const DEFAULT_TOKEN_BUDGET: usize = 2400;
 pub const CORE_TOKEN_BUDGET: usize = 800;
 pub const HANDOFF_TOKEN_BUDGET: usize = 400;
+pub const MAX_CONTEXT_ITEMS: usize = 32;
 pub const MAX_MEMORY_KEY_CHARS: usize = 256;
 pub const MAX_MEMORY_CONTENT_CHARS: usize = 65_536;
 pub const MAX_HANDOFF_CHARS: usize = 32_768;
@@ -402,10 +403,6 @@ pub struct HandoffRequest {
     pub session_id: Option<String>,
     pub orchestrator_task_id: Option<Uuid>,
     pub ttl_secs: Option<i64>,
-}
-
-pub fn estimate_tokens(text: &str) -> usize {
-    text.chars().count().div_ceil(4).max(1)
 }
 
 pub fn contents_equivalent(left: &str, right: &str) -> bool {

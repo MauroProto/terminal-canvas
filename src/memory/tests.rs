@@ -16,6 +16,48 @@ fn store_in(root: &std::path::Path) -> MemoryStore {
 }
 
 #[test]
+fn context_budget_bounds_serialized_metadata_unicode_and_handoffs() {
+    let root = temp_dir();
+    let repo = root.join("repo");
+    init_git_repo(&repo);
+    let store = store_in(&root);
+    for index in 0..40 {
+        let mut request = RememberRequest::human(
+            repo.clone(),
+            format!("budget/{index:02}/{}", "界".repeat(120)),
+            "x",
+        );
+        request.scope = ScopeKind::Task;
+        store.remember(request).unwrap();
+    }
+    store
+        .create_handoff(HandoffRequest {
+            cwd: repo.clone(),
+            summary: "\n\"界".repeat(1000),
+            provider: None,
+            session_id: None,
+            orchestrator_task_id: None,
+            ttl_secs: None,
+        })
+        .unwrap();
+    let pack = build_context_pack(&store, &repo, None, None).unwrap();
+    assert!(!pack.items.is_empty());
+    assert!(pack.items.len() <= crate::memory::model::MAX_CONTEXT_ITEMS);
+    let handoff = pack.handoff.as_ref().unwrap();
+    assert!(handoff.summary.ends_with("[truncated]"));
+    assert!(
+        serde_json::to_string_pretty(handoff).unwrap().len()
+            <= crate::memory::model::HANDOFF_TOKEN_BUDGET * 4
+    );
+    let actual_bytes = crate::memory::format_context_pack(&pack)
+        .len()
+        .max(serde_json::to_string_pretty(&pack).unwrap().len());
+    assert!(actual_bytes <= pack.budget_requested * 4);
+    assert!(actual_bytes <= pack.budget_used * 4);
+    assert!(pack.budget_used <= pack.budget_requested);
+}
+
+#[test]
 fn explicit_tasks_in_same_cwd_keep_handoffs_separate() {
     let root = temp_dir();
     let repo = root.join("repo");
