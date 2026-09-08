@@ -9,16 +9,17 @@
               background: #1a1a1a; color: #f4f4f4; border: 1px solid #383838; border-radius: 4px; }
       button { margin-top: 10px; width: 100%; padding: 6px; cursor: pointer;
                background: #2c2c2c; color: #f4f4f4; border: 1px solid #383838; border-radius: 4px; }
-      p { color: #6e6e6e; line-height: 1.4; }
+      p { color: #aaa; line-height: 1.4; }
     </style>
   </head>
   <body>
     <p>Pegá acá lo que imprime <code>endpoint.sh</code> de TerminalCanvas.</p>
     <label>TC_HOOK_URL<input id="url" placeholder="http://127.0.0.1:54321" /></label>
-    <label>TC_HOOK_TOKEN<input id="token" placeholder="c08b36fe…" /></label>
+    <label>TC_HOOK_TOKEN<input id="token" type="password" autocomplete="off" placeholder="c08b36fe…" /></label>
     <button id="save">Guardar</button>
-    <p id="status"></p>
-    <p>Después: <b>Alt+click</b> en cualquier elemento de la página.</p>
+    <button id="activate">Seleccionar elemento</button>
+    <p id="status" role="status" aria-live="polite"></p>
+    <p>Activá la selección en esta pestaña y hacé clic en el elemento. <b>Esc</b> cancela. Se enviará su HTML, estilos e imagen a la app local.</p>
     <script src="popup.js"></script>
   </body>
 </html>

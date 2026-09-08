@@ -4,6 +4,39 @@
 // navegador (~40 útiles): mandar las 340 de getComputedStyle haría un prompt
 // inservible.
 
+(() => {
+if (globalThis.__tcDesignInstalled) return;
+globalThis.__tcDesignInstalled = true;
+let armed = false;
+let sending = false;
+let banner;
+let hideTimer;
+
+function feedback(text, hide = false) {
+  clearTimeout(hideTimer);
+  if (!banner?.isConnected) {
+    banner = document.createElement("div");
+    banner.setAttribute("role", "status");
+    banner.style.cssText = "position:fixed;top:16px;right:16px;z-index:2147483647;background:#171717;color:#fff;padding:12px 18px;border:1px solid #f0c86e;border-radius:8px;font:14px system-ui;pointer-events:none;max-width:360px;box-shadow:0 4px 20px #0005";
+    document.documentElement.appendChild(banner);
+  }
+  banner.textContent = text;
+  if (hide) hideTimer = setTimeout(() => banner?.remove(), 5000);
+}
+
+chrome.runtime.onMessage.addListener(message => {
+  if (message?.kind !== "tc-design-activate" || sending) return;
+  armed = true;
+  feedback("TerminalCanvas: hacé clic en un elemento. Esc cancela.");
+});
+document.addEventListener("keydown", event => {
+  if (event.key === "Escape" && armed) {
+    armed = false;
+    banner?.remove();
+    event.stopPropagation();
+  }
+}, true);
+
 const USEFUL_PROPS = [
   "display", "position", "top", "right", "bottom", "left", "z-index",
   "width", "height", "min-width", "min-height", "max-width", "max-height",
@@ -51,15 +84,19 @@ function meaningfulStyles(element) {
 
 document.addEventListener(
   "click",
-  (event) => {
-    if (!event.altKey) return;
+  async (event) => {
+    if (!armed || sending) return;
     const element = event.target;
     if (!element || element.nodeType !== 1) return;
     event.preventDefault();
-    event.stopPropagation();
+    event.stopImmediatePropagation();
+    armed = false;
+    sending = true;
+    banner?.remove();
 
     const rect = element.getBoundingClientRect();
-    chrome.runtime.sendMessage({
+    try {
+    const result = await chrome.runtime.sendMessage({
       kind: "tc-design-capture",
       selector: readableSelector(element),
       html: element.outerHTML,
@@ -75,10 +112,12 @@ document.addEventListener(
       dpr: window.devicePixelRatio || 1,
     });
 
-    // Feedback inmediato: un flash sobre el elemento capturado.
-    const previous = element.style.outline;
-    element.style.outline = "2px solid #f0c86e";
-    setTimeout(() => { element.style.outline = previous; }, 350);
+    if (!result?.ok) throw new Error(result?.error || "No se recibió confirmación de la app.");
+    feedback(result.warning || "Elemento enviado a TerminalCanvas.", true);
+    } catch (error) {
+      feedback(error.message || "No se pudo enviar el elemento.", true);
+    } finally { sending = false; }
   },
   true,
 );
+})();
