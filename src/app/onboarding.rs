@@ -159,9 +159,7 @@ impl TerminalApp {
         let mut config = crate::config::runtime_config();
         config.onboarding_dismissed = true;
         crate::config::update_runtime_config(config.clone());
-        if let Err(err) = crate::config::save(&config) {
-            log::warn!("no se pudo persistir el onboarding: {err}");
-        }
+        self.preferences_worker.save_settings(config);
     }
 }
 

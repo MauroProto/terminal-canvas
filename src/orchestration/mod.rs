@@ -27,7 +27,10 @@ pub use code_diff::{
     DiffLineKind, DiffLoader, FileDiff, RepoDiff, WorktreeInfo, WorktreeJob, WorktreeOps,
 };
 #[allow(unused_imports)]
-pub use diff_notes::{format_note, load_notes, save_notes, DiffNote, DiffNotes};
+pub use diff_notes::{
+    format_note, legacy_notes_available, load_legacy_notes, load_notes, save_notes, DiffNote,
+    DiffNotes,
+};
 #[allow(unused_imports)]
 pub use gh_client::{
     issue_branch_name, issue_prompt, GhAvailability, GhClient, GhResult, GhSnapshot, Issue,

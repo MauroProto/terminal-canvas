@@ -40,6 +40,7 @@ mod onboarding;
 mod orchestration_ui;
 mod perf;
 mod persistence_worker;
+mod preferences_worker;
 mod quick_open_ui;
 mod resume_ui;
 mod scrollback_restore_worker;
@@ -95,6 +96,7 @@ pub struct TerminalApp {
     search_buf: String,
     search_panel_id: Option<Uuid>,
     code_review: Option<CodeReviewState>,
+    preferences_worker: preferences_worker::PreferencesWorker,
     diff_loader: crate::orchestration::DiffLoader,
     worktree_ops: crate::orchestration::WorktreeOps,
     quick_open: Option<QuickOpenState>,
@@ -301,6 +303,7 @@ impl TerminalApp {
                 search_buf: String::new(),
                 search_panel_id: None,
                 code_review: None,
+                preferences_worker: Default::default(),
                 diff_loader: crate::orchestration::DiffLoader::default(),
                 worktree_ops: crate::orchestration::WorktreeOps::default(),
                 quick_open: None,
@@ -407,13 +410,14 @@ impl TerminalApp {
                 search_buf: String::new(),
                 search_panel_id: None,
                 code_review: None,
+                preferences_worker: Default::default(),
                 diff_loader: crate::orchestration::DiffLoader::default(),
                 worktree_ops: crate::orchestration::WorktreeOps::default(),
                 quick_open: None,
                 quick_open_rx: None,
                 screenshot_rx: None,
-                file_viewer: None,
                 screenshot_target: None,
+                file_viewer: None,
                 file_viewer_keyboard_active: false,
                 file_viewer_rx: None,
                 settings_open: false,
@@ -1125,6 +1129,10 @@ impl TerminalApp {
         self.sync_window_transitions(ctx);
         self.maybe_refresh_orchestration();
         self.poll_diff_loader();
+        self.poll_preferences_worker();
+        if self.preferences_worker.busy() {
+            ctx.request_repaint_after(Duration::from_millis(80));
+        }
         self.poll_worktree_ops();
         self.poll_quick_open();
         self.poll_hook_events();

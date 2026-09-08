@@ -246,14 +246,7 @@ impl TerminalApp {
         set_base_font_size(new_config.font_size);
         // Actualiza la config runtime (los booleanos se leen en vivo).
         config::update_runtime_config(new_config.clone());
-        // Persistir a disco.
-        match config::save(&new_config) {
-            Ok(()) => self.toast_success("Configuración guardada en config.toml"),
-            Err(err) => {
-                log::warn!("No se pudo guardar config.toml: {err}");
-                self.toast_error(format!("No se pudo guardar config.toml: {err}"));
-            }
-        }
+        self.preferences_worker.save_settings(new_config);
         // Forzá un repintado para que el cambio de fuente se vea ya.
         if let Some(ctx) = self.ctx.clone() {
             ctx.request_repaint();

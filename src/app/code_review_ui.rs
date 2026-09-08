@@ -42,6 +42,9 @@ pub(super) struct CodeReviewState {
     pub(super) worktree_error: Option<String>,
     /// Notas por línea sobre el diff, persistidas por repo.
     pub(super) notes: crate::orchestration::DiffNotes,
+    pub(super) notes_loading: bool,
+    pub(super) legacy_notes_available: bool,
+    pub(super) importing_notes: bool,
     /// Editor de nota activo: `note_id == None` = creando una nueva.
     pub(super) editing_note: Option<NoteEditState>,
     /// Selector de destinos abierto para mandar las notas pendientes.
@@ -110,10 +113,14 @@ impl TerminalApp {
             worktrees: Vec::new(),
             show_worktrees: false,
             worktree_error: None,
-            notes: crate::orchestration::load_notes(&repo_root),
+            notes: Default::default(),
+            notes_loading: true,
+            legacy_notes_available: false,
+            importing_notes: false,
             editing_note: None,
             note_target_picker: false,
         });
+        self.preferences_worker.load_notes(key, repo_root.clone());
         self.diff_loader.request(key, repo_root);
     }
 
@@ -132,14 +139,6 @@ impl TerminalApp {
                     state.files = diff.files;
                     state.selected = 0;
                     state.failed = false;
-                    // Las notas que apuntan a archivos que ya no cambiaron se
-                    // descartan: el feedback localizado pierde destino.
-                    let current_files: Vec<String> =
-                        state.files.iter().map(|file| file.path.clone()).collect();
-                    let repo_root = state.repo_root.clone();
-                    state.notes.prune_missing_files(&current_files);
-                    let notes_snapshot = state.notes.clone();
-                    let _ = crate::orchestration::save_notes(&repo_root, &notes_snapshot);
                     // Listar lanza un subproceso git: va al worker para no
                     // gastar milisegundos del frame.
                     let repo_root = state.repo_root.clone();
@@ -345,6 +344,16 @@ impl TerminalApp {
                 if ui.small_button("Cerrar ✕").clicked() {
                     *close = true;
                 }
+                if let Some(state) = self.code_review.as_mut() {
+                    if state.legacy_notes_available && !state.importing_notes
+                        && ui.small_button("Importar notas anteriores")
+                            .on_hover_text("Importa al repositorio actual. El formato anterior podía mezclar carpetas con nombres parecidos; revisá las notas antes de enviarlas.")
+                            .clicked()
+                    {
+                        state.importing_notes = true;
+                        self.preferences_worker.import_notes(state.key, state.repo_root.clone());
+                    }
+                }
                 // "Enviar N notas": las pendientes de entregar al agente.
                 let pending_count = self
                     .code_review
@@ -387,7 +396,13 @@ impl TerminalApp {
         let (loading, failed, file_count) = self
             .code_review
             .as_ref()
-            .map(|state| (state.loading, state.failed, state.files.len()))
+            .map(|state| {
+                (
+                    state.loading || state.notes_loading,
+                    state.failed,
+                    state.files.len(),
+                )
+            })
             .unwrap_or_default();
 
         if loading {
@@ -973,6 +988,63 @@ impl TerminalApp {
         self.persist_review_notes();
     }
 
+    pub(super) fn poll_preferences_worker(&mut self) {
+        use super::preferences_worker::Completion;
+        for completion in self.preferences_worker.poll() {
+            match completion {
+                Completion::NotesSaved(Err(err)) => {
+                    self.toast_error(format!("No se pudieron guardar las notas: {err}"))
+                }
+                Completion::SettingsSaved(Ok(())) => {
+                    self.toast_success("Configuración guardada en config.toml")
+                }
+                Completion::SettingsSaved(Err(err)) => {
+                    self.toast_error(format!("No se pudo guardar config.toml: {err}"))
+                }
+                Completion::NotesLoaded {
+                    key,
+                    notes,
+                    legacy_available,
+                } => {
+                    if let Some(state) = self.code_review.as_mut().filter(|state| state.key == key)
+                    {
+                        state.notes = notes;
+                        state.notes_loading = false;
+                        state.legacy_notes_available = legacy_available;
+                    }
+                }
+                Completion::NotesImported { key, result } => {
+                    let Some(state) = self.code_review.as_mut().filter(|state| state.key == key)
+                    else {
+                        continue;
+                    };
+                    state.importing_notes = false;
+                    match result {
+                        Ok(imported) => {
+                            for note in imported.notes {
+                                if !state
+                                    .notes
+                                    .notes
+                                    .iter()
+                                    .any(|current| current.id == note.id)
+                                {
+                                    state.notes.notes.push(note);
+                                }
+                            }
+                            state.legacy_notes_available = false;
+                            self.persist_review_notes();
+                            self.toast_success("Notas anteriores importadas. Revisá sus archivos antes de enviarlas.");
+                        }
+                        Err(err) => {
+                            self.toast_error(format!("No se pudieron importar las notas: {err}"))
+                        }
+                    }
+                }
+                Completion::NotesSaved(Ok(())) => {}
+            }
+        }
+    }
+
     /// Guarda las notas del review actual en disco (por repo).
     fn persist_review_notes(&mut self) {
         let Some((repo_root, notes)) = self
@@ -982,9 +1054,7 @@ impl TerminalApp {
         else {
             return;
         };
-        if let Err(err) = crate::orchestration::save_notes(&repo_root, &notes) {
-            log::warn!("No se pudieron guardar las notas del diff: {err}");
-        }
+        self.preferences_worker.save_notes(repo_root, notes);
     }
 
     /// Fila del editor de notas: un TextEdit de una línea + Guardar/Cancelar.
