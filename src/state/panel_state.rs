@@ -40,6 +40,8 @@ impl SavedPanelBounds {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PanelState {
+    #[serde(default)]
+    pub leaf_memory_task_ids: BTreeMap<String, String>,
     pub id: String,
     pub title: String,
     #[serde(default)]
@@ -121,6 +123,7 @@ mod tests {
 
     fn sample_panel_state() -> PanelState {
         PanelState {
+            leaf_memory_task_ids: BTreeMap::new(),
             id: "panel-1".to_owned(),
             title: "Terminal".to_owned(),
             custom_title: None,

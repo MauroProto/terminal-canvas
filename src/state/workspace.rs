@@ -45,6 +45,7 @@ pub struct Workspace {
 
 #[derive(Debug, Clone, Default)]
 pub struct TerminalSpawnRequest {
+    pub memory_task_id: Option<Uuid>,
     pub title: Option<String>,
     pub cwd: Option<PathBuf>,
     pub startup_command: Option<String>,
@@ -201,6 +202,7 @@ impl Workspace {
             Arc::clone(&self.pty_manager),
             cwd.as_deref(),
             SessionSpec {
+                memory_task_id: request.memory_task_id,
                 title: panel.title.clone(),
                 cwd: cwd.clone(),
                 startup_command: request.startup_command.clone(),
@@ -878,6 +880,7 @@ mod tests {
             name: "Restored".to_owned(),
             cwd: Some(PathBuf::from("/tmp/restored")),
             panels: vec![PanelState {
+                leaf_memory_task_ids: Default::default(),
                 id: Uuid::new_v4().to_string(),
                 title: "Terminal".to_owned(),
                 custom_title: None,
@@ -932,6 +935,7 @@ mod tests {
             name: "Shared".to_owned(),
             cwd: Some(PathBuf::from("/tmp/shared")),
             panels: vec![PanelState {
+                leaf_memory_task_ids: Default::default(),
                 id: Uuid::new_v4().to_string(),
                 title: "Terminal".to_owned(),
                 custom_title: None,
@@ -984,6 +988,7 @@ mod tests {
         let ctx = egui::Context::default();
         let panels = (0..20)
             .map(|index| PanelState {
+                leaf_memory_task_ids: Default::default(),
                 id: Uuid::new_v4().to_string(),
                 title: format!("Terminal {index}"),
                 custom_title: None,

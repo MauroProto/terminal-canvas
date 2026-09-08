@@ -156,6 +156,7 @@ pub struct PanelSearch {
 }
 
 pub struct TerminalPanel {
+    leaf_memory_task_ids: HashMap<Uuid, Uuid>,
     pub id: Uuid,
     pub title: String,
     shell_title: String,
@@ -430,6 +431,7 @@ impl TerminalPanel {
             split_tree: None,
             root_leaf: uuid::Uuid::new_v4(),
             leaf_sessions: HashMap::new(),
+            leaf_memory_task_ids: HashMap::new(),
             focused_leaf: uuid::Uuid::nil(),
             session_cwd: None,
             workspace_id: None,
@@ -506,7 +508,14 @@ impl TerminalPanel {
         // pasaba `None` acá: el panel volvía como shell pelado y la sesión
         // anterior quedaba huérfana en el historial del CLI.
         let startup_command = panel.resume_command_for_leaf(restored_leaves.root_leaf);
-        let root_spec = session_spec(
+        panel.leaf_memory_task_ids = saved
+            .leaf_memory_task_ids
+            .iter()
+            .filter_map(|(leaf, task)| {
+                Some((Uuid::parse_str(leaf).ok()?, Uuid::parse_str(task).ok()?))
+            })
+            .collect();
+        let mut root_spec = session_spec(
             panel.title.clone(),
             cwd.map(Path::to_path_buf),
             startup_command,
@@ -515,6 +524,10 @@ impl TerminalPanel {
             Some(restored_leaves.root_leaf),
             Some(workspace_id),
         );
+        root_spec.memory_task_id = panel
+            .leaf_memory_task_ids
+            .get(&restored_leaves.root_leaf)
+            .copied();
         panel.restore_split_tree(restored_leaves, pty_manager, root_spec, cols, rows);
         panel
     }
@@ -530,6 +543,9 @@ impl TerminalPanel {
         self.shell_label = shell_label();
         self.session_cwd = spec.cwd.clone().or_else(|| cwd.map(Path::to_path_buf));
         self.workspace_id = spec.workspace_id;
+        if let Some(task_id) = spec.memory_task_id {
+            self.leaf_memory_task_ids.insert(self.root_leaf, task_id);
+        }
         self.session
             .attach_new_with_spec(pty_manager, spec, cwd, cols, rows);
     }
@@ -662,6 +678,15 @@ impl TerminalPanel {
                 })
                 .collect(),
             runtime_session_id: self.runtime_session_id().map(|id| id.to_string()),
+            leaf_memory_task_ids: self
+                .active_leaf_ids()
+                .into_iter()
+                .filter_map(|leaf| {
+                    self.leaf_memory_task_ids
+                        .get(&leaf)
+                        .map(|task| (leaf.to_string(), task.to_string()))
+                })
+                .collect(),
             leaf_runtime_session_ids: self
                 .active_leaf_ids()
                 .into_iter()
@@ -943,6 +968,15 @@ impl TerminalPanel {
         self.focused_leaf
     }
 
+    pub fn focused_memory_task_id(&self) -> Option<Uuid> {
+        Some(
+            self.leaf_memory_task_ids
+                .get(&self.focused_leaf)
+                .copied()
+                .unwrap_or(self.focused_leaf),
+        )
+    }
+
     pub fn root_leaf_id(&self) -> crate::terminal::split_tree::LeafId {
         self.root_leaf
     }
@@ -990,17 +1024,19 @@ impl TerminalPanel {
             }
             let mut controller = SessionController::default();
             let startup_command = self.resume_command_for_leaf(leaf);
+            let mut spec = session_spec(
+                "Terminal".to_owned(),
+                self.session_cwd.clone(),
+                startup_command,
+                None,
+                Some(self.id),
+                Some(leaf),
+                self.workspace_id,
+            );
+            spec.memory_task_id = self.leaf_memory_task_ids.get(&leaf).copied();
             controller.restore_detached_with_spec(
                 Arc::clone(&pty_manager),
-                session_spec(
-                    "Terminal".to_owned(),
-                    self.session_cwd.clone(),
-                    startup_command,
-                    None,
-                    Some(self.id),
-                    Some(leaf),
-                    self.workspace_id,
-                ),
+                spec,
                 (cols / 2).max(1),
                 rows,
                 restored.runtime_session_ids.get(&leaf).copied(),

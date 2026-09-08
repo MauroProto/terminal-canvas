@@ -284,6 +284,7 @@ pub fn session_spec(
     workspace_id: Option<Uuid>,
 ) -> SessionSpec {
     SessionSpec {
+        memory_task_id: None,
         title,
         cwd,
         startup_command,

@@ -730,6 +730,7 @@ mod tests {
                 name: format!("Workspace {label}"),
                 cwd: Some(PathBuf::from(format!("/tmp/{label}"))),
                 panels: vec![PanelState {
+                    leaf_memory_task_ids: Default::default(),
                     id: Uuid::new_v4().to_string(),
                     title: "Terminal".to_owned(),
                     custom_title: Some(format!("Terminal {label}")),
