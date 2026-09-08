@@ -45,6 +45,7 @@ pub struct DaemonSession {
     /// Frames aún no confirmados por el writer durable del daemon.
     persist_pending: Vec<u8>,
     persist_seq: u64,
+    last_metadata: Vec<u8>,
     /// El PTY real (T2). `None` en los tests del registro, que no montan
     /// procesos: la lógica de sesiones se testea sin spawnear nada.
     pub handle: Option<SharedPtyHandle>,
@@ -60,6 +61,7 @@ impl DaemonSession {
             scrollback_dirty: false,
             persist_pending: Vec::new(),
             persist_seq: 0,
+            last_metadata: Vec::new(),
             handle: None,
         }
     }
@@ -140,7 +142,10 @@ impl DaemonSession {
     fn attach_boundary(&mut self) -> (Vec<u8>, Option<(u64, Vec<u8>)>) {
         let boundary = self.handle.clone().and_then(|handle| {
             handle.lock().ok().and_then(|pty| {
-                pty.attach_snapshot_and_drain(crate::terminal::export::live_snapshot_to_ansi)
+                let (mut snapshot, frames) =
+                    pty.attach_snapshot_and_drain(crate::terminal::export::live_snapshot_to_ansi)?;
+                snapshot.push_str(&String::from_utf8_lossy(&pty.metadata_osc(true)));
+                Some((snapshot, frames))
             })
         });
         let Some((snapshot, frames)) = boundary else {
@@ -396,6 +401,18 @@ impl DaemonState {
                 // se difunde a los clientes.
                 if let Some((seq, data)) = session.ingest_pty_frames(&frames) {
                     events.push(Response::Output { id, seq, data });
+                }
+            }
+            if let Ok(pty) = handle.lock() {
+                let metadata = pty.metadata_osc(false);
+                if metadata != session.last_metadata {
+                    session.last_metadata = metadata.clone();
+                    let seq = session.push_output_event(&metadata);
+                    events.push(Response::Output {
+                        id,
+                        seq,
+                        data: metadata,
+                    });
                 }
             }
             if !alive && session.alive {

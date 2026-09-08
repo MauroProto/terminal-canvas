@@ -42,6 +42,41 @@ struct AgentStatusPayload {
     tool: Option<String>,
     #[serde(default)]
     prompt: Option<String>,
+    #[serde(default)]
+    age_ms: u64,
+}
+
+/// Forward captured metadata without adding it to durable output history.
+pub fn metadata_osc(
+    cwd: Option<&str>,
+    report: Option<&AgentStatusReport>,
+    title: &str,
+    now_ms: Option<i64>,
+) -> Vec<u8> {
+    let clean_title: String = title
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(1024)
+        .collect();
+    let mut output = format!("\x1b]2;{clean_title}\x07");
+    if let Some(cwd) = cwd.filter(|cwd| !cwd.chars().any(char::is_control)) {
+        output.push_str(&format!("\x1b]7;{cwd}\x07"));
+    }
+    if let Some(report) = report {
+        let state = match report.state {
+            AgentStatusState::Working => "working",
+            AgentStatusState::Blocked => "blocked",
+            AgentStatusState::Waiting => "waiting",
+            AgentStatusState::Done => "done",
+        };
+        let payload = serde_json::json!({
+            "state": state, "tool": report.tool, "prompt": report.prompt,
+            "source_revision": report.received_at_ms,
+            "age_ms": now_ms.map(|now| now.saturating_sub(report.received_at_ms).max(0)).unwrap_or(0),
+        });
+        output.push_str(&format!("\x1b]9999;{payload}\x07"));
+    }
+    output.into_bytes()
 }
 
 /// Resultado de interceptar un OSC: estado de agente o cwd del shell.
@@ -292,7 +327,7 @@ fn parse_agent_status_payload(bytes: &[u8], now_ms: i64) -> Option<AgentStatusRe
         state,
         tool: clamp_field(payload.tool, MAX_TOOL_CHARS),
         prompt: clamp_field(payload.prompt, MAX_PROMPT_CHARS),
-        received_at_ms: now_ms,
+        received_at_ms: now_ms.saturating_sub(i64::try_from(payload.age_ms).unwrap_or(i64::MAX)),
     })
 }
 
@@ -469,6 +504,28 @@ mod tests {
         assert_eq!(clean, b"xy");
         assert!(reports.is_empty());
         assert_eq!(cwds, vec!["/Users/me/proj".to_owned()]);
+    }
+
+    #[test]
+    fn forwarded_metadata_roundtrips_without_rejuvenating_stale_status() {
+        let report = super::AgentStatusReport {
+            state: super::AgentStatusState::Blocked,
+            tool: Some("test".to_owned()),
+            prompt: Some("quote \" and ESC \x1b".to_owned()),
+            received_at_ms: 20,
+        };
+        let bytes = super::metadata_osc(
+            Some("/tmp/project"),
+            Some(&report),
+            "title\x1b\x07",
+            Some(120),
+        );
+        let (clean, reports, cwds) = AgentStatusStream::new().process(&bytes, 1000);
+        assert_eq!(cwds, ["/tmp/project"]);
+        assert_eq!(reports[0].received_at_ms, 900);
+        assert_eq!(reports[0].state, report.state);
+        assert_eq!(reports[0].prompt, report.prompt);
+        assert_eq!(clean, b"\x1b]2;title\x07");
     }
 
     #[test]

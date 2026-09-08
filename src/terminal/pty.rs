@@ -473,10 +473,18 @@ impl PtyHandle {
 
         // El historial que el daemon ya tenía se replaya antes de escuchar:
         // así el panel no aparece vacío al reengancharse.
+        let mut agent_stream = AgentStatusStream::new();
+        let (snapshot, reports, cwds) = agent_stream.process(snapshot, pty_clock_now_ms());
+        if let Some(report) = reports.into_iter().next_back() {
+            agent_status.store(Arc::new(Some(report)));
+        }
+        if let Some(new_cwd) = cwds.into_iter().next_back() {
+            cwd.store(Arc::new(Some(new_cwd)));
+        }
         if !snapshot.is_empty() {
             if let Ok(mut term) = term.lock() {
                 let mut processor = Processor::<StdSyncHandler>::new();
-                processor.advance(&mut *term, snapshot);
+                processor.advance(&mut *term, &snapshot);
             }
         }
 
@@ -499,8 +507,17 @@ impl PtyHandle {
         let reader_thread = thread::spawn(move || {
             let loop_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let mut processor = Processor::<StdSyncHandler>::new();
-                let mut agent_stream = AgentStatusStream::new();
                 let mut reader = RemoteReader::from_buffered(events, session_id, attached_seq);
+                drain_terminal_events(
+                    &event_rx,
+                    &writer_for_thread,
+                    &title_for_reader,
+                    &alive_for_reader,
+                    &bell_for_reader,
+                    &window_size_for_reader,
+                    &scheduler_for_reader,
+                    session_id,
+                );
                 loop {
                     wait_for_history_restore(&restoring_for_reader);
                     yield_for_reader_priority(&scheduler_for_reader, session_id);
@@ -703,6 +720,15 @@ impl PtyHandle {
     /// Último cwd reportado por el shell vía OSC 7, si alguno.
     pub fn current_cwd(&self) -> Option<String> {
         (*self.cwd.load_full()).clone()
+    }
+
+    pub fn metadata_osc(&self, attaching: bool) -> Vec<u8> {
+        crate::terminal::agent_status::metadata_osc(
+            self.current_cwd().as_deref(),
+            self.agent_status_snapshot().as_ref(),
+            &self.title.load_full(),
+            attaching.then(pty_clock_now_ms),
+        )
     }
 
     #[cfg(feature = "ghostty-vt")]
