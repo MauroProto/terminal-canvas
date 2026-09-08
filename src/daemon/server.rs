@@ -31,6 +31,9 @@ pub const SUBSCRIBER_QUEUE_CAPACITY: usize = 64;
 /// Presupuesto interactivo (P3.16, T2): la sesión enfocada tiene derecho a
 /// drenar hasta 32 KB antes que cualquier sesión de fondo en cada pump.
 const INTERACTIVE_BYTE_BUDGET: usize = 32 * 1024;
+/// Compact long-lived TUI logs from a disposable replay, never by truncating
+/// bytes needed to recover the hidden primary screen.
+const MAX_ALTERNATE_LOG_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Estado de una sesión desde la vista del daemon.
 pub struct DaemonSession {
@@ -195,6 +198,9 @@ struct IncrementalTarget {
     panel_id: Uuid,
     leaf_id: Option<Uuid>,
     frames: Vec<u8>,
+    alternate: bool,
+    cols: u16,
+    rows: u16,
 }
 
 /// Recorta el snapshot conservando exactamente los bytes más recientes.
@@ -508,6 +514,9 @@ impl DaemonState {
                     panel_id,
                     leaf_id: session.spec.leaf_id,
                     frames: session.persist_pending.clone(),
+                    alternate: session.was_alternate,
+                    cols: session.spec.cols,
+                    rows: session.spec.rows,
                 })
             })
             .collect()
@@ -788,6 +797,15 @@ fn persist_incremental_targets(targets: Vec<IncrementalTarget>) -> (Vec<(Uuid, u
             continue;
         }
         acknowledgements.push((target.session_id, target.frames.len()));
+        if target.alternate
+            && std::fs::metadata(&log_path).is_ok_and(|meta| meta.len() > MAX_ALTERNATE_LOG_BYTES)
+        {
+            if let Err(error) = compact_alternate_log(&dir, &target, generation) {
+                log::warn!(
+                    "could not compact alternate-screen history; preserving its log: {error}"
+                );
+            }
+        }
         if std::fs::metadata(&log_path)
             .map(|metadata| metadata.len() > crate::state::scrollback_log::MAX_LOG_BYTES)
             .unwrap_or(false)
@@ -796,6 +814,76 @@ fn persist_incremental_targets(targets: Vec<IncrementalTarget>) -> (Vec<(Uuid, u
         }
     }
     (acknowledgements, rollover)
+}
+
+fn compact_alternate_log(
+    dir: &Path,
+    target: &IncrementalTarget,
+    generation: u32,
+) -> anyhow::Result<()> {
+    use crate::state::scrollback_log::{encode_header, FrameKind};
+    use alacritty_terminal::term::test::TermSize;
+    use alacritty_terminal::term::{Config, Term, TermMode};
+    use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
+    let (checkpoint, frames) =
+        crate::state::scrollback_store::load_leaf_session(dir, target.panel_id, target.leaf_id);
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut term = Term::new(
+        Config {
+            scrolling_history: crate::config::runtime_config().scrollback_lines,
+            ..Default::default()
+        },
+        &TermSize::new(target.cols.max(1) as usize, target.rows.max(1) as usize),
+        crate::terminal::pty::EventProxy::new(tx),
+    );
+    let mut parser = Processor::<StdSyncHandler>::new();
+    parser.advance(&mut term, &checkpoint);
+    for frame in frames {
+        match frame.kind {
+            FrameKind::Output => parser.advance(&mut term, &frame.payload),
+            FrameKind::Resize => {
+                if let Some((cols, rows)) =
+                    crate::state::scrollback_log::parse_resize(&frame.payload)
+                {
+                    term.resize(TermSize::new(cols.max(1) as usize, rows.max(1) as usize));
+                }
+            }
+            FrameKind::Clear => parser.advance(&mut term, b"\x1b[2J\x1b[3J\x1b[H"),
+        }
+    }
+    if !term.mode().contains(TermMode::ALT_SCREEN) {
+        return Ok(());
+    }
+    // This is a disposable parser, so leaving its alternate screen cannot
+    // mutate the live PTY or its saved cursor, selection, or keyboard stack.
+    parser.advance(&mut term, b"\x1b[?1049l");
+    let mut primary = crate::terminal::export::scrollback_to_ansi(&term);
+    // Store the screen mode inside the same atomic checkpoint as the primary
+    // text. A crash before log rotation must still confine later TUI output.
+    primary.push_str("\x1b[?1049h\n");
+    let next = generation
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("checkpoint generation exhausted"))?;
+    crate::state::scrollback_store::save_leaf_scrollback_versioned(
+        dir,
+        target.panel_id,
+        target.leaf_id,
+        next,
+        &primary,
+    )?;
+    let new_log = encode_header(next);
+    // Future TUI bytes still belong to the alternate screen. Its transient
+    // pixels are unnecessary for cold recovery of the primary shell history.
+    crate::state::durable_write::write_atomic(
+        &dir.join(
+            crate::state::scrollback_store::scrollback_leaf_log_file_name(
+                target.panel_id,
+                target.leaf_id,
+            ),
+        ),
+        &new_log,
+    )?;
+    Ok(())
 }
 
 fn event_session_id(response: &Response) -> Option<Uuid> {
@@ -1410,6 +1498,9 @@ mod tests {
         // El daemon arranca fresco: su persist_seq empieza en 0, así que los
         // frames nuevos tendrían seq 1, 2 sin el renumber.
         let target = super::IncrementalTarget {
+            alternate: false,
+            cols: 80,
+            rows: 24,
             session_id: uuid::Uuid::new_v4(),
             panel_id,
             leaf_id: Some(leaf_id),
@@ -1454,6 +1545,50 @@ mod tests {
             handle_request(&mut state, Request::Kill { id }, None),
             Response::Error { .. }
         ));
+    }
+
+    #[test]
+    fn alternate_log_compaction_keeps_primary_and_atomic_screen_mode() {
+        use crate::state::{scrollback_log, scrollback_store};
+        let dir = std::env::temp_dir().join(format!("tui-compact-{}", Uuid::new_v4()));
+        let panel_id = Uuid::new_v4();
+        scrollback_store::save_leaf_scrollback_versioned(&dir, panel_id, None, 3, "PRIMARY\n")
+            .unwrap();
+        let log = dir.join(scrollback_store::scrollback_leaf_log_file_name(
+            panel_id, None,
+        ));
+        scrollback_log::reset_log(&log, 3).unwrap();
+        scrollback_log::append_frames(
+            &log,
+            &scrollback_log::encode_frame(
+                1,
+                scrollback_log::FrameKind::Output,
+                b"TAIL\r\n\x1b[?1049hTUI",
+            ),
+        )
+        .unwrap();
+        let target = super::IncrementalTarget {
+            session_id: Uuid::new_v4(),
+            panel_id,
+            leaf_id: None,
+            frames: Vec::new(),
+            alternate: true,
+            cols: 80,
+            rows: 24,
+        };
+        super::compact_alternate_log(&dir, &target, 3).unwrap();
+        let (generation, text) =
+            scrollback_store::load_leaf_scrollback_checkpoint(&dir, panel_id, None).unwrap();
+        assert_eq!(generation, Some(4));
+        assert!(text.contains("PRIMARY"));
+        assert!(text.contains("TAIL"));
+        assert!(!text.contains("TUI"));
+        assert!(text.contains("\x1b[?1049h"));
+        let (log_generation, frames) =
+            scrollback_log::read_frames(&std::fs::read(log).unwrap()).unwrap();
+        assert_eq!(log_generation, 4);
+        assert!(frames.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
