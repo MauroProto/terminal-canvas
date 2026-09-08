@@ -47,6 +47,25 @@ fn case_only_memory_update_preserves_the_requested_value() {
 }
 
 #[test]
+fn memory_preserves_nonsecret_code_and_whitespace_updates() {
+    let root = temp_dir();
+    let repo = root.join("repo");
+    init_git_repo(&repo);
+    let store = store_in(&root);
+    let before = "let value = \"a b\";\r\n\tprint(value);\r\n";
+    let after = "let value = \"a  b\";\r\n\tprint(value);\r\n";
+    let original = store
+        .remember(RememberRequest::human(repo.clone(), "code/example", before))
+        .unwrap();
+    assert_eq!(original.memory().content, before);
+    let mut update = RememberRequest::human(repo, "code/example", after);
+    update.expected_revision = Some(original.memory().current_revision);
+    let updated = store.remember(update).unwrap();
+    assert!(matches!(updated, WriteResult::Committed(_)));
+    assert_eq!(updated.memory().content, after);
+}
+
+#[test]
 fn mcp_proposal_conflict_does_not_disclose_another_pending_memory() {
     let root = temp_dir();
     let repo = root.join("repo");

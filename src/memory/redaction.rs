@@ -1,4 +1,4 @@
-//! Redacción de secretos y limpieza de Unicode invisible antes de persistir.
+//! Secret redaction changes only matched spans, preserving surrounding data.
 
 const INVISIBLE: &[char] = &[
     '\u{200B}', '\u{200C}', '\u{200D}', '\u{2060}', '\u{FEFF}', '\u{00AD}', '\u{202A}', '\u{202B}',
@@ -11,37 +11,222 @@ pub fn prepare_content(text: &str) -> String {
 
 pub fn strip_invisible(text: &str) -> String {
     text.chars()
-        .filter(|ch| (!INVISIBLE.contains(ch) && !ch.is_control()) || *ch == '\n' || *ch == '\t')
+        .filter(|ch| {
+            (!INVISIBLE.contains(ch) && !ch.is_control()) || matches!(ch, '\n' | '\r' | '\t')
+        })
         .collect()
 }
 
+struct Redaction {
+    start: usize,
+    end: usize,
+    replacement: &'static str,
+}
+
 pub fn redact_secrets(text: &str) -> String {
-    let mut output = Vec::new();
-    let mut inside_private_key = false;
-    for line in text.lines() {
-        let upper = line.to_ascii_uppercase();
-        if upper.contains("-----BEGIN") && upper.contains("PRIVATE KEY-----") {
-            inside_private_key = true;
-            output.push("[redacted private key]".to_owned());
-            continue;
-        }
-        if inside_private_key {
-            if upper.contains("-----END") && upper.contains("PRIVATE KEY-----") {
-                inside_private_key = false;
+    let mut spans = private_key_spans(text);
+    let mut offset = 0;
+    while offset < text.len() {
+        if let Some((label, label_end)) = label_at(text, offset) {
+            let separator = skip_whitespace(text, label_end);
+            let bare_bearer = label.eq_ignore_ascii_case("bearer") && separator > label_end;
+            let assignment = is_secret_label(label)
+                && matches!(text.as_bytes().get(separator), Some(b'=' | b':'));
+            if assignment || bare_bearer {
+                let mut value_start = if assignment { separator + 1 } else { separator };
+                value_start = skip_whitespace(text, value_start);
+                if assignment && label.to_ascii_lowercase().ends_with("authorization") {
+                    if let Some((scheme, end)) = label_at(text, value_start) {
+                        if matches!(
+                            scheme.to_ascii_lowercase().as_str(),
+                            "bearer" | "basic" | "token"
+                        ) && skip_whitespace(text, end) > end
+                        {
+                            value_start = skip_whitespace(text, end);
+                        }
+                    }
+                }
+                if let Some((start, end)) = secret_value_span(text, value_start) {
+                    spans.push(Redaction {
+                        start,
+                        end,
+                        replacement: "[redacted]",
+                    });
+                    offset = end;
+                    continue;
+                }
             }
+            offset = label_end;
+        } else {
+            offset += text[offset..].chars().next().unwrap().len_utf8();
+        }
+    }
+
+    // Provider tokens and credential-bearing URLs do not always have labels.
+    // Lexing punctuation separately preserves JSON keys and shell assignments.
+    let mut offset = 0;
+    while offset < text.len() {
+        let end = token_end(text, offset);
+        if end > offset {
+            if looks_like_secret(&text[offset..end]) {
+                spans.push(Redaction {
+                    start: offset,
+                    end,
+                    replacement: "[redacted]",
+                });
+            }
+            offset = end;
+        } else {
+            offset += text[offset..].chars().next().unwrap().len_utf8();
+        }
+    }
+
+    spans.sort_by_key(|span| (span.start, std::cmp::Reverse(span.end)));
+    let mut merged: Vec<Redaction> = Vec::new();
+    for span in spans {
+        if let Some(last) = merged.last_mut() {
+            if span.start < last.end {
+                last.end = last.end.max(span.end);
+                continue;
+            }
+        }
+        merged.push(span);
+    }
+    let mut output = String::with_capacity(text.len());
+    let mut copied = 0;
+    for span in merged {
+        output.push_str(&text[copied..span.start]);
+        output.push_str(span.replacement);
+        copied = span.end;
+    }
+    output.push_str(&text[copied..]);
+    output
+}
+
+fn skip_whitespace(text: &str, start: usize) -> usize {
+    let mut end = start;
+    for ch in text[start..].chars() {
+        if !ch.is_whitespace() {
+            break;
+        }
+        end += ch.len_utf8();
+    }
+    end
+}
+
+fn label_at(text: &str, start: usize) -> Option<(&str, usize)> {
+    let quoted = matches!(text.as_bytes().get(start), Some(b'"' | b'\'' | b'\x60'));
+    let label_start = start + usize::from(quoted);
+    let mut end = label_start;
+    while text
+        .as_bytes()
+        .get(end)
+        .is_some_and(|ch| ch.is_ascii_alphanumeric() || *ch == b'_')
+    {
+        end += 1;
+    }
+    if end == label_start {
+        return None;
+    }
+    if quoted {
+        if text.as_bytes().get(end) != text.as_bytes().get(start) {
+            return None;
+        }
+        Some((&text[label_start..end], end + 1))
+    } else {
+        Some((&text[label_start..end], end))
+    }
+}
+
+fn secret_value_span(text: &str, start: usize) -> Option<(usize, usize)> {
+    let first = *text.as_bytes().get(start)?;
+    if text[start..].starts_with("[redacted]") {
+        return Some((start, start + "[redacted]".len()));
+    }
+    if matches!(first, b'"' | b'\'' | b'\x60') {
+        let mut escaped = false;
+        for (offset, ch) in text[start + 1..].char_indices() {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch as u32 == u32::from(first) {
+                return Some((start + 1, start + 1 + offset));
+            }
+        }
+        // An unterminated quoted secret remains secret through the end.
+        return Some((start + 1, text.len()));
+    }
+    let end = text[start..]
+        .char_indices()
+        .find(|(_, ch)| ch.is_whitespace() || matches!(ch, ',' | ';' | '}' | ']' | ')'))
+        .map(|(offset, _)| start + offset)
+        .unwrap_or(text.len());
+    (end > start).then_some((start, end))
+}
+
+fn token_end(text: &str, start: usize) -> usize {
+    let mut url = false;
+    for (offset, ch) in text[start..].char_indices() {
+        let at = start + offset;
+        if ch == ':' && text[at..].starts_with("://") {
+            url = true;
+        }
+        if ch.is_whitespace()
+            || matches!(
+                ch,
+                '"' | '\'' | '\u{60}' | ',' | ';' | '{' | '}' | '[' | ']' | '(' | ')' | '='
+            )
+            || (ch == ':' && !url)
+        {
+            return at;
+        }
+    }
+    text.len()
+}
+
+fn private_key_spans(text: &str) -> Vec<Redaction> {
+    let upper = text.to_ascii_uppercase();
+    let mut spans = Vec::new();
+    let mut offset = 0;
+    while let Some(begin) = upper[offset..].find("-----BEGIN") {
+        let start = offset + begin;
+        let line_end = upper[start..]
+            .find('\n')
+            .map(|n| start + n)
+            .unwrap_or(text.len());
+        if !upper[start..line_end].contains("PRIVATE KEY-----") {
+            offset = line_end;
             continue;
         }
-        output.push(redact_line(line));
+        let end = upper[line_end..]
+            .find("-----END")
+            .and_then(|end_marker| {
+                let marker = line_end + end_marker;
+                let end_line = upper[marker..]
+                    .find('\n')
+                    .map(|n| marker + n)
+                    .unwrap_or(text.len());
+                upper[marker..end_line]
+                    .find("PRIVATE KEY-----")
+                    .map(|suffix| marker + suffix + "PRIVATE KEY-----".len())
+            })
+            .unwrap_or(text.len());
+        spans.push(Redaction {
+            start,
+            end,
+            replacement: "[redacted private key]",
+        });
+        offset = end;
     }
-    output.join("\n")
+    spans
 }
 
 fn looks_like_secret(token: &str) -> bool {
-    let trimmed = token.trim_matches(|ch: char| matches!(ch, '"' | '\'' | '`' | ',' | ';' | '.'));
-    if trimmed.len() < 12 {
+    if token.len() < 12 {
         return false;
     }
-    let lower = trimmed.to_ascii_lowercase();
+    let lower = token.to_ascii_lowercase();
     const PREFIXES: &[&str] = &[
         "sk-",
         "sk_live_",
@@ -58,102 +243,11 @@ fn looks_like_secret(token: &str) -> bool {
         "aiza",
         "eyj",
     ];
-    if PREFIXES.iter().any(|prefix| lower.contains(prefix)) {
-        return true;
-    }
-    if contains_url_credentials(&lower) {
-        return true;
-    }
-    false
-}
-
-fn redact_line(line: &str) -> String {
-    let leading = &line[..line.len() - line.trim_start().len()];
-    let tokens: Vec<_> = line.split_whitespace().collect();
-    let mut output = Vec::new();
-    let mut secret_context = false;
-    let mut index = 0;
-
-    while index < tokens.len() {
-        let token = tokens[index];
-        let clean = token.trim_matches(|ch: char| {
-            matches!(
-                ch,
-                '"' | '\'' | '`' | ',' | ';' | '.' | '(' | ')' | '[' | ']'
-            )
-        });
-        let lower = clean.to_ascii_lowercase();
-
-        if secret_context {
-            if matches!(lower.as_str(), "bearer" | "basic" | "token") {
-                output.push(token.to_owned());
-                index += 1;
-                continue;
-            }
-            output.push("[redacted]".to_owned());
-            secret_context = false;
-            index += 1;
-            continue;
-        }
-
-        // Los logs y handoffs suelen incluir `Bearer <credencial>` sin la
-        // etiqueta Authorization. Es una señal inequívoca para ocultar el
-        // token siguiente antes de persistirlo.
-        if lower == "bearer" {
-            output.push(token.to_owned());
-            secret_context = true;
-            index += 1;
-            continue;
-        }
-
-        let next_is_separator = tokens
-            .get(index + 1)
-            .is_some_and(|next| matches!(*next, "=" | ":"));
-        if is_secret_label(clean) && next_is_separator {
-            output.push(token.to_owned());
-            output.push(tokens[index + 1].to_owned());
-            secret_context = true;
-            index += 2;
-            continue;
-        }
-
-        if let Some((label, value)) = split_assignment(clean) {
-            if is_secret_label(label) && !value.is_empty() {
-                let separator = if clean.contains('=') { '=' } else { ':' };
-                output.push(format!("{label}{separator}[redacted]"));
-                index += 1;
-                continue;
-            }
-        }
-        if (clean.ends_with('=') || clean.ends_with(':'))
-            && is_secret_label(clean.trim_end_matches(['=', ':']))
-        {
-            output.push(token.to_owned());
-            secret_context = true;
-            index += 1;
-            continue;
-        }
-        if looks_like_secret(clean) {
-            output.push("[redacted]".to_owned());
-        } else {
-            output.push(token.to_owned());
-        }
-        index += 1;
-    }
-
-    format!("{leading}{}", output.join(" "))
-}
-
-fn split_assignment(value: &str) -> Option<(&str, &str)> {
-    value
-        .split_once('=')
-        .or_else(|| value.split_once(':').filter(|_| !value.contains("://")))
+    PREFIXES.iter().any(|prefix| lower.starts_with(prefix)) || contains_url_credentials(&lower)
 }
 
 fn is_secret_label(label: &str) -> bool {
-    let normalized = label
-        .trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
-        .to_ascii_lowercase();
+    let normalized = label.to_ascii_lowercase();
     [
         "api_key",
         "apikey",
@@ -176,10 +270,10 @@ fn contains_url_credentials(value: &str) -> bool {
     let Some((_, rest)) = value.split_once("://") else {
         return false;
     };
-    let Some((authority, _)) = rest.split_once('@') else {
-        return false;
-    };
-    authority.contains(':')
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    authority
+        .split_once('@')
+        .is_some_and(|(credentials, _)| credentials.contains(':'))
 }
 
 #[cfg(test)]
@@ -187,14 +281,52 @@ mod tests {
     use super::{prepare_content, redact_secrets, strip_invisible};
 
     #[test]
-    fn secrets_are_redacted_and_invisible_unicode_is_stripped() {
-        let raw = format!("token ghp_{} keep{}", "a".repeat(20), "\u{200B}me");
-        let prepared = prepare_content(&raw);
-        assert!(!prepared.contains("ghp_"), "{prepared}");
-        assert!(prepared.contains("[redacted]"));
-        assert!(prepared.contains("keepme"));
-        assert!(!strip_invisible("a\u{200B}b").contains('\u{200B}'));
-        assert_eq!(redact_secrets("hello world"), "hello world");
+    fn normal_content_preserves_spaces_indentation_and_line_endings() {
+        let raw = "  let value = \"a  b\";\r\n\tif value {\n    print(value);\n}\n\n";
+        assert_eq!(prepare_content(raw), raw);
+        assert_eq!(strip_invisible("a\u{200B}b"), "ab");
+    }
+
+    #[test]
+    fn redacting_prepared_content_is_idempotent() {
+        for raw in [
+            "OPENAI_API_KEY=sk-secretsecretsecret",
+            "password=\"correct horse battery staple\"",
+            "Authorization: Bearer opaque-value",
+            "DATABASE_URL=postgres://user:password@example.com/db",
+        ] {
+            let prepared = prepare_content(raw);
+            assert_eq!(prepare_content(&prepared), prepared);
+        }
+    }
+
+    #[test]
+    fn quoted_secrets_are_redacted_without_changing_surrounding_syntax() {
+        for (raw, expected) in [
+            (
+                "password=\"correct horse battery staple\"",
+                "password=\"[redacted]\"",
+            ),
+            (
+                "password = 'correct horse battery staple'  # keep",
+                "password = '[redacted]'  # keep",
+            ),
+            (
+                r#"{"password":"correct horse battery staple","safe":"a  b"}"#,
+                r#"{"password":"[redacted]","safe":"a  b"}"#,
+            ),
+            ("token: \"a\\\"b c\"\nkeep", "token: \"[redacted]\"\nkeep"),
+            (
+                "password: \"first\nsecond\"\nkeep",
+                "password: \"[redacted]\"\nkeep",
+            ),
+            (
+                "password: \"unterminated secret\nrest",
+                "password: \"[redacted]",
+            ),
+        ] {
+            assert_eq!(prepare_content(raw), expected, "input: {raw}");
+        }
     }
 
     #[test]
@@ -209,7 +341,6 @@ mod tests {
                    -----END OPENSSH PRIVATE KEY-----\n\
                    keep this";
         let redacted = redact_secrets(raw);
-
         for leaked in [
             "sk-secret",
             "opaque-token-value",
@@ -223,5 +354,9 @@ mod tests {
         assert!(redacted.contains("OPENAI_API_KEY=[redacted]"));
         assert!(redacted.contains("[redacted private key]"));
         assert!(redacted.contains("keep this"));
+        assert_eq!(
+            prepare_content("token ghp_abcdefghijklmnopqrst keep\u{200B}me"),
+            "token [redacted] keepme"
+        );
     }
 }
