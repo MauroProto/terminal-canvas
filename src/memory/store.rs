@@ -22,7 +22,7 @@ use super::model::{
 };
 use super::redaction::prepare_content;
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(2);
 const BUSY_RETRY_ATTEMPTS: usize = 6;
 
@@ -415,21 +415,74 @@ impl MemoryStore {
 /// Migra el estado compartible del proyecto fuente antes de enlazarlo. Las
 /// claves activas que colisionan no se pisan: pasan a candidatas para revisión.
 fn merge_project_state(tx: &Transaction<'_>, source: &str, target: &str) -> Result<()> {
+    merge_memory_scope(tx, ScopeKind::Project, source, target)?;
+    let tasks = {
+        let mut stmt = tx.prepare(
+            "SELECT id, identity_value, orchestrator_task_id FROM tasks WHERE project_id = ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![source], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    for (id, identity, orchestrator_id) in tasks {
+        let matching: Option<String> = tx
+            .query_row(
+                "SELECT id FROM tasks WHERE project_id = ?1
+                 AND (identity_value = ?2 OR orchestrator_task_id = ?3)
+                 ORDER BY created_at, id LIMIT 1",
+                params![target, identity, orchestrator_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(existing) = matching {
+            merge_memory_scope(tx, ScopeKind::Task, &id, &existing)?;
+            tx.execute(
+                "UPDATE handoffs SET task_id = ?1 WHERE task_id = ?2",
+                params![existing, id],
+            )?;
+            tx.execute("DELETE FROM tasks WHERE id = ?1", params![id])?;
+        } else {
+            tx.execute(
+                "UPDATE tasks SET project_id = ?1 WHERE id = ?2",
+                params![target, id],
+            )?;
+        }
+    }
+    tx.execute(
+        "UPDATE handoffs SET project_id = ?1 WHERE project_id = ?2",
+        params![target, source],
+    )?;
+    Ok(())
+}
+
+fn merge_memory_scope(
+    tx: &Transaction<'_>,
+    kind: ScopeKind,
+    source: &str,
+    target: &str,
+) -> Result<()> {
     let memories = {
         let mut stmt = tx.prepare(
             "SELECT id, scope_kind, scope_id, kind, stable_key, status, trust_class, content,
                     current_revision, valid_until, created_at, updated_at
-             FROM memories WHERE scope_kind = 'project' AND scope_id = ?1",
+             FROM memories WHERE scope_kind = ?1 AND scope_id = ?2",
         )?;
         let rows = stmt
-            .query_map(params![source], row_to_memory)?
+            .query_map(params![kind.as_str(), source], row_to_memory)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         rows
     };
     let actor = Actor::human();
     for mut memory in memories {
         let collision = memory.status == MemoryStatus::Active
-            && find_active_key(tx, ScopeKind::Project, target, &memory.stable_key)?.is_some();
+            && find_active_key(tx, kind, target, &memory.stable_key)?.is_some();
         if collision {
             memory.status = MemoryStatus::Candidate;
             delete_fts(tx, &memory.id)?;
@@ -461,16 +514,6 @@ fn merge_project_state(tx: &Transaction<'_>, source: &str, target: &str) -> Resu
         )?;
     }
 
-    // Las tareas conservan su id, por lo que los handoffs siguen apuntando al
-    // mismo registro y pasan a ser visibles bajo el proyecto canónico.
-    tx.execute(
-        "UPDATE tasks SET project_id = ?1 WHERE project_id = ?2",
-        params![target, source],
-    )?;
-    tx.execute(
-        "UPDATE handoffs SET project_id = ?1 WHERE project_id = ?2",
-        params![target, source],
-    )?;
     Ok(())
 }
 
@@ -520,7 +563,9 @@ fn is_busy_error(error: &anyhow::Error) -> bool {
     })
 }
 
-fn migrate(conn: &Connection) -> Result<()> {
+fn migrate(conn: &mut Connection) -> Result<()> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let conn = &tx;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS schema_migrations (
             version INTEGER PRIMARY KEY
@@ -560,6 +605,8 @@ fn migrate(conn: &Connection) -> Result<()> {
             created_at INTEGER NOT NULL,
             UNIQUE(project_id, identity_value)
         );
+        CREATE INDEX IF NOT EXISTS tasks_project_orchestrator
+            ON tasks(project_id, orchestrator_task_id, created_at, id);
         CREATE TABLE IF NOT EXISTS memories (
             id TEXT PRIMARY KEY,
             scope_kind TEXT NOT NULL,
@@ -623,6 +670,7 @@ fn migrate(conn: &Connection) -> Result<()> {
             params![SCHEMA_VERSION],
         )?;
     }
+    tx.commit()?;
     Ok(())
 }
 
@@ -966,7 +1014,25 @@ fn upsert_task(
     loc: &super::model::ResolvedLocation,
     orchestrator_task_id: Option<Uuid>,
 ) -> Result<String> {
-    let identity = loc.task_identity();
+    // Explicit task IDs take precedence over the cwd fallback. Existing v1
+    // bindings retain their row and history; ambiguous legacy duplicates use
+    // the earliest binding deterministically rather than changing with cwd.
+    if let Some(orch) = orchestrator_task_id {
+        let by_orch: Option<String> = tx
+            .query_row(
+                "SELECT id FROM tasks WHERE project_id = ?1 AND orchestrator_task_id = ?2
+                 ORDER BY created_at, id LIMIT 1",
+                params![project_id, orch.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(id) = by_orch {
+            return Ok(id);
+        }
+    }
+    let identity = orchestrator_task_id
+        .map(|id| format!("orchestrator:{id}"))
+        .unwrap_or_else(|| loc.task_identity());
     let existing: Option<String> = tx
         .query_row(
             "SELECT id FROM tasks WHERE project_id = ?1 AND identity_value = ?2",
@@ -975,26 +1041,7 @@ fn upsert_task(
         )
         .optional()?;
     if let Some(id) = existing {
-        if let Some(orch) = orchestrator_task_id {
-            tx.execute(
-                "UPDATE tasks SET orchestrator_task_id = COALESCE(orchestrator_task_id, ?1)
-                 WHERE id = ?2",
-                params![orch.to_string(), id],
-            )?;
-        }
         return Ok(id);
-    }
-    if let Some(orch) = orchestrator_task_id {
-        let by_orch: Option<String> = tx
-            .query_row(
-                "SELECT id FROM tasks WHERE project_id = ?1 AND orchestrator_task_id = ?2",
-                params![project_id, orch.to_string()],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if let Some(id) = by_orch {
-            return Ok(id);
-        }
     }
     let id = new_prefixed_id("tsk_");
     tx.execute(

@@ -16,6 +16,119 @@ fn store_in(root: &std::path::Path) -> MemoryStore {
 }
 
 #[test]
+fn explicit_tasks_in_same_cwd_keep_handoffs_separate() {
+    let root = temp_dir();
+    let repo = root.join("repo");
+    init_git_repo(&repo);
+    let store = store_in(&root);
+    let task_a = uuid::Uuid::new_v4();
+    let task_b = uuid::Uuid::new_v4();
+    for (task, summary) in [(task_a, "handoff-task-a"), (task_b, "handoff-task-b")] {
+        store
+            .create_handoff(HandoffRequest {
+                cwd: repo.clone(),
+                summary: summary.to_owned(),
+                provider: Some("test".to_owned()),
+                session_id: None,
+                orchestrator_task_id: Some(task),
+                ttl_secs: Some(3600),
+            })
+            .unwrap();
+    }
+    let a = store.latest_handoff(&repo, Some(task_a)).unwrap().unwrap();
+    let b = store.latest_handoff(&repo, Some(task_b)).unwrap().unwrap();
+    assert_ne!(a.task_id, b.task_id);
+    assert_eq!(a.summary, "handoff-task-a");
+    assert_eq!(b.summary, "handoff-task-b");
+    assert!(store.latest_handoff(&repo, None).unwrap().is_none());
+}
+
+#[test]
+fn schema_v1_task_binding_keeps_history_after_upgrade() {
+    let root = temp_dir();
+    let repo = root.join("repo");
+    init_git_repo(&repo);
+    let store = store_in(&root);
+    let legacy = store
+        .create_handoff(HandoffRequest {
+            cwd: repo.clone(),
+            summary: "legacy handoff".to_owned(),
+            provider: None,
+            session_id: None,
+            orchestrator_task_id: None,
+            ttl_secs: None,
+        })
+        .unwrap();
+    let old_orchestrator = uuid::Uuid::new_v4();
+    let conn = rusqlite::Connection::open(store.path()).unwrap();
+    conn.execute(
+        "UPDATE tasks SET orchestrator_task_id = ?1 WHERE id = ?2",
+        rusqlite::params![old_orchestrator.to_string(), legacy.task_id],
+    )
+    .unwrap();
+    conn.execute_batch(
+        "DELETE FROM schema_migrations; INSERT INTO schema_migrations VALUES (1);
+         DROP INDEX tasks_project_orchestrator;",
+    )
+    .unwrap();
+    drop(conn);
+    let upgraded = MemoryStore::open(store.path()).unwrap();
+    for task in [None, Some(old_orchestrator)] {
+        let retained = upgraded.latest_handoff(&repo, task).unwrap().unwrap();
+        assert_eq!(retained.id, legacy.id);
+        assert_eq!(retained.task_id, legacy.task_id);
+    }
+    assert!(upgraded
+        .latest_handoff(&repo, Some(uuid::Uuid::new_v4()))
+        .unwrap()
+        .is_none());
+    let version: i64 = rusqlite::Connection::open(upgraded.path())
+        .unwrap()
+        .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(version, 2);
+}
+
+#[test]
+fn linking_projects_with_the_same_explicit_task_preserves_both_handoffs() {
+    let root = temp_dir();
+    let first = root.join("first");
+    let second = root.join("second");
+    init_git_repo(&first);
+    init_git_repo(&second);
+    let store = store_in(&root);
+    let task = uuid::Uuid::new_v4();
+    for (cwd, summary) in [(&first, "first handoff"), (&second, "second handoff")] {
+        store
+            .create_handoff(HandoffRequest {
+                cwd: cwd.clone(),
+                summary: summary.to_owned(),
+                provider: None,
+                session_id: None,
+                orchestrator_task_id: Some(task),
+                ttl_secs: None,
+            })
+            .unwrap();
+    }
+    store.link_projects(&first, &second).unwrap();
+    let a = store.latest_handoff(&first, Some(task)).unwrap().unwrap();
+    let b = store.latest_handoff(&second, Some(task)).unwrap().unwrap();
+    assert_eq!(a.task_id, b.task_id);
+    assert_eq!(a.summary, "second handoff");
+    let retained: i64 = rusqlite::Connection::open(store.path())
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM handoffs WHERE task_id = ?1",
+            [&a.task_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(retained, 2);
+}
+
+#[test]
 fn case_only_memory_update_preserves_the_requested_value() {
     let root = temp_dir();
     let repo = root.join("repo");
