@@ -24,6 +24,57 @@ reciben el contexto inicial cuando TerminalCanvas los lanza, pero la consulta
 dinámica requiere configuración manual hasta completar los adaptadores de la
 Fase 2. Esas piezas no deben presentarse como ya entregadas.
 
+### Contratos de persistencia y recuperación implementados
+
+La versión 2 del esquema migra de forma transaccional y conserva memorias,
+revisiones y handoffs. Un UUID explícito identifica una tarea dentro de su
+proyecto, aunque otras tareas usen el mismo directorio. Las llamadas sin UUID
+mantienen la identidad histórica por cwd/worktree. Si una base anterior ya
+vinculaba ese directorio a un UUID, ese UUID sigue leyendo su historial; la
+migración no puede reconstruir tareas que antes quedaron mezcladas. Al vincular
+proyectos se conservan ambos historiales y las memorias incompatibles quedan
+como candidatas para revisión humana.
+
+`TC_MEMORY_TASK_ID` configura el UUID del proceso MCP y sirve de valor por
+defecto para el CLI; `tc-memory --task UUID` lo reemplaza explícitamente. Un
+valor configurado inválido provoca un error, sin caer en la tarea por cwd. El
+servidor MCP lee el valor al iniciar y las herramientas no pueden sustituirlo
+con argumentos. La app debe pasar la misma identidad al contexto inicial y al
+PTY para que consultas y handoffs pertenezcan a la misma tarea. Sin la variable,
+los clientes manuales conservan el comportamiento anterior. `TC_MEMORY_ROOT`
+sigue delimitando el proyecto/worktree autorizado.
+
+La deduplicación compara el texto preparado exactamente: conserva mayúsculas,
+indentación, espacios y saltos de línea. La redacción sustituye solamente los
+fragmentos reconocidos, incluidos valores entre comillas y claves privadas,
+sin reescribir el código restante. Es una detección local de patrones, no una
+garantía de detectar cualquier secreto. Se aplica a nuevas escrituras y no
+reescribe contenido ni revisiones históricas. Las respuestas de propuestas MCP
+contienen identificadores y estado de la propuesta, sin revelar el contenido
+de otra candidata cuando hay conflicto.
+
+La recuperación tiene límites explícitos:
+
+- Contexto: hasta 32 elementos y 2400 unidades estimadas, con 800 para core y
+  400 para el handoff. Cada unidad admite cuatro bytes UTF-8 y se cuenta el
+  mayor tamaño entre el bloque inyectable y el JSON completo, incluidos
+  metadatos, escapes y cursor. Es un límite de tamaño, no un tokenizador del
+  proveedor. Un handoff largo se recorta en un límite Unicode seguro; si sus
+  metadatos solos exceden el límite se omite del contexto.
+- Candidatos de contexto: hasta las 32 entradas activas más recientes por
+  scope, ampliables mediante una consulta explícita. Las entradas restantes
+  siguen persistidas y accesibles mediante búsqueda o exportación.
+- Búsqueda: hasta 100 registros completos y 512 KiB de JSON, con consultas de
+  hasta 512 caracteres y 32 términos FTS. El filtro de scope se aplica en SQL
+  antes del límite. Una consulta amplia debe refinarse si requiere recuperar
+  otras entradas; la búsqueda no promete enumerar toda la base.
+- Listado humano y exportación: conservan el contenido completo de los scopes
+  seleccionados; el CLI aplica también el UUID configurado a pending/export.
+
+Estos contratos se verifican con fixtures sintéticos de migración, tareas que
+comparten cwd, secretos entre comillas, cambios de case/espacios, aislamiento
+FTS y presupuestos con metadatos y Unicode.
+
 ## Resumen ejecutivo
 
 TerminalCanvas incorpora un primer **Memory Hub local y propio** y apunta a
