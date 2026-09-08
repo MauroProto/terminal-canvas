@@ -579,9 +579,10 @@ impl HookServer {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::write_private_endpoint_file;
     use super::{
-        endpoint_script, parse_hook_payload, token_matches, write_private_endpoint_file, HookKind,
-        HookQuery, HookServer,
+        endpoint_script, parse_hook_payload, token_matches, HookKind, HookQuery, HookServer,
     };
     use uuid::Uuid;
 

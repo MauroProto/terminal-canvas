@@ -209,11 +209,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::field_reassign_with_default)] // Drop prevents struct-update syntax.
     fn rapid_edits_coalesce_before_a_queued_reload() {
-        let mut worker = PreferencesWorker {
-            busy: true,
-            ..Default::default()
-        };
+        let mut worker = PreferencesWorker::default();
+        worker.busy = true;
         let root = PathBuf::from("synthetic-repository");
         let key = Uuid::new_v4();
         worker.save_notes(root.clone(), DiffNotes::default());
@@ -234,11 +233,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::field_reassign_with_default)] // Drop prevents struct-update syntax.
     fn abandoned_review_loads_do_not_accumulate() {
-        let mut worker = PreferencesWorker {
-            busy: true,
-            ..Default::default()
-        };
+        let mut worker = PreferencesWorker::default();
+        worker.busy = true;
         let last = Uuid::new_v4();
         for _ in 0..100 {
             worker.load_notes(Uuid::new_v4(), PathBuf::from("old"));
