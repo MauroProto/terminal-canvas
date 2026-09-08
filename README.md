@@ -17,7 +17,8 @@ Native desktop workspace for terminals and coding agents.
 - In-band agent status via the OSC 9999 channel, with an attention inbox in the sidebar
 - Built-in code review: unified diff viewer (changed + new files, colored, open-in-editor)
 - Send review feedback to the agent straight from the code review (bracketed-paste injection)
-- Git worktree lifecycle: list and clean up agent worktrees from the code review
+- Git worktree lifecycle: list, archive and restore agent worktrees from the code review;
+  uncommitted files are retained and directories used by live terminals are protected
 - Quick Open: async fuzzy file finder for the active workspace
 - Built-in code viewer docked to the right of the canvas: resizable panel with a line-number
   gutter, selectable text and real syntax highlighting — TextMate grammars via `two-face`
@@ -94,8 +95,8 @@ The `MI_TERMINAL_ALLOW_OSC52` environment variable still overrides `allow_osc52`
 | Resume a past agent conversation | `Ctrl+Shift+R` |
 | Launch agent | `Ctrl+Shift+A` |
 | Focus next / prev | `Ctrl+Shift+]` / `Ctrl+Shift+[` |
-| Split terminal right / down | `Cmd+D` / `Cmd+Shift+D` |
-| Close split (leaf) | `Cmd+W` |
+| Split terminal right / down | macOS: `Cmd+D` / `Cmd+Shift+D`; Windows/Linux: `Ctrl+Alt+D` / `Ctrl+Alt+Shift+D` |
+| Close split (leaf) | macOS: `Cmd+W`; Windows/Linux: `Ctrl+Alt+W` |
 | Toggle sidebar | `Ctrl+B` |
 | Toggle fullscreen | `F11` |
 
@@ -112,14 +113,18 @@ In the terminal, double-click selects a word and triple-click selects a line.
 
 ## Quickstart
 
+Use Rust through `rustup`; the repository pins its compiler and tools in
+`rust-toolchain.toml`, matching CI. Windows source builds require the MSVC C++
+build tools. Build commands use the committed dependency lockfile.
+
 ```bash
-cargo run --bin mi-terminal
+cargo run --locked --bin mi-terminal
 ```
 
 Optimized release build:
 
 ```bash
-cargo build --release
+cargo build --release --locked --bins
 ./target/release/mi-terminal
 ```
 
@@ -150,7 +155,7 @@ of growing memory without limit, then reattaches from the latest snapshot and
 sequence number. Scrollback checkpoints are written outside the global session
 lock so disk latency cannot block input, resize or attach operations.
 
-The daemon protocol is versioned (currently v3). Each app identifies itself
+The daemon protocol is versioned (currently v4). Each app identifies itself
 with a `client_id` at handshake so the daemon can track session ownership: a
 live app cannot reconcile away another live app's sessions, and orphaned
 sessions are only cleaned up after their owner disconnects. A second daemon
