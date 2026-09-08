@@ -1,4 +1,6 @@
-use std::io::{Read, Write};
+use std::io::Read;
+#[cfg(all(unix, feature = "daemon"))]
+use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
@@ -15,6 +17,10 @@ use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
 use anyhow::Context as _;
 use portable_pty::{native_pty_system, Child, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use uuid::Uuid;
+
+#[path = "input_writer.rs"]
+mod input_writer;
+pub(crate) use input_writer::InputWriter;
 
 fn next_log_sequence(counter: &AtomicU64) -> Option<u64> {
     counter
@@ -123,7 +129,7 @@ pub struct PtyHandle {
     title: Arc<ArcSwap<String>>,
     pub alive: Arc<AtomicBool>,
     pub bell_fired: Arc<AtomicBool>,
-    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    writer: InputWriter,
     last_output_at: Arc<AtomicI64>,
     window_size: Arc<Mutex<WindowSize>>,
     render_revision: Arc<AtomicU64>,
@@ -270,8 +276,8 @@ impl PtyHandle {
         let title_for_reader = Arc::clone(&title);
         let alive_for_reader = Arc::clone(&alive);
         let bell_for_reader = Arc::clone(&bell_fired);
-        let writer_for_reader = Arc::new(Mutex::new(writer));
-        let writer_for_thread = Arc::clone(&writer_for_reader);
+        let writer_for_reader = InputWriter::new(writer).context("start PTY input writer")?;
+        let writer_for_thread = writer_for_reader.clone();
         let output_for_reader = Arc::clone(&last_output_at);
         let term_for_reader = Arc::clone(&term);
         #[cfg(feature = "ghostty-vt")]
@@ -493,8 +499,8 @@ impl PtyHandle {
         }
 
         let writer: Box<dyn Write + Send> = Box::new(RemoteWriter::new(link.clone()));
-        let writer_for_reader = Arc::new(Mutex::new(writer));
-        let writer_for_thread = Arc::clone(&writer_for_reader);
+        let writer_for_reader = InputWriter::new(writer).context("start remote input writer")?;
+        let writer_for_thread = writer_for_reader.clone();
         let title_for_reader = Arc::clone(&title);
         let alive_for_reader = Arc::clone(&alive);
         let bell_for_reader = Arc::clone(&bell_fired);
@@ -531,6 +537,9 @@ impl PtyHandle {
                         }
                         break;
                     };
+                    if let Some(error) = reader.take_input_error() {
+                        writer_for_thread.record_error(error);
+                    }
                     wait_for_history_restore(&restoring_for_reader);
                     let now_ms = pty_clock_now_ms();
                     let (clean, agent_reports, cwd_reports) = agent_stream.process(&bytes, now_ms);
@@ -687,11 +696,21 @@ impl PtyHandle {
     }
 
     pub fn write_all(&self, bytes: &[u8]) {
-        if let Ok(mut writer) = self.writer.lock() {
-            if writer.write_all(bytes).is_ok() {
-                let _ = writer.flush();
-            }
+        if let Err(error) = self.try_write_all(bytes) {
+            log::warn!("{error}");
         }
+    }
+
+    pub fn try_write_all(&self, bytes: &[u8]) -> std::io::Result<()> {
+        self.writer.enqueue(bytes)
+    }
+
+    pub fn input_error(&self) -> Option<String> {
+        #[cfg(all(unix, feature = "daemon"))]
+        if let Some(error) = self.remote.as_ref().and_then(RemoteLink::input_error) {
+            return Some(error);
+        }
+        self.writer.error()
     }
 
     pub fn output_elapsed(&self) -> Duration {
@@ -1199,7 +1218,7 @@ impl HookIdentity {
 
 fn drain_terminal_events(
     event_rx: &mpsc::Receiver<Event>,
-    writer: &Arc<Mutex<Box<dyn Write + Send>>>,
+    writer: &InputWriter,
     title: &Arc<ArcSwap<String>>,
     alive: &Arc<AtomicBool>,
     bell_fired: &Arc<AtomicBool>,
@@ -1211,10 +1230,7 @@ fn drain_terminal_events(
     while let Ok(event) = event_rx.try_recv() {
         match event {
             Event::PtyWrite(text) => {
-                if let Ok(mut writer) = writer.lock() {
-                    let _ = writer.write_all(text.as_bytes());
-                    let _ = writer.flush();
-                }
+                let _ = writer.enqueue(text.as_bytes());
             }
             Event::Title(new_title) => {
                 title.store(Arc::new(new_title));
@@ -1235,10 +1251,7 @@ fn drain_terminal_events(
                 if osc52_clipboard_enabled() {
                     if let Ok(mut clipboard) = arboard::Clipboard::new() {
                         if let Ok(text) = clipboard.get_text() {
-                            if let Ok(mut writer) = writer.lock() {
-                                let _ = writer.write_all(formatter(&text).as_bytes());
-                                let _ = writer.flush();
-                            }
+                            let _ = writer.enqueue(formatter(&text).as_bytes());
                         }
                     }
                 }
@@ -1251,18 +1264,12 @@ fn drain_terminal_events(
                         g: color.g(),
                         b: color.b(),
                     };
-                    if let Ok(mut writer) = writer.lock() {
-                        let _ = writer.write_all(formatter(rgb).as_bytes());
-                        let _ = writer.flush();
-                    }
+                    let _ = writer.enqueue(formatter(rgb).as_bytes());
                 }
             }
             Event::TextAreaSizeRequest(formatter) => {
                 if let Ok(size) = window_size.lock().map(|guard| *guard) {
-                    if let Ok(mut writer) = writer.lock() {
-                        let _ = writer.write_all(formatter(size).as_bytes());
-                        let _ = writer.flush();
-                    }
+                    let _ = writer.enqueue(formatter(size).as_bytes());
                 }
             }
             Event::Bell => {
@@ -1320,6 +1327,7 @@ impl SchedulerEventFlags {
 
 impl Drop for PtyHandle {
     fn drop(&mut self) {
+        self.writer.close();
         self.alive.store(false, Ordering::Relaxed);
         #[cfg(all(unix, feature = "daemon"))]
         if let Some(remote) = &self.remote {

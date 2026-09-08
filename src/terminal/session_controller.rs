@@ -221,6 +221,10 @@ impl SessionController {
         self.spawn_error.as_deref()
     }
 
+    pub fn input_error(&self) -> Option<String> {
+        self.handle()?.lock().ok()?.input_error()
+    }
+
     pub fn update_session_title_hint(&self, title: &str) {
         let Some(manager) = &self.pty_manager else {
             return;

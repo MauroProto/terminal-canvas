@@ -8,7 +8,7 @@
 
 use std::io::{BufReader, Write};
 use std::os::unix::net::UnixStream;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use uuid::Uuid;
 
@@ -21,16 +21,35 @@ use crate::daemon::protocol::{
 #[derive(Clone)]
 pub struct RemoteLink {
     session_id: Uuid,
-    control: Arc<Mutex<UnixStream>>,
+    control: Result<super::pty::InputWriter, Arc<String>>,
     disconnect: Option<Arc<UnixStream>>,
+    killing: Arc<std::sync::atomic::AtomicBool>,
+}
+
+struct SocketWriter(UnixStream);
+impl Write for SocketWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.write(bytes)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
+}
+impl Drop for SocketWriter {
+    fn drop(&mut self) {
+        let _ = self.0.shutdown(std::net::Shutdown::Both);
+    }
 }
 
 impl RemoteLink {
     pub fn new(session_id: Uuid, control: UnixStream) -> Self {
+        let _ = control.set_write_timeout(Some(std::time::Duration::from_secs(5)));
         Self {
             session_id,
             disconnect: control.try_clone().ok().map(Arc::new),
-            control: Arc::new(Mutex::new(control)),
+            killing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            control: super::pty::InputWriter::new(Box::new(SocketWriter(control)))
+                .map_err(|error| Arc::new(error.to_string())),
         }
     }
 
@@ -39,12 +58,11 @@ impl RemoteLink {
     }
 
     fn send(&self, request: &Request) -> std::io::Result<()> {
-        let mut control = self
+        let control = self
             .control
-            .lock()
-            .map_err(|_| std::io::Error::other("canal remoto envenenado"))?;
-        control.write_all(encode_line(request).as_bytes())?;
-        control.flush()
+            .as_ref()
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        control.enqueue(encode_line(request).as_bytes())
     }
 
     pub fn resize(&self, cols: u16, rows: u16) {
@@ -56,16 +74,40 @@ impl RemoteLink {
     }
 
     pub fn kill(&self) {
-        let _ = self.send(&Request::Kill {
-            id: self.session_id,
-        });
+        if let Ok(writer) = &self.control {
+            if writer
+                .enqueue_final(
+                    encode_line(&Request::Kill {
+                        id: self.session_id,
+                    })
+                    .as_bytes(),
+                )
+                .is_ok()
+            {
+                self.killing
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
     }
 
     /// Disconnect this UI without terminating the daemon's PTY. This clone
     /// is independent of the writer mutex, so it also cancels a stuck write.
     pub fn disconnect(&self) {
+        if self.killing.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        if let Ok(writer) = &self.control {
+            writer.close();
+        }
         if let Some(stream) = &self.disconnect {
             let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
+    }
+
+    pub fn input_error(&self) -> Option<String> {
+        match &self.control {
+            Ok(writer) => writer.error(),
+            Err(error) => Some(error.to_string()),
         }
     }
 }
@@ -106,6 +148,7 @@ pub struct RemoteReader {
     session_id: Uuid,
     attached_seq: u64,
     exited: bool,
+    input_error: Option<String>,
 }
 
 impl RemoteReader {
@@ -124,12 +167,17 @@ impl RemoteReader {
             session_id,
             attached_seq,
             exited: false,
+            input_error: None,
         }
     }
 
     /// ¿La sesión terminó del otro lado?
     pub fn exited(&self) -> bool {
         self.exited
+    }
+
+    pub fn take_input_error(&mut self) -> Option<String> {
+        self.input_error.take()
     }
 
     /// Próximo bloque de salida de esta sesión. `None` cuando el socket cierra
@@ -141,6 +189,10 @@ impl RemoteReader {
                 Ok(None) | Err(_) => return None,
             };
             match decode_line::<Response>(&line) {
+                Some(Response::InputError { id, message }) if id == self.session_id => {
+                    self.input_error = Some(message);
+                    return Some(Vec::new());
+                }
                 Some(Response::Output { id, seq, data })
                     if id == self.session_id && seq > self.attached_seq =>
                 {

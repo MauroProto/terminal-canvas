@@ -50,6 +50,7 @@ pub struct DaemonSession {
     persist_seq: u64,
     last_metadata: Vec<u8>,
     was_alternate: bool,
+    last_input_error: Option<String>,
     /// El PTY real (T2). `None` en los tests del registro, que no montan
     /// procesos: la lógica de sesiones se testea sin spawnear nada.
     pub handle: Option<SharedPtyHandle>,
@@ -67,6 +68,7 @@ impl DaemonSession {
             persist_seq: 0,
             last_metadata: Vec::new(),
             was_alternate: false,
+            last_input_error: None,
             handle: None,
         }
     }
@@ -431,6 +433,12 @@ impl DaemonState {
                 events.push(Response::Output { id, seq, data });
             }
             if let Ok(pty) = handle.lock() {
+                if let Some(message) = pty.input_error() {
+                    if session.last_input_error.as_ref() != Some(&message) {
+                        session.last_input_error = Some(message.clone());
+                        events.push(Response::InputError { id, message });
+                    }
+                }
                 let metadata = pty.metadata_osc(false);
                 if metadata != session.last_metadata {
                     session.last_metadata = metadata.clone();
@@ -888,7 +896,9 @@ fn compact_alternate_log(
 
 fn event_session_id(response: &Response) -> Option<Uuid> {
     match response {
-        Response::Output { id, .. } | Response::Exit { id } => Some(*id),
+        Response::Output { id, .. } | Response::Exit { id } | Response::InputError { id, .. } => {
+            Some(*id)
+        }
         _ => None,
     }
 }

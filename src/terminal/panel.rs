@@ -2622,6 +2622,21 @@ impl TerminalPanel {
                 Color32::from_rgb(244, 244, 244),
             );
         }
+
+        if let Some(error) = self
+            .focused_session()
+            .and_then(SessionController::input_error)
+        {
+            let message = egui::RichText::new(error).color(Color32::from_rgb(255, 190, 95));
+            ui.scope_builder(
+                egui::UiBuilder::new()
+                    .max_rect(content_rect.shrink(8.0))
+                    .layout(egui::Layout::bottom_up(egui::Align::LEFT)),
+                |ui| {
+                    ui.label(message);
+                },
+            );
+        }
         if let Some(new) = updated_activity_label {
             self.activity_label = new;
         }

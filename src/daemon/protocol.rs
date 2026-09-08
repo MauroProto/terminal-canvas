@@ -185,6 +185,10 @@ pub enum Response {
     Exit {
         id: Uuid,
     },
+    InputError {
+        id: Uuid,
+        message: String,
+    },
     Killed {
         id: Uuid,
     },

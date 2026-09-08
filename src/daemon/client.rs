@@ -32,7 +32,10 @@ pub fn is_duplicate_after_attach(event_seq: u64, attached_seq: u64) -> bool {
 /// a un pedido)? El daemon manda `Output`/`Exit` cuando quiere, así que se
 /// mezclan con las respuestas en el mismo socket.
 pub fn is_pushed_event(response: &Response) -> bool {
-    matches!(response, Response::Output { .. } | Response::Exit { .. })
+    matches!(
+        response,
+        Response::Output { .. } | Response::Exit { .. } | Response::InputError { .. }
+    )
 }
 
 pub struct DaemonConn {
