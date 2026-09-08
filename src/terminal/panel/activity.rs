@@ -179,7 +179,7 @@ pub(super) fn shell_label() -> String {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("shell");
-    format!("-{}", shell_name)
+    format!("-{shell_name}")
 }
 
 pub(super) fn cwd_label(cwd: Option<&Path>) -> String {

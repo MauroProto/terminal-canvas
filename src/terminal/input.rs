@@ -206,7 +206,7 @@ pub fn tilde_key_with_mods(code: u8, modifiers: &Modifiers) -> Option<Vec<u8>> {
     if modifiers.shift || modifiers.alt || modifiers.ctrl {
         Some(format!("\x1b[{};{}~", code, modifier_param(modifiers)).into_bytes())
     } else {
-        Some(format!("\x1b[{}~", code).into_bytes())
+        Some(format!("\x1b[{code}~").into_bytes())
     }
 }
 
@@ -250,7 +250,7 @@ pub fn fkey_sequence(fnum: u8, modifiers: &Modifiers) -> Option<Vec<u8>> {
             if has_mods {
                 Some(format!("\x1b[{};{}~", code, modifier_param(modifiers)).into_bytes())
             } else {
-                Some(format!("\x1b[{}~", code).into_bytes())
+                Some(format!("\x1b[{code}~").into_bytes())
             }
         }
         _ => None,
@@ -276,7 +276,7 @@ pub fn is_paste_shortcut(modifiers: &Modifiers, key: &Key) -> bool {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        (modifiers.ctrl && *key == Key::V) || (modifiers.ctrl && modifiers.shift && *key == Key::V)
+        modifiers.ctrl && *key == Key::V
     }
 }
 
