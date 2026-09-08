@@ -16,6 +16,7 @@ use super::TerminalApp;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct BroadcastTarget {
     pub(super) panel_id: Uuid,
+    pub(super) leaf_id: Uuid,
     pub(super) title: String,
     /// Un panel sin terminal vivo no puede recibir nada: se lista en gris y
     /// no se puede tildar.
@@ -24,6 +25,8 @@ pub(super) struct BroadcastTarget {
 }
 
 pub(super) struct BroadcastState {
+    workspace_id: Uuid,
+    request_focus: bool,
     pub(super) text: String,
     pub(super) targets: Vec<BroadcastTarget>,
 }
@@ -81,6 +84,7 @@ impl TerminalApp {
                 };
                 BroadcastTarget {
                     panel_id: panel.id(),
+                    leaf_id: panel.focused_leaf_id(),
                     title,
                     alive: panel.is_alive(),
                     // Por defecto todos los vivos: el caso común es "a todos".
@@ -94,6 +98,8 @@ impl TerminalApp {
             return;
         }
         self.broadcast = Some(BroadcastState {
+            workspace_id: self.ws().id,
+            request_focus: true,
             text: String::new(),
             targets,
         });
@@ -108,6 +114,7 @@ impl TerminalApp {
             return;
         }
 
+        self.refresh_broadcast_targets();
         let mut send = false;
         let mut cancel = false;
         let screen = ctx.screen_rect();
@@ -159,7 +166,9 @@ impl TerminalApp {
                                 .desired_width(f32::INFINITY)
                                 .hint_text("git pull --rebase"),
                         );
-                        field.request_focus();
+                        if std::mem::take(&mut state.request_focus) {
+                            field.request_focus();
+                        }
                         ui.add_space(10.0);
 
                         let (alive, selected) = (state.alive_count(), state.selected_count());
@@ -237,7 +246,23 @@ impl TerminalApp {
         }
     }
 
+    fn refresh_broadcast_targets(&mut self) {
+        let Some(state) = self.broadcast.as_mut() else {
+            return;
+        };
+        let workspace = self
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == state.workspace_id);
+        for target in &mut state.targets {
+            target.alive = workspace
+                .and_then(|workspace| workspace.panel(target.panel_id))
+                .is_some_and(|panel| panel.is_alive() && panel.focused_leaf_id() == target.leaf_id);
+        }
+    }
+
     fn dispatch_broadcast(&mut self) {
+        self.refresh_broadcast_targets();
         let Some(state) = self.broadcast.as_ref() else {
             return;
         };
@@ -246,12 +271,18 @@ impl TerminalApp {
         }
         let text = state.text.trim().to_owned();
         let ids = state.selected_ids();
+        let workspace_id = state.workspace_id;
         self.broadcast = None;
 
         let mut sent = 0usize;
         let mut failed = 0usize;
         for panel_id in ids {
-            if self.ws_mut().send_prompt_to_panel(panel_id, &text) {
+            if self
+                .workspaces
+                .iter_mut()
+                .find(|workspace| workspace.id == workspace_id)
+                .is_some_and(|workspace| workspace.send_prompt_to_panel(panel_id, &text))
+            {
                 sent += 1;
             } else {
                 failed += 1;
@@ -275,6 +306,7 @@ mod tests {
     fn target(title: &str, alive: bool, selected: bool) -> BroadcastTarget {
         BroadcastTarget {
             panel_id: Uuid::new_v4(),
+            leaf_id: Uuid::new_v4(),
             title: title.to_owned(),
             alive,
             selected,
@@ -283,6 +315,8 @@ mod tests {
 
     fn state(text: &str, targets: Vec<BroadcastTarget>) -> BroadcastState {
         BroadcastState {
+            workspace_id: Uuid::new_v4(),
+            request_focus: true,
             text: text.to_owned(),
             targets,
         }
