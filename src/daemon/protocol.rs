@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// Versión del protocolo. Cambiarla obliga a un socket nuevo.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// Tope duro de una línea NDJSON completa, incluido el salto final.
 ///
@@ -168,6 +168,7 @@ pub enum Response {
         #[serde(with = "wire_bytes")]
         snapshot: Vec<u8>,
         seq: u64,
+        alive: bool,
     },
     Sessions {
         ids: Vec<Uuid>,
@@ -476,6 +477,7 @@ mod tests {
                 id,
                 snapshot: b"hola\n".to_vec(),
                 seq: 42,
+                alive: true,
             },
             Response::Sessions { ids: vec![id] },
             Response::Output {

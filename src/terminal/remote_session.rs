@@ -22,12 +22,14 @@ use crate::daemon::protocol::{
 pub struct RemoteLink {
     session_id: Uuid,
     control: Arc<Mutex<UnixStream>>,
+    disconnect: Option<Arc<UnixStream>>,
 }
 
 impl RemoteLink {
     pub fn new(session_id: Uuid, control: UnixStream) -> Self {
         Self {
             session_id,
+            disconnect: control.try_clone().ok().map(Arc::new),
             control: Arc::new(Mutex::new(control)),
         }
     }
@@ -57,6 +59,14 @@ impl RemoteLink {
         let _ = self.send(&Request::Kill {
             id: self.session_id,
         });
+    }
+
+    /// Disconnect this UI without terminating the daemon's PTY. This clone
+    /// is independent of the writer mutex, so it also cancels a stuck write.
+    pub fn disconnect(&self) {
+        if let Some(stream) = &self.disconnect {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
     }
 }
 
@@ -136,7 +146,7 @@ impl RemoteReader {
                 {
                     return Some(data);
                 }
-                Some(Response::Exit { id }) if id == self.session_id => {
+                Some(Response::Exit { id } | Response::Killed { id }) if id == self.session_id => {
                     self.exited = true;
                     return None;
                 }
@@ -351,6 +361,7 @@ mod tests {
                 id,
                 snapshot: Vec::new(),
                 seq: 1,
+                alive: true,
             }),
             encode_line(&Response::Output {
                 id,
@@ -372,5 +383,16 @@ mod tests {
         let mut reader = RemoteReader::from_buffered(buffered, id, 1);
         assert_eq!(reader.next_output(), Some(b"after".to_vec()));
         assert_eq!(reader.next_output(), None);
+    }
+
+    #[test]
+    fn disconnect_releases_the_reader_without_killing_a_session() {
+        let (ours, _theirs) = socket_pair();
+        let id = Uuid::new_v4();
+        let link = RemoteLink::new(id, ours.try_clone().unwrap());
+        let mut reader = RemoteReader::new(ours, id, 0);
+        link.disconnect();
+        assert_eq!(reader.next_output(), None);
+        assert!(!reader.exited(), "local detach is not process exit");
     }
 }

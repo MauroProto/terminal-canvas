@@ -149,6 +149,8 @@ pub struct PtyHandle {
     /// Sesión del daemon a la que este handle está atado, si es remota.
     #[cfg(all(unix, feature = "daemon"))]
     remote: Option<RemoteLink>,
+    #[cfg(all(unix, feature = "daemon"))]
+    remote_exited: Arc<AtomicBool>,
     /// El daemon ya replayó el historial de una sesión preexistente. El store
     /// local no debe inyectar además el mismo checkpoint.
     hot_reattached: bool,
@@ -385,6 +387,8 @@ impl PtyHandle {
             child: Some(child),
             #[cfg(all(unix, feature = "daemon"))]
             remote: None,
+            #[cfg(all(unix, feature = "daemon"))]
+            remote_exited: Arc::new(AtomicBool::new(false)),
             hot_reattached: false,
             _reader_thread: reader_thread,
         })
@@ -404,6 +408,7 @@ impl PtyHandle {
         snapshot: &[u8],
         attached_seq: u64,
         hot_reattached: bool,
+        session_alive: bool,
         cols: u16,
         rows: u16,
         scheduler: SharedRuntimeScheduler,
@@ -412,7 +417,8 @@ impl PtyHandle {
 
         let link = RemoteLink::new(session_id, control);
         let title = Arc::new(ArcSwap::from_pointee("Terminal".to_owned()));
-        let alive = Arc::new(AtomicBool::new(true));
+        let alive = Arc::new(AtomicBool::new(session_alive));
+        let remote_exited = Arc::new(AtomicBool::new(!session_alive));
         let bell_fired = Arc::new(AtomicBool::new(false));
         let last_output_at = Arc::new(AtomicI64::new(pty_clock_now_ms()));
         let window_size = Arc::new(Mutex::new(WindowSize {
@@ -462,6 +468,7 @@ impl PtyHandle {
         let cwd_for_reader = Arc::clone(&cwd);
         let scheduler_for_reader = Arc::clone(&scheduler);
         let restoring_for_reader = Arc::clone(&restoring_history);
+        let exited_for_reader = Arc::clone(&remote_exited);
 
         let reader_thread = thread::spawn(move || {
             let loop_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -472,6 +479,9 @@ impl PtyHandle {
                     wait_for_history_restore(&restoring_for_reader);
                     yield_for_reader_priority(&scheduler_for_reader, session_id);
                     let Some(bytes) = reader.next_output() else {
+                        if reader.exited() {
+                            exited_for_reader.store(true, Ordering::Release);
+                        }
                         break;
                     };
                     wait_for_history_restore(&restoring_for_reader);
@@ -535,6 +545,7 @@ impl PtyHandle {
             killer: None,
             child: None,
             remote: Some(link),
+            remote_exited,
             hot_reattached,
             _reader_thread: reader_thread,
         })
@@ -603,6 +614,18 @@ impl PtyHandle {
         #[cfg(all(unix, feature = "daemon"))]
         {
             self.remote.is_some()
+        }
+        #[cfg(not(all(unix, feature = "daemon")))]
+        {
+            false
+        }
+    }
+
+    /// An explicit process exit must not be retried as a transport failure.
+    pub fn remote_session_exited(&self) -> bool {
+        #[cfg(all(unix, feature = "daemon"))]
+        {
+            self.remote_exited.load(Ordering::Acquire)
         }
         #[cfg(not(all(unix, feature = "daemon")))]
         {
@@ -1151,6 +1174,10 @@ impl SchedulerEventFlags {
 impl Drop for PtyHandle {
     fn drop(&mut self) {
         self.alive.store(false, Ordering::Relaxed);
+        #[cfg(all(unix, feature = "daemon"))]
+        if let Some(remote) = &self.remote {
+            remote.disconnect();
+        }
         if let Some(killer) = self.killer.as_mut() {
             let _ = killer.kill();
         }

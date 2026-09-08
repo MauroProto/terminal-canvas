@@ -79,13 +79,17 @@ pub fn spawn_remote(
     // ese caso hay que reusarla en vez de crear otra encima (P3.15, T4).
     let mut existing = None;
     if let Some(id) = desired_id {
-        if let Ok(Response::Attached { snapshot, seq, .. }) =
-            request(&mut writer, &mut reader, &Request::Attach { id })
+        if let Ok(Response::Attached {
+            snapshot,
+            seq,
+            alive,
+            ..
+        }) = request(&mut writer, &mut reader, &Request::Attach { id })
         {
-            existing = Some((id, snapshot, seq));
+            existing = Some((id, snapshot, seq, alive));
         }
     }
-    if let Some((session_id, snapshot, seq)) = existing {
+    if let Some((session_id, snapshot, seq, alive)) = existing {
         let control = stream
             .try_clone()
             .map_err(|err| anyhow::anyhow!("no se pudo clonar el socket: {err}"))?;
@@ -96,6 +100,7 @@ pub fn spawn_remote(
             &snapshot,
             seq,
             true,
+            alive,
             cols.max(1),
             rows.max(1),
             scheduler,
@@ -118,12 +123,17 @@ pub fn spawn_remote(
     };
 
     // Engancharse: trae el historial ya emitido y desde qué `seq` es nuevo.
-    let (snapshot, seq) = match request(
+    let (snapshot, seq, alive) = match request(
         &mut writer,
         &mut reader,
         &Request::Attach { id: session_id },
     )? {
-        Response::Attached { snapshot, seq, .. } => (snapshot, seq),
+        Response::Attached {
+            snapshot,
+            seq,
+            alive,
+            ..
+        } => (snapshot, seq, alive),
         other => anyhow::bail!("el daemon no dejó engancharse: {other:?}"),
     };
 
@@ -138,6 +148,7 @@ pub fn spawn_remote(
         &snapshot,
         seq,
         false,
+        alive,
         cols.max(1),
         rows.max(1),
         scheduler,
@@ -158,12 +169,17 @@ pub fn attach_existing(
         .ok_or_else(|| anyhow::anyhow!("no se pudo conectar al daemon"))?;
     let mut writer = stream.try_clone()?;
     let mut reader = BufReader::new(stream.try_clone()?);
-    let (snapshot, seq) = match request(
+    let (snapshot, seq, alive) = match request(
         &mut writer,
         &mut reader,
         &Request::Attach { id: session_id },
     )? {
-        Response::Attached { snapshot, seq, .. } => (snapshot, seq),
+        Response::Attached {
+            snapshot,
+            seq,
+            alive,
+            ..
+        } => (snapshot, seq, alive),
         other => anyhow::bail!("la sesión {session_id} no existe en el daemon: {other:?}"),
     };
     let control = stream.try_clone()?;
@@ -174,6 +190,7 @@ pub fn attach_existing(
         &snapshot,
         seq,
         true,
+        alive,
         cols.max(1),
         rows.max(1),
         scheduler,

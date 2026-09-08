@@ -472,6 +472,7 @@ impl DaemonState {
     pub fn kill(&mut self, id: Uuid) -> bool {
         match self.sessions.remove(&id) {
             Some(session) => {
+                self.broadcast(&[Response::Exit { id }]);
                 self.session_claimants.remove(&id);
                 if self.priority_session == Some(id) {
                     self.priority_session = None;
@@ -789,7 +790,12 @@ fn handle_request_for_client(
             Some(session) => {
                 let (snapshot, pending_output) = session.attach_boundary();
                 let seq = session.seq;
-                let response = Response::Attached { id, snapshot, seq };
+                let response = Response::Attached {
+                    id,
+                    snapshot,
+                    seq,
+                    alive: session.alive,
+                };
                 if let Some((seq, data)) = pending_output {
                     state.broadcast(&[Response::Output { id, seq, data }]);
                 }
@@ -1211,6 +1217,21 @@ mod tests {
         let mut state = DaemonState::new();
         let id = spawn_one(&mut state);
         assert_eq!(state.session_ids(), vec![id]);
+    }
+
+    #[test]
+    fn attach_reports_process_exit_and_kill_notifies_subscribers() {
+        let mut state = DaemonState::new();
+        let id = spawn_one(&mut state);
+        state.session_mut(id).unwrap().alive = false;
+        assert!(matches!(
+            handle_request(&mut state, Request::Attach { id }, None),
+            Response::Attached { alive: false, .. }
+        ));
+        let (tx, rx) = std::sync::mpsc::sync_channel(2);
+        state.subscribe(Uuid::new_v4(), id, tx, None);
+        assert!(state.kill(id));
+        assert_eq!(rx.try_recv().unwrap(), Response::Exit { id });
     }
 
     #[test]
