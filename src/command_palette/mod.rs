@@ -52,7 +52,7 @@ impl CommandPalette {
         area.show(ctx, |ui| {
             Frame::default()
                 .fill(palette::SURFACE)
-                .stroke(egui::Stroke::new(1.0, palette::LINE))
+                .stroke(egui::Stroke::new(1.0_f32, palette::LINE))
                 .corner_radius(10.0)
                 .inner_margin(egui::Margin::same(10))
                 .show(ui, |ui: &mut egui::Ui| {

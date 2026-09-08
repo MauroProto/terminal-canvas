@@ -178,7 +178,7 @@ pub fn draw_workspace_tree(
                     egui::pos2(ui.min_rect().left() + inset, divider_y),
                     egui::pos2(ui.min_rect().right() - inset, divider_y),
                 ],
-                egui::Stroke::new(1.0, SIDEBAR_BORDER),
+                egui::Stroke::new(1.0_f32, SIDEBAR_BORDER),
             );
             ui.add_space(2.0);
         } else {

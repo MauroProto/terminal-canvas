@@ -288,7 +288,7 @@ impl Sidebar {
                         egui::pos2(cursor_x, underline_y),
                         egui::pos2(cursor_x + text_width, underline_y),
                     ],
-                    Stroke::new(1.5, TEXT_PRIMARY),
+                    Stroke::new(1.5_f32, TEXT_PRIMARY),
                 );
             }
             cursor_x += text_width + item_gap;
@@ -478,7 +478,7 @@ fn draw_attention_section(ui: &mut Ui, attention: &[AttentionItem]) -> Vec<Sideb
         ui.painter().rect_stroke(
             diff_rect,
             4.0,
-            Stroke::new(1.0, diff_color),
+            Stroke::new(1.0_f32, diff_color),
             egui::StrokeKind::Middle,
         );
         ui.painter().text(
@@ -568,13 +568,13 @@ fn render_action_button(ui: &mut Ui, label: &str, slot_width: f32, primary: bool
     ui.scope(|ui| {
         let widgets = &mut ui.visuals_mut().widgets;
         widgets.inactive.bg_fill = if primary { RAISED } else { INK };
-        widgets.inactive.bg_stroke = Stroke::new(1.0, LINE);
+        widgets.inactive.bg_stroke = Stroke::new(1.0_f32, LINE);
         widgets.inactive.fg_stroke.color = if primary { TEXT_PRIMARY } else { TEXT };
         widgets.hovered.bg_fill = HOVER;
-        widgets.hovered.bg_stroke = Stroke::new(1.0, RING);
+        widgets.hovered.bg_stroke = Stroke::new(1.0_f32, RING);
         widgets.hovered.fg_stroke.color = TEXT_PRIMARY;
         widgets.active.bg_fill = FOCUS;
-        widgets.active.bg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
+        widgets.active.bg_stroke = Stroke::new(1.0_f32, TEXT_PRIMARY);
         widgets.active.fg_stroke.color = TEXT_PRIMARY;
 
         ui.add_sized(

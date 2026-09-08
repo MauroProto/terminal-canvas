@@ -71,7 +71,7 @@ pub fn show(
     painter.rect_stroke(
         reset_rect,
         11.0,
-        Stroke::new(1.0, palette::LINE),
+        Stroke::new(1.0_f32, palette::LINE),
         egui::StrokeKind::Middle,
     );
     painter.text(
@@ -125,7 +125,7 @@ pub fn show(
     painter.rect_stroke(
         visible_rect,
         2.0,
-        Stroke::new(1.0, MINIMAP_VIEWPORT_BORDER),
+        Stroke::new(1.0_f32, MINIMAP_VIEWPORT_BORDER),
         egui::StrokeKind::Middle,
     );
 

@@ -2648,7 +2648,7 @@ impl TerminalPanel {
         chrome_painter.rect_stroke(
             stroke_rect,
             panel_rounding,
-            Stroke::new(0.75, border_color),
+            Stroke::new(0.75_f32, border_color),
             egui::StrokeKind::Middle,
         );
         if matches!(lod, PanelLod::Full) {
@@ -2657,7 +2657,7 @@ impl TerminalPanel {
                     pos2(screen_rect.left() + separator_inset, separator_y),
                     pos2(screen_rect.right() - separator_inset, separator_y),
                 ],
-                Stroke::new(1.0, border_color),
+                Stroke::new(1.0_f32, border_color),
             );
         }
 
@@ -2716,7 +2716,7 @@ impl TerminalPanel {
             painter.rect_stroke(
                 focused.rect,
                 0.0,
-                Stroke::new(1.5, palette::FOCUS),
+                Stroke::new(1.5_f32, palette::FOCUS),
                 egui::StrokeKind::Middle,
             );
         }
@@ -3315,7 +3315,7 @@ fn draw_search_highlight(
             painter.rect_stroke(
                 rect,
                 2.0,
-                Stroke::new(1.0, SEARCH_HIGHLIGHT),
+                Stroke::new(1.0_f32, SEARCH_HIGHLIGHT),
                 egui::StrokeKind::Middle,
             );
         }

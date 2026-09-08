@@ -1079,7 +1079,7 @@ fn draw_decoration_shapes(
                 pos2(text_pos.x, y),
                 pos2(text_pos.x + metrics.cell_width, y),
             ],
-            Stroke::new(1.0, fg),
+            Stroke::new(1.0_f32, fg),
         ));
     }
     if flags.contains(Flags::STRIKEOUT) {
@@ -1089,7 +1089,7 @@ fn draw_decoration_shapes(
                 pos2(text_pos.x, y),
                 pos2(text_pos.x + metrics.cell_width, y),
             ],
-            Stroke::new(1.0, fg),
+            Stroke::new(1.0_f32, fg),
         ));
     }
 }
@@ -1157,7 +1157,10 @@ pub fn render_terminal_preview(
         painter.rect_stroke(
             badge_rect,
             badge_height * 0.5,
-            Stroke::new(1.0, Color32::from_rgba_premultiplied(110, 110, 110, 120)),
+            Stroke::new(
+                1.0_f32,
+                Color32::from_rgba_premultiplied(110, 110, 110, 120),
+            ),
             egui::StrokeKind::Middle,
         );
         painter.text(
