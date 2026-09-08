@@ -70,6 +70,8 @@ pub fn pid_path(dir: &Path) -> PathBuf {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WireSpec {
     #[serde(default)]
+    pub memory_task_id: Option<Uuid>,
+    #[serde(default)]
     pub title: String,
     #[serde(default)]
     pub cwd: Option<String>,
@@ -430,6 +432,7 @@ mod tests {
             Request::Spawn {
                 id: None,
                 spec: WireSpec {
+                    memory_task_id: None,
                     title: "Terminal".to_owned(),
                     cwd: Some("/tmp".to_owned()),
                     startup_command: Some("claude".to_owned()),

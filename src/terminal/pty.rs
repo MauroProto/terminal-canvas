@@ -1128,7 +1128,7 @@ fn shell_command(cwd: Option<&Path>, hooks: HookIdentity) -> CommandBuilder {
     if let Some(leaf_id) = hooks.leaf_id {
         cmd.env("TC_LEAF_ID", leaf_id.to_string());
     }
-    if let Some(task_id) = hooks.leaf_id.or(hooks.panel_id) {
+    if let Some(task_id) = hooks.memory_task_id.or(hooks.leaf_id).or(hooks.panel_id) {
         cmd.env("TC_MEMORY_TASK_ID", task_id.to_string());
     }
     cmd
@@ -1138,6 +1138,7 @@ fn shell_command(cwd: Option<&Path>, hooks: HookIdentity) -> CommandBuilder {
 /// vienen (P2.12).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct HookIdentity {
+    pub memory_task_id: Option<Uuid>,
     pub panel_id: Option<Uuid>,
     pub workspace_id: Option<Uuid>,
     pub leaf_id: Option<Uuid>,
@@ -1145,7 +1146,10 @@ pub struct HookIdentity {
 
 impl HookIdentity {
     pub fn memory_task_id(self, session_id: Uuid) -> Uuid {
-        self.leaf_id.or(self.panel_id).unwrap_or(session_id)
+        self.memory_task_id
+            .or(self.leaf_id)
+            .or(self.panel_id)
+            .unwrap_or(session_id)
     }
 }
 
@@ -1456,6 +1460,7 @@ mod tests {
                 panel_id: Some(panel),
                 workspace_id: Some(workspace),
                 leaf_id: Some(leaf),
+                memory_task_id: None,
             },
         );
 

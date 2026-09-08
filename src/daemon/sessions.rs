@@ -40,6 +40,7 @@ impl DaemonEndpoint {
 /// Spec de la app traducido al del protocolo.
 pub fn wire_spec_from(spec: &crate::runtime::SessionSpec, cols: u16, rows: u16) -> WireSpec {
     WireSpec {
+        memory_task_id: spec.memory_task_id,
         title: spec.title.clone(),
         cwd: spec
             .cwd

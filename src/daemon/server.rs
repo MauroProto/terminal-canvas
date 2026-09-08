@@ -299,6 +299,7 @@ impl DaemonState {
             id,
             Arc::clone(scheduler),
             HookIdentity {
+                memory_task_id: spec.memory_task_id,
                 panel_id: spec.panel_id,
                 workspace_id: spec.workspace_id,
                 leaf_id: spec.leaf_id,
