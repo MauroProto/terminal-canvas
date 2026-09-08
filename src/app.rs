@@ -102,6 +102,7 @@ pub struct TerminalApp {
     /// Resultado pendiente de la captura interactiva de pantalla (corre en un
     /// worker porque bloquea hasta que el usuario selecciona o cancela).
     screenshot_rx: Option<std::sync::mpsc::Receiver<anyhow::Result<PathBuf>>>,
+    screenshot_target: Option<(Uuid, Uuid, Uuid)>,
     file_viewer: Option<file_viewer_ui::FileViewerState>,
     file_viewer_keyboard_active: bool,
     file_viewer_rx: Option<std::sync::mpsc::Receiver<file_viewer_ui::FileViewerState>>,
@@ -305,6 +306,7 @@ impl TerminalApp {
                 quick_open: None,
                 quick_open_rx: None,
                 screenshot_rx: None,
+                screenshot_target: None,
                 file_viewer: None,
                 file_viewer_keyboard_active: false,
                 file_viewer_rx: None,
@@ -1836,6 +1838,15 @@ impl TerminalApp {
             self.toast_error("Ya hay una captura en curso");
             return;
         }
+        let Some(target) = self
+            .ws()
+            .focused_panel()
+            .filter(|panel| panel.is_alive())
+            .map(|panel| (self.ws().id, panel.id(), panel.focused_leaf_id()))
+        else {
+            self.toast_error("Elegí una terminal activa para adjuntar la captura");
+            return;
+        };
         let Some(dir) = crate::utils::platform::screenshots_dir() else {
             self.toast_error("No pude resolver el directorio de capturas");
             return;
@@ -1858,6 +1869,7 @@ impl TerminalApp {
                 let _ = tx.send(result);
             });
         self.screenshot_rx = Some(rx);
+        self.screenshot_target = Some(target);
         self.toast_success("Seleccioná el área de la pantalla a capturar");
         ctx.request_repaint();
     }
@@ -1873,6 +1885,7 @@ impl TerminalApp {
             }
             Ok(Err(err)) => {
                 self.screenshot_rx = None;
+                self.screenshot_target = None;
                 self.toast_error(err.to_string());
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {
@@ -1881,13 +1894,25 @@ impl TerminalApp {
             }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 self.screenshot_rx = None;
+                self.screenshot_target = None;
             }
         }
     }
 
     fn deliver_screenshot(&mut self, path: PathBuf) {
-        let Some(panel_id) = self.ws().focused_panel().map(|panel| panel.id()) else {
-            self.toast_error("No hay terminal enfocado donde mandarla");
+        let Some((workspace_id, panel_id, leaf_id)) = self.screenshot_target.take() else {
+            return;
+        };
+        let target_index = self.workspace_index_by_id(workspace_id).filter(|index| {
+            self.workspaces[*index]
+                .panel(panel_id)
+                .is_some_and(|panel| panel.is_alive() && panel.focused_leaf_id() == leaf_id)
+        });
+        let Some(index) = target_index else {
+            self.toast_error(format!(
+                "El destino cambió. Captura guardada en {}",
+                path.display()
+            ));
             return;
         };
         // El path va quoteado: los agentes reciben el literal exacto aunque
@@ -1896,7 +1921,7 @@ impl TerminalApp {
             "Mirá esta captura: {}",
             crate::terminal::shell_quote::quote_path(&path.to_string_lossy())
         );
-        if self.ws_mut().send_prompt_to_panel(panel_id, &prompt) {
+        if self.workspaces[index].send_prompt_to_panel(panel_id, &prompt) {
             self.toast_success("Captura enviada al agente");
         } else {
             self.toast_error("No se pudo escribir en ese terminal");
