@@ -143,11 +143,11 @@ impl SessionController {
         let next_rows = rows.max(1);
         let resize_needed =
             attached_grid_resize_needed(self.last_cols, self.last_rows, next_cols, next_rows);
-        self.last_cols = next_cols;
-        self.last_rows = next_rows;
         if defer_resize {
             return;
         }
+        self.last_cols = next_cols;
+        self.last_rows = next_rows;
         if !self.is_attached() || !self.is_alive() {
             let _ = self.ensure_attached();
             return;
@@ -311,6 +311,17 @@ mod tests {
     fn changed_attached_grid_needs_resize() {
         assert!(attached_grid_resize_needed(120, 32, 121, 32));
         assert!(attached_grid_resize_needed(120, 32, 120, 33));
+    }
+
+    #[test]
+    fn deferred_resize_does_not_acknowledge_dimensions_until_release() {
+        let mut session = super::SessionController::default();
+        session.set_last_grid_size_for_tests(80, 24);
+        session.sync_grid_size(120, 30, true);
+        assert_eq!(session.last_grid_size(), (80, 24));
+        assert!(attached_grid_resize_needed(80, 24, 120, 30));
+        session.sync_grid_size(120, 30, false);
+        assert_eq!(session.last_grid_size(), (120, 30));
     }
 
     #[test]
