@@ -1,13 +1,15 @@
 # Homebrew cask para TerminalCanvas (Ship-it 7.1, T4).
 #
 # Va en un tap propio: `homebrew-tap/Casks/terminalcanvas.rb`.
-# Después de cada release hay que actualizar `version` y `sha256` (el script
-# scripts/bundle.sh --dmg imprime el sha256 del dmg y lo deja en un .sha256).
+# Plantilla: no instalar hasta reemplazar ambos SHA256 con los checksums de
+# una release firmada. scripts/bundle.sh --dmg genera un .sha256 por arquitectura.
 cask "terminalcanvas" do
+  arch arm: "aarch64", intel: "x86_64"
   version "1.2.0"
-  sha256 "REEMPLAZAR_CON_EL_SHA256_DEL_DMG"
+  sha256 arm: "REEMPLAZAR_CON_EL_SHA256_DEL_DMG_ARM64",
+         intel: "REEMPLAZAR_CON_EL_SHA256_DEL_DMG_INTEL"
 
-  url "https://github.com/MauroProto/terminal-canvas/releases/download/v#{version}/TerminalCanvas-#{version}.dmg"
+  url "https://github.com/MauroProto/terminal-canvas/releases/download/v#{version}/TerminalCanvas-#{version}-macos-#{arch}.dmg"
   name "TerminalCanvas"
   desc "Canvas de terminales para trabajar con varios agentes de codigo a la vez"
   homepage "https://github.com/MauroProto/terminal-canvas"
