@@ -13,11 +13,13 @@ pub struct CommandPalette {
     pub open: bool,
     pub query: String,
     pub selected: usize,
+    request_focus: bool,
 }
 
 impl CommandPalette {
     pub fn toggle(&mut self) {
         self.open = !self.open;
+        self.request_focus = self.open;
         if !self.open {
             self.query.clear();
             self.selected = 0;
@@ -37,8 +39,6 @@ impl CommandPalette {
 
         let screen = ctx.available_rect();
         let width = (screen.width() - 40.0).min(500.0);
-        let entries = self.filtered_entries();
-        self.selected = self.selected.min(entries.len().saturating_sub(1));
 
         let backdrop = ctx.layer_painter(egui::LayerId::new(Order::Debug, Id::new("cp-backdrop")));
         backdrop.rect_filled(screen, 0.0, Color32::from_rgba_premultiplied(0, 0, 0, 150));
@@ -62,6 +62,20 @@ impl CommandPalette {
                             .hint_text("Type a command...")
                             .font(FontId::monospace(14.0)),
                     );
+                    let focus_requested = std::mem::take(&mut self.request_focus);
+                    if focus_requested {
+                        search.request_focus();
+                    }
+                    if search.changed() {
+                        self.selected = 0;
+                    }
+                    let entries = self.filtered_entries();
+                    self.selected = self.selected.min(entries.len().saturating_sub(1));
+                    let scroll_selection = focus_requested
+                        || search.changed()
+                        || ui.input(|input| {
+                            input.key_pressed(Key::ArrowDown) || input.key_pressed(Key::ArrowUp)
+                        });
                     if search.lost_focus()
                         && ui.input(|i: &egui::InputState| i.key_pressed(Key::Escape))
                     {
@@ -91,32 +105,50 @@ impl CommandPalette {
 
                     ui.separator();
 
-                    for (index, entry) in entries.iter().take(10).enumerate() {
-                        let selected = index == self.selected;
-                        let (rect, response) =
-                            ui.allocate_exact_size(vec2(width - 20.0, 32.0), egui::Sense::click());
-                        if selected {
-                            ui.painter()
-                                .rect_filled(rect.shrink(2.0), 6.0, palette::HOVER);
-                        }
-                        ui.painter().text(
-                            rect.left_center() + vec2(12.0, 0.0),
-                            Align2::LEFT_CENTER,
-                            format!("{} {}", if selected { "▸" } else { " " }, entry.label),
-                            FontId::proportional(13.0),
-                            Color32::WHITE,
-                        );
-                        ui.painter().text(
-                            rect.right_center() - vec2(12.0, 0.0),
-                            Align2::RIGHT_CENTER,
-                            entry.shortcut,
-                            FontId::monospace(10.5),
-                            palette::TEXT,
-                        );
-                        if response.clicked() {
-                            command = Some(entry.command);
-                        }
-                    }
+                    egui::ScrollArea::vertical()
+                        .max_height(320.0)
+                        .id_salt("command-palette-results")
+                        .show(ui, |ui| {
+                            for (index, entry) in entries.iter().enumerate() {
+                                let selected = index == self.selected;
+                                let (rect, response) = ui.allocate_exact_size(
+                                    vec2(width - 20.0, 32.0),
+                                    egui::Sense::click(),
+                                );
+                                response.widget_info(|| {
+                                    egui::WidgetInfo::selected(
+                                        egui::WidgetType::SelectableLabel,
+                                        ui.is_enabled(),
+                                        selected,
+                                        entry.label,
+                                    )
+                                });
+                                if selected && scroll_selection {
+                                    response.scroll_to_me(Some(egui::Align::Center));
+                                }
+                                if selected {
+                                    ui.painter()
+                                        .rect_filled(rect.shrink(2.0), 6.0, palette::HOVER);
+                                }
+                                ui.painter().text(
+                                    rect.left_center() + vec2(12.0, 0.0),
+                                    Align2::LEFT_CENTER,
+                                    format!("{} {}", if selected { "▸" } else { " " }, entry.label),
+                                    FontId::proportional(13.0),
+                                    Color32::WHITE,
+                                );
+                                ui.painter().text(
+                                    rect.right_center() - vec2(12.0, 0.0),
+                                    Align2::RIGHT_CENTER,
+                                    entry.shortcut,
+                                    FontId::monospace(10.5),
+                                    palette::TEXT,
+                                );
+                                if response.clicked() {
+                                    command = Some(entry.command);
+                                }
+                            }
+                        });
                     if entries.is_empty() {
                         ui.label(RichText::new("No commands match").color(palette::TEXT));
                     }
