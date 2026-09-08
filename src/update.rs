@@ -256,61 +256,39 @@ pub fn check_latest_release() -> Result<UpdateState, String> {
 }
 
 pub fn find_platform_asset(json: &serde_json::Value) -> Option<String> {
-    let assets = json.get("assets")?.as_array()?;
-    #[cfg(target_os = "macos")]
-    let expected_macos_name = format!(
-        "terminalcanvas-{}.dmg",
-        json.get("tag_name")?
-            .as_str()?
-            .strip_prefix('v')
-            .unwrap_or(json.get("tag_name")?.as_str()?)
-            .to_ascii_lowercase()
-    );
-    #[cfg(any(target_os = "windows", target_os = "linux"))]
-    let arch_aliases: &[&str] = if cfg!(target_arch = "aarch64") {
-        &["aarch64", "arm64"]
-    } else {
-        &["x86_64", "amd64"]
-    };
-
-    assets.iter().find_map(|asset| {
-        let name = asset.get("name")?.as_str()?.to_lowercase();
-        let url = asset
-            .get("browser_download_url")
-            .and_then(|value| value.as_str())
-            .filter(|url| allowed_release_asset_url(url))
-            .map(str::to_owned);
-
-        #[cfg(target_os = "windows")]
-        {
-            if name.ends_with(".exe")
-                && (arch_aliases.iter().any(|arch| name.contains(arch)) || !name.contains("arm"))
-            {
-                return url;
-            }
-        }
-        #[cfg(target_os = "macos")]
-        {
-            // El bundle oficial se llama `TerminalCanvas-<version>.dmg`; un
-            // artefacto universal no lleva arquitectura en el nombre.
-            if name == expected_macos_name {
-                return url;
-            }
-        }
-        #[cfg(target_os = "linux")]
-        {
-            if name.contains("linux")
-                && name.ends_with(".tar.gz")
-                && arch_aliases.iter().any(|arch| name.contains(arch))
-            {
-                return url;
-            }
-        }
-
-        None
-    })
+    find_platform_asset_for(json, std::env::consts::OS, std::env::consts::ARCH)
 }
 
+fn find_platform_asset_for(json: &serde_json::Value, os: &str, arch: &str) -> Option<String> {
+    let extension = match os {
+        "windows" => "zip",
+        "macos" => "dmg",
+        "linux" => "tar.gz",
+        _ => return None,
+    };
+    if !matches!(arch, "x86_64" | "aarch64") {
+        return None;
+    }
+    let tag = json.get("tag_name")?.as_str()?;
+    let version = tag.strip_prefix('v').unwrap_or(tag);
+    // Release artifacts have an explicit OS/architecture and exact tag version.
+    // Unlabelled old DMGs were native builds, never proven universal binaries.
+    if parse_version(version).is_none()
+        || !version
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-'))
+    {
+        return None;
+    }
+    let expected_name = format!("TerminalCanvas-{version}-{os}-{arch}.{extension}");
+    let expected_url = format!("{RELEASE_ASSET_PREFIX}{tag}/{expected_name}");
+    json.get("assets")?.as_array()?.iter().find_map(|asset| {
+        let name = asset.get("name")?.as_str()?;
+        let url = asset.get("browser_download_url")?.as_str()?;
+        (name == expected_name && url == expected_url && allowed_release_asset_url(url))
+            .then(|| url.to_owned())
+    })
+}
 fn allowed_release_asset_url(raw_url: &str) -> bool {
     url::Url::parse(raw_url).is_ok_and(|url| {
         url.scheme() == "https"
@@ -372,7 +350,7 @@ pub fn checksum_string(bytes: &[u8]) -> String {
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use super::{checksum_string, find_platform_asset, verify_checksum, version_newer};
+    use super::{checksum_string, find_platform_asset_for, verify_checksum, version_newer};
 
     #[test]
     fn version_comparison() {
@@ -416,20 +394,54 @@ mod tests {
         assert!(super::RELEASES_URL.contains("MauroProto/terminal-canvas"));
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
-    fn macos_selects_the_bundle_asset_published_by_the_release_script() {
-        let release = serde_json::json!({
-            "tag_name": "v1.3.0",
-            "assets": [{
-                "name": "TerminalCanvas-1.3.0.dmg",
-                "browser_download_url": "https://github.com/MauroProto/terminal-canvas/releases/download/v1.3.0/TerminalCanvas-1.3.0.dmg"
-            }]
-        });
-        assert_eq!(
-            find_platform_asset(&release).as_deref(),
-            Some("https://github.com/MauroProto/terminal-canvas/releases/download/v1.3.0/TerminalCanvas-1.3.0.dmg")
-        );
+    fn release_selection_matches_every_platform_and_architecture_exactly() {
+        let mut assets = Vec::new();
+        for (os, extension) in [("macos", "dmg"), ("windows", "zip"), ("linux", "tar.gz")] {
+            for arch in ["x86_64", "aarch64"] {
+                let name = format!("TerminalCanvas-1.3.0-{os}-{arch}.{extension}");
+                assets.push(serde_json::json!({"name":name,
+                    "browser_download_url":format!("{}{}/{}", super::RELEASE_ASSET_PREFIX, "v1.3.0", name)}));
+            }
+        }
+        let release = serde_json::json!({"tag_name":"v1.3.0", "assets":assets});
+        for (os, extension) in [("macos", "dmg"), ("windows", "zip"), ("linux", "tar.gz")] {
+            for arch in ["x86_64", "aarch64"] {
+                let selected = find_platform_asset_for(&release, os, arch).unwrap();
+                assert!(selected.ends_with(&format!("-{os}-{arch}.{extension}")));
+            }
+        }
+        assert!(find_platform_asset_for(&release, "windows", "x86").is_none());
+        assert!(find_platform_asset_for(&release, "unknown", "x86_64").is_none());
+    }
+
+    #[test]
+    fn release_selection_rejects_ambiguous_or_mislabeled_assets() {
+        for (name, path) in [
+            ("TerminalCanvas-1.3.0.dmg", "TerminalCanvas-1.3.0.dmg"),
+            (
+                "TerminalCanvas-1.3.0-macos-universal.dmg",
+                "TerminalCanvas-1.3.0-macos-universal.dmg",
+            ),
+            (
+                "TerminalCanvas-1.3.0-windows-x86_64.exe",
+                "TerminalCanvas-1.3.0-windows-x86_64.exe",
+            ),
+            (
+                "TerminalCanvas-1.3.0-macos-aarch64.dmg",
+                "TerminalCanvas-1.3.0-macos-x86_64.dmg",
+            ),
+            (
+                "TerminalCanvas-9.9.9-macos-aarch64.dmg",
+                "TerminalCanvas-9.9.9-macos-aarch64.dmg",
+            ),
+        ] {
+            let release = serde_json::json!({"tag_name":"v1.3.0", "assets":[{
+                "name":name,"browser_download_url":format!("{}v1.3.0/{path}", super::RELEASE_ASSET_PREFIX)
+            }]});
+            assert!(find_platform_asset_for(&release, "macos", "aarch64").is_none());
+            assert!(find_platform_asset_for(&release, "windows", "aarch64").is_none());
+        }
     }
 
     #[test]
@@ -451,7 +463,6 @@ mod tests {
         ));
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn macos_rejects_an_asset_whose_version_does_not_match_the_release_tag() {
         let release = serde_json::json!({
@@ -461,7 +472,7 @@ mod tests {
                 "browser_download_url": "https://github.com/MauroProto/terminal-canvas/releases/download/v1.3.0/TerminalCanvas-9.9.9.dmg"
             }]
         });
-        assert!(find_platform_asset(&release).is_none());
+        assert!(find_platform_asset_for(&release, "macos", "aarch64").is_none());
     }
 
     fn tempfile_dir() -> PathBuf {
