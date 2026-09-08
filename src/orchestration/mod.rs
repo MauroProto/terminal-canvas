@@ -9,6 +9,7 @@ mod hook_server;
 mod linear_client;
 mod manager;
 mod matching;
+mod worktree_archive;
 mod worktree_removal_safety;
 mod worktree_trash;
 

@@ -46,6 +46,26 @@ impl WorkspacePanel {
         }
     }
 
+    pub fn focused_leaf_id(&self) -> Uuid {
+        match self {
+            Self::Terminal(panel) => panel.focused_leaf_id(),
+        }
+    }
+
+    pub fn live_leaf_cwds(&self) -> Vec<std::path::PathBuf> {
+        match self {
+            Self::Terminal(panel) => panel
+                .leaf_ids()
+                .into_iter()
+                .filter_map(|id| {
+                    let handle = panel.leaf_session_handle(id)?;
+                    let session = handle.lock().ok()?;
+                    session.current_cwd().map(std::path::PathBuf::from)
+                })
+                .collect(),
+        }
+    }
+
     pub fn selected_text(&self) -> Option<String> {
         match self {
             Self::Terminal(panel) => panel.selected_text(),

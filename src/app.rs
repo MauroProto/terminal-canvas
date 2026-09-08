@@ -873,9 +873,8 @@ impl TerminalApp {
             }
         }
         self.switch_workspace(index);
-        // Trash diferido (P1.9): al abrir el workspace se barren las entradas
-        // stale del trash de este repo.
-        crate::orchestration::sweep_stale_trash(&path);
+        // Opening a project never deletes old worktree files. Archives and
+        // legacy trash are retained for explicit recovery.
         if !already_open || self.ws().panels.is_empty() {
             self.ws_mut().spawn_terminal(ctx);
         }

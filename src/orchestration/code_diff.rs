@@ -345,6 +345,8 @@ pub struct WorktreeInfo {
     pub path: PathBuf,
     pub branch: String,
     pub is_main: bool,
+    pub is_managed: bool,
+    pub archived_from: Option<PathBuf>,
 }
 
 /// Lista los worktrees del repo (parseo de `git worktree list --porcelain`).
@@ -369,6 +371,8 @@ pub fn list_git_worktrees(repo_root: &Path) -> Vec<WorktreeInfo> {
                 path: PathBuf::from(path.trim()),
                 branch: String::new(),
                 is_main: false,
+                is_managed: false,
+                archived_from: None,
             });
         } else if let Some(worktree) = current.as_mut() {
             if let Some(branch) = line.strip_prefix("branch ") {
@@ -384,6 +388,12 @@ pub fn list_git_worktrees(repo_root: &Path) -> Vec<WorktreeInfo> {
     // El primer worktree listado es el principal.
     if let Some(first) = worktrees.first_mut() {
         first.is_main = true;
+    }
+    if let Some(main) = worktrees.first().map(|wt| wt.path.clone()) {
+        for worktree in &mut worktrees {
+            worktree.is_managed = is_managed_worktree(&main, &worktree.path);
+            worktree.archived_from = super::worktree_archive::original_for(&main, &worktree.path);
+        }
     }
     worktrees
 }
@@ -814,7 +824,7 @@ index 1..2 100644
         assert!(worktrees[0].is_main, "first worktree is main");
         let managed = worktrees
             .iter()
-            .find(|wt| wt.path == wt_path)
+            .find(|wt| std::fs::canonicalize(&wt.path).ok().as_ref() == Some(&wt_path))
             .expect("managed worktree listed");
         assert!(!managed.is_main);
 
@@ -822,7 +832,9 @@ index 1..2 100644
         super::remove_git_worktree(&dir, &wt_path).expect("remove managed worktree");
         let after = super::list_git_worktrees(&dir);
         assert!(
-            after.iter().all(|wt| wt.path != wt_path),
+            after
+                .iter()
+                .all(|wt| std::fs::canonicalize(&wt.path).ok().as_ref() != Some(&wt_path)),
             "removed worktree no longer listed"
         );
 
@@ -896,6 +908,7 @@ index 1..2 100644
         let outcome = super::run_worktree_job(super::WorktreeJob::Remove {
             repo_root: std::env::temp_dir(),
             worktree_path: std::env::temp_dir().join("no-existe-cbf1f0"),
+            live_paths: Vec::new(),
         });
         assert!(outcome.error.is_some(), "removal outside a repo must fail");
         assert!(outcome.worktrees.is_empty());
@@ -927,6 +940,7 @@ index 1..2 100644
         ops.request(super::WorktreeJob::Remove {
             repo_root: std::env::temp_dir(),
             worktree_path: std::env::temp_dir().join("no-existe-cbf1f0"),
+            live_paths: Vec::new(),
         });
         assert!(
             started.elapsed() < std::time::Duration::from_millis(200),
@@ -950,6 +964,12 @@ pub enum WorktreeJob {
     Remove {
         repo_root: PathBuf,
         worktree_path: PathBuf,
+        live_paths: Vec<PathBuf>,
+    },
+    Restore {
+        repo_root: PathBuf,
+        worktree_path: PathBuf,
+        live_paths: Vec<PathBuf>,
     },
 }
 
@@ -957,6 +977,7 @@ pub enum WorktreeJob {
 /// así la UI no necesita encadenar un segundo pedido después de borrar.
 #[derive(Debug)]
 pub struct WorktreeOutcome {
+    pub repo_root: PathBuf,
     pub worktrees: Vec<WorktreeInfo>,
     /// Mensaje de error del borrado, si falló.
     pub error: Option<String>,
@@ -1021,48 +1042,35 @@ fn spawn_worktree_ops_worker() -> Option<WorktreeOpsWorker> {
 }
 
 fn run_worktree_job(job: WorktreeJob) -> WorktreeOutcome {
-    match job {
-        WorktreeJob::List { repo_root } => WorktreeOutcome {
-            worktrees: list_git_worktrees(&repo_root),
-            error: None,
-        },
+    let (repo_root, operation) = match job {
+        WorktreeJob::List { repo_root } => (repo_root, None),
         WorktreeJob::Remove {
             repo_root,
             worktree_path,
-        } => {
-            let error = remove_worktree_with_trash(&repo_root, &worktree_path)
-                .err()
-                .map(|err| err.to_string());
-            // Se re-lista siempre, incluso si el borrado falló: el estado en
-            // disco pudo cambiar parcialmente.
-            WorktreeOutcome {
-                worktrees: list_git_worktrees(&repo_root),
-                error,
-            }
-        }
-    }
-}
-
-/// Borrado de worktree con trash diferido y salvaguardas (P1.9): primero las
-/// guards, luego rename al trash, `git worktree prune` para desregistrar, y al
-/// final el borrado recursivo del trash (ya en el worker, serializado). Si el
-/// rename falla (cross-volume) se cae al `git worktree remove` directo.
-fn remove_worktree_with_trash(repo_root: &Path, worktree_path: &Path) -> anyhow::Result<()> {
-    let registered: Vec<PathBuf> = list_git_worktrees(repo_root)
-        .into_iter()
-        .map(|info| info.path)
-        .collect();
-    super::worktree_removal_safety::check_recursive_delete(worktree_path, repo_root, &registered)
-        .map_err(|guard| anyhow::anyhow!("borrado rechazado: {}", guard.0))?;
-
-    match super::worktree_trash::move_to_trash(repo_root, worktree_path) {
-        Some(trash_path) => {
-            // El rename ya sacó el dir del registro de git en la práctica;
-            // prune limpia el metadata de worktrees que quede colgando.
-            let _ = git_string(repo_root, &["worktree", "prune"]);
-            std::fs::remove_dir_all(&trash_path)
-                .map_err(|err| anyhow::anyhow!("no se pudo borrar el trash: {err}"))
-        }
-        None => remove_git_worktree(repo_root, worktree_path),
+            live_paths,
+        } => (repo_root, Some((false, worktree_path, live_paths))),
+        WorktreeJob::Restore {
+            repo_root,
+            worktree_path,
+            live_paths,
+        } => (repo_root, Some((true, worktree_path, live_paths))),
+    };
+    let main_root = list_git_worktrees(&repo_root)
+        .first()
+        .map(|wt| wt.path.clone());
+    let error = operation.and_then(|(restore, path, live)| {
+        let result = match main_root {
+            Some(ref root) if restore => super::worktree_archive::restore(root, &path, &live),
+            Some(ref root) => super::worktree_archive::archive(root, &path, &live).map(|_| ()),
+            None => Err(anyhow::anyhow!(
+                "No se pudo resolver el repositorio principal"
+            )),
+        };
+        result.err().map(|error| error.to_string())
+    });
+    WorktreeOutcome {
+        worktrees: list_git_worktrees(&repo_root),
+        repo_root,
+        error,
     }
 }

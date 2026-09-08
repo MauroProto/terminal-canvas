@@ -738,13 +738,9 @@ impl TerminalApp {
     /// Sección de ciclo de vida de worktrees: lista los worktrees del repo y
     /// permite limpiar los gestionados (`.terminalcanvas/worktrees`).
     fn code_review_worktrees(&mut self, ui: &mut egui::Ui) {
-        let (repo_root, worktrees, error) = {
+        let (worktrees, error) = {
             let state = self.code_review.as_ref().unwrap();
-            (
-                state.repo_root.clone(),
-                state.worktrees.clone(),
-                state.worktree_error.clone(),
-            )
+            (state.worktrees.clone(), state.worktree_error.clone())
         };
 
         ui.horizontal(|ui| {
@@ -763,6 +759,14 @@ impl TerminalApp {
         ui.add_space(4.0);
 
         let mut to_remove: Option<PathBuf> = None;
+        let mut to_restore: Option<PathBuf> = None;
+        ui.label(
+            RichText::new(
+                "Archivar conserva todos los archivos. Podés restaurar el worktree después.",
+            )
+            .size(10.5)
+            .color(palette::DIM),
+        );
         ScrollArea::vertical()
             .id_salt("code-review-worktrees")
             .max_height(70.0)
@@ -791,14 +795,17 @@ impl TerminalApp {
                                     .color(palette::DIM),
                             );
                         }
-                        let is_managed =
-                            crate::orchestration::is_managed_worktree(&repo_root, &worktree.path);
-                        if !worktree.is_main && is_managed {
+                        if worktree.archived_from.is_some()
+                            && ui.small_button("Restaurar").clicked()
+                        {
+                            to_restore = Some(worktree.path.clone());
+                        }
+                        if !worktree.is_main && worktree.is_managed {
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
                                     ui.add_space(14.0);
-                                    if ui.small_button("Limpiar").clicked() {
+                                    if ui.small_button("Archivar").clicked() {
                                         to_remove = Some(worktree.path.clone());
                                     }
                                 },
@@ -809,7 +816,10 @@ impl TerminalApp {
             });
 
         if let Some(path) = to_remove {
-            self.remove_code_review_worktree(&path);
+            self.queue_worktree_move(&path, false);
+        }
+        if let Some(path) = to_restore {
+            self.queue_worktree_move(&path, true);
         }
         ui.add_space(4.0);
     }
@@ -817,14 +827,44 @@ impl TerminalApp {
     /// Pide el borrado al worker. `git worktree remove` borra un árbol de
     /// trabajo entero y en un repo grande tarda segundos: hacerlo acá
     /// congelaba la ventana.
-    fn remove_code_review_worktree(&mut self, path: &Path) {
+    fn queue_worktree_move(&mut self, path: &Path, restore: bool) {
         let Some(state) = self.code_review.as_ref() else {
             return;
         };
         let repo_root = state.repo_root.clone();
-        self.worktree_ops.request(WorktreeJob::Remove {
-            repo_root,
-            worktree_path: path.to_path_buf(),
+        let mut live_paths = Vec::new();
+        for workspace in &self.workspaces {
+            for panel in &workspace.panels {
+                if panel.is_alive() {
+                    live_paths.extend(panel.live_leaf_cwds());
+                    if let Some(cwd) = &workspace.cwd {
+                        live_paths.push(cwd.clone());
+                    }
+                    for session in self
+                        .orchestrator
+                        .sessions()
+                        .iter()
+                        .filter(|session| session.panel_id == Some(panel.id()))
+                    {
+                        live_paths.extend(session.cwd.iter().cloned());
+                        live_paths.extend(session.worktree_path.iter().cloned());
+                    }
+                }
+            }
+        }
+        let worktree_path = path.to_path_buf();
+        self.worktree_ops.request(if restore {
+            WorktreeJob::Restore {
+                repo_root,
+                worktree_path,
+                live_paths,
+            }
+        } else {
+            WorktreeJob::Remove {
+                repo_root,
+                worktree_path,
+                live_paths,
+            }
         });
     }
 
@@ -835,6 +875,9 @@ impl TerminalApp {
             return;
         };
         for outcome in outcomes {
+            if outcome.repo_root != state.repo_root {
+                continue;
+            }
             state.worktrees = outcome.worktrees;
             state.worktree_error = outcome.error;
         }
