@@ -436,6 +436,43 @@ impl PtyHandle {
             );
         });
 
+        // ConPTY may keep its output pipe open until ClosePseudoConsole, even
+        // after the shell has exited. Observe the process independently while
+        // the reader continues draining its final output. Unix keeps EOF as the
+        // output/exit boundary used by daemon replay.
+        #[cfg(windows)]
+        let child = {
+            let alive_for_waiter = Arc::clone(&alive);
+            let scheduler_for_waiter = Arc::clone(&scheduler);
+            let watcher = thread::Builder::new()
+                .name("pty-process-exit".to_owned())
+                .spawn(move || {
+                    let mut child = child;
+                    match child.wait() {
+                        Ok(_) => {
+                            alive_for_waiter.store(false, Ordering::Relaxed);
+                            if let Ok(mut scheduler) = scheduler_for_waiter.lock() {
+                                scheduler.record_exit(session_id);
+                            }
+                        }
+                        Err(error) => {
+                            log::error!(
+                                "No se pudo observar la salida del PTY {session_id}: {error}"
+                            );
+                        }
+                    }
+                });
+            if let Err(error) = watcher {
+                writer_for_reader.close();
+                let mut killer = killer;
+                let _ = killer.kill();
+                return Err(error).context("start PTY process watcher");
+            }
+            None
+        };
+        #[cfg(not(windows))]
+        let child = Some(child);
+
         Ok(Self {
             term,
             title,
@@ -457,7 +494,7 @@ impl PtyHandle {
             ghostty_runtime,
             master: Some(pair.master),
             killer: Some(killer),
-            child: Some(child),
+            child,
             #[cfg(all(unix, feature = "daemon"))]
             remote: None,
             #[cfg(all(unix, feature = "daemon"))]
