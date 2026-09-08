@@ -1,11 +1,10 @@
 //! Diagnóstico exportable (Ship-it 7.5).
 //!
 //! Arma un zip con lo mínimo para debuggear un problema reportado — panic.log,
-//! runs.log, config.toml, versión y layout.json — **sin filtrar secretos ni
-//! nombres de proyectos**: las claves que parecen token se redactan y los
-//! títulos de panel se reemplazan por un hash corto y estable.
+//! runs.log, config.toml, versión y layout.json. Config y layout se anonimizan;
+//! los logs pueden contener texto de errores y deben revisarse antes de compartir.
 
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
@@ -146,7 +145,12 @@ pub struct DiagnosticEntry {
 
 /// Junta las entradas del diagnóstico desde el data dir. Puro respecto del
 /// zip: se puede testear sin escribir el archivo.
-pub fn collect_entries(data_dir: &Path, version: &str) -> Vec<DiagnosticEntry> {
+pub fn collect_entries(
+    data_dir: &Path,
+    config_path: &Path,
+    panic_path: &Path,
+    version: &str,
+) -> Vec<DiagnosticEntry> {
     let mut entries = vec![DiagnosticEntry {
         name: "version.txt".to_owned(),
         contents: format!(
@@ -156,33 +160,58 @@ pub fn collect_entries(data_dir: &Path, version: &str) -> Vec<DiagnosticEntry> {
         ),
     }];
 
-    let read = |name: &str| std::fs::read_to_string(data_dir.join(name)).ok();
-
-    if let Some(panic_log) = read("panic.log") {
+    let read = |path: &Path, tail: bool| read_bounded(path, tail).ok();
+    if let Some(panic_log) = read(panic_path, true) {
         entries.push(DiagnosticEntry {
             name: "panic.log".to_owned(),
             contents: panic_log,
         });
     }
-    if let Some(runs) = read("runs.log") {
+    if let Some(runs) = read(&data_dir.join("runs.log"), true) {
         entries.push(DiagnosticEntry {
             name: "runs.log".to_owned(),
             contents: runs,
         });
     }
-    if let Some(config) = read("config.toml") {
+    if let Some(config) = read(config_path, false) {
         entries.push(DiagnosticEntry {
             name: "config.toml".to_owned(),
             contents: redact_config(&config),
         });
     }
-    if let Some(layout) = read("layout.json") {
+    if let Some(layout) = read(&data_dir.join("layout.json"), false) {
         entries.push(DiagnosticEntry {
             name: "layout.json".to_owned(),
             contents: anonymize_layout(&layout),
         });
     }
     entries
+}
+
+const MAX_DIAGNOSTIC_BYTES: u64 = 4 * 1024 * 1024;
+
+fn read_bounded(path: &Path, tail: bool) -> std::io::Result<String> {
+    let mut file = std::fs::File::open(path)?;
+    let size = file.metadata()?.len();
+    let truncated = size > MAX_DIAGNOSTIC_BYTES;
+    if truncated && !tail {
+        return Ok("# File omitted: exceeds diagnostic size limit.\n".to_owned());
+    }
+    if truncated {
+        file.seek(SeekFrom::End(-(MAX_DIAGNOSTIC_BYTES as i64)))?;
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_DIAGNOSTIC_BYTES).read_to_end(&mut bytes)?;
+    let text = String::from_utf8_lossy(&bytes);
+    if truncated {
+        // Skip the first partial record, including a potentially split UTF-8 codepoint.
+        Ok(format!(
+            "[Earlier log entries omitted]\n{}",
+            text.split_once('\n').map_or("", |(_, rest)| rest)
+        ))
+    } else {
+        Ok(text.into_owned())
+    }
 }
 
 /// Escribe el zip con las entradas dadas.
@@ -206,7 +235,14 @@ pub fn write_zip(path: &Path, entries: &[DiagnosticEntry]) -> anyhow::Result<()>
 pub fn export(version: &str) -> anyhow::Result<PathBuf> {
     let dirs = directories::ProjectDirs::from("", "", "terminal-app")
         .ok_or_else(|| anyhow::anyhow!("no se pudo resolver el data dir"))?;
-    let entries = collect_entries(dirs.data_dir(), version);
+    let home = super::platform::home_dir()
+        .ok_or_else(|| anyhow::anyhow!("no se pudo resolver el directorio del usuario"))?;
+    let entries = collect_entries(
+        dirs.data_dir(),
+        &dirs.config_dir().join("config.toml"),
+        &super::platform::panic_log_path(&home),
+        version,
+    );
     let downloads = directories::UserDirs::new()
         .and_then(|dirs| dirs.download_dir().map(Path::to_path_buf))
         .unwrap_or_else(std::env::temp_dir);
@@ -332,7 +368,12 @@ mod tests {
         std::fs::write(dir.join("runs.log"), "run 1\n").unwrap();
         std::fs::write(dir.join("config.toml"), "linear_token = \"x\"\n").unwrap();
 
-        let entries = collect_entries(&dir, "1.2.3");
+        let entries = collect_entries(
+            &dir,
+            &dir.join("config.toml"),
+            &dir.join("panic.log"),
+            "1.2.3",
+        );
         let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
         assert!(names.contains(&"version.txt"));
         assert!(names.contains(&"runs.log"));
@@ -344,6 +385,39 @@ mod tests {
         assert!(entries[0].contents.contains("1.2.3"));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn collects_real_sources_when_config_and_logs_live_outside_data_dir() {
+        let root = std::env::temp_dir().join(format!("diag-sources-{}", uuid::Uuid::new_v4()));
+        let data = root.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let config = root.join("external-config.toml");
+        let panic = root.join("external-panic.log");
+        std::fs::write(&config, "token = 'secret'\n").unwrap();
+        std::fs::write(&panic, "actual panic\n").unwrap();
+        let entries = collect_entries(&data, &config, &panic, "test");
+        assert_eq!(
+            entries
+                .iter()
+                .find(|e| e.name == "panic.log")
+                .unwrap()
+                .contents,
+            "actual panic\n"
+        );
+        assert!(!entries
+            .iter()
+            .find(|e| e.name == "config.toml")
+            .unwrap()
+            .contents
+            .contains("secret"));
+        let large = "é\n".repeat(super::MAX_DIAGNOSTIC_BYTES as usize / 2);
+        std::fs::write(&panic, large).unwrap();
+        let tail = super::read_bounded(&panic, true).unwrap();
+        assert!(tail.starts_with("[Earlier log entries omitted]"));
+        assert!(!tail.contains('\u{fffd}'));
+        assert!(tail.len() <= super::MAX_DIAGNOSTIC_BYTES as usize + 40);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

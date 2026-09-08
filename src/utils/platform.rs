@@ -21,6 +21,11 @@ pub fn home_dir() -> Option<PathBuf> {
     directories::UserDirs::new().map(|dirs| dirs.home_dir().to_path_buf())
 }
 
+/// Shared by the panic writer and diagnostic exporter, including legacy logs.
+pub fn panic_log_path(home: &Path) -> PathBuf {
+    home.join(".mi-terminal").join("logs").join("panic.log")
+}
+
 /// Carpeta de descargas del usuario, el destino menos sorpresivo para los
 /// archivos que la app genera (exports). Si el SO no la reporta, cae al
 /// directorio temporal en vez de escribir dentro del repo del usuario.

@@ -6,7 +6,9 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use mi_terminal::{app, collab, config, terminal, utils};
 
 use std::sync::Arc;
-use std::{backtrace::Backtrace, fmt::Write as _, fs, io::Write as _, path::Path, path::PathBuf};
+use std::{backtrace::Backtrace, fmt::Write as _, fs, io::Write as _};
+
+use utils::platform::panic_log_path;
 
 use anyhow::Result;
 
@@ -128,10 +130,6 @@ fn panic_payload(info: &std::panic::PanicHookInfo<'_>) -> String {
     } else {
         "panic without string payload".to_owned()
     }
-}
-
-fn panic_log_path(home: &Path) -> PathBuf {
-    home.join(".mi-terminal").join("logs").join("panic.log")
 }
 
 fn format_panic_report(message: &str, location: Option<&str>, backtrace: &str) -> String {
