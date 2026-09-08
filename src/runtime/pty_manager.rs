@@ -398,12 +398,12 @@ impl PtyManager {
             if session.is_alive() {
                 return Ok(());
             }
-            let was_remote = session
+            let reconnect_transport = session
                 .handle
                 .as_ref()
                 .and_then(|handle| handle.lock().ok())
-                .is_some_and(|handle| handle.is_remote());
-            if !was_remote {
+                .is_some_and(|handle| handle.is_remote() && !handle.remote_session_exited());
+            if !reconnect_transport {
                 // Un proceso local que terminó no se relanza a espaldas del
                 // usuario. La recuperación automática es sólo del transporte
                 // remoto, donde el PTY puede seguir vivo en el daemon.
