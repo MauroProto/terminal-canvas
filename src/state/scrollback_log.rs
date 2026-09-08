@@ -167,7 +167,7 @@ pub fn reset_log(path: &Path, generation: u32) -> std::io::Result<()> {
 /// Appendea bytes de frames al log. Si el archivo no existe, lo crea con
 /// header de generation 0 primero.
 pub fn append_frames(path: &Path, frames_bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
+    use std::io::{Seek, SeekFrom, Write};
     if !path.exists() {
         crate::state::durable_write::write_atomic(path, &encode_header(0))?;
     }
@@ -178,10 +178,13 @@ pub fn append_frames(path: &Path, frames_bytes: &[u8]) -> std::io::Result<()> {
             "log incremental inválido",
         ));
     };
-    let mut file = std::fs::OpenOptions::new().append(true).open(path)?;
+    // Windows append-only access cannot truncate a torn frame. The single
+    // durable writer repairs it with write access, then seeks to the new EOF.
+    let mut file = std::fs::OpenOptions::new().write(true).open(path)?;
     if valid_len < bytes.len() {
         file.set_len(valid_len as u64)?;
     }
+    file.seek(SeekFrom::End(0))?;
     file.write_all(frames_bytes)?;
     // El autosave afirma durabilidad frente a crash/power loss, no sólo que
     // los bytes llegaron al page cache del proceso.
