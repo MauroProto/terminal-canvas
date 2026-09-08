@@ -1,0 +1,37 @@
+name: Reportar un problema
+description: Ayudanos a reproducir y resolver un fallo de TerminalCanvas.
+title: "[Bug] "
+labels: [bug]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: Versión o commit
+      placeholder: "1.2.0 / salida de git rev-parse --short HEAD"
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Sistema, arquitectura y shell
+      placeholder: "Windows 11 x86_64, PowerShell 7 / macOS arm64, zsh / Ubuntu, bash"
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Pasos para reproducir
+      description: Incluí el comando o agente usado y si ocurre después de reabrir la app.
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Resultado esperado y resultado observado
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnóstico o captura opcional
+      description: Revisá los logs antes de compartirlos. Omití tokens, contenido privado y datos de proyectos; el texto de errores puede contenerlos aunque config y layout estén anonimizados.
