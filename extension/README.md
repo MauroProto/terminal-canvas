@@ -1,8 +1,8 @@
 # TerminalCanvas Design Mode (extensión MV3)
 
-Alt+click en cualquier elemento de una página y su HTML, CSS computado
-relevante, rect y un screenshot recortado se van al agente enfocado de
-TerminalCanvas.
+Activá la selección desde el icono de la extensión y elegí un elemento de la
+página. Su HTML, CSS computado, rectángulo e imagen recortada se envían a
+TerminalCanvas para el agente enfocado.
 
 ## Instalación (descomprimida)
 
@@ -26,8 +26,11 @@ TerminalCanvas.
 
 ## Uso
 
-- **Alt+click** sobre el elemento que querés cambiar. Un flash naranja confirma
-  la captura y en TerminalCanvas aparece el toast "Elemento capturado".
+- En el popup, pulsá **Seleccionar elemento**. Aparece una indicación en esa
+  pestaña; hacé clic sobre el elemento que querés cambiar. **Esc** cancela.
+- La confirmación aparece cuando la app local acepta la captura. Los errores
+  de token, conexión y cambio de pestaña se muestran en la página. Si falta
+  la imagen, la confirmación lo indica explícitamente.
 - El prompt le llega al **agente enfocado** con este formato exacto:
 
   ```
@@ -40,9 +43,28 @@ TerminalCanvas.
 
 ## Notas
 
-- El CSS que se manda son solo las props que **difieren del default** del
-  navegador para ese tag (~40 candidatas): mandar las 340 de
-  `getComputedStyle` haría el prompt inservible.
-- HTML y CSS se recortan a 32 KB cada uno del lado de la app.
+- Se envía un conjunto acotado de propiedades de diseño computadas, sin
+  insertar elementos de prueba que alteren el documento o hereden su CSS.
+- La copia del HTML limita profundidad, cantidad de nodos y longitud. Omite
+  scripts, iframes, manejadores de eventos, valores de formularios y atributos
+  que indiquen credenciales. Revisá qué elemento seleccionás: su texto e imagen
+  forman parte del contexto enviado.
+- HTML y CSS se recortan también a 32 KB cada uno del lado de la app.
 - Si el screenshot falla, la captura se manda igual sin la línea `Screenshot:`.
-- El endpoint solo escucha en `127.0.0.1` y exige el header `X-TC-Token`.
+- La imagen pertenece a la ventana de origen y se recorta al área visible del
+  elemento. Un cambio de pestaña o URL aborta el envío.
+- El endpoint solo admite `http://127.0.0.1:puerto`, exige `X-TC-Token` y no
+  sigue redirecciones. La extensión no solicita acceso persistente a todas las
+  páginas: usa el permiso temporal de la acción del usuario.
+
+## Verificación
+
+```sh
+node --test extension/tests/*.test.cjs
+```
+
+Las pruebas cubren aceptación y rechazo HTTP, cambio de pestaña, origen local
+y recorte de imágenes. La activación sigue el contrato oficial de
+[activeTab](https://developer.chrome.com/docs/extensions/develop/concepts/activeTab)
+y la captura usa el `windowId` requerido por
+[captureVisibleTab](https://developer.chrome.com/docs/extensions/reference/api/tabs#method-captureVisibleTab).
