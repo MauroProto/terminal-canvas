@@ -937,6 +937,7 @@ impl PtyHandle {
         let checkpoint = checkpoint.to_vec();
         let frames = frames.to_vec();
         let term = Arc::clone(&self.term);
+        let window_size = Arc::clone(&self.window_size);
         let restoring = Arc::clone(&self.restoring_history);
         let restoring_for_thread = Arc::clone(&restoring);
         let render_revision = Arc::clone(&self.render_revision);
@@ -955,8 +956,15 @@ impl PtyHandle {
                         let Ok(mut term) = term.lock() else {
                             return;
                         };
-                        let live = export_live(&term);
-                        processor.advance(&mut *term, b"\x1b[2J\x1b[3J");
+                        let exported = export_live(&term);
+                        let mut live = Vec::with_capacity(exported.len());
+                        for (index, byte) in exported.iter().copied().enumerate() {
+                            if byte == b'\n' && (index == 0 || exported[index - 1] != b'\r') {
+                                live.push(b'\r');
+                            }
+                            live.push(byte);
+                        }
+                        processor.advance(&mut *term, b"\x1b[2J\x1b[3J\x1b[H");
                         live
                     };
                     for chunk in checkpoint.chunks(CHUNK_BYTES) {
@@ -993,11 +1001,21 @@ impl PtyHandle {
                                 let Ok(mut term) = term.lock() else {
                                     return;
                                 };
-                                processor.advance(&mut *term, b"\x1b[2J\x1b[3J");
+                                processor.advance(&mut *term, b"\x1b[2J\x1b[3J\x1b[H");
                             }
                         }
                     }
+                    let size = window_size
+                        .lock()
+                        .ok()
+                        .map(|size| (size.num_cols, size.num_lines));
                     if let Ok(mut term) = term.lock() {
+                        // A replayed resize belongs to the old process. Restore
+                        // current physical dimensions before injecting the live prompt.
+                        if let Some((cols, rows)) = size {
+                            term.resize(TermSize::new(cols.max(1) as usize, rows.max(1) as usize));
+                        }
+                        processor.advance(&mut *term, b"\x1b[?1049l\x1b[0m");
                         processor
                             .advance(&mut *term, &crate::state::scrollback_store::replay_marker());
                     }
