@@ -431,8 +431,7 @@ pub fn list_git_worktrees(repo_root: &Path) -> Vec<WorktreeInfo> {
 }
 
 /// Remueve un worktree (solo los vinculados bajo `.terminalcanvas/worktrees`,
-/// nunca el principal). Usa `--force` porque suelen quedar cambios sin
-/// commitear del agente.
+/// nunca el principal). Dirty or ignored files must be archived instead.
 pub fn remove_git_worktree(repo_root: &Path, worktree_path: &Path) -> anyhow::Result<()> {
     let root =
         git_toplevel(repo_root).ok_or_else(|| anyhow::anyhow!("No es un repositorio git"))?;
@@ -445,11 +444,17 @@ pub fn remove_git_worktree(repo_root: &Path, worktree_path: &Path) -> anyhow::Re
         .collect::<Vec<_>>();
     super::worktree_removal_safety::check_recursive_delete(worktree_path, &root, &registered)
         .map_err(|guard| anyhow::anyhow!("borrado rechazado: {}", guard.0))?;
+    let status = git_string(worktree_path, &["status", "--porcelain", "-z", "--ignored"])
+        .ok_or_else(|| anyhow::anyhow!("No se pudo verificar el estado del worktree"))?;
+    anyhow::ensure!(
+        status.is_empty(),
+        "El worktree tiene archivos locales; archivá para preservarlos"
+    );
     let mut command = Command::new("git");
     command
         .arg("-C")
         .arg(&root)
-        .args(["worktree", "remove", "--force"])
+        .args(["worktree", "remove"])
         .arg(worktree_path);
     let output = super::git::run_with_timeout(&mut command, std::time::Duration::from_secs(30))?;
     if !output.status.success() {
@@ -881,6 +886,14 @@ index 1..2 100644
             .find(|wt| std::fs::canonicalize(&wt.path).ok().as_ref() == Some(&wt_path))
             .expect("managed worktree listed");
         assert!(!managed.is_main);
+
+        std::fs::write(wt_path.join("local.txt"), "must survive").unwrap();
+        assert!(super::remove_git_worktree(&dir, &wt_path).is_err());
+        assert_eq!(
+            std::fs::read_to_string(wt_path.join("local.txt")).unwrap(),
+            "must survive"
+        );
+        std::fs::remove_file(wt_path.join("local.txt")).unwrap();
 
         // Remover el worktree gestionado.
         super::remove_git_worktree(&dir, &wt_path).expect("remove managed worktree");
