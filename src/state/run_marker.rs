@@ -35,6 +35,70 @@ struct RunClaim {
 /// snapshots distintos y hacen que un proyecto parezca desaparecer.
 static RUN_CLAIM: OnceLock<RunClaim> = OnceLock::new();
 
+/// Keeps ownership stable for the entire durable write, not just its preflight.
+pub struct RunWriteGuard {
+    _file: Option<std::fs::File>,
+}
+
+fn lock_run_dir(dir: &Path) -> std::io::Result<RunWriteGuard> {
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join("run.lock");
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).read(true).write(true).truncate(false);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.share_mode(0);
+    }
+    let started = std::time::Instant::now();
+    loop {
+        match options.open(&path) {
+            Ok(file) => {
+                #[cfg(unix)]
+                {
+                    use std::os::fd::AsRawFd;
+                    // SAFETY: the descriptor stays owned by the guard. Closing
+                    // it releases the advisory process lock on every exit path.
+                    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0
+                    {
+                        let error = std::io::Error::last_os_error();
+                        if error.kind() != std::io::ErrorKind::WouldBlock {
+                            return Err(error);
+                        }
+                        drop(file);
+                    } else {
+                        return Ok(RunWriteGuard { _file: Some(file) });
+                    }
+                }
+                #[cfg(not(unix))]
+                return Ok(RunWriteGuard { _file: Some(file) });
+            }
+            #[cfg(windows)]
+            Err(error) if matches!(error.raw_os_error(), Some(32 | 33)) => {}
+            Err(error) => return Err(error),
+        }
+        if started.elapsed() >= std::time::Duration::from_secs(5) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "persistence ownership lock timed out",
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+pub fn acquire_write_guard() -> std::io::Result<Option<RunWriteGuard>> {
+    let Some(claim) = RUN_CLAIM.get() else {
+        return Ok(Some(RunWriteGuard { _file: None }));
+    };
+    let dir = claim
+        .marker_path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("run marker has no parent"))?;
+    let guard = lock_run_dir(dir)?;
+    Ok(marker_has_token(&claim.marker_path, &claim.token).then_some(guard))
+}
+
 fn data_dir() -> Option<PathBuf> {
     directories::ProjectDirs::from("", "", "terminal-app").map(|dirs| dirs.data_dir().to_path_buf())
 }
@@ -65,6 +129,9 @@ pub fn begin_run() -> Option<DirtyRun> {
 /// Marca el final limpio de la corrida actual.
 pub fn end_run_clean() {
     let Some(claim) = RUN_CLAIM.get() else {
+        return;
+    };
+    let Ok(Some(_guard)) = acquire_write_guard() else {
         return;
     };
     // Una instancia anterior nunca debe borrar el marker de la nueva.
@@ -105,7 +172,13 @@ pub fn begin_run_in(dir: &Path, pid: u32, timestamp: &str) -> Option<DirtyRun> {
 }
 
 fn claim_run_in(dir: &Path, pid: u32, token: &str, timestamp: &str) -> Option<DirtyRun> {
-    let _ = std::fs::create_dir_all(dir);
+    let _guard = match lock_run_dir(dir) {
+        Ok(guard) => guard,
+        Err(error) => {
+            log::error!("failed to claim persistence ownership: {error}");
+            return None;
+        }
+    };
     let marker = marker_path_in(dir);
     let previous = std::fs::read_to_string(&marker)
         .ok()
@@ -199,7 +272,10 @@ fn trim_log_if_needed(path: &Path) {
     let Ok(contents) = std::fs::read_to_string(path) else {
         return;
     };
-    let keep_from = contents.len() / 2;
+    let mut keep_from = contents.len() / 2;
+    while !contents.is_char_boundary(keep_from) {
+        keep_from += 1;
+    }
     // Alinear a un borde de línea para no dejar una entrada partida.
     let aligned = contents[keep_from..]
         .find('\n')
@@ -318,5 +394,38 @@ mod tests {
         let size = std::fs::metadata(log_path_in(&dir)).expect("meta").len();
         let _ = std::fs::remove_dir_all(&dir);
         assert!(size < 200 * 1024, "log was not trimmed: {size} bytes");
+    }
+
+    #[test]
+    fn takeover_waits_for_the_previous_durable_write() {
+        let dir = temp_dir("writer-lock");
+        claim_run_in(&dir, std::process::id(), "old", "before");
+        let guard = super::lock_run_dir(&dir).expect("writer lock");
+        let takeover_dir = dir.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            claim_run_in(&takeover_dir, std::process::id(), "new", "after");
+            tx.send(()).unwrap();
+        });
+        assert!(rx
+            .recv_timeout(std::time::Duration::from_millis(80))
+            .is_err());
+        assert!(marker_has_token(&marker_path_in(&dir), "old"));
+        drop(guard);
+        rx.recv_timeout(std::time::Duration::from_secs(2))
+            .expect("takeover completes");
+        thread.join().unwrap();
+        assert!(marker_has_token(&marker_path_in(&dir), "new"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn trimming_a_multibyte_log_never_slices_inside_a_character() {
+        let dir = temp_dir("utf8-log");
+        let path = log_path_in(&dir);
+        std::fs::write(&path, "é".repeat(100_001)).unwrap();
+        super::trim_log_if_needed(&path);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "é".repeat(50_000));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

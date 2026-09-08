@@ -443,9 +443,9 @@ pub fn save_state(state: &AppState) {
 }
 
 pub fn try_save_state(state: &AppState) -> anyhow::Result<()> {
-    if !crate::state::run_marker::current_process_may_write() {
+    let Some(_guard) = crate::state::run_marker::acquire_write_guard()? else {
         anyhow::bail!("otra instancia de TerminalCanvas posee la lease de persistencia");
-    }
+    };
     let Some(path) = state_file_path() else {
         anyhow::bail!("Could not determine state file path");
     };
