@@ -53,6 +53,7 @@ pub(super) struct NoteEditState {
     pub(super) note_id: Option<Uuid>,
     pub(super) file_path: String,
     pub(super) line: u32,
+    pub(super) old_side: bool,
     pub(super) body: String,
 }
 
@@ -625,6 +626,7 @@ impl TerminalApp {
                                             actions.push(NoteAction::Create {
                                                 file_path: file.path.clone(),
                                                 line,
+                                                old_side: file.lines[*line_index].new_ln.is_none(),
                                             });
                                         }
                                     }
@@ -889,13 +891,18 @@ impl TerminalApp {
     /// puede mutar el estado: las filas se construyen desde un snapshot).
     fn apply_note_action(&mut self, action: NoteAction) {
         match action {
-            NoteAction::Create { file_path, line } => {
+            NoteAction::Create {
+                file_path,
+                line,
+                old_side,
+            } => {
                 if let Some(state) = self.code_review.as_mut() {
                     state.note_target_picker = false;
                     state.editing_note = Some(NoteEditState {
                         note_id: None,
                         file_path,
                         line,
+                        old_side,
                         body: String::new(),
                     });
                 }
@@ -908,6 +915,7 @@ impl TerminalApp {
                             note_id: Some(id),
                             file_path: note.file_path.clone(),
                             line: note.line,
+                            old_side: note.old_side,
                             body: note.body.clone(),
                         });
                     }
@@ -952,9 +960,12 @@ impl TerminalApp {
             match editing.note_id {
                 Some(id) => state.notes.edit(id, &editing.body),
                 None => {
-                    state
-                        .notes
-                        .add(&editing.file_path, None, editing.line, &editing.body);
+                    state.notes.add_on_side(
+                        &editing.file_path,
+                        editing.line,
+                        &editing.body,
+                        editing.old_side,
+                    );
                 }
             }
             state.editing_note = None;
@@ -1277,8 +1288,8 @@ fn build_review_rows<'a>(
         .collect();
     let editor_anchor = editing
         .filter(|edit| edit.file_path == file.path)
-        .map(|edit| edit.line);
-    let mut anchored_notes: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        .map(|edit| (edit.line, edit.old_side));
+    let mut anchored_notes: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
     let mut editor_anchored = false;
 
     let mut rows: Vec<ReviewRow<'a>> = Vec::with_capacity(file.lines.len() + file_notes.len() + 1);
@@ -1287,18 +1298,21 @@ fn build_review_rows<'a>(
         let Some(anchor) = diff_line_anchor(line) else {
             continue;
         };
-        for note in file_notes.iter().filter(|note| note.line == anchor) {
+        for note in file_notes
+            .iter()
+            .filter(|note| note.line == anchor && note.old_side == line.new_ln.is_none())
+        {
             rows.push(ReviewRow::Note(note));
-            anchored_notes.insert(anchor);
+            anchored_notes.insert(note.id);
         }
-        if editor_anchor == Some(anchor) {
+        if editor_anchor == Some((anchor, line.new_ln.is_none())) {
             rows.push(ReviewRow::Editor);
             editor_anchored = true;
         }
     }
     for note in file_notes
         .iter()
-        .filter(|note| !anchored_notes.contains(&note.line))
+        .filter(|note| !anchored_notes.contains(&note.id))
     {
         rows.push(ReviewRow::Note(note));
     }
@@ -1331,7 +1345,12 @@ fn draw_note_row(
     );
     let label = match note.start_line {
         Some(start) if start != note.line => format!("L{start}-{} · {}", note.line, note.body),
-        _ => format!("L{} · {}", note.line, note.body),
+        _ => format!(
+            "{}L{} · {}",
+            if note.old_side { "−" } else { "" },
+            note.line,
+            note.body
+        ),
     };
     let sent_suffix = if note.sent_at.is_some() { "  ✓" } else { "" };
     let font = FontId::monospace(MONO_SIZE * 0.95);
@@ -1394,7 +1413,11 @@ fn draw_note_row(
 /// Acciones que el render de notas produce y el app aplica después (el render
 /// trabaja sobre un snapshot y no puede mutar el estado directamente).
 enum NoteAction {
-    Create { file_path: String, line: u32 },
+    Create {
+        file_path: String,
+        line: u32,
+        old_side: bool,
+    },
     Edit(Uuid),
     Delete(Uuid),
     SaveEditor,
@@ -1454,6 +1477,7 @@ mod tests {
             note_id: None,
             file_path: "src/a.rs".to_owned(),
             line: 1,
+            old_side: false,
             body: String::new(),
         };
         let (rows, _, _) = build_review_rows(&file, &[], Some(&editing));

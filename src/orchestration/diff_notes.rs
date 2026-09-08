@@ -24,6 +24,8 @@ pub struct DiffNote {
     #[serde(default)]
     pub start_line: Option<u32>,
     pub line: u32,
+    #[serde(default)]
+    pub old_side: bool,
     pub body: String,
     pub created_at: DateTime<Utc>,
     /// `Some` = ya se mandó al agente. Editar el cuerpo la devuelve a `None`.
@@ -47,10 +49,19 @@ impl DiffNotes {
             file_path: file_path.to_owned(),
             start_line,
             line,
+            old_side: false,
             body: body.trim().to_owned(),
             created_at: Utc::now(),
             sent_at: None,
         });
+        id
+    }
+
+    pub fn add_on_side(&mut self, file_path: &str, line: u32, body: &str, old_side: bool) -> Uuid {
+        let id = self.add(file_path, None, line, body);
+        if let Some(note) = self.notes.iter_mut().find(|note| note.id == id) {
+            note.old_side = old_side;
+        }
         id
     }
 
@@ -107,6 +118,9 @@ pub fn format_note(note: &DiffNote) -> String {
             }
         }
     }
+    if note.old_side {
+        out.push_str("\nSide: old (removed code)");
+    }
     out.push_str(&format!("\nUser comment: \"{}\"", escape_body(&note.body)));
     out
 }
@@ -128,10 +142,12 @@ fn notes_dir() -> Option<PathBuf> {
 /// Slug del repo para usarlo de nombre de archivo: separadores → `-`
 /// (mismo criterio que los slugs de `agent_sessions`).
 fn repo_slug(repo_root: &Path) -> String {
-    repo_root
-        .to_string_lossy()
-        .replace(['/', '\\'], "-")
-        .replace(':', "-")
+    use sha2::{Digest, Sha256};
+    let identity = std::fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+    format!(
+        "{:x}",
+        Sha256::digest(identity.as_os_str().as_encoded_bytes())
+    )
 }
 
 fn notes_file(repo_root: &Path) -> Option<PathBuf> {
@@ -170,6 +186,24 @@ mod tests {
     use chrono::Utc;
 
     use super::{format_note, load_notes, save_notes, DiffNotes};
+
+    #[test]
+    fn note_storage_keys_do_not_collapse_separators_into_dashes() {
+        assert_ne!(
+            super::repo_slug(std::path::Path::new("/repos/a-b")),
+            super::repo_slug(std::path::Path::new("/repos-a/b"))
+        );
+        assert_eq!(super::repo_slug(std::path::Path::new("a")).len(), 64);
+    }
+
+    #[test]
+    fn removed_line_feedback_identifies_its_side() {
+        let mut notes = DiffNotes::default();
+        notes.add_on_side("a.rs", 7, "keep this behavior", true);
+        let text = format_note(&notes.notes[0]);
+        assert!(text.contains("Side: old (removed code)"));
+        assert!(text.contains("Lines: 7"));
+    }
 
     #[test]
     fn editing_a_sent_note_requeues_it() {
