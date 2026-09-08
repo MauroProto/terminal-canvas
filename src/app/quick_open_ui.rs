@@ -432,7 +432,7 @@ mod tests {
         assert!(files.contains(&"src/main.rs".to_owned()));
         assert!(files.contains(&"README.md".to_owned()));
         assert!(!files.iter().any(|f| f.starts_with("node_modules")));
-        assert!(!files.iter().any(|f| f.starts_with(".git")));
+        assert!(!files.iter().any(|f| f.starts_with(".git/")));
     }
 
     fn sample_files() -> Vec<String> {

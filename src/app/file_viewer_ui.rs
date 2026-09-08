@@ -112,7 +112,6 @@ impl TerminalApp {
     fn activate_loaded_file(&mut self, mut state: FileViewerState) {
         if !state.binary && !state.lines.is_empty() {
             let name = state.file_name();
-            state.language = super::code_highlight::detect_language(&name, state.lines[0].as_str());
             // El texto se reensambla para el worker; el visor ya puede pintar
             // el plano mientras tanto.
             let text = state.lines.join("\n");
@@ -475,6 +474,14 @@ fn load_file_for_view(path: &Path) -> FileViewerState {
         .map(str::to_owned)
         .collect();
     let truncated = truncated || source_lines.next().is_some();
+    let language = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| {
+            lines
+                .first()
+                .and_then(|first| super::code_highlight::detect_language(name, first))
+        });
     FileViewerState {
         path: path.to_path_buf(),
         lines,
@@ -482,7 +489,7 @@ fn load_file_for_view(path: &Path) -> FileViewerState {
         binary: false,
         highlighted: Vec::new(),
         highlight_token: None,
-        language: None,
+        language,
         loading: false,
     }
 }

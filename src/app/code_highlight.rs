@@ -40,8 +40,9 @@ fn syntax_set() -> &'static SyntaxSet {
 /// Catppuccin Mocha: de los temas disponibles es el que más colores distintos
 /// produce sobre código real y el que mejor combina con el gris neutro de la
 /// app.
+static THEME: OnceLock<Theme> = OnceLock::new();
+
 fn theme() -> &'static Theme {
-    static THEME: OnceLock<Theme> = OnceLock::new();
     THEME.get_or_init(|| {
         two_face::theme::extra()
             .get(EmbeddedThemeName::CatppuccinMocha)
@@ -53,9 +54,9 @@ fn theme() -> &'static Theme {
 /// propio) es lo que hace que los colores se vean como en un editor de verdad,
 /// porque están elegidos para ese fondo.
 pub fn theme_background() -> Color32 {
-    theme()
-        .settings
-        .background
+    THEME
+        .get()
+        .and_then(|theme| theme.settings.background)
         .map(syntect_color)
         .unwrap_or(Color32::from_rgb(30, 30, 46))
 }
@@ -63,9 +64,9 @@ pub fn theme_background() -> Color32 {
 /// Color del texto sin token asignado (y del fallback mientras no llegó el
 /// resaltado).
 pub fn theme_foreground() -> Color32 {
-    theme()
-        .settings
-        .foreground
+    THEME
+        .get()
+        .and_then(|theme| theme.settings.foreground)
         .map(syntect_color)
         .unwrap_or(Color32::from_rgb(205, 214, 244))
 }
@@ -156,7 +157,12 @@ impl Highlighter {
         std::thread::Builder::new()
             .name("code-highlighter".to_owned())
             .spawn(move || {
-                while let Ok(job) = job_rx.recv() {
+                while let Ok(mut job) = job_rx.recv() {
+                    // Only the latest file can be displayed. Skip obsolete
+                    // queued requests before starting expensive regex work.
+                    while let Ok(newer) = job_rx.try_recv() {
+                        job = newer;
+                    }
                     let lines = highlight_text(&job.file_name, &job.text);
                     if result_tx
                         .send(HighlightResult {
