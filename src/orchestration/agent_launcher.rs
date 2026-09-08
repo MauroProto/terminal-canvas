@@ -355,7 +355,7 @@ fn npm_entry_point(shim: &str) -> Option<PathBuf> {
 }
 
 fn attach_parent_console() {
-    #[windows]
+    #[cfg(windows)]
     {
         #[link(name = "kernel32")]
         unsafe extern "system" {
