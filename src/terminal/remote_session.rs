@@ -340,7 +340,7 @@ mod tests {
             link.write_input(&vec![b'x'; 2 * 1024 * 1024])
                 .unwrap_err()
                 .kind(),
-            std::io::ErrorKind::WouldBlock
+            std::io::ErrorKind::InvalidInput
         );
         link.write_input(b"accepted").unwrap();
         let mut reader = BufReader::new(theirs);

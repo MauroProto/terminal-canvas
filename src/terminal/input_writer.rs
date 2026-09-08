@@ -75,7 +75,9 @@ impl InputWriter {
         let mut guard = state
             .lock()
             .map_err(|_| io::Error::other("input queue poisoned"))?;
-        let failure = if guard.closed || guard.finishing {
+        let failure = if bytes.len() > MAX_INPUT_BYTES {
+            Some((io::ErrorKind::InvalidInput, "No se envió la entrada: el texto supera el límite de 2 MiB. Dividilo en partes más pequeñas."))
+        } else if guard.closed || guard.finishing {
             Some((
                 io::ErrorKind::BrokenPipe,
                 "No se envió la entrada: el canal del terminal está cerrado.",
