@@ -107,7 +107,7 @@ fn twenty_live_terminals_deliver_output_resize_and_exit() {
                     (
                         *id,
                         handle.input_error(),
-                        handle.with_term(scrollback_to_text),
+                        handle.with_term(|term| scrollback_to_text(term)),
                     )
                 })
                 .collect();
