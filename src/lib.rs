@@ -5,6 +5,7 @@
 
 pub mod app;
 pub mod canvas;
+#[allow(clippy::uninlined_format_args)]
 pub mod collab;
 pub mod command_palette;
 pub mod config;
