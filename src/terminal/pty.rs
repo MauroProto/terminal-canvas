@@ -796,6 +796,13 @@ impl PtyHandle {
 
     #[cfg(feature = "ghostty-vt")]
     pub fn backend_kind(&self) -> TerminalBackendKind {
+        if self
+            .ghostty_runtime
+            .as_ref()
+            .is_some_and(|runtime| !runtime.is_healthy())
+        {
+            return TerminalBackendKind::Alacritty;
+        }
         self.backend_kind
     }
 

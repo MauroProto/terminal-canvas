@@ -4,6 +4,7 @@ use anyhow::Context as _;
 use libghostty_vt::render::{CellIterator, CursorVisualStyle, Dirty, RowIterator};
 use libghostty_vt::terminal::ScrollViewport;
 use libghostty_vt::{RenderState, Terminal, TerminalOptions};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 
@@ -22,8 +23,9 @@ pub struct GhosttyRuntimeHandle {
 }
 
 struct GhosttyRuntimeInner {
-    command_tx: mpsc::Sender<GhosttyRuntimeCommand>,
+    command_tx: mpsc::SyncSender<GhosttyRuntimeCommand>,
     snapshot: Arc<Mutex<Option<Arc<GhosttyTextSnapshot>>>>,
+    healthy: AtomicBool,
 }
 
 pub struct GhosttyProbe {
@@ -289,7 +291,7 @@ impl GhosttyRuntimeHandle {
     pub fn spawn(cols: u16, rows: u16, max_scrollback: usize) -> anyhow::Result<Self> {
         let snapshot = Arc::new(Mutex::new(None));
         let snapshot_for_thread = Arc::clone(&snapshot);
-        let (command_tx, command_rx) = mpsc::channel();
+        let (command_tx, command_rx) = mpsc::sync_channel(64);
         let (init_tx, init_rx) = mpsc::sync_channel(1);
         let _thread = thread::spawn(move || {
             let mut probe = match GhosttyProbe::new(cols, rows, max_scrollback) {
@@ -308,8 +310,13 @@ impl GhosttyRuntimeHandle {
 
             while let Ok(command) = command_rx.recv() {
                 apply_runtime_command(&mut probe, command);
-                while let Ok(command) = command_rx.try_recv() {
-                    apply_runtime_command(&mut probe, command);
+                // Publish even under continuous output; an unbounded drain
+                // could postpone the first visible snapshot indefinitely.
+                for _ in 0..15 {
+                    match command_rx.try_recv() {
+                        Ok(command) => apply_runtime_command(&mut probe, command),
+                        Err(_) => break,
+                    }
                 }
 
                 if let Ok(snapshot) = probe.snapshot() {
@@ -319,7 +326,7 @@ impl GhosttyRuntimeHandle {
                 }
             }
         });
-        match init_rx.recv() {
+        match init_rx.recv_timeout(std::time::Duration::from_secs(5)) {
             Ok(Ok(())) => {}
             Ok(Err(err)) => anyhow::bail!(err),
             Err(_) => anyhow::bail!("ghostty runtime failed to initialize"),
@@ -329,39 +336,59 @@ impl GhosttyRuntimeHandle {
             inner: Arc::new(GhosttyRuntimeInner {
                 command_tx,
                 snapshot,
+                healthy: AtomicBool::new(true),
             }),
         })
     }
 
     pub fn feed(&self, bytes: &[u8]) {
-        let _ = self
-            .inner
-            .command_tx
-            .send(GhosttyRuntimeCommand::Output(bytes.to_vec()));
+        if !self.is_healthy() {
+            return;
+        }
+        // Called by the PTY reader, so bounded backpressure here never blocks
+        // the UI. Alacritty has already parsed the same bytes as a fallback.
+        for chunk in bytes.chunks(65_536) {
+            if self
+                .inner
+                .command_tx
+                .send(GhosttyRuntimeCommand::Output(chunk.to_vec()))
+                .is_err()
+            {
+                self.inner.healthy.store(false, Ordering::Release);
+                break;
+            }
+        }
     }
 
     pub fn resize(&self, cols: u16, rows: u16) {
-        let _ = self
-            .inner
-            .command_tx
-            .send(GhosttyRuntimeCommand::Resize { cols, rows });
+        self.send_ui_command(GhosttyRuntimeCommand::Resize { cols, rows });
     }
 
     pub fn scroll_delta(&self, delta: i32) {
-        let _ = self
-            .inner
-            .command_tx
-            .send(GhosttyRuntimeCommand::ScrollDelta(delta));
+        self.send_ui_command(GhosttyRuntimeCommand::ScrollDelta(delta));
     }
 
     pub fn scroll_to_display_offset(&self, target: usize) {
-        let _ = self
-            .inner
-            .command_tx
-            .send(GhosttyRuntimeCommand::ScrollToDisplayOffset(target));
+        self.send_ui_command(GhosttyRuntimeCommand::ScrollToDisplayOffset(target));
+    }
+
+    fn send_ui_command(&self, command: GhosttyRuntimeCommand) {
+        if self.is_healthy() && self.inner.command_tx.try_send(command).is_err() {
+            self.inner.healthy.store(false, Ordering::Release);
+            log::warn!(
+                "Ghostty queue unavailable; continuing with the synchronized Alacritty renderer"
+            );
+        }
+    }
+
+    pub fn is_healthy(&self) -> bool {
+        self.inner.healthy.load(Ordering::Acquire)
     }
 
     pub fn snapshot(&self) -> Option<Arc<GhosttyTextSnapshot>> {
+        if !self.is_healthy() {
+            return None;
+        }
         self.inner.snapshot.lock().ok()?.clone()
     }
 }
