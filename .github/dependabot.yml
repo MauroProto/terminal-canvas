@@ -8,6 +8,12 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    groups:
+      egui-family:
+        patterns:
+          - egui
+          - eframe
+          - egui_kittest
 
   - package-ecosystem: github-actions
     directory: /

@@ -48,6 +48,10 @@ jobs:
       - name: Run test suite
         run: cargo test --all-targets --locked --quiet
 
+      - name: Verify browser extension
+        if: runner.os == 'Linux'
+        run: node --test extension/tests/*.test.cjs
+
       # El daemon usa Unix sockets. Ubuntu y macOS validan el artefacto que se
       # distribuye; Windows conserva la cobertura del fallback in-process.
       - name: Check daemon feature (Unix)
