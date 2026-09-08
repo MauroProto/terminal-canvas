@@ -778,6 +778,7 @@ impl TerminalApp {
     /// archivos del proyecto no se tocan: sólo se cierran sus sesiones y se
     /// quita el workspace del estado de TerminalCanvas.
     fn close_workspace_confirmed(&mut self, workspace_id: Uuid) {
+        self.orchestrator.cancel_workspace_launches(workspace_id);
         self.remember_scrollback_layout();
         let Some(workspace) = self
             .workspaces

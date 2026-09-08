@@ -499,6 +499,10 @@ impl TerminalApp {
                 });
             });
         if cancel {
+            if let Some(session_id) = draft.pending_session {
+                self.orchestrator.cancel_launch(session_id);
+                self.pending_issue_links.remove(&session_id);
+            }
             self.launch_agent = None;
         } else {
             self.launch_agent = Some(draft);

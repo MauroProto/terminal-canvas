@@ -899,6 +899,27 @@ impl Orchestrator {
         !self.pending_launches.is_empty()
     }
 
+    /// Cancels delivery of an in-flight worktree. Git may finish creating the
+    /// directory, but its late completion cannot launch a process. Keep any
+    /// created worktree recoverable rather than racing Git with a deletion.
+    pub fn cancel_launch(&mut self, session_id: Uuid) {
+        if let Some(plan) = self.pending_launches.remove(&session_id) {
+            self.discard_failed_launch(&plan);
+        }
+    }
+
+    pub fn cancel_workspace_launches(&mut self, workspace_id: Uuid) {
+        let ids: Vec<_> = self
+            .pending_launches
+            .values()
+            .filter(|plan| plan.workspace_id == workspace_id)
+            .map(|plan| plan.session_id)
+            .collect();
+        for id in ids {
+            self.cancel_launch(id);
+        }
+    }
+
     fn discard_failed_launch(&mut self, plan: &AgentLaunchPlan) {
         self.state
             .sessions
