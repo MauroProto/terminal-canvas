@@ -9,6 +9,7 @@ use alacritty_terminal::grid::{Dimensions, Row};
 use alacritty_terminal::index::Line;
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::Term;
+use alacritty_terminal::term::TermMode;
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor};
 
 use super::colors::{dim_color, indexed_to_egui};
@@ -46,6 +47,167 @@ pub fn scrollback_to_ansi(term: &Term<EventProxy>) -> String {
         lines.push(row_to_ansi(&grid[Line(line)]));
     }
     join_document(lines)
+}
+
+/// A live attach is not a text document: retain row wrapping, cursor and
+/// input modes so subsequent PTY bytes continue at the same visible state.
+/// This deliberately differs from the compact durable history export.
+pub fn live_snapshot_to_ansi(term: &Term<EventProxy>) -> String {
+    use std::fmt::Write as _;
+    let grid = term.grid();
+    let mut out = String::from("\x1bc");
+    if term.mode().contains(TermMode::ALT_SCREEN) {
+        out.push_str("\x1b[?1049h");
+    }
+    let first = -(grid.history_size() as i32);
+    let last = grid.screen_lines() as i32 - 1;
+    let mut previous_style = String::new();
+    for line in first..=last {
+        let row = &grid[Line(line)];
+        for cell in row {
+            if cell
+                .flags
+                .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+            {
+                continue;
+            }
+            let style = live_cell_style(cell);
+            if style != previous_style {
+                out.push_str(&style);
+                previous_style = style;
+            }
+            out.push(cell.c);
+            if let Some(extra) = cell.zerowidth() {
+                out.extend(extra);
+            }
+        }
+        // A wrapped row must stay wrapped after a later resize. Let the next
+        // printable cell trigger autowrap; explicit line endings use CRLF.
+        if line != last
+            && !row[alacritty_terminal::index::Column(row.len() - 1)]
+                .flags
+                .contains(Flags::WRAPLINE)
+        {
+            out.push_str("\r\n");
+        }
+    }
+    out.push_str("\x1b[0m");
+    // Origin mode homes the cursor, so apply modes before restoring positions.
+    out.push_str(&live_mode_sequence(*term.mode()));
+    let saved = &grid.saved_cursor;
+    let _ = write!(
+        out,
+        "\x1b[{};{}H{}\x1b7",
+        saved.point.line.0 + 1,
+        saved.point.column.0 + 1,
+        live_cell_style(&saved.template)
+    );
+    let cursor = &grid.cursor;
+    let _ = write!(
+        out,
+        "\x1b[{};{}H",
+        cursor.point.line.0 + 1,
+        cursor.point.column.0 + 1
+    );
+    if cursor.input_needs_wrap {
+        let mut point = cursor.point;
+        if grid[point].flags.contains(Flags::WIDE_CHAR_SPACER) && point.column.0 > 0 {
+            point.column.0 -= 1;
+            let _ = write!(out, "\x1b[{};{}H", point.line.0 + 1, point.column.0 + 1);
+        }
+        let cell = &grid[point];
+        out.push_str(&live_cell_style(cell));
+        out.push(cell.c);
+        if let Some(extra) = cell.zerowidth() {
+            out.extend(extra);
+        }
+    }
+    out.push_str(&live_cell_style(&cursor.template));
+    let style = term.cursor_style();
+    let shape = match style.shape {
+        alacritty_terminal::vte::ansi::CursorShape::Underline => 3,
+        alacritty_terminal::vte::ansi::CursorShape::Beam => 5,
+        _ => 1,
+    } + usize::from(!style.blinking);
+    let _ = write!(out, "\x1b[{shape} q");
+    out
+}
+
+fn live_cell_style(cell: &Cell) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::from("\x1b[0");
+    for (flag, code) in [
+        (Flags::BOLD, 1),
+        (Flags::DIM, 2),
+        (Flags::ITALIC, 3),
+        (Flags::UNDERLINE, 4),
+        (Flags::INVERSE, 7),
+        (Flags::HIDDEN, 8),
+        (Flags::STRIKEOUT, 9),
+        (Flags::DOUBLE_UNDERLINE, 21),
+    ] {
+        if cell.flags.contains(flag) {
+            let _ = write!(out, ";{code}");
+        }
+    }
+    for (color, foreground) in [(&cell.fg, true), (&cell.bg, false)] {
+        if let Some((r, g, b)) = color_rgb(color, foreground) {
+            let _ = write!(out, ";{};2;{r};{g};{b}", if foreground { 38 } else { 48 });
+        }
+    }
+    out.push('m');
+    out
+}
+
+pub fn live_mode_sequence(mode: TermMode) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    for (flag, code) in [
+        (TermMode::APP_CURSOR, 1),
+        (TermMode::ORIGIN, 6),
+        (TermMode::LINE_WRAP, 7),
+        (TermMode::SHOW_CURSOR, 25),
+        (TermMode::MOUSE_REPORT_CLICK, 1000),
+        (TermMode::MOUSE_DRAG, 1002),
+        (TermMode::MOUSE_MOTION, 1003),
+        (TermMode::FOCUS_IN_OUT, 1004),
+        (TermMode::UTF8_MOUSE, 1005),
+        (TermMode::SGR_MOUSE, 1006),
+        (TermMode::ALTERNATE_SCROLL, 1007),
+        (TermMode::BRACKETED_PASTE, 2004),
+    ] {
+        let _ = write!(
+            out,
+            "\x1b[?{code}{}",
+            if mode.contains(flag) { 'h' } else { 'l' }
+        );
+    }
+    for (flag, code) in [(TermMode::INSERT, 4), (TermMode::LINE_FEED_NEW_LINE, 20)] {
+        let _ = write!(
+            out,
+            "\x1b[{code}{}",
+            if mode.contains(flag) { 'h' } else { 'l' }
+        );
+    }
+    out.push_str(if mode.contains(TermMode::APP_KEYPAD) {
+        "\x1b="
+    } else {
+        "\x1b>"
+    });
+    let mut keyboard = 0;
+    for (flag, bit) in [
+        (TermMode::DISAMBIGUATE_ESC_CODES, 1),
+        (TermMode::REPORT_EVENT_TYPES, 2),
+        (TermMode::REPORT_ALTERNATE_KEYS, 4),
+        (TermMode::REPORT_ALL_KEYS_AS_ESC, 8),
+        (TermMode::REPORT_ASSOCIATED_TEXT, 16),
+    ] {
+        if mode.contains(flag) {
+            keyboard |= bit;
+        }
+    }
+    let _ = write!(out, "\x1b[={keyboard}u");
+    out
 }
 
 /// Fila del grid con SGR mínimo y sin el relleno de la derecha (misma regla de
@@ -319,6 +481,47 @@ mod tests {
     fn exports_the_active_screen() {
         let term = term_with("alpha\r\nbeta\r\n", 6, 20);
         assert_eq!(scrollback_to_text(&term), "alpha\nbeta\n");
+    }
+
+    #[test]
+    fn live_snapshot_preserves_cursor_modes_and_combining_text() {
+        let original = term_with(
+            "first\r\nsecond e\u{301}\x1b[2;3H\x1b[31m\x1b7\x1b[3;5H\x1b[?1h\x1b[?2004h\x1b[?25l\x1b[4 q",
+            5,
+            24,
+        );
+        let replayed = term_with(&super::live_snapshot_to_ansi(&original), 5, 24);
+        assert_eq!(scrollback_to_text(&original), scrollback_to_text(&replayed));
+        assert_eq!(original.grid().cursor.point, replayed.grid().cursor.point);
+        assert_eq!(
+            original.grid().saved_cursor.point,
+            replayed.grid().saved_cursor.point
+        );
+        assert_eq!(original.mode(), replayed.mode());
+        assert_eq!(original.cursor_style(), replayed.cursor_style());
+        assert_eq!(
+            original.grid()[Line(1)][alacritty_terminal::index::Column(7)].zerowidth(),
+            replayed.grid()[Line(1)][alacritty_terminal::index::Column(7)].zerowidth()
+        );
+    }
+
+    #[test]
+    fn live_snapshot_preserves_pending_wrap_and_alternate_screen() {
+        for input in ["12345678", "\x1b[?1049h12345678"] {
+            let mut original = term_with(input, 3, 8);
+            let mut replayed = term_with(&super::live_snapshot_to_ansi(&original), 3, 8);
+            assert_eq!(
+                original.grid().cursor.input_needs_wrap,
+                replayed.grid().cursor.input_needs_wrap
+            );
+            let mut parser = Processor::<StdSyncHandler>::new();
+            parser.advance(&mut original, b"X");
+            let mut parser = Processor::<StdSyncHandler>::new();
+            parser.advance(&mut replayed, b"X");
+            assert_eq!(scrollback_to_text(&original), scrollback_to_text(&replayed));
+            assert_eq!(original.grid().cursor.point, replayed.grid().cursor.point);
+            assert_eq!(original.mode(), replayed.mode());
+        }
     }
 
     #[test]

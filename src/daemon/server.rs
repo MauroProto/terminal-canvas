@@ -140,7 +140,7 @@ impl DaemonSession {
     fn attach_boundary(&mut self) -> (Vec<u8>, Option<(u64, Vec<u8>)>) {
         let boundary = self.handle.clone().and_then(|handle| {
             handle.lock().ok().and_then(|pty| {
-                pty.attach_snapshot_and_drain(crate::terminal::export::scrollback_to_ansi)
+                pty.attach_snapshot_and_drain(crate::terminal::export::live_snapshot_to_ansi)
             })
         });
         let Some((snapshot, frames)) = boundary else {
