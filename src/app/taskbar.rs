@@ -320,6 +320,13 @@ impl TerminalApp {
     pub(super) fn show_taskbar(&mut self, ctx: &egui::Context) {
         if !matches!(self.collab.mode(), CollabMode::Guest) {
             let mut requested_panel = None;
+            let focused_id = self.ws().focused_panel().map(|panel| panel.id());
+            let focus_key = egui::Id::new(("taskbar-last-focus", self.ws().id));
+            let reveal_focus = ctx.data_mut(|data| {
+                let previous = data.get_temp::<Option<Uuid>>(focus_key);
+                data.insert_temp(focus_key, focused_id);
+                previous != Some(focused_id)
+            });
             let panel_count = self.ws().panels.len();
             let mut taskbar_button_rects = HashMap::with_capacity(panel_count);
             // Stable creation order so clicks don't reshuffle items by z-index.
@@ -425,6 +432,9 @@ impl TerminalApp {
                                             title,
                                         )
                                     });
+                                    if *focused && reveal_focus {
+                                        response.scroll_to_me(Some(egui::Align::Center));
+                                    }
                                     let response = response.on_hover_text(title);
                                     let dot_x = rect.left() + pad_x + dot_size * 0.5;
                                     let text_x = rect.left() + pad_x + dot_size + dot_pad;

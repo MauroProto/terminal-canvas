@@ -1256,9 +1256,9 @@ impl TerminalApp {
     /// al PTY. Toda superficie modal vive acá para que briefs, invites y
     /// passphrases nunca se escriban también en el shell detrás del diálogo.
     fn terminal_input_is_routable(&self) -> bool {
-        !self.modal_input_is_active()
-            && !(self.file_viewer.is_some() && self.file_viewer_keyboard_active)
-            && !matches!(self.collab.mode(), CollabMode::Guest)
+        !(self.modal_input_is_active()
+            || (self.file_viewer.is_some() && self.file_viewer_keyboard_active)
+            || matches!(self.collab.mode(), CollabMode::Guest))
     }
 
     fn modal_input_is_active(&self) -> bool {

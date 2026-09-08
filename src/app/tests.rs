@@ -34,6 +34,47 @@ fn test_app_never_owns_the_users_run_marker() {
 }
 
 #[test]
+fn taskbar_reveals_a_focused_terminal_beyond_the_window_width() {
+    use egui_kittest::{kittest::Queryable, Harness};
+    let ctx = egui::Context::default();
+    let mut app = super::TerminalApp::new_for_tests(&ctx);
+    app.ws_mut().panels.clear();
+    let mut ids = Vec::new();
+    for index in 0..12 {
+        let mut panel = CanvasPanel::Terminal(TerminalPanel::new(
+            pos2(0.0, 0.0),
+            vec2(300.0, 200.0),
+            Color32::WHITE,
+            index,
+        ));
+        panel.set_title(format!("Terminal {index}"));
+        panel.set_focused(index == 0);
+        ids.push(panel.id());
+        app.ws_mut().panels.push(panel);
+    }
+    let mut harness = Harness::builder()
+        .with_size(vec2(600.0, 400.0))
+        .build_state(
+            |ctx, app: &mut super::TerminalApp| {
+                app.show_taskbar(ctx);
+                CentralPanel::default().show(ctx, |_| {});
+            },
+            app,
+        );
+    harness.state_mut().ws_mut().bring_to_front(ids[11]);
+    harness.run();
+    let last = harness.get_by_label("Terminal 11").rect();
+    assert!(
+        last.left() >= 0.0 && last.right() <= 600.0,
+        "last terminal must be visible: {last:?}"
+    );
+    harness.state_mut().ws_mut().bring_to_front(ids[0]);
+    harness.run();
+    let first = harness.get_by_label("Terminal 0").rect();
+    assert!(first.left() >= 0.0 && first.right() <= 600.0);
+}
+
+#[test]
 fn docked_viewer_switches_keyboard_ownership_by_pointer_and_escape() {
     use egui_kittest::{kittest::Queryable, Harness};
     let ctx = egui::Context::default();
