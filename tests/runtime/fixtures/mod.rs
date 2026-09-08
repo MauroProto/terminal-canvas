@@ -62,6 +62,7 @@ impl RuntimeHarness {
             let session_id = self.registry.create_session_with_spec(
                 workspace_id,
                 SessionSpec {
+                    memory_task_id: None,
                     title: format!("session-{index}"),
                     cwd: Some(
                         format!("/tmp/workspace-{}/{index}", index % workspace_ids.len()).into(),
@@ -131,6 +132,7 @@ impl RuntimeHarness {
             let session_id = self.registry.create_session_with_spec(
                 workspace_id,
                 SessionSpec {
+                    memory_task_id: None,
                     title: format!("budget-session-{index}"),
                     cwd: Some(
                         format!("/tmp/workspace-{}/{index}", index % workspace_ids.len()).into(),

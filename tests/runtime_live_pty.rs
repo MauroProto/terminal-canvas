@@ -62,6 +62,36 @@ fn twenty_live_terminals_deliver_output_resize_and_exit() {
             handle.with_term(|term| (term.columns(), term.screen_lines())),
             Some((100, 30))
         );
+        #[cfg(unix)]
+        handle.write_all(b"stty size\r");
+    }
+    #[cfg(unix)]
+    {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !sessions.iter().all(|(id, _)| {
+            manager
+                .handle(*id)
+                .unwrap()
+                .lock()
+                .unwrap()
+                .with_term(|term| {
+                    scrollback_to_text(term)
+                        .lines()
+                        .any(|line| line.trim() == "30 100")
+                })
+                .unwrap_or(false)
+        }) {
+            manager.drain_ui_updates();
+            assert!(
+                Instant::now() < deadline,
+                "kernel PTY size did not match the grid"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    for (id, _) in &sessions {
+        let handle = manager.handle(*id).unwrap();
+        let handle = handle.lock().unwrap();
         handle.write_all(b"exit\r");
     }
     let deadline = Instant::now() + Duration::from_secs(15);
