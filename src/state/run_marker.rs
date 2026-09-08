@@ -238,7 +238,29 @@ fn process_is_alive(pid: u32) -> bool {
     result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn process_is_alive(pid: u32) -> bool {
+    type Handle = *mut std::ffi::c_void;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> Handle;
+        fn GetExitCodeProcess(process: Handle, code: *mut u32) -> i32;
+        fn CloseHandle(handle: Handle) -> i32;
+    }
+    // SAFETY: query-only access; every successful handle is closed exactly once.
+    unsafe {
+        let handle = OpenProcess(0x1000, 0, pid);
+        if handle.is_null() {
+            return std::io::Error::last_os_error().raw_os_error() == Some(5);
+        }
+        let mut code = 0;
+        let queried = GetExitCodeProcess(handle, &mut code) != 0;
+        CloseHandle(handle);
+        queried && code == 259
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 fn process_is_alive(_pid: u32) -> bool {
     false
 }
@@ -360,7 +382,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn a_live_instance_is_a_takeover_not_a_false_crash() {
         let dir = temp_dir("live-takeover");
