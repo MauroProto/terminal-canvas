@@ -34,6 +34,51 @@ fn test_app_never_owns_the_users_run_marker() {
 }
 
 #[test]
+fn docked_viewer_switches_keyboard_ownership_by_pointer_and_escape() {
+    use egui_kittest::{kittest::Queryable, Harness};
+    let ctx = egui::Context::default();
+    let mut app = super::TerminalApp::new_for_tests(&ctx);
+    app.file_viewer = Some(super::file_viewer_ui::FileViewerState {
+        path: "example.rs".into(),
+        lines: vec!["fn main() {}".into()],
+        truncated: false,
+        binary: false,
+        highlighted: Vec::new(),
+        highlight_token: None,
+        language: None,
+        loading: false,
+    });
+    let mut harness = Harness::builder()
+        .with_size(vec2(1100.0, 700.0))
+        .build_state(
+            |ctx, app: &mut super::TerminalApp| {
+                app.show_file_viewer(ctx);
+                CentralPanel::default().show(ctx, |ui| {
+                    ui.label("Terminal area");
+                });
+            },
+            app,
+        );
+    harness.get_by_label("example.rs").click();
+    harness.run();
+    assert!(!harness.state().terminal_input_is_routable());
+    harness.get_by_label("Terminal area").click();
+    harness.run();
+    assert!(harness.state().terminal_input_is_routable());
+    harness.key_press(egui::Key::Escape);
+    harness.run();
+    assert!(
+        harness.state().file_viewer.is_some(),
+        "Escape aimed at the terminal must leave the viewer open"
+    );
+    harness.get_by_label("example.rs").click();
+    harness.run();
+    harness.key_press(egui::Key::Escape);
+    harness.run();
+    assert!(harness.state().file_viewer.is_none());
+}
+
+#[test]
 fn docked_viewer_only_captures_keyboard_when_its_content_is_active() {
     let ctx = egui::Context::default();
     let mut app = super::TerminalApp::new_for_tests(&ctx);
