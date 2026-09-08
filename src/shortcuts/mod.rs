@@ -57,11 +57,10 @@ pub fn shortcut_command(modifiers: &Modifiers, key: Key) -> Option<Command> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "macos")))]
 mod tests {
     use super::*;
 
-    #[cfg(not(target_os = "macos"))]
     #[test]
     fn splits_are_reachable_when_command_is_control() {
         let mut modifiers = Modifiers {
