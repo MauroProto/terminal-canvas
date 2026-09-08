@@ -28,9 +28,27 @@ impl WorkspacePanel {
         }
     }
 
+    pub fn all_runtime_session_ids(&self) -> Vec<Uuid> {
+        match self {
+            Self::Terminal(panel) => panel.all_runtime_session_ids(),
+        }
+    }
+
+    pub fn focused_runtime_session_id(&self) -> Option<Uuid> {
+        match self {
+            Self::Terminal(panel) => panel.focused_runtime_session_id(),
+        }
+    }
+
     pub fn current_cwd(&self) -> Option<String> {
         match self {
             Self::Terminal(panel) => panel.current_cwd(),
+        }
+    }
+
+    pub fn selected_text(&self) -> Option<String> {
+        match self {
+            Self::Terminal(panel) => panel.selected_text(),
         }
     }
 
@@ -345,6 +363,24 @@ impl WorkspacePanel {
         }
     }
 
+    pub fn replace_focused_session(
+        &mut self,
+        pty_manager: Arc<Mutex<crate::runtime::PtyManager>>,
+        cwd: Option<&std::path::Path>,
+        workspace_id: Uuid,
+        startup_command: String,
+        agent_command: String,
+    ) -> bool {
+        let Self::Terminal(panel) = self;
+        panel.replace_focused_session(
+            pty_manager,
+            cwd,
+            workspace_id,
+            startup_command,
+            agent_command,
+        )
+    }
+
     pub fn insert_text(&mut self, text: &str) {
         match self {
             Self::Terminal(panel) => panel.insert_text(text),
@@ -357,13 +393,32 @@ impl WorkspacePanel {
         }
     }
 
-    pub fn leaf_scrollbacks(&self) -> Vec<(Option<uuid::Uuid>, String)> {
+    pub fn leaf_scrollbacks(&self) -> Vec<(Option<uuid::Uuid>, String, usize)> {
         match self {
             Self::Terminal(panel) => panel.leaf_scrollbacks(),
         }
     }
 
-    pub fn restore_leaf_histories(&mut self, histories: &[(Option<uuid::Uuid>, String)]) -> bool {
+    pub fn leaf_ids(&self) -> Vec<uuid::Uuid> {
+        match self {
+            Self::Terminal(panel) => panel.leaf_ids(),
+        }
+    }
+
+    pub fn root_leaf_id(&self) -> uuid::Uuid {
+        match self {
+            Self::Terminal(panel) => panel.root_leaf_id(),
+        }
+    }
+
+    pub fn restore_leaf_histories(
+        &mut self,
+        histories: &[(
+            Option<uuid::Uuid>,
+            String,
+            Vec<crate::state::scrollback_log::Frame>,
+        )],
+    ) -> bool {
         let Self::Terminal(panel) = self;
         panel.restore_leaf_histories(histories)
     }
@@ -380,6 +435,18 @@ impl WorkspacePanel {
         }
     }
 
+    pub fn pending_leaf_logs(&self) -> Vec<(uuid::Uuid, Vec<u8>)> {
+        match self {
+            Self::Terminal(panel) => panel.pending_leaf_logs(),
+        }
+    }
+
+    pub fn acknowledge_leaf_log(&self, leaf_id: uuid::Uuid, written_bytes: usize) {
+        match self {
+            Self::Terminal(panel) => panel.acknowledge_leaf_log(leaf_id, written_bytes),
+        }
+    }
+
     pub fn unread(&self) -> bool {
         match self {
             Self::Terminal(panel) => panel.unread(),
@@ -391,9 +458,24 @@ impl WorkspacePanel {
         panel.set_agent_session_id(session_id);
     }
 
+    pub fn set_agent_session_id_for_leaf(
+        &mut self,
+        leaf_id: uuid::Uuid,
+        session_id: Option<String>,
+    ) {
+        let Self::Terminal(panel) = self;
+        panel.set_agent_session_id_for_leaf(leaf_id, session_id);
+    }
+
     pub fn agent_session_id(&self) -> Option<&str> {
         match self {
             Self::Terminal(panel) => panel.agent_session_id(),
+        }
+    }
+
+    pub fn agent_command(&self) -> Option<&str> {
+        match self {
+            Self::Terminal(panel) => panel.agent_command(),
         }
     }
 
@@ -444,11 +526,12 @@ impl WorkspacePanel {
         axis: crate::terminal::split_tree::Axis,
         pty_manager: Arc<Mutex<crate::runtime::PtyManager>>,
         cwd: Option<&std::path::Path>,
+        workspace_id: Option<Uuid>,
         cols: u16,
         rows: u16,
     ) {
         let Self::Terminal(panel) = self;
-        panel.split_focused(axis, pty_manager, cwd, cols, rows);
+        panel.split_focused(axis, pty_manager, cwd, workspace_id, cols, rows);
     }
 
     pub fn close_focused_leaf(&mut self) -> bool {

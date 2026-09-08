@@ -29,18 +29,31 @@ pub const BACKUP_MIN_SPACING: Duration = Duration::from_secs(60 * 60);
 /// Escribe `bytes` en `path` de forma durable. Devuelve `true` si escribió;
 /// `false` si el archivo ya tenía exactamente ese contenido (no-op).
 pub fn write_durable(path: &Path, bytes: &[u8]) -> std::io::Result<bool> {
+    // No-op por contenido: reescribir el mismo estado solo gasta disco y le
+    // miente al ring de backups (copias idénticas).
+    if content_matches(path, bytes) {
+        return Ok(false);
+    }
+    rotate_backup_ring(path, SystemTime::now(), BACKUP_MIN_SPACING);
+    write_atomic_changed(path, bytes)?;
+    Ok(true)
+}
+
+/// Escritura atómica y durable sin ring de backups. Es la variante apropiada
+/// para checkpoints frecuentes y regenerables (scrollback): mantiene el
+/// patrón tmp/fsync/rename y el no-op por contenido, sin multiplicar archivos.
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<bool> {
+    if content_matches(path, bytes) {
+        return Ok(false);
+    }
+    write_atomic_changed(path, bytes)?;
+    Ok(true)
+}
+
+fn write_atomic_changed(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    // No-op por contenido: reescribir el mismo estado solo gasta disco y le
-    // miente al ring de backups (copias idénticas).
-    if let Ok(existing) = std::fs::read(path) {
-        if existing == bytes {
-            return Ok(false);
-        }
-    }
-    rotate_backup_ring(path, SystemTime::now(), BACKUP_MIN_SPACING);
-
     let tmp = tmp_path(path);
     {
         let mut file = std::fs::File::create(&tmp)?;
@@ -51,7 +64,11 @@ pub fn write_durable(path: &Path, bytes: &[u8]) -> std::io::Result<bool> {
     }
     std::fs::rename(&tmp, path)?;
     sync_directory(path);
-    Ok(true)
+    Ok(())
+}
+
+fn content_matches(path: &Path, bytes: &[u8]) -> bool {
+    std::fs::read(path).is_ok_and(|existing| existing == bytes)
 }
 
 /// Carga el primer contenido válido en el orden principal → `.bak.0..4`.
@@ -153,7 +170,8 @@ mod tests {
     use std::time::{Duration, SystemTime};
 
     use super::{
-        backup_path, load_first_valid, rotate_backup_ring, tmp_path, write_durable, BACKUP_SLOTS,
+        backup_path, load_first_valid, rotate_backup_ring, tmp_path, write_atomic, write_durable,
+        BACKUP_SLOTS,
     };
 
     fn unique_dir() -> std::path::PathBuf {
@@ -188,6 +206,18 @@ mod tests {
     }
 
     #[test]
+    fn atomic_write_is_durable_without_creating_backup_artifacts() {
+        let dir = unique_dir();
+        let path = dir.join("checkpoint.txt");
+        assert!(write_atomic(&path, b"v1").unwrap());
+        assert!(write_atomic(&path, b"v2").unwrap());
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"v2");
+        assert!(!backup_path(&path, 0).exists());
+        assert!(!tmp_path(&path).exists());
+    }
+
+    #[test]
     fn a_second_save_backs_up_the_previous_content() {
         let dir = unique_dir();
         let path = dir.join("layout.json");
@@ -217,7 +247,11 @@ mod tests {
         let path = dir.join("layout.json");
         // Espaciado 0: rota en cada escritura.
         for version in 0..8u32 {
-            rotate_backup_ring(&path, SystemTime::now(), Duration::ZERO);
+            // `copy` puede dejar un mtime apenas posterior a un `now`
+            // capturado justo antes. Un reloj futuro controlado hace que el
+            // test verifique el ring, no la granularidad del filesystem.
+            let now = SystemTime::now() + Duration::from_secs(60 + u64::from(version));
+            rotate_backup_ring(&path, now, Duration::ZERO);
             std::fs::write(&path, format!("v{version}")).unwrap();
         }
         // 8 escrituras → el anillo retiene las últimas 5 copias desplazadas:

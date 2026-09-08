@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <meta name="theme-color" content="#0a0a0a" />
+    <title>TerminalCanvas — Native desktop for terminals and agents</title>
+    <meta
+      name="description"
+      content="Native tiled desktop for terminals and coding-agent sessions. Folder workspaces, in-app review, local collab. Not an IDE in the terminal."
+    />
+    <meta property="og:title" content="TerminalCanvas — Native desktop for terminals and agents" />
+    <meta
+      property="og:description"
+      content="Native tiled desktop for terminals and coding-agent sessions. Folder workspaces, in-app review, local collab."
+    />
+    <meta property="og:type" content="website" />
+    <meta name="twitter:card" content="summary" />
+    <link rel="icon" href="favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="styles.css" />
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "SoftwareApplication",
+        "name": "TerminalCanvas",
+        "applicationCategory": "DeveloperApplication",
+        "operatingSystem": "macOS",
+        "softwareVersion": "1.2.0",
+        "license": "https://opensource.org/licenses/MIT",
+        "url": "https://github.com/MauroProto/terminal-canvas",
+        "description": "Native tiled desktop for terminals and coding-agent sessions."
+      }
+    </script>
+  </head>
+  <body>
+    <a class="skip" href="#main">Skip to content</a>
+
+    <header class="nav">
+      <a class="brand" href="#top" aria-label="TerminalCanvas home">
+        <svg class="mark" width="22" height="22" viewBox="0 0 22 22" aria-hidden="true">
+          <rect x="1" y="1" width="20" height="20" rx="4" fill="#171717" stroke="#737373" stroke-width="1" />
+          <rect x="1" y="1" width="20" height="6" rx="4" fill="#262626" />
+          <rect x="1" y="4" width="20" height="3" fill="#262626" />
+          <circle cx="4.6" cy="4" r="1.05" fill="#ff5f57" />
+          <circle cx="7.6" cy="4" r="1.05" fill="#febc2e" />
+          <circle cx="10.6" cy="4" r="1.05" fill="#28c840" />
+          <path stroke="rgba(255,255,255,0.14)" stroke-width="1" d="M11 7v13M1 13.5h20" />
+        </svg>
+        <span class="word">TerminalCanvas</span>
+      </a>
+      <nav aria-label="Primary">
+        <a href="#features">Features</a>
+        <a href="#install">Install</a>
+        <a href="https://github.com/MauroProto/terminal-canvas" rel="noopener noreferrer">GitHub</a>
+      </nav>
+    </header>
+
+    <main id="main">
+      <div class="above">
+        <section class="hero" id="top">
+          <h1 id="tagline">Native desktop for terminals and agents.</h1>
+          <p class="lede">
+            Tiled panels for shells and coding-agent sessions. Folder workspaces, in-app review, local collab. Not an IDE in the terminal.
+          </p>
+          <div class="install-cluster">
+            <div class="run" role="group" aria-label="Run from source">
+              <span class="prompt" aria-hidden="true">$</span>
+              <code id="install-cmd">cargo run --bin mi-terminal</code>
+              <button type="button" class="copy" data-copy="cargo run --bin mi-terminal" aria-label="Copy run command">copy</button>
+            </div>
+            <a class="cta-gh" href="https://github.com/MauroProto/terminal-canvas" rel="noopener noreferrer">GitHub</a>
+            <p class="copy-status" aria-live="polite"></p>
+            <ul class="meta">
+              <li>v1.2.0</li>
+              <li>MIT</li>
+              <li>macOS first</li>
+              <li>source only</li>
+            </ul>
+          </div>
+        </section>
+
+        <section class="demo-wrap" aria-label="Simulated TerminalCanvas window">
+          <p class="demo-caption">Simulation of the native app. Tiled desktop — not a browser PTY.</p>
+
+          <div class="app" id="desktop">
+            <div class="osbar">
+              <div class="os-lights" aria-hidden="true">
+                <span class="os-dot close"></span>
+                <span class="os-dot min"></span>
+                <span class="os-dot max"></span>
+              </div>
+              <p class="os-title">My Terminal | v1.2.0</p>
+            </div>
+
+            <div class="app-body">
+              <aside class="sidebar" aria-label="Sidebar">
+                <div class="side-tabs" role="tablist">
+                  <button type="button" class="stab is-on" role="tab" aria-selected="true" data-tab="workspaces">Workspaces</button>
+                  <button type="button" class="stab" role="tab" aria-selected="false" data-tab="files">Files</button>
+                  <button type="button" class="stab" role="tab" aria-selected="false" data-tab="tasks">Tasks</button>
+                  <button type="button" class="stab" role="tab" aria-selected="false" data-tab="online">Online</button>
+                </div>
+
+                <div class="side-scroll">
+                  <div class="side-panel" data-panel="workspaces" role="tabpanel">
+                    <p class="side-k">Atención (2)</p>
+                    <button type="button" class="attn" data-focus="opencode">
+                      <span class="attn-dot fail"></span>
+                      <span class="attn-label">OpenCode · Failed</span>
+                      <span class="diff">diff</span>
+                    </button>
+                    <button type="button" class="attn" data-focus="grok">
+                      <span class="attn-dot wait"></span>
+                      <span class="attn-label">grok · Waiting</span>
+                      <span class="diff">diff</span>
+                    </button>
+                    <div class="ws">
+                      <div class="ws-head"><span class="ws-name">Default</span><span class="ws-add">+</span></div>
+                      <p class="ws-item"><span class="live"></span>Claude Code</p>
+                      <p class="ws-item"><span class="live"></span>Terminal</p>
+                    </div>
+                    <div class="ws">
+                      <div class="ws-head"><span class="ws-name">guard-landing</span><span class="ws-add">+</span></div>
+                      <p class="ws-path">~/Desktop/proyectos/guard-landing</p>
+                    </div>
+                    <div class="ws is-active">
+                      <div class="ws-head"><span class="ws-name">harness-app</span><span class="ws-add">+</span></div>
+                      <p class="ws-path">~/Desktop/proyectos/harness-app</p>
+                      <p class="ws-item"><span class="live"></span>Claude Code</p>
+                      <p class="ws-item"><span class="live"></span>OpenCode</p>
+                      <p class="ws-item"><span class="live grok"></span>grok</p>
+                      <p class="ws-item"><span class="live"></span>Terminal</p>
+                    </div>
+                    <div class="ws">
+                      <div class="ws-head"><span class="ws-name">discord agent</span><span class="ws-add">+</span></div>
+                      <p class="ws-path">~/Desktop/proyectos/discord agent</p>
+                    </div>
+                    <p class="ws-open">+ Open folder</p>
+                  </div>
+                  <div class="side-panel" data-panel="files" role="tabpanel" hidden>
+                    <p class="tree-root">harness-app</p>
+                    <ul class="tree">
+                      <li class="dir">src/</li>
+                      <li class="file indent">app.rs</li>
+                      <li class="file indent">lib.rs</li>
+                      <li class="file">Cargo.toml</li>
+                    </ul>
+                  </div>
+                  <div class="side-panel" data-panel="tasks" role="tabpanel" hidden>
+                    <p class="side-empty">No GitHub tasks in this workspace.</p>
+                    <p class="side-hint">The Tasks tab lists issues and PRs from the folder’s repo.</p>
+                  </div>
+                  <div class="side-panel" data-panel="online" role="tabpanel" hidden>
+                    <p class="online-state"><span class="attn-dot"></span>Not sharing</p>
+                    <p class="online-links"><span>Share</span><span>Join</span></p>
+                    <p class="side-hint">Share this workspace or join a session. Local TLS, device approval.</p>
+                  </div>
+                </div>
+
+                <div class="side-foot">
+                  <p><span class="glyph">⚙</span>Settings</p>
+                  <p><span class="glyph">»</span>Broadcast</p>
+                  <p><span class="glyph">↓</span>Export output</p>
+                </div>
+              </aside>
+
+              <div class="desk">
+                <article class="pane is-focused" data-pane="claude" tabindex="0" aria-current="true" aria-label="Claude Code">
+                  <header class="titlebar">
+                    <div class="lights" aria-hidden="true"><span class="ctl close"></span><span class="ctl min"></span><span class="ctl max"></span></div>
+                    <h3>Claude Code</h3>
+                    <span class="branch">codex/demo-v1-harness</span>
+                  </header>
+                  <pre class="pty" aria-hidden="true"><span class="claude-mark">▄▄▄▄▄▄▄
+▄▀▄     ▄▀▄
+▀█▄▄▄▄▄▄▄▄▄█▀</span>
+<span class="strong">Claude Code</span> v2.1.219
+Opus 5 (1M context) with xhigh effort
+<span class="dim">~/Desktop/proyectos/harness-app</span>
+API Usage Billing · <span class="dim">0 tokens</span>
+<span class="strong">&gt;</span> <span class="caret"></span>
+<span class="claude">▶ auto mode on · 1 agent</span></pre>
+                </article>
+
+                <article class="pane" data-pane="opencode" tabindex="0" aria-label="OpenCode">
+                  <header class="titlebar">
+                    <div class="lights" aria-hidden="true"><span class="ctl close"></span><span class="ctl min"></span><span class="ctl max"></span></div>
+                    <h3>OpenCode</h3>
+                    <span class="branch">codex/demo-v1-harness</span>
+                  </header>
+                  <pre class="pty" aria-hidden="true"><span class="banner"> ██████╗ ██████╗ ███████╗███╗   ██╗
+██╔═══██╗██╔══██╗██╔════╝████╗  ██║
+██║   ██║██████╔╝█████╗  ██╔██╗ ██║
+╚██████╔╝██║     ███████╗██║ ╚████║
+ ╚═════╝ ╚═╝     ╚══════╝╚═╝  ╚═══╝</span>
+<span class="ask">Ask anything… “What is the tech stack of this project?”</span>
+Build · Qwen3.8 Max · <span class="warn">xhigh</span>
+<span class="dim">tab agents  ctrl+p commands</span>
+<span class="dim">1 MCP /status 1.18.18</span></pre>
+                </article>
+
+                <article class="pane" data-pane="zsh" tabindex="0" aria-label="-zsh">
+                  <header class="titlebar">
+                    <div class="lights" aria-hidden="true"><span class="ctl close"></span><span class="ctl min"></span><span class="ctl max"></span></div>
+                    <h3>-zsh</h3>
+                    <span class="branch">codex/demo-v1-harness</span>
+                  </header>
+                  <pre class="pty" aria-hidden="true"><span class="lain">██╗      █████╗ ██╗███╗   ██╗
+██║     ███████║██║██╔██╗ ██║
+███████╗██║  ██║██║██║ ╚████║
+╚══════╝╚═╝  ╚═╝╚═╝╚═╝  ╚═══╝</span>
+  | Main Menu |
+  | /ask &lt;question&gt; |
+  | /set-key &lt;api_key&gt; |
+<span class="dim">~/Desktop/proyectos/harness-app</span> <span class="ok">main</span>
+<span class="dim">$</span> <span class="caret"></span></pre>
+                </article>
+
+                <article class="pane" data-pane="grok" tabindex="0" aria-label="grok">
+                  <header class="titlebar">
+                    <div class="lights" aria-hidden="true"><span class="ctl close"></span><span class="ctl min"></span><span class="ctl max"></span></div>
+                    <h3>grok</h3>
+                    <span class="branch">codex/demo-v1-harness</span>
+                  </header>
+                  <pre class="pty" aria-hidden="true"><span class="dim">~/Desktop/proyectos/harness-app</span>
+  New worktree <span class="dim">(ctrl+w)</span>
+  Resume session <span class="dim">(ctrl+s)</span>
+  Changelog · Quit <span class="dim">(ctrl+q)</span>
+<span class="warn">Grok 4.6 is here!</span> Select under /model.
+<span class="dim">Update: v1.0.5 available</span>
+<span class="strong">&gt;</span> <span class="caret"></span>
+<span class="dim">Grok 4.5 (xhigh) · always-approve</span>
+<span class="dim">Grok Build 1.0.3 [stable]</span></pre>
+                </article>
+              </div>
+
+              <div class="taskbar" role="toolbar" aria-label="Taskbar">
+                <button type="button" class="task is-current" data-focus="claude"><span class="tdot claude"></span>Claude Code</button>
+                <button type="button" class="task" data-focus="opencode"><span class="tdot opencode"></span>OpenCode</button>
+                <button type="button" class="task" data-focus="zsh"><span class="tdot term"></span>Terminal</button>
+                <button type="button" class="task" data-focus="grok"><span class="tdot grok"></span>grok</button>
+              </div>
+            </div>
+          </div>
+        </section>
+      </div>
+
+      <a class="more" href="#features">***</a>
+
+      <section id="features" class="features">
+        <h2>Features</h2>
+        <div class="bento">
+          <article>
+            <h3>Tiled desktop</h3>
+            <p>Up to four live panes fill the workspace. Snap, minimize, restore from the taskbar. GPU-accelerated via <code>egui</code> / <code>wgpu</code>.</p>
+          </article>
+          <article>
+            <h3>Agent sessions</h3>
+            <p><kbd>Ctrl+Shift+A</kbd> launches Claude Code, Codex, or OpenCode with provider detection and Git worktrees.</p>
+          </article>
+          <article>
+            <h3>In-app review</h3>
+            <p>Unified diff of changed and new files. Annotate lines and inject notes back with bracketed paste.</p>
+          </article>
+          <article>
+            <h3>PTY daemon</h3>
+            <p>macOS bundles ship <code>mi-terminal-daemon</code>. Close the UI; the agents keep working. Source builds keep it opt-in.</p>
+          </article>
+          <article>
+            <h3>Local collab</h3>
+            <p>Trusted live sessions over local TLS with device approval. Not a public room.</p>
+          </article>
+          <article>
+            <h3>Agent memory</h3>
+            <p>Private SQLite. Agent proposals stay pending until a human approves. <code>tc-memory</code> CLI and <code>tc-memory-mcp</code>.</p>
+          </article>
+          <article>
+            <h3>Workspaces</h3>
+            <p>Folder-backed. Quick Open <kbd>Ctrl+P</kbd>. Built-in viewer, 213 languages, Catppuccin Mocha.</p>
+          </article>
+          <article>
+            <h3>Persistence</h3>
+            <p>Scrollback survives restarts. Broadcast one command to many live terminals with <kbd>Ctrl+Shift+Enter</kbd>.</p>
+          </article>
+        </div>
+      </section>
+
+      <section id="install" class="install">
+        <h2>Install</h2>
+        <p>
+          Source only. Homebrew cask and signed DMG are coming — no tap, no public download.
+          The crate binary is <code>mi-terminal</code>. Version <strong>1.2.0</strong> lives in the tree.
+        </p>
+        <div class="blocks">
+          <div class="block">
+            <div class="block-head">
+              <h3>From source</h3>
+              <button type="button" class="copy" data-copy="git clone https://github.com/MauroProto/terminal-canvas.git&#10;cd terminal-canvas&#10;cargo run --bin mi-terminal">copy</button>
+            </div>
+            <pre><code>git clone https://github.com/MauroProto/terminal-canvas.git
+cd terminal-canvas
+cargo run --bin mi-terminal</code></pre>
+          </div>
+          <div class="block">
+            <div class="block-head">
+              <h3>Release binary</h3>
+              <button type="button" class="copy" data-copy="cargo build --release&#10;./target/release/mi-terminal">copy</button>
+            </div>
+            <pre><code>cargo build --release
+./target/release/mi-terminal</code></pre>
+          </div>
+          <div class="block">
+            <div class="block-head">
+              <h3>macOS .app</h3>
+              <button type="button" class="copy" data-copy="scripts/bundle.sh">copy</button>
+            </div>
+            <pre><code>scripts/bundle.sh
+scripts/bundle.sh --dmg</code></pre>
+            <p class="fine">Local unsigned bundles are blocked by Gatekeeper on other machines. Signing needs Apple credentials. This is not a public download.</p>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer class="foot">
+      <p>
+        <span>TerminalCanvas</span>
+        <span aria-hidden="true">·</span>
+        <span>v1.2.0</span>
+        <span aria-hidden="true">·</span>
+        <span>MIT</span>
+        <span aria-hidden="true">·</span>
+        <span>macOS first</span>
+        <span aria-hidden="true">·</span>
+        <span>binary: <code>mi-terminal</code></span>
+        <span aria-hidden="true">·</span>
+        <a href="https://github.com/MauroProto/terminal-canvas" rel="noopener noreferrer">GitHub</a>
+      </p>
+    </footer>
+
+    <script src="app.js" defer></script>
+  </body>
+</html>

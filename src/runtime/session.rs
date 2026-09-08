@@ -13,6 +13,9 @@ pub struct SessionSpec {
     pub panel_id: Option<Uuid>,
     /// Workspace dueño de la sesión, exportado como `TC_WORKSPACE_ID`.
     pub workspace_id: Option<Uuid>,
+    /// Hoja estable dentro del panel. Permite que el daemon persista varias
+    /// sesiones de un split sin sobrescribirlas bajo el mismo `panel_id`.
+    pub leaf_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,6 +43,7 @@ impl Default for SessionSpec {
             startup_input: None,
             panel_id: None,
             workspace_id: None,
+            leaf_id: None,
         }
     }
 }

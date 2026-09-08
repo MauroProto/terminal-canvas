@@ -13,8 +13,14 @@ use uuid::Uuid;
 /// Tope por panel. El scrollback se recorta desde el principio (se conservan
 /// las últimas líneas, que son las que el usuario quiere ver).
 pub const MAX_PERSISTED_BYTES: usize = 256 * 1024;
+const CHECKPOINT_MAGIC: &[u8] = b"TC-SCROLLBACK\x00\x02";
 
 pub fn scrollback_dir() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("MI_TERMINAL_SCROLLBACK_DIR") {
+        if !path.trim().is_empty() {
+            return Some(PathBuf::from(path));
+        }
+    }
     let dirs = directories::ProjectDirs::from("", "", "terminal-app")?;
     Some(dirs.data_dir().join("scrollback"))
 }
@@ -27,9 +33,9 @@ pub fn scrollback_file_name(panel_id: Uuid) -> String {
 
 /// Nombre de archivo de una **hoja** de un panel con splits (P2.11, T4).
 ///
-/// La migración es implícita: la hoja raíz usa el nombre viejo (sin sufijo),
-/// así los archivos de antes de los splits siguen siendo el historial de la
-/// hoja raíz sin tener que mover nada en disco.
+/// `Some(leaf)` es siempre el formato canónico, incluso para la raíz. `None`
+/// conserva exclusivamente el nombre histórico como fallback de lectura, de
+/// modo que la migración no destruye archivos de versiones anteriores.
 pub fn scrollback_leaf_file_name(panel_id: Uuid, leaf_id: Option<Uuid>) -> String {
     match leaf_id {
         Some(leaf) => format!("{}-{}.txt", panel_id.simple(), leaf.simple()),
@@ -42,9 +48,23 @@ pub fn scrollback_log_file_name(panel_id: Uuid) -> String {
     format!("{}.mtlg", panel_id.simple())
 }
 
+pub fn scrollback_leaf_log_file_name(panel_id: Uuid, leaf_id: Option<Uuid>) -> String {
+    match leaf_id {
+        Some(leaf) => format!("{}-{}.mtlg", panel_id.simple(), leaf.simple()),
+        None => scrollback_log_file_name(panel_id),
+    }
+}
+
 /// Nombre del archivo de generation de un panel (P1.7).
 pub fn scrollback_gen_file_name(panel_id: Uuid) -> String {
     format!("{}.gen", panel_id.simple())
+}
+
+pub fn scrollback_leaf_gen_file_name(panel_id: Uuid, leaf_id: Option<Uuid>) -> String {
+    match leaf_id {
+        Some(leaf) => format!("{}-{}.gen", panel_id.simple(), leaf.simple()),
+        None => scrollback_gen_file_name(panel_id),
+    }
 }
 
 /// Recorta el historial al tope conservando el **final**, alineado a un borde
@@ -82,8 +102,8 @@ pub fn clamp_scrollback(text: &str, max_bytes: usize) -> &str {
     }
 }
 
-/// Guarda el scrollback de una hoja concreta (P2.11, T4). `leaf_id: None` es
-/// la hoja raíz, que usa el nombre histórico.
+/// Guarda el scrollback de una hoja concreta (P2.11, T4). `Some(leaf)` es el
+/// formato canónico; `None` sólo se usa para compatibilidad histórica.
 pub fn save_leaf_scrollback(
     dir: &Path,
     panel_id: Uuid,
@@ -97,14 +117,53 @@ pub fn save_leaf_scrollback(
     }
     std::fs::create_dir_all(dir)?;
     let clamped = clamp_scrollback(text, MAX_PERSISTED_BYTES);
-    std::fs::write(dir.join(&name), clamped.as_bytes())?;
+    crate::state::durable_write::write_atomic(&dir.join(&name), clamped.as_bytes())?;
     Ok(())
+}
+
+/// Guarda checkpoint y generation en una sola escritura atómica. Esto evita
+/// que un crash entre dos sidecars haga reaplicar un log que ya está incluido
+/// en el checkpoint.
+pub fn save_leaf_scrollback_versioned(
+    dir: &Path,
+    panel_id: Uuid,
+    leaf_id: Option<Uuid>,
+    generation: u32,
+    text: &str,
+) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let clamped = clamp_scrollback(text, MAX_PERSISTED_BYTES);
+    let mut bytes = Vec::with_capacity(CHECKPOINT_MAGIC.len() + 4 + clamped.len());
+    bytes.extend_from_slice(CHECKPOINT_MAGIC);
+    bytes.extend_from_slice(&generation.to_le_bytes());
+    bytes.extend_from_slice(clamped.as_bytes());
+    crate::state::durable_write::write_atomic(
+        &dir.join(scrollback_leaf_file_name(panel_id, leaf_id)),
+        &bytes,
+    )?;
+    Ok(())
+}
+
+/// Lee tanto checkpoints versionados como los `.txt` históricos.
+pub fn load_leaf_scrollback_checkpoint(
+    dir: &Path,
+    panel_id: Uuid,
+    leaf_id: Option<Uuid>,
+) -> Option<(Option<u32>, String)> {
+    let bytes = std::fs::read(dir.join(scrollback_leaf_file_name(panel_id, leaf_id))).ok()?;
+    if bytes.starts_with(CHECKPOINT_MAGIC) && bytes.len() >= CHECKPOINT_MAGIC.len() + 4 {
+        let offset = CHECKPOINT_MAGIC.len();
+        let generation = u32::from_le_bytes(bytes[offset..offset + 4].try_into().ok()?);
+        let text = String::from_utf8_lossy(&bytes[offset + 4..]).into_owned();
+        Some((Some(generation), text))
+    } else {
+        Some((None, String::from_utf8_lossy(&bytes).into_owned()))
+    }
 }
 
 /// Carga el scrollback de una hoja concreta.
 pub fn load_leaf_scrollback(dir: &Path, panel_id: Uuid, leaf_id: Option<Uuid>) -> Option<String> {
-    let bytes = std::fs::read(dir.join(scrollback_leaf_file_name(panel_id, leaf_id))).ok()?;
-    let text = String::from_utf8_lossy(&bytes).into_owned();
+    let (_, text) = load_leaf_scrollback_checkpoint(dir, panel_id, leaf_id)?;
     if text.trim().is_empty() {
         None
     } else {
@@ -121,7 +180,10 @@ pub fn save_scrollback(dir: &Path, panel_id: Uuid, text: &str) -> anyhow::Result
     }
     std::fs::create_dir_all(dir)?;
     let clamped = clamp_scrollback(text, MAX_PERSISTED_BYTES);
-    std::fs::write(dir.join(scrollback_file_name(panel_id)), clamped.as_bytes())?;
+    crate::state::durable_write::write_atomic(
+        &dir.join(scrollback_file_name(panel_id)),
+        clamped.as_bytes(),
+    )?;
     Ok(())
 }
 
@@ -136,10 +198,18 @@ pub fn load_scrollback(dir: &Path, panel_id: Uuid) -> Option<String> {
     }
 }
 
-/// Borra los archivos de paneles que ya no existen, para que el directorio no
-/// crezca sin límite a medida que se abren y cierran terminales.
-pub fn prune_scrollback(dir: &Path, live_panel_ids: &[Uuid]) -> usize {
-    let live_stems: Vec<String> = live_panel_ids
+/// Borra artefactos de paneles que esta instancia conoce y que ya no existen.
+///
+/// El alcance `known_panel_ids` es deliberadamente obligatorio: varias
+/// instancias de TerminalCanvas pueden compartir el directorio durable. Una
+/// lista local de paneles vivos no demuestra que un UUID desconocido esté
+/// muerto; podarlo causaría pérdida de historial en la otra instancia.
+pub fn prune_scrollback(dir: &Path, live_panel_ids: &[Uuid], known_panel_ids: &[Uuid]) -> usize {
+    let live_stems: std::collections::HashSet<String> = live_panel_ids
+        .iter()
+        .map(|id| id.simple().to_string())
+        .collect();
+    let known_stems: std::collections::HashSet<String> = known_panel_ids
         .iter()
         .map(|id| id.simple().to_string())
         .collect();
@@ -151,10 +221,47 @@ pub fn prune_scrollback(dir: &Path, live_panel_ids: &[Uuid]) -> usize {
         let name = entry.file_name().to_string_lossy().to_string();
         // Sólo tocamos nuestros propios archivos (checkpoint, log, generation).
         let ours = name.ends_with(".txt") || name.ends_with(".mtlg") || name.ends_with(".gen");
-        if !ours || live_stems.iter().any(|stem| stem == panel_stem_of(&name)) {
+        let panel_stem = panel_stem_of(&name);
+        if !ours || !known_stems.contains(panel_stem) || live_stems.contains(panel_stem) {
             continue;
         }
         if std::fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// Elimina artefactos de hojas que ya no pertenecen al árbol activo de un
+/// panel. Sin esta poda, abrir/cerrar splits acumula checkpoints y logs para
+/// siempre aunque el panel continúe vivo.
+pub fn prune_panel_leaf_scrollback(
+    dir: &Path,
+    panel_id: Uuid,
+    live_leaf_ids: &[Uuid],
+    known_leaf_ids: &[Uuid],
+) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let prefix = format!("{}-", panel_id.simple());
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let Some(leaf_text) = name.strip_prefix(&prefix).and_then(|rest| {
+            rest.strip_suffix(".txt")
+                .or_else(|| rest.strip_suffix(".mtlg"))
+                .or_else(|| rest.strip_suffix(".gen"))
+        }) else {
+            continue;
+        };
+        let Ok(leaf_id) = Uuid::parse_str(leaf_text) else {
+            continue;
+        };
+        if known_leaf_ids.contains(&leaf_id)
+            && !live_leaf_ids.contains(&leaf_id)
+            && std::fs::remove_file(entry.path()).is_ok()
+        {
             removed += 1;
         }
     }
@@ -222,8 +329,8 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        clamp_scrollback, load_scrollback, prune_scrollback, replay_bytes, save_scrollback,
-        scrollback_file_name, MAX_PERSISTED_BYTES,
+        clamp_scrollback, load_scrollback, prune_panel_leaf_scrollback, prune_scrollback,
+        replay_bytes, save_scrollback, scrollback_file_name, MAX_PERSISTED_BYTES,
     };
 
     fn temp_dir(tag: &str) -> std::path::PathBuf {
@@ -355,7 +462,7 @@ mod tests {
         save_scrollback(&dir, live, "vivo\n").expect("save");
         save_scrollback(&dir, dead, "muerto\n").expect("save");
 
-        let removed = prune_scrollback(&dir, &[live]);
+        let removed = prune_scrollback(&dir, &[live], &[live, dead]);
         let live_after = load_scrollback(&dir, live);
         let dead_after = load_scrollback(&dir, dead);
         let _ = std::fs::remove_dir_all(&dir);
@@ -366,13 +473,61 @@ mod tests {
     }
 
     #[test]
+    fn pruning_a_live_panel_removes_only_closed_leaf_artifacts() {
+        let dir = temp_dir("prune-leaves");
+        let panel = Uuid::new_v4();
+        let live = Uuid::new_v4();
+        let closed = Uuid::new_v4();
+        super::save_leaf_scrollback(&dir, panel, Some(live), "viva\n").unwrap();
+        super::save_leaf_scrollback(&dir, panel, Some(closed), "cerrada\n").unwrap();
+        std::fs::write(
+            dir.join(super::scrollback_leaf_log_file_name(panel, Some(closed))),
+            b"old log",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(super::scrollback_leaf_gen_file_name(panel, Some(closed))),
+            b"old gen",
+        )
+        .unwrap();
+
+        assert_eq!(
+            prune_panel_leaf_scrollback(&dir, panel, &[live], &[live, closed]),
+            3
+        );
+        assert!(super::load_leaf_scrollback(&dir, panel, Some(live)).is_some());
+        assert!(super::load_leaf_scrollback(&dir, panel, Some(closed)).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pruning_a_panel_keeps_leaves_created_by_another_instance() {
+        let dir = temp_dir("foreign-leaf");
+        let panel = Uuid::new_v4();
+        let local_leaf = Uuid::new_v4();
+        let foreign_leaf = Uuid::new_v4();
+        super::save_leaf_scrollback(&dir, panel, Some(local_leaf), "local\n").unwrap();
+        super::save_leaf_scrollback(&dir, panel, Some(foreign_leaf), "foreign\n").unwrap();
+
+        assert_eq!(
+            prune_panel_leaf_scrollback(&dir, panel, &[local_leaf], &[local_leaf]),
+            0
+        );
+        assert_eq!(
+            super::load_leaf_scrollback(&dir, panel, Some(foreign_leaf)).as_deref(),
+            Some("foreign\n")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn pruning_ignores_foreign_files() {
         let dir = temp_dir("foreign");
         std::fs::create_dir_all(&dir).expect("mkdir");
         let foreign = dir.join("no-nuestro.json");
         std::fs::write(&foreign, b"{}").expect("write");
 
-        let removed = prune_scrollback(&dir, &[]);
+        let removed = prune_scrollback(&dir, &[], &[]);
         let survived = foreign.exists();
         let _ = std::fs::remove_dir_all(&dir);
 
@@ -382,7 +537,7 @@ mod tests {
 
     #[test]
     fn pruning_a_missing_directory_is_a_noop() {
-        assert_eq!(prune_scrollback(&temp_dir("missing"), &[]), 0);
+        assert_eq!(prune_scrollback(&temp_dir("missing"), &[], &[]), 0);
     }
 
     #[test]
@@ -409,9 +564,8 @@ mod tests {
     }
 
     #[test]
-    fn the_root_leaf_keeps_the_historic_file_name() {
-        // Ésta es la migración: los archivos de antes de los splits son el
-        // historial de la hoja raíz, sin mover nada en disco.
+    fn the_legacy_root_alias_keeps_the_historic_file_name() {
+        // El alias de lectura conserva los archivos previos sin moverlos.
         let panel = Uuid::new_v4();
         assert_eq!(
             super::scrollback_leaf_file_name(panel, None),
@@ -465,7 +619,7 @@ mod tests {
         super::save_leaf_scrollback(&dir, live, Some(leaf), "hoja viva\n").unwrap();
         super::save_leaf_scrollback(&dir, dead, Some(leaf), "hoja muerta\n").unwrap();
 
-        let removed = prune_scrollback(&dir, &[live]);
+        let removed = prune_scrollback(&dir, &[live], &[live, dead]);
         let leaf_alive = super::load_leaf_scrollback(&dir, live, Some(leaf));
         let root_alive = super::load_leaf_scrollback(&dir, live, None);
         let leaf_dead = super::load_leaf_scrollback(&dir, dead, Some(leaf));

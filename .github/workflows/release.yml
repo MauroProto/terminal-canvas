@@ -1,0 +1,100 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  macos-dmg:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Verify tag matches Cargo version
+        shell: bash
+        run: |
+          version="$(awk -F'"' '/^version[[:space:]]*=/ {print $2; exit}' Cargo.toml)"
+          test "${GITHUB_REF_NAME}" = "v${version}"
+
+      - name: Release preflight
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --all-targets --locked --features daemon -- -D warnings
+          cargo test --all-targets --locked --features daemon --quiet
+
+      - name: Import signing certificate
+        env:
+          CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.MACOS_KEYCHAIN_PASSWORD }}
+        run: |
+          if [[ -z "$CERTIFICATE_P12" || -z "$CERTIFICATE_PASSWORD" || -z "$KEYCHAIN_PASSWORD" ]]; then
+            echo "Faltan secrets del certificado de firma" >&2
+            exit 1
+          fi
+          keychain="$RUNNER_TEMP/terminalcanvas.keychain-db"
+          certificate="$RUNNER_TEMP/terminalcanvas.p12"
+          echo "$CERTIFICATE_P12" | base64 --decode > "$certificate"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$keychain"
+          security import "$certificate" -P "$CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
+          security list-keychain -d user -s "$keychain"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$keychain"
+
+      - name: Build signed DMG
+        env:
+          CODESIGN_IDENTITY: ${{ secrets.CODESIGN_IDENTITY }}
+        run: |
+          if [[ -z "$CODESIGN_IDENTITY" ]]; then
+            echo "Falta el secret CODESIGN_IDENTITY" >&2
+            exit 1
+          fi
+          scripts/bundle.sh --dmg
+
+      - name: Notarize and staple
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          if [[ -z "$APPLE_ID" || -z "$APPLE_TEAM_ID" || -z "$APPLE_APP_PASSWORD" ]]; then
+            echo "Faltan credenciales de notarización Apple" >&2
+            exit 1
+          fi
+          version="${GITHUB_REF_NAME#v}"
+          dmg="dist/TerminalCanvas-${version}.dmg"
+          xcrun notarytool submit "$dmg" --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait
+          xcrun stapler staple "$dmg"
+          xcrun stapler validate "$dmg"
+          shasum -a 256 "$dmg" | tee "$dmg.sha256"
+
+      - name: Verify bundle and checksum
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          test -x dist/TerminalCanvas.app/Contents/MacOS/mi-terminal-daemon
+          test -x dist/TerminalCanvas.app/Contents/MacOS/tc-memory
+          test -x dist/TerminalCanvas.app/Contents/MacOS/tc-memory-mcp
+          shasum -a 256 -c "dist/TerminalCanvas-${version}.dmg.sha256"
+          codesign --verify --deep --strict --verbose=2 dist/TerminalCanvas.app
+
+      - name: Publish GitHub release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/TerminalCanvas-*.dmg
+            dist/TerminalCanvas-*.dmg.sha256

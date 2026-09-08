@@ -64,6 +64,41 @@ pub(super) fn upsert_workspace_for_folder(workspaces: &mut Vec<Workspace>, path:
     workspaces.len() - 1
 }
 
+/// Quita un workspace sólo después de cerrar definitivamente todas sus
+/// terminales. Si era el último, conserva el invariante de la app dejando un
+/// workspace vacío sin carpeta. Devuelve cuántas terminales fueron cerradas.
+pub(super) fn close_workspace_for_good(
+    workspaces: &mut Vec<Workspace>,
+    active_ws: &mut usize,
+    workspace_id: uuid::Uuid,
+) -> Option<usize> {
+    let index = workspaces
+        .iter()
+        .position(|workspace| workspace.id == workspace_id)?;
+    let active_id = workspaces.get(*active_ws).map(|workspace| workspace.id);
+    let mut removed = workspaces.remove(index);
+    let terminal_count = removed.panels.len();
+    removed.close_all_panels();
+
+    if workspaces.is_empty() {
+        workspaces.push(Workspace::new("Default", None));
+        *active_ws = 0;
+    } else if active_id == Some(workspace_id) {
+        // Si cerró el activo, seleccionar el que ocupó su posición o, al
+        // cerrar el último de la lista, el anterior.
+        *active_ws = index.min(workspaces.len() - 1);
+    } else if let Some(active_id) = active_id {
+        // Si cerró otro workspace, mantener seleccionado el mismo proyecto,
+        // aunque su índice haya cambiado.
+        *active_ws = workspaces
+            .iter()
+            .position(|workspace| workspace.id == active_id)
+            .unwrap_or(0);
+    }
+
+    Some(terminal_count)
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn overview_viewport_for_panels(
     panels: &[CanvasPanel],

@@ -126,6 +126,8 @@ Semántica actual:
 
 - `invite_secret` autoriza el join
 - `session_secret` protege el payload cifrado de la sesión
+- el servidor de relay no recibe ni persiste `session_secret`; la clave sólo
+  viaja dentro del invite entre host e invitados autorizados
 - `tls_cert_pem` pinnea el certificado auto-firmado del host
 - `expires_at` invalida invites viejos
 - `requires_passphrase` obliga a una credencial separada del invite

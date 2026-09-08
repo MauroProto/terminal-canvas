@@ -6,18 +6,22 @@
 //! para que los hooks del agente (que corren en otro proceso) sepan a dónde
 //! postear sin hardcodear nada.
 //!
-//! Los eventos llegan al loop de la app por un canal mpsc que se drena en
-//! `begin_frame`.
+//! Los eventos llegan al loop de la app por canales mpsc acotados que se
+//! drenan en `begin_frame`. Un productor defectuoso nunca puede hacer crecer
+//! la memoria de la UI sin límite.
 
+use std::io::Write as _;
 use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use axum::extract::{Path as AxumPath, Query, State};
+use axum::extract::{DefaultBodyLimit, Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::routing::post;
+use axum::Json;
 use axum::Router;
 use serde::Deserialize;
 use uuid::Uuid;
@@ -26,11 +30,25 @@ use uuid::Uuid;
 /// request se rechaza con 401.
 pub const TOKEN_HEADER: &str = "X-TC-Token";
 
+/// Los hooks de estado son descartables: el refresco periódico vuelve a
+/// converger. Este buffer absorbe ráfagas sin permitir crecimiento ilimitado.
+const HOOK_EVENT_QUEUE_CAPACITY: usize = 256;
+/// Las capturas pesan bastante más; una cola corta evita retener muchos HTML,
+/// CSS y paths mientras la UI está suspendida.
+const DESIGN_CAPTURE_QUEUE_CAPACITY: usize = 16;
+/// Límite explícito del request completo. Incluye capturas PNG en base64 y
+/// evita depender del default implícito de la versión de Axum.
+const MAX_HOOK_BODY_BYTES: usize = 8 * 1024 * 1024;
+/// Reserva máxima para la parte base64 de una captura.
+const MAX_SCREENSHOT_BASE64_BYTES: usize = 6 * 1024 * 1024;
+
 /// Tipo de evento de hook, normalizado entre providers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HookKind {
     /// El agente terminó su turno.
     Stop,
+    /// Arranque de sesión: frontera segura para inyectar contexto.
+    SessionStart,
     /// El usuario mandó un prompt (el agente arranca a trabajar).
     UserPromptSubmit,
     /// El agente pide permiso para algo.
@@ -43,7 +61,8 @@ impl HookKind {
     /// Mapea el nombre de evento del provider a nuestro tipo normalizado.
     pub fn from_event_name(name: &str) -> Option<Self> {
         match name.trim() {
-            "Stop" | "SubagentStop" | "stop" => Some(Self::Stop),
+            "Stop" | "SubagentStop" | "stop" | "SessionEnd" | "session_end" => Some(Self::Stop),
+            "SessionStart" | "session_start" => Some(Self::SessionStart),
             "UserPromptSubmit" | "user_prompt_submit" => Some(Self::UserPromptSubmit),
             "PermissionRequest" | "Notification" | "permission_request" => {
                 Some(Self::PermissionRequest)
@@ -62,8 +81,12 @@ pub struct HookEvent {
     /// Panel que originó el evento, si el hook lo reportó (`TC_PANEL_ID`).
     pub panel_id: Option<Uuid>,
     pub workspace_id: Option<Uuid>,
+    /// Hoja de split que originó el evento (`TC_LEAF_ID`).
+    pub leaf_id: Option<Uuid>,
     /// Id de sesión del agente, para el resume exacto.
     pub session_id: Option<String>,
+    /// Cwd que reportó el hook, si vino en el payload.
+    pub cwd: Option<std::path::PathBuf>,
 }
 
 /// Params de query que mandan los hooks (vienen de las env vars del spawn).
@@ -71,6 +94,7 @@ pub struct HookEvent {
 pub struct HookQuery {
     pub panel: Option<String>,
     pub workspace: Option<String>,
+    pub leaf: Option<String>,
 }
 
 /// Construye el evento desde el payload crudo del provider. Puro y testeable:
@@ -90,6 +114,11 @@ pub fn parse_hook_payload(
         .and_then(|value| value.as_str())
         .map(str::to_owned)
         .filter(|id| !id.trim().is_empty());
+    let cwd = body
+        .get("cwd")
+        .and_then(|value| value.as_str())
+        .filter(|cwd| !cwd.trim().is_empty())
+        .map(std::path::PathBuf::from);
     Some(HookEvent {
         provider: provider.to_owned(),
         kind,
@@ -101,7 +130,12 @@ pub fn parse_hook_payload(
             .workspace
             .as_deref()
             .and_then(|id| Uuid::parse_str(id).ok()),
+        leaf_id: query
+            .leaf
+            .as_deref()
+            .and_then(|id| Uuid::parse_str(id).ok()),
         session_id,
+        cwd,
     })
 }
 
@@ -130,6 +164,51 @@ pub fn hooks_dir() -> Option<PathBuf> {
 /// Contenido del endpoint file que sourcean los hooks.
 pub fn endpoint_script(url: &str, token: &str) -> String {
     format!("export TC_HOOK_URL={url}\nexport TC_HOOK_TOKEN={token}\n")
+}
+
+/// El endpoint contiene una credencial de control local. Se escribe de forma
+/// atómica y privada para que no quede ni parcialmente escrito ni world-readable.
+fn write_private_endpoint_file(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    let Some(parent) = path.parent() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "endpoint sin directorio padre",
+        ));
+    };
+    std::fs::create_dir_all(parent)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+    }
+
+    let tmp = path.with_file_name(format!(".endpoint-{}.tmp", Uuid::new_v4().simple()));
+    let result = (|| {
+        let mut options = std::fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&tmp)?;
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(tmp);
+    }
+    result
 }
 
 /// Captura de un elemento del navegador mandada por la extensión (P3.18).
@@ -195,10 +274,13 @@ pub fn write_screenshot(base64_png: &str, dir: &std::path::Path) -> Option<std::
         .split_once("base64,")
         .map(|(_, rest)| rest)
         .unwrap_or(base64_png);
+    if payload.len() > MAX_SCREENSHOT_BASE64_BYTES {
+        return None;
+    }
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(payload.trim())
         .ok()?;
-    if bytes.is_empty() {
+    if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
         return None;
     }
     std::fs::create_dir_all(dir).ok()?;
@@ -260,8 +342,8 @@ pub fn format_design_capture(capture: &DesignCapture) -> String {
 #[derive(Clone)]
 struct HookState {
     token: String,
-    sender: Arc<Mutex<Sender<HookEvent>>>,
-    design_sender: Arc<Mutex<Sender<DesignCapture>>>,
+    sender: Arc<Mutex<SyncSender<HookEvent>>>,
+    design_sender: Arc<Mutex<SyncSender<DesignCapture>>>,
     design_dir: std::path::PathBuf,
 }
 
@@ -271,24 +353,74 @@ async fn hook_handler(
     Query(query): Query<HookQuery>,
     headers: HeaderMap,
     body: String,
-) -> StatusCode {
+) -> Response {
     let provided = headers
         .get(TOKEN_HEADER)
         .and_then(|value| value.to_str().ok());
     if !token_matches(&state.token, provided) {
-        return StatusCode::UNAUTHORIZED;
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "ok": false, "error": "unauthorized" })),
+        )
+            .into_response();
     }
     let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) else {
-        return StatusCode::BAD_REQUEST;
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "ok": false, "error": "bad json" })),
+        )
+            .into_response();
     };
     let Some(event) = parse_hook_payload(&provider, &json, &query) else {
         // Evento que no nos interesa: 204, no es un error del hook.
-        return StatusCode::NO_CONTENT;
+        return StatusCode::NO_CONTENT.into_response();
+    };
+    let event_name = json
+        .get("hook_event_name")
+        .and_then(|value| value.as_str())
+        .or_else(|| json.get("event").and_then(|value| value.as_str()))
+        .unwrap_or("unknown");
+    let boundary = crate::memory::PromptBoundary::from_event_name(event_name);
+    // SessionEnd.reason vale clear/logout/etc.; no describe el trabajo hecho
+    // y no puede convertirse en el handoff más reciente.
+    let summary = matches!(boundary, crate::memory::PromptBoundary::Stop)
+        .then(|| {
+            json.get("summary")
+                .or_else(|| json.get("last_assistant_message"))
+                .and_then(|value| value.as_str())
+        })
+        .flatten();
+    // PermissionRequest/PreToolUse sólo alimentan el estado visual. No abrir
+    // SQLite ni ejecutar detección git en cada tool call si no hay trabajo de
+    // memoria en esa frontera.
+    let output = if boundary.injects_context() || boundary.records_handoff() {
+        let store = crate::memory::process_store();
+        crate::memory::respond_to_hook_scoped(
+            store.as_ref(),
+            boundary,
+            event_name,
+            event.cwd.as_deref(),
+            summary,
+            None,
+            event.workspace_id,
+        )
+    } else {
+        None
     };
     if let Ok(sender) = state.sender.lock() {
-        let _ = sender.send(event);
+        if let Err(err) = sender.try_send(event) {
+            match err {
+                TrySendError::Full(_) => log::warn!("cola de hooks llena; se descartó un evento"),
+                TrySendError::Disconnected(_) => {
+                    log::warn!("la UI dejó de consumir eventos de hooks")
+                }
+            }
+        }
     }
-    StatusCode::OK
+    match output {
+        Some(body) => (StatusCode::OK, Json(body)).into_response(),
+        None => StatusCode::NO_CONTENT.into_response(),
+    }
 }
 
 async fn design_handler(
@@ -311,9 +443,26 @@ async fn design_handler(
         .and_then(|encoded| write_screenshot(encoded, &state.design_dir));
     let capture = build_design_capture(payload, screenshot);
     if let Ok(sender) = state.design_sender.lock() {
-        let _ = sender.send(capture);
+        return match sender.try_send(capture) {
+            Ok(()) => StatusCode::OK,
+            Err(TrySendError::Full(capture)) => {
+                discard_capture_file(&capture);
+                StatusCode::TOO_MANY_REQUESTS
+            }
+            Err(TrySendError::Disconnected(capture)) => {
+                discard_capture_file(&capture);
+                StatusCode::SERVICE_UNAVAILABLE
+            }
+        };
     }
-    StatusCode::OK
+    discard_capture_file(&capture);
+    StatusCode::SERVICE_UNAVAILABLE
+}
+
+fn discard_capture_file(capture: &DesignCapture) {
+    if let Some(path) = capture.screenshot_path.as_ref() {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 /// Servidor de hooks vivo. Al dropearse, el hilo queda cerrado por el cierre
@@ -336,8 +485,10 @@ impl HookServer {
         let url = format!("http://127.0.0.1:{port}");
         let token = Uuid::new_v4().simple().to_string();
 
-        let (sender, receiver) = std::sync::mpsc::channel::<HookEvent>();
-        let (design_sender, design_receiver) = std::sync::mpsc::channel::<DesignCapture>();
+        let (sender, receiver) =
+            std::sync::mpsc::sync_channel::<HookEvent>(HOOK_EVENT_QUEUE_CAPACITY);
+        let (design_sender, design_receiver) =
+            std::sync::mpsc::sync_channel::<DesignCapture>(DESIGN_CAPTURE_QUEUE_CAPACITY);
         let design_dir = hooks_dir()
             .map(|dir| dir.join("captures"))
             .unwrap_or_else(std::env::temp_dir);
@@ -350,6 +501,7 @@ impl HookServer {
         let router = Router::new()
             .route("/hook/:provider", post(hook_handler))
             .route("/design/capture", post(design_handler))
+            .layer(DefaultBodyLimit::max(MAX_HOOK_BODY_BYTES))
             .with_state(state);
 
         // Nada de unwrap acá: un fallo del server de hooks no puede tirar la app.
@@ -390,12 +542,10 @@ impl HookServer {
         let Some(dir) = hooks_dir() else {
             return;
         };
-        if let Err(err) = std::fs::create_dir_all(&dir) {
-            log::warn!("no se pudo crear el dir de hooks: {err}");
-            return;
-        }
         let path = dir.join("endpoint.sh");
-        if let Err(err) = std::fs::write(&path, endpoint_script(&self.url, &self.token)) {
+        if let Err(err) =
+            write_private_endpoint_file(&path, &endpoint_script(&self.url, &self.token))
+        {
             log::warn!("no se pudo escribir el endpoint file de hooks: {err}");
         }
     }
@@ -430,7 +580,8 @@ impl HookServer {
 #[cfg(test)]
 mod tests {
     use super::{
-        endpoint_script, parse_hook_payload, token_matches, HookKind, HookQuery, HookServer,
+        endpoint_script, parse_hook_payload, token_matches, write_private_endpoint_file, HookKind,
+        HookQuery, HookServer,
     };
     use uuid::Uuid;
 
@@ -438,12 +589,17 @@ mod tests {
         HookQuery {
             panel: panel.map(str::to_owned),
             workspace: None,
+            leaf: None,
         }
     }
 
     #[test]
     fn event_names_map_to_normalized_kinds() {
         assert_eq!(HookKind::from_event_name("Stop"), Some(HookKind::Stop));
+        assert_eq!(
+            HookKind::from_event_name("SessionStart"),
+            Some(HookKind::SessionStart)
+        );
         assert_eq!(
             HookKind::from_event_name("SubagentStop"),
             Some(HookKind::Stop)
@@ -466,16 +622,41 @@ mod tests {
     #[test]
     fn payload_extracts_kind_session_and_panel() {
         let panel = Uuid::new_v4();
+        let leaf = Uuid::new_v4();
         let body = serde_json::json!({
             "hook_event_name": "Stop",
             "session_id": "abc-123",
         });
-        let event = parse_hook_payload("claude", &body, &query(Some(&panel.to_string())))
-            .expect("evento válido");
+        let event = parse_hook_payload(
+            "claude",
+            &body,
+            &HookQuery {
+                panel: Some(panel.to_string()),
+                workspace: None,
+                leaf: Some(leaf.to_string()),
+            },
+        )
+        .expect("evento válido");
         assert_eq!(event.kind, HookKind::Stop);
         assert_eq!(event.session_id.as_deref(), Some("abc-123"));
         assert_eq!(event.panel_id, Some(panel));
+        assert_eq!(event.leaf_id, Some(leaf));
         assert_eq!(event.provider, "claude");
+        assert_eq!(event.cwd, None);
+    }
+
+    #[test]
+    fn payload_extracts_cwd_when_present() {
+        let body = serde_json::json!({
+            "hook_event_name": "SessionStart",
+            "cwd": "/tmp/project",
+        });
+        let event = parse_hook_payload("claude", &body, &query(None)).expect("evento");
+        assert_eq!(event.kind, HookKind::SessionStart);
+        assert_eq!(
+            event.cwd.as_deref(),
+            Some(std::path::Path::new("/tmp/project"))
+        );
     }
 
     #[test]
@@ -518,6 +699,31 @@ mod tests {
         let script = endpoint_script("http://127.0.0.1:9999", "tok");
         assert!(script.contains("export TC_HOOK_URL=http://127.0.0.1:9999"));
         assert!(script.contains("export TC_HOOK_TOKEN=tok"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn endpoint_token_file_and_directory_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root =
+            std::env::temp_dir().join(format!("tc-hook-test-{}", Uuid::new_v4().as_simple()));
+        let path = root.join("hooks").join("endpoint.sh");
+        write_private_endpoint_file(&path, "export TC_HOOK_TOKEN=secret\n").unwrap();
+
+        let dir_mode = std::fs::metadata(path.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        let file_mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700);
+        assert_eq!(file_mode, 0o600);
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            "export TC_HOOK_TOKEN=secret\n"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -624,9 +830,14 @@ mod tests {
 
     #[test]
     fn a_broken_screenshot_does_not_kill_the_capture() {
+        use base64::Engine;
+
         let dir = std::env::temp_dir().join(format!("design-bad-{}", Uuid::new_v4()));
         assert_eq!(super::write_screenshot("no-es-base64!!!", &dir), None);
         assert_eq!(super::write_screenshot("", &dir), None);
+        let not_png = base64::engine::general_purpose::STANDARD.encode(b"plain text");
+        assert_eq!(super::write_screenshot(&not_png, &dir), None);
+        assert!(!dir.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

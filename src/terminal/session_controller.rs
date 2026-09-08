@@ -102,6 +102,15 @@ impl SessionController {
             .unwrap_or(false)
     }
 
+    pub fn was_hot_reattached(&self) -> bool {
+        self.with_pty(PtyHandle::was_hot_reattached)
+            .unwrap_or(false)
+    }
+
+    pub fn is_remote(&self) -> bool {
+        self.with_pty(PtyHandle::is_remote).unwrap_or(false)
+    }
+
     pub fn ensure_attached(&mut self) -> bool {
         let Some(manager) = &self.pty_manager else {
             return false;
@@ -139,7 +148,7 @@ impl SessionController {
         if defer_resize {
             return;
         }
-        if !self.is_attached() {
+        if !self.is_attached() || !self.is_alive() {
             let _ = self.ensure_attached();
             return;
         }
@@ -271,6 +280,8 @@ pub fn session_spec(
     startup_command: Option<String>,
     startup_input: Option<String>,
     panel_id: Option<Uuid>,
+    leaf_id: Option<Uuid>,
+    workspace_id: Option<Uuid>,
 ) -> SessionSpec {
     SessionSpec {
         title,
@@ -278,13 +289,18 @@ pub fn session_spec(
         startup_command,
         startup_input,
         panel_id,
-        workspace_id: None,
+        workspace_id,
+        leaf_id,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::attached_grid_resize_needed;
+    use std::path::PathBuf;
+
+    use uuid::Uuid;
+
+    use super::{attached_grid_resize_needed, session_spec};
 
     #[test]
     fn unchanged_attached_grid_does_not_need_resize() {
@@ -295,5 +311,26 @@ mod tests {
     fn changed_attached_grid_needs_resize() {
         assert!(attached_grid_resize_needed(120, 32, 121, 32));
         assert!(attached_grid_resize_needed(120, 32, 120, 33));
+    }
+
+    #[test]
+    fn split_session_spec_keeps_project_ownership_and_cwd() {
+        let panel_id = Uuid::new_v4();
+        let workspace_id = Uuid::new_v4();
+        let cwd = PathBuf::from("/tmp/project");
+
+        let spec = session_spec(
+            "Terminal".to_owned(),
+            Some(cwd.clone()),
+            None,
+            None,
+            Some(panel_id),
+            Some(Uuid::new_v4()),
+            Some(workspace_id),
+        );
+
+        assert_eq!(spec.cwd, Some(cwd));
+        assert_eq!(spec.panel_id, Some(panel_id));
+        assert_eq!(spec.workspace_id, Some(workspace_id));
     }
 }

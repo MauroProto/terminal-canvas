@@ -33,8 +33,9 @@ const MAX_VISIBLE_ENTRIES: usize = 2_000;
 /// Tope de entradas leídas por directorio.
 const MAX_ENTRIES_PER_DIR: usize = 1_000;
 
-const ROW_HEIGHT: f32 = 20.0;
+const ROW_HEIGHT: f32 = 24.0;
 const INDENT: f32 = 12.0;
+const CONTENT_PAD_X: f32 = 12.0;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileTreeEntry {
@@ -54,6 +55,14 @@ pub struct FileTreeState {
     expanded: HashSet<PathBuf>,
     visible: Vec<FileTreeEntry>,
     dirty: bool,
+    revision: u64,
+    in_flight: Option<FileTreeLoad>,
+}
+
+#[derive(Debug)]
+struct FileTreeLoad {
+    revision: u64,
+    receiver: std::sync::mpsc::Receiver<Vec<FileTreeEntry>>,
 }
 
 impl FileTreeState {
@@ -66,7 +75,7 @@ impl FileTreeState {
         self.root = root;
         self.expanded.clear();
         self.visible.clear();
-        self.dirty = true;
+        self.mark_dirty();
     }
 
     pub fn root(&self) -> Option<&Path> {
@@ -76,6 +85,7 @@ impl FileTreeState {
     /// Fuerza releer el disco en el próximo frame (para el botón de refresh).
     pub fn mark_dirty(&mut self) {
         self.dirty = true;
+        self.revision = self.revision.wrapping_add(1);
     }
 
     fn toggle(&mut self, rel_path: &Path) {
@@ -84,18 +94,54 @@ impl FileTreeState {
         } else {
             self.expanded.insert(rel_path.to_path_buf());
         }
-        self.dirty = true;
+        self.mark_dirty();
     }
 
-    fn rebuild_if_needed(&mut self) {
-        if !self.dirty {
+    fn rebuild_if_needed(&mut self, ctx: &egui::Context) {
+        let completed = self
+            .in_flight
+            .as_ref()
+            .map(|job| (job.revision, job.receiver.try_recv()));
+        match completed {
+            Some((revision, Ok(visible))) => {
+                self.in_flight = None;
+                if revision == self.revision {
+                    self.visible = visible;
+                }
+            }
+            Some((_, Err(std::sync::mpsc::TryRecvError::Disconnected))) => {
+                self.in_flight = None;
+            }
+            Some((_, Err(std::sync::mpsc::TryRecvError::Empty))) | None => {}
+        }
+
+        if !self.dirty || self.in_flight.is_some() {
+            if self.in_flight.is_some() {
+                ctx.request_repaint_after(std::time::Duration::from_millis(50));
+            }
             return;
         }
         self.dirty = false;
-        self.visible = match self.root.as_deref() {
-            Some(root) => flatten_tree(root, &self.expanded),
-            None => Vec::new(),
+        let Some(root) = self.root.clone() else {
+            self.visible.clear();
+            return;
         };
+        let expanded = self.expanded.clone();
+        let revision = self.revision;
+        let repaint = ctx.clone();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let spawned = std::thread::Builder::new()
+            .name("sidebar-file-tree".to_owned())
+            .spawn(move || {
+                let visible = flatten_tree(&root, &expanded);
+                let _ = sender.send(visible);
+                repaint.request_repaint();
+            })
+            .is_ok();
+        if spawned {
+            self.in_flight = Some(FileTreeLoad { revision, receiver });
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
     }
 }
 
@@ -179,40 +225,73 @@ pub fn draw_file_tree(ui: &mut Ui, state: &mut FileTreeState) -> Vec<SidebarResp
     let mut responses = Vec::new();
 
     let Some(root) = state.root.clone() else {
-        ui.add_space(8.0);
-        ui.label(
-            egui::RichText::new("Abrí una carpeta para ver sus archivos")
-                .size(11.0)
-                .color(TEXT_MUTED),
-        );
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            ui.add_space(CONTENT_PAD_X);
+            ui.label(
+                egui::RichText::new("Abrí una carpeta para ver sus archivos")
+                    .size(11.5)
+                    .color(TEXT_MUTED),
+            );
+        });
         return responses;
     };
 
-    state.rebuild_if_needed();
+    state.rebuild_if_needed(ui.ctx());
 
     // Encabezado con el nombre de la carpeta y un refresh.
     let header = root
         .file_name()
         .map(|name| name.to_string_lossy().to_string())
         .unwrap_or_else(|| root.display().to_string());
-    ui.horizontal(|ui| {
-        ui.label(egui::RichText::new(header).size(11.0).color(TEXT_SECONDARY));
-        if ui
-            .small_button("↻")
-            .on_hover_text("Releer del disco")
-            .clicked()
-        {
-            state.mark_dirty();
-        }
-    });
-    ui.add_space(2.0);
+    let refresh_width = 62.0;
+    let (header_rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width().max(60.0), 28.0),
+        Sense::hover(),
+    );
+    let refresh_rect = egui::Rect::from_min_size(
+        egui::pos2(
+            header_rect.right() - CONTENT_PAD_X - refresh_width,
+            header_rect.top(),
+        ),
+        egui::vec2(refresh_width, 28.0),
+    );
+    let label_rect = egui::Rect::from_min_max(
+        egui::pos2(header_rect.left() + CONTENT_PAD_X, header_rect.top()),
+        egui::pos2(refresh_rect.left() - 8.0, header_rect.bottom()),
+    );
+    ui.put(
+        label_rect,
+        egui::Label::new(
+            egui::RichText::new(header)
+                .size(12.0)
+                .color(TEXT_PRIMARY)
+                .strong(),
+        )
+        .truncate(),
+    );
+    if ui
+        .put(
+            refresh_rect,
+            egui::Button::new(egui::RichText::new("Refresh").size(11.0)),
+        )
+        .on_hover_text("Releer del disco")
+        .clicked()
+    {
+        state.mark_dirty();
+    }
+    ui.add_space(4.0);
 
     if state.visible.is_empty() {
-        ui.label(
-            egui::RichText::new("(carpeta vacía)")
-                .size(11.0)
-                .color(TEXT_MUTED),
-        );
+        let label = if state.in_flight.is_some() {
+            "(leyendo carpeta…)"
+        } else {
+            "(carpeta vacía)"
+        };
+        ui.horizontal(|ui| {
+            ui.add_space(CONTENT_PAD_X);
+            ui.label(egui::RichText::new(label).size(11.5).color(TEXT_MUTED));
+        });
         return responses;
     }
 
@@ -221,18 +300,28 @@ pub fn draw_file_tree(ui: &mut Ui, state: &mut FileTreeState) -> Vec<SidebarResp
     for entry in &state.visible {
         let (rect, response) =
             ui.allocate_exact_size(egui::vec2(width.max(60.0), ROW_HEIGHT), Sense::click());
+        response.widget_info(|| {
+            let action = if entry.is_dir {
+                "Abrir carpeta"
+            } else {
+                "Abrir archivo"
+            };
+            egui::WidgetInfo::labeled(
+                egui::WidgetType::Button,
+                ui.is_enabled(),
+                format!("{action} {}", entry.name),
+            )
+        });
         if response.hovered() {
             ui.painter()
                 .rect_filled(rect.shrink2(egui::vec2(2.0, 1.0)), 4.0, RAISED);
         }
-        let color = if response.hovered() {
+        let color = if response.hovered() || entry.is_dir {
             TEXT_PRIMARY
-        } else if entry.is_dir {
-            TEXT_SECONDARY
         } else {
-            TEXT_MUTED
+            TEXT_SECONDARY
         };
-        let x = rect.left() + 8.0 + entry.depth as f32 * INDENT;
+        let x = rect.left() + CONTENT_PAD_X + entry.depth as f32 * INDENT;
         let marker = if entry.is_dir {
             if state.expanded.contains(&entry.rel_path) {
                 "▾"
@@ -246,14 +335,14 @@ pub fn draw_file_tree(ui: &mut Ui, state: &mut FileTreeState) -> Vec<SidebarResp
             egui::pos2(x, rect.center().y),
             Align2::LEFT_CENTER,
             marker,
-            FontId::proportional(9.0),
+            FontId::proportional(10.0),
             color,
         );
         ui.painter().text(
             egui::pos2(x + 12.0, rect.center().y),
             Align2::LEFT_CENTER,
             &entry.name,
-            FontId::proportional(11.0),
+            FontId::proportional(12.0),
             color,
         );
         if response.clicked() {

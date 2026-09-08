@@ -47,6 +47,20 @@ jobs:
       - name: Run test suite
         run: cargo test --all-targets --locked --quiet
 
+      # El daemon usa Unix sockets. Ubuntu y macOS validan el artefacto que se
+      # distribuye; Windows conserva la cobertura del fallback in-process.
+      - name: Check daemon feature (Unix)
+        if: runner.os != 'Windows'
+        run: cargo check --all-targets --locked --features daemon
+
+      - name: Clippy daemon feature (Unix)
+        if: runner.os != 'Windows'
+        run: cargo clippy --all-targets --locked --features daemon -- -D warnings
+
+      - name: Run daemon feature test suite (Unix)
+        if: runner.os != 'Windows'
+        run: cargo test --all-targets --locked --features daemon --quiet
+
   bench:
     # Presupuesto de performance (Ship-it 7.3): compara las rutas calientes
     # contra el commit anterior y falla si algo se degrada más de 15%.

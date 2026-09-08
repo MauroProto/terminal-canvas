@@ -70,6 +70,7 @@ impl RuntimeHarness {
                     startup_input: None,
                     panel_id: None,
                     workspace_id: None,
+                    leaf_id: None,
                 },
             );
 
@@ -138,6 +139,7 @@ impl RuntimeHarness {
                     startup_input: None,
                     panel_id: None,
                     workspace_id: None,
+                    leaf_id: None,
                 },
             );
 

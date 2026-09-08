@@ -1,3 +1,5 @@
 /target
 config/
 dist/
+.playwright-cli/
+.cursor/hooks/state/

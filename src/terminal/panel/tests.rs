@@ -156,10 +156,10 @@ fn zoomed_out_panel_roundings_fit_visible_header_and_body() {
 
     let roundings = panel_roundings(screen_rect, title_rect, body_rect);
 
-    assert!(roundings.panel.nw <= title_rect.height() * 0.5);
-    assert!(roundings.panel.ne <= title_rect.height() * 0.5);
-    assert!(roundings.panel.sw <= body_rect.height() * 0.5);
-    assert!(roundings.panel.se <= body_rect.height() * 0.5);
+    assert!(f32::from(roundings.panel.nw) <= title_rect.height() * 0.5);
+    assert!(f32::from(roundings.panel.ne) <= title_rect.height() * 0.5);
+    assert!(f32::from(roundings.panel.sw) <= body_rect.height() * 0.5);
+    assert!(f32::from(roundings.panel.se) <= body_rect.height() * 0.5);
     assert_eq!(roundings.title.nw, roundings.panel.nw);
     assert_eq!(roundings.body.sw, roundings.panel.sw);
 }

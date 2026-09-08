@@ -13,9 +13,9 @@ pub(super) enum PanelLod {
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct PanelRoundings {
-    pub(super) panel: Rounding,
-    pub(super) title: Rounding,
-    pub(super) body: Rounding,
+    pub(super) panel: CornerRadius,
+    pub(super) title: CornerRadius,
+    pub(super) body: CornerRadius,
 }
 
 impl ResizeHandle {
@@ -248,28 +248,30 @@ pub(super) fn panel_roundings(
     let top_radius = base_radius
         .min(title_rect.width() * 0.5)
         .min(title_rect.height() * 0.5)
-        .max(0.0);
+        .max(0.0)
+        .floor() as u8;
     let bottom_radius = base_radius
         .min(body_rect.width() * 0.5)
         .min(body_rect.height() * 0.5)
-        .max(0.0);
+        .max(0.0)
+        .floor() as u8;
 
     PanelRoundings {
-        panel: Rounding {
+        panel: CornerRadius {
             nw: top_radius,
             ne: top_radius,
             sw: bottom_radius,
             se: bottom_radius,
         },
-        title: Rounding {
+        title: CornerRadius {
             nw: top_radius,
             ne: top_radius,
-            sw: 0.0,
-            se: 0.0,
+            sw: 0,
+            se: 0,
         },
-        body: Rounding {
-            nw: 0.0,
-            ne: 0.0,
+        body: CornerRadius {
+            nw: 0,
+            ne: 0,
             sw: bottom_radius,
             se: bottom_radius,
         },
@@ -277,12 +279,14 @@ pub(super) fn panel_roundings(
 }
 
 pub(super) fn max_panel_corner_radius(roundings: PanelRoundings) -> f32 {
-    roundings
-        .panel
-        .nw
-        .max(roundings.panel.ne)
-        .max(roundings.panel.sw)
-        .max(roundings.panel.se)
+    f32::from(
+        roundings
+            .panel
+            .nw
+            .max(roundings.panel.ne)
+            .max(roundings.panel.sw)
+            .max(roundings.panel.se),
+    )
 }
 
 pub(super) fn panel_lod(screen_rect: Rect, title_rect: Rect) -> PanelLod {

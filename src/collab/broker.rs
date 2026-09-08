@@ -26,11 +26,11 @@ use uuid::Uuid;
 
 use super::auth::{constant_time_str_eq, verify_passphrase};
 use super::models::{
-    GuestConnectionState, GuestId, GuestPresence, JoinDecision, JoinRequest, SessionRole,
-    ShareSessionId, TrustedDevice,
+    GuestConnectionState, GuestId, GuestPresence, JoinDecision, JoinRequest, ParticipantId,
+    SessionRole, ShareSessionId, TrustedDevice,
 };
 use super::protocol::{
-    BrokerControlMessage, CreateShareSessionRequest, CreateShareSessionResponse,
+    BrokerControlMessage, CollabEnvelope, CreateShareSessionRequest, CreateShareSessionResponse,
     EndShareSessionRequest, JoinDecisionRequest, JoinShareSessionRequest, JoinShareSessionResponse,
     RotateInviteRequest,
 };
@@ -46,10 +46,10 @@ const JOIN_BACKOFF_MAX_SECS: u64 = 30;
 // resources forever.
 const CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(75);
 const MAX_WS_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
-// Bounds per-connection memory: a consumer that stops reading gets its
-// oldest-undelivered messages dropped instead of growing the queue without
-// limit. The protocol is snapshot-based, so a later snapshot supersedes any
-// dropped one.
+// Bounds per-connection memory: a consumer that stops reading sheds new relay
+// frames instead of growing without limit. Hosts republish a full snapshot on
+// a heartbeat, so snapshot loss is recoverable without making this queue
+// unbounded.
 const OUTBOUND_QUEUE_CAPACITY: usize = 512;
 
 /// Diferencias de política entre el broker embebido y el standalone.
@@ -81,8 +81,6 @@ struct Sessions {
 }
 
 struct SessionRecord {
-    #[allow(dead_code)]
-    session_secret: String,
     invite_secret: String,
     invite_expires_at: Option<chrono::DateTime<chrono::Utc>>,
     passphrase_hash: Option<String>,
@@ -170,7 +168,6 @@ async fn create_share_session(
     let session_id = ShareSessionId(Uuid::new_v4());
     let host_token = random_token();
     let session = SessionRecord {
-        session_secret: body.session_secret,
         invite_secret: body.invite_secret,
         invite_expires_at: body.invite_expires_at,
         passphrase_hash: body.passphrase_hash,
@@ -577,10 +574,28 @@ async fn handle_socket(
         mark_connection_activity(&state, session_id, auth, connection_id).await;
         match message {
             Message::Binary(payload) => {
+                if let Err(message) = validate_relay_envelope(session_id, auth, &payload) {
+                    send_json(
+                        &tx,
+                        &BrokerControlMessage::Error {
+                            message: message.to_owned(),
+                        },
+                    );
+                    break;
+                }
                 relay_payload(&state, session_id, auth, Message::Binary(payload)).await;
             }
-            Message::Text(payload) => {
-                relay_payload(&state, session_id, auth, Message::Text(payload)).await;
+            Message::Text(_) => {
+                // Text frames are reserved for broker-generated control
+                // messages. Relaying client text would let a participant forge
+                // `SessionEnded`, presence, or approval notifications.
+                send_json(
+                    &tx,
+                    &BrokerControlMessage::Error {
+                        message: "Client text frames are not allowed".to_owned(),
+                    },
+                );
+                break;
             }
             Message::Close(_) => break,
             Message::Ping(payload) => {
@@ -602,6 +617,29 @@ async fn handle_socket(
     {
         send_task.abort();
     }
+}
+
+fn validate_relay_envelope(
+    session_id: ShareSessionId,
+    auth: StreamAuth,
+    payload: &[u8],
+) -> Result<(), &'static str> {
+    let envelope: CollabEnvelope =
+        rmp_serde::from_slice(payload).map_err(|_| "Invalid collaboration envelope")?;
+    if envelope.session_id != session_id {
+        return Err("Envelope session does not match the authenticated stream");
+    }
+    let sender_matches = match (auth, envelope.sender_id) {
+        (StreamAuth::Host, ParticipantId::Host) => true,
+        (StreamAuth::Guest(authenticated), ParticipantId::Guest(claimed)) => {
+            authenticated == claimed
+        }
+        _ => false,
+    };
+    if !sender_matches {
+        return Err("Envelope sender does not match the authenticated stream");
+    }
+    Ok(())
 }
 
 async fn relay_payload(
@@ -937,7 +975,6 @@ mod tests {
             .header("content-type", "application/json")
             .body(Body::from(
                 serde_json::to_vec(&CreateShareSessionRequest {
-                    session_secret: "secret".to_owned(),
                     invite_secret: "invite-secret".to_owned(),
                     invite_expires_at: None,
                     passphrase_hash: None,
@@ -946,6 +983,56 @@ mod tests {
                 .expect("serialize create body"),
             ))
             .expect("create request")
+    }
+
+    fn relay_envelope(session_id: ShareSessionId, sender_id: ParticipantId) -> Vec<u8> {
+        rmp_serde::to_vec_named(&CollabEnvelope {
+            session_id,
+            sender_id,
+            message_seq: 1,
+            nonce: "nonce".to_owned(),
+            encrypted_payload: "payload".to_owned(),
+        })
+        .expect("serialize relay envelope")
+    }
+
+    #[test]
+    fn relay_binds_claimed_sender_to_the_authenticated_connection() {
+        let session_id = ShareSessionId(Uuid::new_v4());
+        let authenticated_guest = GuestId(Uuid::new_v4());
+        let other_guest = GuestId(Uuid::new_v4());
+
+        assert!(validate_relay_envelope(
+            session_id,
+            StreamAuth::Guest(authenticated_guest),
+            &relay_envelope(session_id, ParticipantId::Guest(authenticated_guest)),
+        )
+        .is_ok());
+        assert!(validate_relay_envelope(
+            session_id,
+            StreamAuth::Guest(authenticated_guest),
+            &relay_envelope(session_id, ParticipantId::Host),
+        )
+        .is_err());
+        assert!(validate_relay_envelope(
+            session_id,
+            StreamAuth::Guest(authenticated_guest),
+            &relay_envelope(session_id, ParticipantId::Guest(other_guest)),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn relay_rejects_an_envelope_for_another_session() {
+        let stream_session = ShareSessionId(Uuid::new_v4());
+        let envelope_session = ShareSessionId(Uuid::new_v4());
+
+        assert!(validate_relay_envelope(
+            stream_session,
+            StreamAuth::Host,
+            &relay_envelope(envelope_session, ParticipantId::Host),
+        )
+        .is_err());
     }
 
     async fn create_session(app: &Router) -> CreateShareSessionResponse {
@@ -1218,7 +1305,6 @@ mod tests {
         state.inner.lock().await.sessions.insert(
             session_id,
             SessionRecord {
-                session_secret: "secret".to_owned(),
                 invite_secret: "invite-secret".to_owned(),
                 invite_expires_at: None,
                 passphrase_hash: None,
@@ -1295,7 +1381,6 @@ mod tests {
         state.inner.lock().await.sessions.insert(
             session_id,
             SessionRecord {
-                session_secret: "secret".to_owned(),
                 invite_secret: "invite-secret".to_owned(),
                 invite_expires_at: None,
                 passphrase_hash: None,

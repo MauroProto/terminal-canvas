@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -8,7 +9,7 @@ use crate::collab::TrustedDevice;
 use crate::orchestration::OrchestrationState;
 use crate::state::panel_state::PanelState;
 
-const APP_STATE_SCHEMA_VERSION: u32 = 2;
+pub const APP_STATE_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AppState {
@@ -175,6 +176,122 @@ impl From<LegacyWorkspaceState> for WorkspaceState {
     }
 }
 
+/// Repara identidades persistidas antes de crear workspaces y sesiones.
+///
+/// Los UUID de panel son parte de la clave durable del scrollback y los UUID
+/// de runtime apuntan a PTYs vivos. Aceptar duplicados provenientes de un
+/// layout copiado o editado mezclaría proyectos o atachearía dos hojas a la
+/// misma sesión. Se conserva siempre la primera identidad válida; las
+/// posteriores reciben identidad nueva y pierden sólo el reattach ambiguo.
+pub fn normalize_saved_state(state: &mut AppState) {
+    if state.workspaces.is_empty() {
+        log::warn!("layout persistido sin workspaces; se creó uno vacío y seguro");
+        state.workspaces.push(WorkspaceState {
+            id: Uuid::new_v4().to_string(),
+            name: "Default".to_owned(),
+            cwd: None,
+            panels: Vec::new(),
+            desktop: WorkspaceDesktopState::default(),
+            legacy_canvas: LegacyCanvasState::default(),
+        });
+    }
+    state.active_ws = state.active_ws.min(state.workspaces.len() - 1);
+
+    let mut workspace_ids = HashSet::new();
+    let mut panel_ids = HashSet::new();
+    let mut runtime_ids = HashSet::new();
+
+    for workspace in &mut state.workspaces {
+        let workspace_id = parse_non_nil_uuid(&workspace.id);
+        let workspace_identity_reset = match workspace_id {
+            Some(id) if workspace_ids.insert(id) => false,
+            _ => {
+                let id = fresh_uuid(&mut workspace_ids);
+                log::warn!(
+                    "workspace persistido con identidad inválida o duplicada; se reasignó a {id}"
+                );
+                workspace.id = id.to_string();
+                true
+            }
+        };
+
+        for panel in &mut workspace.panels {
+            let panel_id = parse_non_nil_uuid(&panel.id);
+            let panel_identity_reset = match panel_id {
+                Some(id) if panel_ids.insert(id) => false,
+                _ => {
+                    let id = fresh_uuid(&mut panel_ids);
+                    log::warn!(
+                        "panel persistido con identidad inválida o duplicada; se reasignó a {id}"
+                    );
+                    panel.id = id.to_string();
+                    true
+                }
+            };
+
+            if workspace_identity_reset || panel_identity_reset {
+                panel.runtime_session_id = None;
+                panel.leaf_runtime_session_ids.clear();
+                continue;
+            }
+
+            let mut local_runtime_ids = HashSet::new();
+            let mut normalized = BTreeMap::new();
+            for (leaf, runtime) in std::mem::take(&mut panel.leaf_runtime_session_ids) {
+                let Some(leaf_id) = parse_non_nil_uuid(&leaf) else {
+                    log::warn!("se descartó una identidad de hoja inválida del layout");
+                    continue;
+                };
+                let Some(runtime_id) = parse_non_nil_uuid(&runtime) else {
+                    log::warn!("se descartó una identidad de runtime inválida del layout");
+                    continue;
+                };
+                if local_runtime_ids.contains(&runtime_id) || runtime_ids.contains(&runtime_id) {
+                    log::warn!("se descartó una identidad de runtime duplicada del layout");
+                    continue;
+                }
+                local_runtime_ids.insert(runtime_id);
+                runtime_ids.insert(runtime_id);
+                normalized.insert(leaf_id.to_string(), runtime_id.to_string());
+            }
+            panel.leaf_runtime_session_ids = normalized;
+
+            let Some(runtime_id) = panel
+                .runtime_session_id
+                .as_deref()
+                .and_then(parse_non_nil_uuid)
+            else {
+                panel.runtime_session_id = None;
+                continue;
+            };
+            // El campo legado de raíz puede (y debe) repetir el valor que ya
+            // está en el mapa del mismo panel. Cualquier otra repetición es
+            // ambigua entre paneles y se descarta.
+            if local_runtime_ids.contains(&runtime_id) || runtime_ids.insert(runtime_id) {
+                panel.runtime_session_id = Some(runtime_id.to_string());
+            } else {
+                log::warn!("se descartó el alias de un runtime duplicado del layout");
+                panel.runtime_session_id = None;
+            }
+        }
+    }
+
+    state.schema_version = APP_STATE_SCHEMA_VERSION;
+}
+
+fn parse_non_nil_uuid(value: &str) -> Option<Uuid> {
+    Uuid::parse_str(value).ok().filter(|id| !id.is_nil())
+}
+
+fn fresh_uuid(used: &mut HashSet<Uuid>) -> Uuid {
+    loop {
+        let id = Uuid::new_v4();
+        if used.insert(id) {
+            return id;
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AutosaveDecision {
     Idle,
@@ -186,6 +303,36 @@ pub enum AutosaveDecision {
 pub struct AutosaveController {
     interval: Duration,
     last_save_at: Instant,
+}
+
+/// Cadencia independiente para artefactos que cambian aunque el layout no lo
+/// haga (por ejemplo, el log incremental de scrollback).
+#[derive(Debug)]
+pub struct PeriodicFlushController {
+    interval: Duration,
+    last_flush_at: Instant,
+}
+
+impl PeriodicFlushController {
+    pub fn new(interval: Duration) -> Self {
+        Self {
+            interval,
+            last_flush_at: Instant::now(),
+        }
+    }
+
+    pub fn decision(&self, now: Instant) -> AutosaveDecision {
+        let elapsed = now.saturating_duration_since(self.last_flush_at);
+        if elapsed >= self.interval {
+            AutosaveDecision::SaveNow
+        } else {
+            AutosaveDecision::ScheduleAfter(self.interval - elapsed)
+        }
+    }
+
+    pub fn mark_flushed(&mut self, now: Instant) {
+        self.last_flush_at = now;
+    }
 }
 
 impl AutosaveController {
@@ -225,14 +372,68 @@ pub fn state_file_path() -> Option<PathBuf> {
 }
 
 pub fn load_state() -> Option<AppState> {
-    let path = state_file_path()?;
-    load_state_from_path(&path)
+    load_state_result().into_state()
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum StateLoadResult {
+    Loaded(AppState),
+    MissingOrUnreadable,
+    IncompatibleFuture { version: u32 },
+}
+
+impl StateLoadResult {
+    pub fn into_state(self) -> Option<AppState> {
+        match self {
+            Self::Loaded(state) => Some(state),
+            Self::MissingOrUnreadable | Self::IncompatibleFuture { .. } => None,
+        }
+    }
+}
+
+pub fn load_state_result() -> StateLoadResult {
+    let Some(path) = state_file_path() else {
+        return StateLoadResult::MissingOrUnreadable;
+    };
+    load_state_result_from_path(&path)
 }
 
 pub fn load_state_from_path(path: &Path) -> Option<AppState> {
+    load_state_result_from_path(path).into_state()
+}
+
+pub fn load_state_result_from_path(path: &Path) -> StateLoadResult {
     // Si el principal está corrupto (crash a mitad de escritura), se prueba el
-    // ring de backups slot por slot hasta encontrar uno que parsee.
-    crate::state::durable_write::load_first_valid(path, parse_state_bytes)
+    // ring en orden. Un schema futuro no es corrupción: si aparece antes que
+    // un snapshot compatible, se bloquea el downgrade y toda escritura de la
+    // app durante esta ejecución.
+    let candidates = std::iter::once(path.to_path_buf()).chain(
+        (0..crate::state::durable_write::BACKUP_SLOTS)
+            .map(|slot| crate::state::durable_write::backup_path(path, slot)),
+    );
+    for candidate in candidates {
+        let Ok(bytes) = std::fs::read(candidate) else {
+            continue;
+        };
+        if let Some(version) =
+            serialized_schema_version(&bytes).filter(|version| *version > APP_STATE_SCHEMA_VERSION)
+        {
+            log::warn!("layout creado por una versión más nueva; no se modificará");
+            return StateLoadResult::IncompatibleFuture { version };
+        }
+        if let Some(state) = parse_state_bytes(&bytes) {
+            return StateLoadResult::Loaded(state);
+        }
+    }
+    StateLoadResult::MissingOrUnreadable
+}
+
+fn serialized_schema_version(bytes: &[u8]) -> Option<u32> {
+    serde_json::from_slice::<serde_json::Value>(bytes)
+        .ok()?
+        .get("schema_version")?
+        .as_u64()
+        .and_then(|version| u32::try_from(version).ok())
 }
 
 pub fn save_state(state: &AppState) {
@@ -242,6 +443,9 @@ pub fn save_state(state: &AppState) {
 }
 
 pub fn try_save_state(state: &AppState) -> anyhow::Result<()> {
+    if !crate::state::run_marker::current_process_may_write() {
+        anyhow::bail!("otra instancia de TerminalCanvas posee la lease de persistencia");
+    }
     let Some(path) = state_file_path() else {
         anyhow::bail!("Could not determine state file path");
     };
@@ -266,17 +470,29 @@ fn parse_state_bytes(bytes: &[u8]) -> Option<AppState> {
         .map(|object| object.contains_key("schema_version"))
         .unwrap_or(false);
 
-    if has_schema_version {
-        serde_json::from_value(json).ok()
+    let mut state = if has_schema_version {
+        let state: AppState = serde_json::from_value(json).ok()?;
+        if state.schema_version > APP_STATE_SCHEMA_VERSION {
+            log::warn!(
+                "layout schema {} is newer than supported schema {}",
+                state.schema_version,
+                APP_STATE_SCHEMA_VERSION
+            );
+            return None;
+        }
+        state
     } else {
         serde_json::from_value::<LegacyAppState>(json)
             .ok()
-            .map(AppState::from)
-    }
+            .map(AppState::from)?
+    };
+    normalize_saved_state(&mut state);
+    Some(state)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::fs;
     use std::path::PathBuf;
     use std::time::Duration;
@@ -285,9 +501,10 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        load_state_from_path, save_state_to_path, AppState, AutosaveController, AutosaveDecision,
-        LegacyCanvasState, LegacyCanvasUiState, WorkspaceDesktopState, WorkspaceState,
-        APP_STATE_SCHEMA_VERSION,
+        load_state_from_path, load_state_result_from_path, normalize_saved_state,
+        save_state_to_path, AppState, AutosaveController, AutosaveDecision, LegacyCanvasState,
+        LegacyCanvasUiState, PeriodicFlushController, StateLoadResult, WorkspaceDesktopState,
+        WorkspaceState, APP_STATE_SCHEMA_VERSION,
     };
     use crate::collab::{PanelShareScope, TrustedDevice};
     use crate::orchestration::OrchestrationState;
@@ -319,6 +536,22 @@ mod tests {
         let decision = controller.should_persist(&state, None, now + Duration::from_secs(2));
 
         assert_eq!(decision, AutosaveDecision::SaveNow);
+    }
+
+    #[test]
+    fn periodic_flush_is_due_without_a_layout_snapshot() {
+        let mut controller = PeriodicFlushController::new(Duration::from_secs(2));
+        let now = std::time::Instant::now();
+        controller.mark_flushed(now);
+
+        assert_eq!(
+            controller.decision(now + Duration::from_secs(1)),
+            AutosaveDecision::ScheduleAfter(Duration::from_secs(1))
+        );
+        assert_eq!(
+            controller.decision(now + Duration::from_secs(2)),
+            AutosaveDecision::SaveNow
+        );
     }
 
     #[test]
@@ -357,6 +590,138 @@ mod tests {
         assert!(!crate::state::durable_write::tmp_path(&path).exists());
     }
 
+    #[test]
+    fn normalization_prevents_cross_project_identity_collisions() {
+        let mut state = sample_state("identity-isolation");
+        let first_workspace = state.workspaces[0].clone();
+        let first_panel_id = first_workspace.panels[0].id.clone();
+        let leaf_id = Uuid::new_v4();
+        let runtime_id = Uuid::new_v4();
+        state.workspaces[0].panels[0].root_leaf = Some(leaf_id.to_string());
+        state.workspaces[0].panels[0].runtime_session_id = Some(runtime_id.to_string());
+        state.workspaces[0].panels[0]
+            .leaf_runtime_session_ids
+            .insert(leaf_id.to_string(), runtime_id.to_string());
+
+        // Proyecto distinto, panel distinto, pero runtime copiado: no puede
+        // atachear la misma PTY que el primero.
+        let mut duplicate_runtime_workspace = state.workspaces[0].clone();
+        duplicate_runtime_workspace.id = Uuid::new_v4().to_string();
+        duplicate_runtime_workspace.panels[0].id = Uuid::new_v4().to_string();
+
+        // Layout clonado literalmente: workspace y panel deben recibir UUIDs
+        // nuevos y abandonar cualquier reattach ambiguo.
+        let duplicated_workspace = state.workspaces[0].clone();
+        state.workspaces.push(duplicate_runtime_workspace);
+        state.workspaces.push(duplicated_workspace);
+
+        normalize_saved_state(&mut state);
+
+        let workspace_ids: HashSet<_> = state
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.id.clone())
+            .collect();
+        let panel_ids: HashSet<_> = state
+            .workspaces
+            .iter()
+            .flat_map(|workspace| workspace.panels.iter().map(|panel| panel.id.clone()))
+            .collect();
+        assert_eq!(workspace_ids.len(), 3);
+        assert_eq!(panel_ids.len(), 3);
+        assert_eq!(state.workspaces[0].panels[0].id, first_panel_id);
+        assert_eq!(
+            state.workspaces[0].panels[0].runtime_session_id,
+            Some(runtime_id.to_string())
+        );
+        assert!(state.workspaces[1].panels[0]
+            .leaf_runtime_session_ids
+            .is_empty());
+        assert!(state.workspaces[1].panels[0].runtime_session_id.is_none());
+        assert!(state.workspaces[2].panels[0]
+            .leaf_runtime_session_ids
+            .is_empty());
+        assert!(state.workspaces[2].panels[0].runtime_session_id.is_none());
+        assert_eq!(state.schema_version, APP_STATE_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn normalization_repairs_an_empty_workspace_list_and_active_index() {
+        let mut state = sample_state("empty-layout");
+        state.workspaces.clear();
+        state.active_ws = usize::MAX;
+
+        normalize_saved_state(&mut state);
+
+        assert_eq!(state.workspaces.len(), 1);
+        assert_eq!(state.active_ws, 0);
+        assert_eq!(state.workspaces[0].name, "Default");
+        assert!(state.workspaces[0].cwd.is_none());
+        assert!(state.workspaces[0].panels.is_empty());
+        assert!(Uuid::parse_str(&state.workspaces[0].id).is_ok_and(|id| !id.is_nil()));
+    }
+
+    #[test]
+    fn normalization_clamps_an_out_of_range_active_workspace() {
+        let mut state = sample_state("bad-active-index");
+        state.active_ws = usize::MAX;
+
+        normalize_saved_state(&mut state);
+
+        assert_eq!(state.active_ws, 0);
+    }
+
+    #[test]
+    fn future_schema_is_rejected_instead_of_being_overwritten() {
+        let dir = unique_temp_dir();
+        let path = dir.join("layout.json");
+        let older = sample_state("older-backup");
+        save_state_to_path(&path, &older).unwrap();
+        let mut state = sample_state("future");
+        state.schema_version = APP_STATE_SCHEMA_VERSION + 1;
+        save_state_to_path(&path, &state).unwrap();
+
+        // Aunque exista un backup válido de esquema viejo, no se hace
+        // downgrade silencioso del archivo principal futuro.
+        assert!(load_state_from_path(&path).is_none());
+        assert_eq!(
+            load_state_result_from_path(&path),
+            StateLoadResult::IncompatibleFuture {
+                version: APP_STATE_SCHEMA_VERSION + 1
+            }
+        );
+        let before = fs::read(&path).unwrap();
+        // La clasificación no toca ni el principal ni su backup.
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn future_schema_in_newest_valid_backup_blocks_an_older_downgrade() {
+        let dir = unique_temp_dir();
+        let path = dir.join("layout.json");
+        fs::write(&path, b"{corrupt").unwrap();
+
+        let mut future = sample_state("future-backup");
+        future.schema_version = APP_STATE_SCHEMA_VERSION + 2;
+        fs::write(
+            crate::state::durable_write::backup_path(&path, 0),
+            serde_json::to_vec(&future).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            crate::state::durable_write::backup_path(&path, 1),
+            serde_json::to_vec(&sample_state("older-compatible")).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            load_state_result_from_path(&path),
+            StateLoadResult::IncompatibleFuture {
+                version: APP_STATE_SCHEMA_VERSION + 2
+            }
+        );
+    }
+
     fn sample_state(label: &str) -> AppState {
         AppState {
             schema_version: APP_STATE_SCHEMA_VERSION,
@@ -379,11 +744,15 @@ mod tests {
                     restore_bounds: Some(SavedPanelBounds::new([10.0, 20.0], [300.0, 200.0])),
                     share_scope: PanelShareScope::VisibleOnly,
                     agent_command: None,
+                    leaf_agent_commands: Default::default(),
                     unread: false,
                     split_tree: None,
                     focused_leaf: None,
+                    root_leaf: None,
+                    leaf_runtime_session_ids: Default::default(),
                     linked_issue: None,
                     agent_session_id: None,
+                    leaf_agent_session_ids: Default::default(),
                     runtime_session_id: None,
                 }],
                 desktop: WorkspaceDesktopState {
@@ -493,7 +862,7 @@ mod tests {
         save_state_to_path(&path, &state).unwrap();
 
         let serialized = fs::read_to_string(&path).unwrap();
-        assert!(serialized.contains("\"schema_version\": 2"));
+        assert!(serialized.contains(&format!("\"schema_version\": {APP_STATE_SCHEMA_VERSION}")));
         assert!(serialized.contains("\"legacy_canvas_ui\""));
         assert!(serialized.contains("\"desktop\""));
         // El registro entero de sesiones de runtime sigue fuera del layout: es

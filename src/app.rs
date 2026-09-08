@@ -19,8 +19,8 @@ use crate::orchestration::{AgentProvider, Orchestrator, WorktreeMode};
 use crate::runtime::RenderTier;
 use crate::shortcuts::shortcut_command;
 use crate::sidebar::{Sidebar, SidebarResponse};
-use crate::state::persistence::{AutosaveController, AutosaveDecision};
-use crate::state::{load_state, save_state, AppState, Workspace};
+use crate::state::persistence::{AutosaveController, AutosaveDecision, PeriodicFlushController};
+use crate::state::{save_state, AppState, Workspace};
 use crate::theme::colors as palette;
 use crate::theme::fonts::setup_fonts;
 use crate::update::{RepaintPolicy, UpdateChecker};
@@ -34,12 +34,15 @@ mod desktop;
 mod dialogs;
 mod export_action;
 mod file_viewer_ui;
+mod memory_ui;
 mod notify_policy;
 mod onboarding;
 mod orchestration_ui;
 mod perf;
+mod persistence_worker;
 mod quick_open_ui;
 mod resume_ui;
+mod scrollback_restore_worker;
 mod settings_ui;
 mod taskbar;
 #[cfg(test)]
@@ -51,12 +54,12 @@ use self::code_review_ui::CodeReviewState;
 use self::collab_ui::{
     default_guest_display_name, host_terminal_input_pending, JoinSessionDraft, ShareWorkspaceDraft,
 };
+use self::desktop::{
+    close_workspace_for_good, panel_scroll_capture_active, split_resize_hit, top_panel_hit,
+    top_panel_scroll_hit, upsert_workspace_for_folder, SplitResizeAxis,
+};
 #[cfg(test)]
 use self::desktop::{interpolate_viewport, overview_viewport_for_panels};
-use self::desktop::{
-    panel_scroll_capture_active, split_resize_hit, top_panel_hit, top_panel_scroll_hit,
-    upsert_workspace_for_folder, SplitResizeAxis,
-};
 use self::orchestration_ui::{LaunchAgentDraft, ORCHESTRATION_REFRESH_INTERVAL};
 use self::perf::FramePerfSnapshot;
 use self::quick_open_ui::QuickOpenState;
@@ -86,6 +89,7 @@ pub struct TerminalApp {
     ctx: Option<egui::Context>,
     command_palette: CommandPalette,
     renaming_panel: Option<Uuid>,
+    closing_workspace: Option<Uuid>,
     rename_buf: String,
     search_open: bool,
     search_buf: String,
@@ -99,6 +103,7 @@ pub struct TerminalApp {
     /// worker porque bloquea hasta que el usuario selecciona o cancela).
     screenshot_rx: Option<std::sync::mpsc::Receiver<anyhow::Result<PathBuf>>>,
     file_viewer: Option<file_viewer_ui::FileViewerState>,
+    file_viewer_rx: Option<std::sync::mpsc::Receiver<file_viewer_ui::FileViewerState>>,
     settings_open: bool,
     settings_draft: Option<settings_ui::SettingsDraft>,
     broadcast: Option<broadcast_ui::BroadcastState>,
@@ -106,6 +111,12 @@ pub struct TerminalApp {
     file_tree: crate::sidebar::file_tree::FileTreeState,
     /// Paneles cuyo scrollback persistido ya se reinyectó en esta corrida.
     scrollback_restored: HashSet<Uuid>,
+    scrollback_restore_worker: scrollback_restore_worker::ScrollbackRestoreWorker,
+    scrollback_restore_ready: HashMap<Uuid, LeafHistories>,
+    /// Identidades de panel/hoja observadas por esta instancia. La poda de
+    /// scrollback queda limitada a este alcance para no borrar datos de otra
+    /// ventana que use el mismo directorio durable.
+    scrollback_known_leaves: HashMap<Uuid, HashSet<Uuid>>,
     highlighter: code_highlight::Highlighter,
     toasts: toast::Toasts,
     /// Último estado de agente por sesión que vimos, para notificar solo en la
@@ -140,9 +151,15 @@ pub struct TerminalApp {
     panel_gesture: Option<PanelGesture>,
     global_sash_drag: Option<GlobalSashDrag>,
     autosave: AutosaveController,
+    /// La salida de los PTYs cambia aunque el layout permanezca idéntico.
+    /// Este pulso mantiene durable el log incremental con cadencia propia.
+    scrollback_flush: PeriodicFlushController,
     persisted_state: Option<AppState>,
+    persistence_worker: persistence_worker::PersistenceWorker,
     repaint_policy: RepaintPolicy,
     launch_agent: Option<LaunchAgentDraft>,
+    launch_memory_worker: orchestration_ui::LaunchMemoryWorker,
+    memory_ui: Option<memory_ui::MemoryUiState>,
     share_workspace_open: bool,
     share_workspace_draft: ShareWorkspaceDraft,
     join_session_open: bool,
@@ -156,19 +173,40 @@ pub struct TerminalApp {
     taskbar_button_rects: HashMap<Uuid, Rect>,
     window_transitions: HashMap<Uuid, WindowTransition>,
     consecutive_update_panics: u32,
+    /// Sólo una app real crea y elimina el marker global. El harness jamás
+    /// debe borrar el marker perteneciente a una instancia viva del usuario.
+    run_marker_active: bool,
+    /// Un layout de schema futuro se abre sin restaurar, pero toda escritura
+    /// durable queda bloqueada para no destruirlo ni podar sus scrollbacks.
+    persistence_writes_enabled: bool,
 }
 
 impl TerminalApp {
     pub fn new(cc: &eframe::CreationContext<'_>, pending_join_invite: Option<String>) -> Self {
         setup_fonts(cc);
         let brand_texture = load_brand_texture(cc);
-        Self::build(
+        let (loaded_state, incompatible_version) =
+            match crate::state::persistence::load_state_result() {
+                crate::state::persistence::StateLoadResult::Loaded(state) => (Some(state), None),
+                crate::state::persistence::StateLoadResult::MissingOrUnreadable => (None, None),
+                crate::state::persistence::StateLoadResult::IncompatibleFuture { version } => {
+                    (None, Some(version))
+                }
+            };
+        let mut app = Self::build(
             &cc.egui_ctx,
             brand_texture,
-            load_state(),
+            loaded_state,
             pending_join_invite,
             true,
-        )
+            incompatible_version.is_none(),
+        );
+        if let Some(version) = incompatible_version {
+            app.toast_error(format!(
+                "El layout usa el schema {version}, más nuevo que esta app; se abrió sin escribir para preservarlo"
+            ));
+        }
+        app
     }
 
     /// Constructor sin `eframe::CreationContext` (Ship-it 7.4): el único
@@ -179,7 +217,7 @@ impl TerminalApp {
     pub fn new_for_tests(ctx: &egui::Context) -> Self {
         // `side_effects: false`: el harness no levanta el hook server ni
         // instala hooks en el ~/.claude del usuario que corre los tests.
-        Self::build(ctx, None, None, None, false)
+        Self::build(ctx, None, None, None, false, false)
     }
 
     fn build(
@@ -188,8 +226,13 @@ impl TerminalApp {
         loaded_state: Option<crate::state::persistence::AppState>,
         pending_join_invite: Option<String>,
         side_effects: bool,
+        persistence_writes_enabled: bool,
     ) -> Self {
-        let update_checker = UpdateChecker::new(egui_ctx);
+        let update_checker = if side_effects {
+            UpdateChecker::new(egui_ctx)
+        } else {
+            UpdateChecker::disabled()
+        };
         let has_saved_state = loaded_state.is_some();
 
         // El daemon se adopta **antes** de que exista cualquier workspace
@@ -206,7 +249,8 @@ impl TerminalApp {
         #[cfg(all(unix, feature = "daemon"))]
         let daemon_endpoint = daemon.endpoint();
 
-        let mut app = if let Some(saved) = loaded_state {
+        let mut app = if let Some(mut saved) = loaded_state {
+            crate::state::persistence::normalize_saved_state(&mut saved);
             let collab = CollabManager::new();
             let broker_url = collab.broker_url().to_owned();
             let orchestration = Orchestrator::from_saved(Some(saved.orchestration.clone()));
@@ -249,6 +293,7 @@ impl TerminalApp {
                 ctx: Some(egui_ctx.clone()),
                 command_palette: CommandPalette::default(),
                 renaming_panel: None,
+                closing_workspace: None,
                 rename_buf: String::new(),
                 search_open: false,
                 search_buf: String::new(),
@@ -260,12 +305,17 @@ impl TerminalApp {
                 quick_open_rx: None,
                 screenshot_rx: None,
                 file_viewer: None,
+                file_viewer_rx: None,
                 settings_open: false,
                 settings_draft: None,
                 broadcast: None,
                 resume_picker: None,
                 file_tree: Default::default(),
                 scrollback_restored: HashSet::new(),
+                scrollback_restore_worker: scrollback_restore_worker::ScrollbackRestoreWorker::new(
+                ),
+                scrollback_restore_ready: HashMap::new(),
+                scrollback_known_leaves: HashMap::new(),
                 highlighter: code_highlight::Highlighter::new(),
                 toasts: Default::default(),
                 agent_status_seen: HashMap::new(),
@@ -290,9 +340,13 @@ impl TerminalApp {
                 panel_gesture: None,
                 global_sash_drag: None,
                 autosave: AutosaveController::new(AUTOSAVE_INTERVAL),
+                scrollback_flush: PeriodicFlushController::new(AUTOSAVE_INTERVAL),
                 persisted_state: None,
+                persistence_worker: persistence_worker::PersistenceWorker::new(),
                 repaint_policy: RepaintPolicy::new(RUNTIME_REPAINT_BATCH),
                 launch_agent: None,
+                launch_memory_worker: orchestration_ui::LaunchMemoryWorker::new(),
+                memory_ui: None,
                 share_workspace_open: false,
                 share_workspace_draft: ShareWorkspaceDraft {
                     broker_url,
@@ -319,6 +373,8 @@ impl TerminalApp {
                 taskbar_button_rects: HashMap::new(),
                 window_transitions: HashMap::new(),
                 consecutive_update_panics: 0,
+                run_marker_active: side_effects,
+                persistence_writes_enabled,
             }
         } else {
             let collab = CollabManager::new();
@@ -341,6 +397,7 @@ impl TerminalApp {
                 ctx: Some(egui_ctx.clone()),
                 command_palette: CommandPalette::default(),
                 renaming_panel: None,
+                closing_workspace: None,
                 rename_buf: String::new(),
                 search_open: false,
                 search_buf: String::new(),
@@ -352,12 +409,17 @@ impl TerminalApp {
                 quick_open_rx: None,
                 screenshot_rx: None,
                 file_viewer: None,
+                file_viewer_rx: None,
                 settings_open: false,
                 settings_draft: None,
                 broadcast: None,
                 resume_picker: None,
                 file_tree: Default::default(),
                 scrollback_restored: HashSet::new(),
+                scrollback_restore_worker: scrollback_restore_worker::ScrollbackRestoreWorker::new(
+                ),
+                scrollback_restore_ready: HashMap::new(),
+                scrollback_known_leaves: HashMap::new(),
                 highlighter: code_highlight::Highlighter::new(),
                 toasts: Default::default(),
                 agent_status_seen: HashMap::new(),
@@ -382,9 +444,13 @@ impl TerminalApp {
                 panel_gesture: None,
                 global_sash_drag: None,
                 autosave: AutosaveController::new(AUTOSAVE_INTERVAL),
+                scrollback_flush: PeriodicFlushController::new(AUTOSAVE_INTERVAL),
                 persisted_state: None,
+                persistence_worker: persistence_worker::PersistenceWorker::new(),
                 repaint_policy: RepaintPolicy::new(RUNTIME_REPAINT_BATCH),
                 launch_agent: None,
+                launch_memory_worker: orchestration_ui::LaunchMemoryWorker::new(),
+                memory_ui: None,
                 share_workspace_open: false,
                 share_workspace_draft: ShareWorkspaceDraft {
                     broker_url,
@@ -411,6 +477,8 @@ impl TerminalApp {
                 taskbar_button_rects: HashMap::new(),
                 window_transitions: HashMap::new(),
                 consecutive_update_panics: 0,
+                run_marker_active: side_effects,
+                persistence_writes_enabled,
             }
         };
 
@@ -418,6 +486,7 @@ impl TerminalApp {
             app.viewport.pan = workspace.viewport_pan;
             app.viewport.zoom = workspace.viewport_zoom.max(0.125);
         }
+        app.remember_scrollback_layout();
 
         if has_saved_state {
             app.persisted_state = Some(app.snapshot_state());
@@ -429,7 +498,7 @@ impl TerminalApp {
         // Marcador de corrida: si la anterior murió sin cierre limpio (kill,
         // crash nativo, OOM), avisamos que el estado igual se restauró. Sin
         // esto, una muerte súbita y un cierre normal eran indistinguibles.
-        if crate::state::run_marker::begin_run().is_some() {
+        if side_effects && crate::state::run_marker::begin_run().is_some() {
             app.toast_error(
                 "La sesión anterior terminó de golpe; se restauró el último estado guardado",
             );
@@ -467,7 +536,7 @@ impl TerminalApp {
             .collect();
 
         AppState {
-            schema_version: 2,
+            schema_version: crate::state::persistence::APP_STATE_SCHEMA_VERSION,
             workspaces,
             active_ws: self.active_ws,
             sidebar_visible: self.sidebar_visible,
@@ -524,6 +593,9 @@ impl TerminalApp {
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) -> Option<Command> {
+        if self.modal_input_is_active() {
+            return None;
+        }
         for event in ctx.input(|i| i.events.clone()) {
             if let egui::Event::Key {
                 key,
@@ -533,10 +605,14 @@ impl TerminalApp {
             } = event
             {
                 if modifiers.ctrl && modifiers.shift && key == Key::P {
+                    consume_key_event(ctx, modifiers, key);
                     self.command_palette.toggle();
                     return None;
                 }
                 if let Some(command) = shortcut_command(&modifiers, key) {
+                    // El atajo es de la app. Quitarlo del stream evita que la
+                    // misma tecla llegue después al PTY como byte de control.
+                    consume_key_event(ctx, modifiers, key);
                     return Some(command);
                 }
             }
@@ -558,6 +634,7 @@ impl TerminalApp {
         {
             return;
         }
+        self.remember_scrollback_layout();
         match command {
             Command::NewTerminal => {
                 self.ws_mut().spawn_terminal(ctx);
@@ -636,6 +713,9 @@ impl TerminalApp {
                 self.fullscreen = !self.fullscreen;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
             }
+            Command::OpenMemory => self.open_memory_hub(),
+            Command::RememberSelection => self.open_remember_selection(),
+            Command::CreateHandoff => self.open_create_handoff(),
         }
     }
 
@@ -692,6 +772,73 @@ impl TerminalApp {
         self.viewport.zoom = self.workspaces[self.active_ws].viewport_zoom;
     }
 
+    /// Ejecuta el cierre que la persona ya confirmó en el diálogo. Los
+    /// archivos del proyecto no se tocan: sólo se cierran sus sesiones y se
+    /// quita el workspace del estado de TerminalCanvas.
+    fn close_workspace_confirmed(&mut self, workspace_id: Uuid) {
+        self.remember_scrollback_layout();
+        let Some(workspace) = self
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == workspace_id)
+        else {
+            return;
+        };
+        let name = workspace.name.clone();
+        let was_active = self.ws().id == workspace_id;
+        let was_shared = self.collab.shared_workspace_id() == Some(workspace_id);
+        if should_stop_collaboration_on_workspace_close(self.collab.mode(), was_active, was_shared)
+        {
+            self.collab.stop_session();
+        }
+
+        self.workspaces[self.active_ws].viewport_pan = self.viewport.pan;
+        self.workspaces[self.active_ws].viewport_zoom = self.viewport.zoom;
+        let Some(closed_terminals) =
+            close_workspace_for_good(&mut self.workspaces, &mut self.active_ws, workspace_id)
+        else {
+            return;
+        };
+
+        #[cfg(all(unix, feature = "daemon"))]
+        if let Some(endpoint) = self.daemon.endpoint() {
+            install_daemon_spawner_on(self.ws(), &endpoint);
+        }
+        self.viewport.pan = self.ws().viewport_pan;
+        self.viewport.zoom = self.ws().viewport_zoom.max(0.125);
+        let can_persist = self.ensure_persistence_ownership();
+        if can_persist {
+            self.persist_scrollbacks(false);
+        }
+        self.reconcile_daemon_sessions();
+        self.reconcile_orchestration();
+        self.refresh_orchestration();
+
+        // Un cierre explícito no debe reaparecer si la app termina antes del
+        // próximo tick de autosave.
+        if can_persist {
+            let snapshot = self.snapshot_state();
+            match crate::state::persistence::try_save_state(&snapshot) {
+                Ok(()) => {
+                    self.persisted_state = Some(snapshot);
+                    self.autosave.mark_saved(Instant::now());
+                }
+                Err(err) => {
+                    log::warn!("no se pudo persistir el cierre del workspace: {err}");
+                    self.toast_error("El proyecto se cerró, pero no se pudo guardar el cambio");
+                    return;
+                }
+            }
+        }
+
+        let terminal_summary = if closed_terminals == 1 {
+            "1 terminal cerrado".to_owned()
+        } else {
+            format!("{closed_terminals} terminales cerrados")
+        };
+        self.toast_success(format!("{name} cerrado · {terminal_summary}"));
+    }
+
     fn pick_workspace_folder(&mut self, ctx: &egui::Context) {
         let start_dir = self
             .workspaces
@@ -738,12 +885,8 @@ impl TerminalApp {
             match response {
                 SidebarResponse::SwitchWorkspace(index) => self.switch_workspace(index),
                 SidebarResponse::OpenFolder => self.pick_workspace_folder(ctx),
-                SidebarResponse::DeleteWorkspace(index) => {
-                    if self.workspaces.len() > 1 && index < self.workspaces.len() {
-                        self.workspaces.remove(index);
-                        self.active_ws =
-                            self.active_ws.min(self.workspaces.len().saturating_sub(1));
-                    }
+                SidebarResponse::RequestCloseWorkspace(workspace_id) => {
+                    self.closing_workspace = Some(workspace_id);
                 }
                 SidebarResponse::FocusPanel(panel_id) => {
                     self.focus_panel_across_workspaces(panel_id, Some(ctx.available_rect()));
@@ -788,6 +931,11 @@ impl TerminalApp {
                     self.start_work_on_linear_issue(&identifier)
                 }
                 SidebarResponse::ExportScrollback => self.export_focused_scrollback(),
+                SidebarResponse::OpenUpdate(url) => {
+                    if let Err(err) = crate::utils::platform::open_url_external(&url) {
+                        self.toast_error(format!("No se pudo abrir la actualización: {err}"));
+                    }
+                }
                 SidebarResponse::OpenFileInViewer(path) => self.open_file_viewer(path),
             }
         }
@@ -795,33 +943,130 @@ impl TerminalApp {
     }
 
     fn maybe_persist_state(&mut self, ctx: &egui::Context) {
+        if !self.persistence_writes_enabled {
+            return;
+        }
         let snapshot = self.snapshot_state();
         let now = Instant::now();
-        match self
-            .autosave
-            .should_persist(&snapshot, self.persisted_state.as_ref(), now)
+        let state_decision =
+            self.autosave
+                .should_persist(&snapshot, self.persisted_state.as_ref(), now);
+        let scrollback_decision = self.scrollback_flush.decision(now);
+        if (matches!(state_decision, AutosaveDecision::SaveNow)
+            || matches!(scrollback_decision, AutosaveDecision::SaveNow))
+            && !self.ensure_persistence_ownership()
         {
+            return;
+        }
+
+        match state_decision {
             AutosaveDecision::Idle => {}
             AutosaveDecision::ScheduleAfter(delay) => ctx.request_repaint_after(delay),
             AutosaveDecision::SaveNow => {
-                match crate::state::persistence::try_save_state(&snapshot) {
+                if self.persistence_worker.state_in_flight()
+                    || self.persistence_worker.submit_state(snapshot)
+                {
+                    ctx.request_repaint_after(Duration::from_millis(50));
+                } else {
+                    ctx.request_repaint_after(AUTOSAVE_INTERVAL);
+                }
+            }
+        }
+
+        // El scrollback no forma parte de `AppState`; condicionarlo a que el
+        // layout cambie deja la salida estable sólo en RAM hasta `on_exit`.
+        match scrollback_decision {
+            AutosaveDecision::Idle => {}
+            AutosaveDecision::ScheduleAfter(delay) => ctx.request_repaint_after(delay),
+            AutosaveDecision::SaveNow => {
+                if self.persist_scrollbacks(false) {
+                    self.reconcile_daemon_sessions();
+                    self.scrollback_flush.mark_flushed(now);
+                    ctx.request_repaint_after(AUTOSAVE_INTERVAL);
+                } else {
+                    ctx.request_repaint_after(Duration::from_millis(50));
+                }
+            }
+        }
+    }
+
+    fn ensure_persistence_ownership(&mut self) -> bool {
+        if !self.persistence_writes_enabled {
+            return false;
+        }
+        if !self.run_marker_active || crate::state::run_marker::current_process_may_write() {
+            return true;
+        }
+        self.persistence_writes_enabled = false;
+        self.toast_error(
+            "Otra instancia de TerminalCanvas tomó el guardado; esta ventana dejó de escribir para proteger tus proyectos",
+        );
+        false
+    }
+
+    fn poll_persistence_worker(&mut self, ctx: &egui::Context) {
+        for completion in self.persistence_worker.poll() {
+            match completion {
+                persistence_worker::Completion::State { snapshot, result } => match result {
                     Ok(()) => {
                         self.persisted_state = Some(snapshot);
-                        self.autosave.mark_saved(now);
-                        // El scrollback va junto al layout: si guardamos uno sin
-                        // el otro, al restaurar el historial no matchea.
-                        // Autosave de 2 s → solo log incremental (P1.7).
-                        self.persist_scrollbacks(false);
-                        self.reconcile_daemon_sessions();
+                        self.autosave.mark_saved(Instant::now());
                     }
                     Err(err) => {
                         log::warn!("Autosave failed: {err}");
                         ctx.request_repaint_after(AUTOSAVE_INTERVAL);
                     }
+                },
+                persistence_worker::Completion::Incremental {
+                    rollover_panels,
+                    acknowledgements,
+                } => {
+                    self.acknowledge_persisted_logs(acknowledgements);
+                    if rollover_panels.is_empty() {
+                        continue;
+                    }
+                    let Some(dir) = crate::state::scrollback_store::scrollback_dir() else {
+                        continue;
+                    };
+                    let wanted = rollover_panels.into_iter().collect::<HashSet<_>>();
+                    let entries = self.full_scrollback_entries(&dir, Some(&wanted));
+                    if !entries.is_empty() && !self.persistence_worker.submit_full(entries) {
+                        log::warn!("no se pudo encolar el rollover de scrollback");
+                    }
+                }
+                persistence_worker::Completion::Full { acknowledgements } => {
+                    self.acknowledge_persisted_logs(acknowledgements);
                 }
             }
         }
     }
+
+    fn acknowledge_persisted_logs(
+        &self,
+        acknowledgements: Vec<persistence_worker::IncrementalAck>,
+    ) {
+        for acknowledgement in acknowledgements {
+            let Some(leaf_id) = acknowledgement.leaf_id else {
+                continue;
+            };
+            if let Some(panel) = self
+                .workspaces
+                .iter()
+                .flat_map(|workspace| workspace.panels.iter())
+                .find(|panel| panel.id() == acknowledgement.panel_id)
+            {
+                panel.acknowledge_leaf_log(leaf_id, acknowledgement.written_bytes);
+            }
+        }
+    }
+}
+
+fn should_stop_collaboration_on_workspace_close(
+    mode: CollabMode,
+    was_active: bool,
+    was_shared: bool,
+) -> bool {
+    !matches!(mode, CollabMode::Inactive) && (was_active || was_shared)
 }
 
 impl TerminalApp {
@@ -845,10 +1090,10 @@ impl TerminalApp {
 
         CentralPanel::default()
             .frame(
-                egui::Frame::none()
+                egui::Frame::NONE
                     .fill(CANVAS_BG)
-                    .inner_margin(egui::Margin::same(0.0))
-                    .outer_margin(egui::Margin::same(0.0)),
+                    .inner_margin(egui::Margin::same(0))
+                    .outer_margin(egui::Margin::same(0)),
             )
             .show(ctx, |ui| {
                 let canvas_rect = ui.max_rect();
@@ -869,6 +1114,7 @@ impl TerminalApp {
     fn begin_frame(&mut self, ctx: &egui::Context) {
         self.ctx = Some(ctx.clone());
         self.window_focused = ctx.input(|input| input.focused);
+        self.poll_persistence_worker(ctx);
         self.handle_collab_events();
         self.sync_window_transitions(ctx);
         self.maybe_refresh_orchestration();
@@ -895,6 +1141,13 @@ impl TerminalApp {
     /// Fase 2: drena la salida de los PTYs, alimenta la política de repintado
     /// y registra los contadores de sesiones del frame.
     fn pump_runtime_updates(&mut self, perf_snapshot: &mut FramePerfSnapshot) {
+        #[cfg(all(unix, feature = "daemon"))]
+        let focused_session = self
+            .ws()
+            .focused_panel()
+            .and_then(|panel| panel.focused_runtime_session_id());
+        #[cfg(all(unix, feature = "daemon"))]
+        self.daemon.set_priority_session(focused_session);
         let runtime_updates = self.ws().drain_runtime_updates();
         if !runtime_updates.session_updates.is_empty() {
             let dirty_sessions = runtime_updates
@@ -905,7 +1158,7 @@ impl TerminalApp {
             let focused_dirty = self
                 .ws()
                 .focused_panel()
-                .and_then(|panel| panel.runtime_session_id())
+                .and_then(|panel| panel.focused_runtime_session_id())
                 .map(|session_id| dirty_sessions.contains(&session_id))
                 .unwrap_or(false);
             if focused_dirty {
@@ -915,9 +1168,9 @@ impl TerminalApp {
             }
             for panel in &mut self.ws_mut().panels {
                 if panel
-                    .runtime_session_id()
-                    .map(|session_id| dirty_sessions.contains(&session_id))
-                    .unwrap_or(false)
+                    .all_runtime_session_ids()
+                    .iter()
+                    .any(|session_id| dirty_sessions.contains(session_id))
                 {
                     panel.sync_title();
                 }
@@ -942,17 +1195,7 @@ impl TerminalApp {
     /// Fase 3: teclado hacia la terminal enfocada, salvo que un diálogo, la
     /// paleta o el modo guest lo capturen.
     fn forward_input_to_focused_panel(&mut self, ctx: &egui::Context) {
-        if !self.command_palette.open
-            && self.renaming_panel.is_none()
-            && !self.search_open
-            && self.code_review.is_none()
-            && self.quick_open.is_none()
-            && self.file_viewer.is_none()
-            && !self.settings_open
-            && self.broadcast.is_none()
-            && self.resume_picker.is_none()
-            && !matches!(self.collab.mode(), CollabMode::Guest)
-        {
+        if self.terminal_input_is_routable() {
             let focused_panel_id = self.ws().focused_panel().map(|panel| panel.id());
             if let Some(panel_id) = focused_panel_id {
                 if matches!(self.collab.mode(), CollabMode::Host)
@@ -984,18 +1227,44 @@ impl TerminalApp {
         }
     }
 
+    /// Única interfaz que decide si los eventos crudos del frame pertenecen
+    /// al PTY. Toda superficie modal vive acá para que briefs, invites y
+    /// passphrases nunca se escriban también en el shell detrás del diálogo.
+    fn terminal_input_is_routable(&self) -> bool {
+        !self.modal_input_is_active() && !matches!(self.collab.mode(), CollabMode::Guest)
+    }
+
+    fn modal_input_is_active(&self) -> bool {
+        self.command_palette.open
+            || self.renaming_panel.is_some()
+            || self.closing_workspace.is_some()
+            || self.search_open
+            || self.code_review.is_some()
+            || self.quick_open.is_some()
+            || self.file_viewer.is_some()
+            || self.settings_open
+            || self.broadcast.is_some()
+            || self.resume_picker.is_some()
+            || self.launch_agent.is_some()
+            || self.memory_ui.is_some()
+            || self.share_workspace_open
+            || self.join_session_open
+    }
+
     fn show_sidebar(&mut self, ctx: &egui::Context) {
         if self.sidebar_visible && !matches!(self.collab.mode(), CollabMode::Guest) {
             SidePanel::left("sidebar")
-                .resizable(true)
-                .default_width(220.0)
-                .min_width(180.0)
-                .max_width(320.0)
+                // Un ancho estable evita saltos de layout al pasar entre
+                // Workspaces, Files, Tasks y Online. El contenido largo se
+                // trunca o envuelve dentro del panel en vez de quitarle lugar
+                // de golpe a las terminales.
+                .resizable(false)
+                .exact_width(228.0)
                 .frame(
-                    egui::Frame::none()
+                    egui::Frame::NONE
                         .fill(crate::theme::colors::INK)
-                        .inner_margin(egui::Margin::same(0.0))
-                        .outer_margin(egui::Margin::same(0.0)),
+                        .inner_margin(egui::Margin::same(0))
+                        .outer_margin(egui::Margin::same(0)),
                 )
                 .show_separator_line(false)
                 .show(ctx, |ui| {
@@ -1069,8 +1338,7 @@ impl TerminalApp {
             let live: Vec<Uuid> = self
                 .workspaces
                 .iter()
-                .flat_map(|workspace| workspace.panels.iter())
-                .filter_map(|panel| panel.runtime_session_id())
+                .flat_map(crate::state::Workspace::all_runtime_session_ids)
                 .collect();
             let killed = self.daemon.reconcile_live(live);
             if !killed.is_empty() {
@@ -1091,150 +1359,224 @@ impl TerminalApp {
     }
 
     /// Guarda el scrollback de cada panel vivo de todos los workspaces y borra
-    /// los archivos de paneles que ya no existen.
+    /// los archivos de paneles conocidos por esta instancia que ya no existen.
     ///
     /// `full` reescribe el checkpoint completo (cierre limpio / panic /
     /// rollover); `false` appendea solo el log incremental (autosave de 2 s).
-    fn persist_scrollbacks(&mut self, full: bool) {
+    fn persist_scrollbacks(&mut self, full: bool) -> bool {
         let Some(dir) = crate::state::scrollback_store::scrollback_dir() else {
-            return;
+            return false;
         };
+        self.remember_scrollback_layout();
+        if full {
+            self.persistence_worker.wait_until_idle();
+            let entries = self.full_scrollback_entries(&dir, None);
+            let _ = persistence_worker::persist_full_entries(entries);
+            self.prune_scrollback_files(&dir);
+            return true;
+        }
+        if self.persistence_worker.scrollback_in_flight() {
+            return false;
+        }
+
+        let mut entries = Vec::new();
+        let mut live_panels = Vec::new();
+        for workspace in &self.workspaces {
+            for panel in &workspace.panels {
+                let panel_id = panel.id();
+                live_panels.push((panel_id, panel.leaf_ids()));
+                entries.extend(
+                    panel
+                        .pending_leaf_logs()
+                        .into_iter()
+                        .filter(|(_, frames)| !frames.is_empty())
+                        .map(|(leaf, frames)| persistence_worker::IncrementalEntry {
+                            dir: dir.clone(),
+                            panel_id,
+                            leaf_id: Some(leaf),
+                            frames,
+                        }),
+                );
+            }
+        }
+        let known_panels = self
+            .scrollback_known_leaves
+            .iter()
+            .map(|(panel, leaves)| (*panel, leaves.iter().copied().collect()))
+            .collect();
+        let submitted =
+            self.persistence_worker
+                .submit_incremental(persistence_worker::IncrementalBatch {
+                    dir,
+                    entries,
+                    live_panels,
+                    known_panels,
+                });
+        if submitted {
+            // El batch ya conserva el alcance de poda que necesita. Retener
+            // después sólo el layout vivo evita que una sesión larga acumule
+            // un UUID por cada terminal y split cerrados.
+            self.scrollback_known_leaves.clear();
+            self.remember_scrollback_layout();
+        }
+        submitted
+    }
+
+    fn remember_scrollback_layout(&mut self) {
+        let live = self
+            .workspaces
+            .iter()
+            .flat_map(|workspace| {
+                workspace
+                    .panels
+                    .iter()
+                    .map(|panel| (panel.id(), panel.leaf_ids()))
+            })
+            .collect::<Vec<_>>();
+        for (panel, leaves) in live {
+            self.scrollback_known_leaves
+                .entry(panel)
+                .or_default()
+                .extend(leaves);
+        }
+    }
+
+    fn prune_scrollback_files(&mut self, dir: &std::path::Path) {
+        self.remember_scrollback_layout();
         let mut live_ids = Vec::new();
         for workspace in &self.workspaces {
             for panel in &workspace.panels {
                 live_ids.push(panel.id());
-                if full {
-                    self.persist_full_checkpoint(&dir, panel);
-                } else {
-                    self.persist_incremental_log(&dir, panel);
-                }
+                let known_leaves = self
+                    .scrollback_known_leaves
+                    .get(&panel.id())
+                    .map(|leaves| leaves.iter().copied().collect::<Vec<_>>())
+                    .unwrap_or_default();
+                crate::state::scrollback_store::prune_panel_leaf_scrollback(
+                    dir,
+                    panel.id(),
+                    &panel.leaf_ids(),
+                    &known_leaves,
+                );
             }
         }
-        crate::state::scrollback_store::prune_scrollback(&dir, &live_ids);
+        let known_ids = self
+            .scrollback_known_leaves
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        crate::state::scrollback_store::prune_scrollback(dir, &live_ids, &known_ids);
     }
 
-    /// Checkpoint completo ANSI + sube la generation y descarta el log (P1.7).
-    ///
-    /// Con splits se guarda una hoja por archivo (P2.11, T4); la raíz mantiene
-    /// el nombre histórico.
-    fn persist_full_checkpoint(&self, dir: &std::path::Path, panel: &crate::panel::CanvasPanel) {
-        let panel_id = panel.id();
-        if panel.leaf_count() > 1 {
-            for (leaf, text) in panel.leaf_scrollbacks() {
-                if let Err(err) =
-                    crate::state::scrollback_store::save_leaf_scrollback(dir, panel_id, leaf, &text)
-                {
-                    log::warn!("no se pudo guardar el scrollback de una hoja: {err}");
+    fn full_scrollback_entries(
+        &self,
+        dir: &std::path::Path,
+        only_panels: Option<&HashSet<Uuid>>,
+    ) -> Vec<persistence_worker::FullEntry> {
+        let mut entries = Vec::new();
+        for workspace in &self.workspaces {
+            for panel in &workspace.panels {
+                let panel_id = panel.id();
+                if only_panels.is_some_and(|wanted| !wanted.contains(&panel_id)) {
+                    continue;
                 }
-            }
-            return;
-        }
-        // Un panel detached no tiene texto que leer; su archivo previo se
-        // conserva tal cual (es justo el historial a restaurar).
-        let Some(text) = panel.scrollback_ansi() else {
-            return;
-        };
-        let gen = read_generation(dir, panel_id);
-        // Orden a prueba de crash: primero la generation nueva, luego el
-        // checkpoint, al final borro el log. Si cae a mitad, el mismatch de
-        // generation descarta el log viejo y nunca se duplica output.
-        let _ = write_generation(dir, panel_id, gen + 1);
-        if let Err(err) = crate::state::scrollback_store::save_scrollback(dir, panel_id, &text) {
-            log::warn!("No se pudo guardar el scrollback del panel: {err}");
-        }
-        let _ = std::fs::remove_file(dir.join(
-            crate::state::scrollback_store::scrollback_log_file_name(panel_id),
-        ));
-    }
-
-    /// Appendea los frames pendientes al log; si supera el tope, rollover a
-    /// checkpoint completo (P1.7).
-    fn persist_incremental_log(&self, dir: &std::path::Path, panel: &crate::panel::CanvasPanel) {
-        let panel_id = panel.id();
-        if let Some(frames) = panel.drain_pending_log() {
-            if !frames.is_empty() {
-                let log_path = dir.join(crate::state::scrollback_store::scrollback_log_file_name(
-                    panel_id,
+                entries.extend(panel.leaf_scrollbacks().into_iter().map(
+                    |(leaf, text, pending_bytes)| persistence_worker::FullEntry {
+                        dir: dir.to_path_buf(),
+                        panel_id,
+                        leaf_id: leaf,
+                        text,
+                        pending_bytes,
+                    },
                 ));
-                // Si el log no existe, se crea con la generation del checkpoint
-                // actual para que el restore los asocie.
-                if !log_path.exists() {
-                    let gen = read_generation(dir, panel_id);
-                    let _ = crate::state::scrollback_log::reset_log(&log_path, gen);
-                }
-                if let Err(err) = crate::state::scrollback_log::append_frames(&log_path, &frames) {
-                    log::warn!("No se pudo appendear al log del panel: {err}");
-                }
-                // Rollover: log demasiado grande → checkpoint completo.
-                if std::fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0)
-                    > crate::state::scrollback_log::MAX_LOG_BYTES
-                {
-                    self.persist_full_checkpoint(dir, panel);
-                }
             }
         }
+        entries
     }
 
     /// Reinyecta el historial guardado en los paneles que acaban de conseguir
     /// terminal. Cada panel se restaura una sola vez por corrida.
     fn restore_pending_scrollbacks(&mut self) {
-        if self.scrollback_restored.len() == self.total_panel_count() {
-            return;
-        }
-        let Some(dir) = crate::state::scrollback_store::scrollback_dir() else {
-            return;
-        };
-        let pending: Vec<Uuid> = self
+        let live_panels = self
             .workspaces
             .iter()
             .flat_map(|workspace| workspace.panels.iter())
-            .filter(|panel| !self.scrollback_restored.contains(&panel.id()))
-            .map(|panel| panel.id())
-            .collect();
+            .map(crate::panel::CanvasPanel::id)
+            .collect::<HashSet<_>>();
+        self.scrollback_restored
+            .retain(|panel_id| live_panels.contains(panel_id));
 
-        for panel_id in pending {
-            let Some(text) = crate::state::scrollback_store::load_scrollback(&dir, panel_id) else {
-                // Sin historial guardado: no hay nada que reintentar después.
-                self.scrollback_restored.insert(panel_id);
+        for completion in self.scrollback_restore_worker.poll() {
+            if live_panels.contains(&completion.panel_id) {
+                self.scrollback_restore_ready
+                    .insert(completion.panel_id, completion.histories);
+            }
+        }
+
+        let ready_panels = self
+            .scrollback_restore_ready
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        for panel_id in ready_panels {
+            let Some(leaf_histories) = self.scrollback_restore_ready.remove(&panel_id) else {
                 continue;
             };
-            // Con splits, cada hoja tiene su propio archivo (P2.11, T4).
-            let leaf_histories = collect_leaf_histories(&dir, panel_id);
-            if !leaf_histories.is_empty() {
-                let restored = self
-                    .workspaces
-                    .iter_mut()
-                    .flat_map(|workspace| workspace.panels.iter_mut())
-                    .find(|panel| panel.id() == panel_id)
-                    .map(|panel| panel.restore_leaf_histories(&leaf_histories))
-                    .unwrap_or(true);
-                if restored {
-                    self.scrollback_restored.insert(panel_id);
-                }
+            if leaf_histories.is_empty() {
+                self.scrollback_restored.insert(panel_id);
                 continue;
             }
-            // Log incremental (P1.7): solo se replaya si la generation coincide
-            // con la del checkpoint; si no, se ignora (mismatch o cola rota).
-            let frames = load_session_frames(&dir, panel_id);
+            let active_leaves: HashSet<_> = self
+                .workspaces
+                .iter()
+                .flat_map(|workspace| workspace.panels.iter())
+                .find(|panel| panel.id() == panel_id)
+                .map(crate::panel::CanvasPanel::leaf_ids)
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+            if !leaf_histories
+                .iter()
+                .any(|(leaf, _, _)| leaf.is_none_or(|leaf| active_leaves.contains(&leaf)))
+            {
+                self.scrollback_restored.insert(panel_id);
+                continue;
+            }
             let restored = self
                 .workspaces
                 .iter_mut()
                 .flat_map(|workspace| workspace.panels.iter_mut())
                 .find(|panel| panel.id() == panel_id)
-                .map(|panel| panel.restore_session(&text, &frames))
+                .map(|panel| panel.restore_leaf_histories(&leaf_histories))
                 .unwrap_or(true);
-            // Si todavía está detached, se reintenta en un frame posterior.
             if restored {
                 self.scrollback_restored.insert(panel_id);
+            } else {
+                self.scrollback_restore_ready
+                    .insert(panel_id, leaf_histories);
             }
         }
-    }
 
-    fn total_panel_count(&self) -> usize {
-        self.workspaces
-            .iter()
-            .map(|workspace| workspace.panels.len())
-            .sum()
+        if self.scrollback_restored.len() == live_panels.len() {
+            return;
+        }
+        let Some(dir) = crate::state::scrollback_store::scrollback_dir() else {
+            return;
+        };
+        if !self.scrollback_restore_worker.in_flight() {
+            let next = live_panels.iter().copied().find(|panel_id| {
+                !self.scrollback_restored.contains(panel_id)
+                    && !self.scrollback_restore_ready.contains_key(panel_id)
+            });
+            if let Some(panel_id) = next {
+                self.scrollback_restore_worker.submit(dir, panel_id);
+            }
+        }
+        if self.scrollback_restore_worker.in_flight() {
+            if let Some(ctx) = &self.ctx {
+                ctx.request_repaint_after(Duration::from_millis(16));
+            }
+        }
     }
 
     fn attention_items(&self) -> Vec<crate::sidebar::AttentionItem> {
@@ -1299,8 +1641,12 @@ impl TerminalApp {
         clamp_workspace_panels_to_desktop(self.ws_mut(), desktop_rect);
         ui.painter()
             .rect_filled(desktop_screen, 0.0, palette::SURFACE);
-        ui.painter()
-            .rect_stroke(desktop_screen, 0.0, Stroke::new(0.0, palette::LINE));
+        ui.painter().rect_stroke(
+            desktop_screen,
+            0.0,
+            Stroke::new(0.0, palette::LINE),
+            egui::StrokeKind::Middle,
+        );
         let pointer_pos = gesture_pointer_pos(latest_pos, interact_pos, hover_pos);
         let split_hit: Option<desktop::SplitResizeHit> = None;
         let _ = split_resize_hit;
@@ -1454,6 +1800,7 @@ impl TerminalApp {
                     screen_rect.expand(2.0),
                     10.0,
                     Stroke::new(2.0, palette::TEXT_STRONG),
+                    egui::StrokeKind::Middle,
                 );
             }
         }
@@ -1629,12 +1976,14 @@ impl TerminalApp {
         }
         self.show_launch_dialog(ctx);
         self.show_rename_dialog(ctx);
+        self.show_close_workspace_dialog(ctx);
         self.show_search_bar(ctx);
         self.show_code_review(ctx);
         self.show_quick_open(ctx);
         self.show_onboarding(ctx);
         self.restore_pending_scrollbacks();
         self.show_settings(ctx);
+        self.show_memory_hub(ctx);
         self.show_broadcast(ctx);
         self.show_resume_picker(ctx);
         // Los toasts van último: se dibujan por encima de cualquier overlay.
@@ -1678,10 +2027,15 @@ impl eframe::App for TerminalApp {
                     // disco, así que se guarda lo mismo que en una salida
                     // limpia. Antes sólo se guardaba el layout y el scrollback
                     // de la sesión se perdía entero.
-                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        save_state(&self.snapshot_state());
-                        self.persist_scrollbacks(true);
-                    }));
+                    if self.persistence_writes_enabled
+                        && (!self.run_marker_active
+                            || crate::state::run_marker::current_process_may_write())
+                    {
+                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            save_state(&self.snapshot_state());
+                            self.persist_scrollbacks(true);
+                        }));
+                    }
                     std::process::exit(1);
                 }
                 ctx.request_repaint();
@@ -1691,15 +2045,37 @@ impl eframe::App for TerminalApp {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.collab.stop_session();
-        save_state(&self.snapshot_state());
-        // El autosave puede tener hasta AUTOSAVE_INTERVAL de atraso: al salir
-        // guardamos el scrollback definitivo para no perder las últimas líneas.
-        self.persist_scrollbacks(true);
+        if self.persistence_writes_enabled
+            && (!self.run_marker_active || crate::state::run_marker::current_process_may_write())
+        {
+            save_state(&self.snapshot_state());
+            // El autosave puede tener hasta AUTOSAVE_INTERVAL de atraso: al salir
+            // guardamos el scrollback definitivo para no perder las últimas líneas.
+            self.persist_scrollbacks(true);
+        }
         // El daemon se apaga solo si no le quedan sesiones (P3.15, T5).
         #[cfg(all(unix, feature = "daemon"))]
         self.daemon.shutdown_if_idle();
-        crate::state::run_marker::end_run_clean();
+        if self.run_marker_active {
+            crate::state::run_marker::end_run_clean();
+        }
     }
+}
+
+fn consume_key_event(ctx: &egui::Context, modifiers: egui::Modifiers, key: Key) {
+    ctx.input_mut(|input| {
+        input.events.retain(|event| {
+            !matches!(
+                event,
+                egui::Event::Key {
+                    key: event_key,
+                    pressed: true,
+                    modifiers: event_modifiers,
+                    ..
+                } if *event_key == key && *event_modifiers == modifiers
+            )
+        });
+    });
 }
 
 /// Hace que las sesiones nuevas de este workspace se creen en el daemon
@@ -1738,11 +2114,14 @@ fn start_hook_server() -> Option<crate::orchestration::HookServer> {
     }
 }
 
-/// Lee la generation persistida de un panel (P1.7); 0 si no existe.
-fn read_generation(dir: &std::path::Path, panel_id: Uuid) -> u32 {
-    let path = dir.join(crate::state::scrollback_store::scrollback_gen_file_name(
-        panel_id,
-    ));
+fn read_leaf_generation(dir: &std::path::Path, panel_id: Uuid, leaf_id: Option<Uuid>) -> u32 {
+    if let Some((Some(generation), _)) =
+        crate::state::scrollback_store::load_leaf_scrollback_checkpoint(dir, panel_id, leaf_id)
+    {
+        return generation;
+    }
+    let path =
+        dir.join(crate::state::scrollback_store::scrollback_leaf_gen_file_name(panel_id, leaf_id));
     std::fs::read(path)
         .ok()
         .filter(|bytes| bytes.len() >= 4)
@@ -1750,65 +2129,147 @@ fn read_generation(dir: &std::path::Path, panel_id: Uuid) -> u32 {
         .unwrap_or(0)
 }
 
+#[cfg(test)]
 fn write_generation(dir: &std::path::Path, panel_id: Uuid, generation: u32) -> std::io::Result<()> {
-    let path = dir.join(crate::state::scrollback_store::scrollback_gen_file_name(
-        panel_id,
-    ));
-    std::fs::write(path, generation.to_le_bytes())
+    write_leaf_generation(dir, panel_id, None, generation)
 }
 
-/// Historiales por hoja de un panel con splits (P2.11, T4). Vacío si el panel
-/// no tiene archivos de hoja (o sea: no estaba spliteado).
-fn collect_leaf_histories(dir: &std::path::Path, panel_id: Uuid) -> Vec<(Option<Uuid>, String)> {
+#[cfg(test)]
+fn write_leaf_generation(
+    dir: &std::path::Path,
+    panel_id: Uuid,
+    leaf_id: Option<Uuid>,
+    generation: u32,
+) -> std::io::Result<()> {
+    let path =
+        dir.join(crate::state::scrollback_store::scrollback_leaf_gen_file_name(panel_id, leaf_id));
+    crate::state::durable_write::write_atomic(&path, &generation.to_le_bytes()).map(|_| ())
+}
+
+/// Appendea un lote ya encodeado al log de una sesión. Devuelve `true` si el
+/// log alcanzó el umbral de rollover.
+fn persist_incremental_frames(
+    dir: &std::path::Path,
+    panel_id: Uuid,
+    leaf_id: Option<Uuid>,
+    frames: &[u8],
+) -> Option<bool> {
+    let log_path =
+        dir.join(crate::state::scrollback_store::scrollback_leaf_log_file_name(panel_id, leaf_id));
+    let generation = read_leaf_generation(dir, panel_id, leaf_id);
+    let log_is_current = std::fs::read(&log_path)
+        .ok()
+        .and_then(|bytes| crate::state::scrollback_log::read_frames(&bytes))
+        .is_some_and(|(log_generation, _)| log_generation == generation);
+    if !log_is_current {
+        if let Err(err) = crate::state::scrollback_log::reset_log(&log_path, generation) {
+            log::warn!("No se pudo inicializar el log del panel: {err}");
+            return None;
+        }
+    }
+    if let Err(err) = crate::state::scrollback_log::append_frames(&log_path, frames) {
+        log::warn!("No se pudo appendear al log del panel: {err}");
+        return None;
+    }
+    Some(
+        std::fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0)
+            > crate::state::scrollback_log::MAX_LOG_BYTES,
+    )
+}
+
+/// Historiales por hoja de un panel con splits (P2.11, T4). Descubre tanto
+/// checkpoints como logs: un crash puede ocurrir antes del primer checkpoint.
+type LeafHistories = Vec<(
+    Option<Uuid>,
+    String,
+    Vec<crate::state::scrollback_log::Frame>,
+)>;
+
+fn collect_leaf_histories(dir: &std::path::Path, panel_id: Uuid) -> LeafHistories {
+    use std::collections::BTreeSet;
+
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
     let prefix = format!("{}-", panel_id.simple());
-    let mut out = Vec::new();
+    let mut leaves = BTreeSet::new();
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
-        let Some(rest) = name
-            .strip_prefix(&prefix)
-            .and_then(|r| r.strip_suffix(".txt"))
-        else {
+        let Some(rest) = name.strip_prefix(&prefix).and_then(|rest| {
+            rest.strip_suffix(".txt")
+                .or_else(|| rest.strip_suffix(".mtlg"))
+                .or_else(|| rest.strip_suffix(".gen"))
+        }) else {
             continue;
         };
         let Ok(leaf) = Uuid::parse_str(rest) else {
             continue;
         };
-        if let Some(text) =
-            crate::state::scrollback_store::load_leaf_scrollback(dir, panel_id, Some(leaf))
-        {
-            out.push((Some(leaf), text));
+        leaves.insert(leaf);
+    }
+    let mut out = Vec::new();
+    for leaf in leaves {
+        let text = crate::state::scrollback_store::load_leaf_scrollback(dir, panel_id, Some(leaf))
+            .unwrap_or_default();
+        let frames = load_leaf_session_frames(dir, panel_id, Some(leaf));
+        let has_generation_marker = dir
+            .join(
+                crate::state::scrollback_store::scrollback_leaf_gen_file_name(panel_id, Some(leaf)),
+            )
+            .exists()
+            || dir
+                .join(crate::state::scrollback_store::scrollback_leaf_file_name(
+                    panel_id,
+                    Some(leaf),
+                ))
+                .exists();
+        // Un marker sin contenido representa de forma durable una hoja vacía.
+        // Es importante durante la migración: evita que un checkpoint legado
+        // de raíz reaparezca después de que el usuario limpió la terminal.
+        if !text.is_empty() || !frames.is_empty() || has_generation_marker {
+            out.push((Some(leaf), text, frames));
         }
     }
-    if out.is_empty() {
-        return Vec::new();
-    }
-    // La raíz usa el nombre histórico: va primero para que el orden de replay
-    // sea estable.
-    if let Some(root) = crate::state::scrollback_store::load_leaf_scrollback(dir, panel_id, None) {
-        out.insert(0, (None, root));
+    // Alias legado de la raíz. La clave estable `Some(root_leaf)` gana dentro
+    // del panel si ambos formatos coexisten durante la migración.
+    let legacy_root = crate::state::scrollback_store::load_leaf_scrollback(dir, panel_id, None)
+        .unwrap_or_default();
+    let legacy_frames = load_leaf_session_frames(dir, panel_id, None);
+    let legacy_checkpoint_exists = dir
+        .join(crate::state::scrollback_store::scrollback_leaf_file_name(
+            panel_id, None,
+        ))
+        .exists();
+    if !legacy_root.is_empty() || !legacy_frames.is_empty() || legacy_checkpoint_exists {
+        out.insert(0, (None, legacy_root, legacy_frames));
     }
     out
 }
 
 /// Frames del log incremental que corresponden al checkpoint actual (P1.7).
 /// Devuelve vacío si no hay log o si la generation no matchea.
+#[cfg(test)]
 fn load_session_frames(
     dir: &std::path::Path,
     panel_id: Uuid,
 ) -> Vec<crate::state::scrollback_log::Frame> {
-    let log_path = dir.join(crate::state::scrollback_store::scrollback_log_file_name(
-        panel_id,
-    ));
+    load_leaf_session_frames(dir, panel_id, None)
+}
+
+fn load_leaf_session_frames(
+    dir: &std::path::Path,
+    panel_id: Uuid,
+    leaf_id: Option<Uuid>,
+) -> Vec<crate::state::scrollback_log::Frame> {
+    let log_path =
+        dir.join(crate::state::scrollback_store::scrollback_leaf_log_file_name(panel_id, leaf_id));
     let Ok(bytes) = std::fs::read(log_path) else {
         return Vec::new();
     };
     let Some((log_gen, frames)) = crate::state::scrollback_log::read_frames(&bytes) else {
         return Vec::new();
     };
-    if log_gen != read_generation(dir, panel_id) {
+    if log_gen != read_leaf_generation(dir, panel_id, leaf_id) {
         return Vec::new();
     }
     frames
@@ -1841,25 +2302,39 @@ pub(crate) fn gesture_pointer_pos(
 /// camino que ningún test unitario toca: construcción + update + render.
 #[cfg(test)]
 mod smoke_e2e {
+    use egui_kittest::kittest::NodeT;
+
     use super::TerminalApp;
 
     /// Corre la app dentro del harness, opcionalmente inyectando eventos antes
-    /// de los últimos frames, y devuelve el dump de accesibilidad.
-    fn run_app(frames: usize, events: Vec<egui::Event>) -> String {
+    /// de los últimos frames, y devuelve las etiquetas de accesibilidad.
+    fn run_app(frames: usize, events: Vec<egui::Event>) -> Vec<String> {
         let mut app: Option<TerminalApp> = None;
         let mut harness = egui_kittest::Harness::new(|ctx| {
             let app = app.get_or_insert_with(|| TerminalApp::new_for_tests(ctx));
             app.update_for_tests(ctx);
         });
-        for _ in 0..frames {
-            harness.run();
-        }
+        // La app tiene repaints periódicos legítimos (cursor y polling de los
+        // workers). `Harness::run` exige que la UI llegue a reposo y por eso
+        // se vuelve flaky bajo carga paralela; acá queremos exactamente N
+        // frames, no esperar una quietud que una terminal viva no promete.
+        harness.run_steps(frames);
         if !events.is_empty() {
             harness.input_mut().events.extend(events);
-            harness.run();
-            harness.run();
+            harness.run_steps(2);
         }
-        format!("{:#?}", harness.kittest_state())
+        let root = harness.root();
+        std::iter::once(root)
+            .chain(root.children_recursive())
+            .flat_map(|node| {
+                let node = node.accesskit_node();
+                [node.label(), node.value()].into_iter().flatten()
+            })
+            .collect()
+    }
+
+    fn contains_label(labels: &[String], expected: &str) -> bool {
+        labels.iter().any(|label| label.contains(expected))
     }
 
     fn ctrl(key: egui::Key) -> egui::Event {
@@ -1873,32 +2348,37 @@ mod smoke_e2e {
     }
 
     #[test]
-    fn a_fresh_app_shows_the_empty_state_and_its_action() {
-        // Sin estado en disco no hay carpeta: lo primero que se ofrece es
-        // abrir una (Ship-it 7.2).
-        let tree = run_app(3, Vec::new());
+    fn a_fresh_app_with_its_default_terminal_does_not_show_an_empty_state() {
+        // Sin estado en disco la app crea un shell en HOME. Aunque todavía no
+        // haya una carpeta elegida, el canvas ya no está vacío y la invitación
+        // a abrir una carpeta no debe dibujarse encima del terminal.
+        let labels = run_app(3, Vec::new());
         assert!(
-            tree.contains("Todavía no hay carpeta abierta"),
-            "falta el empty state:\n{tree}"
+            !contains_label(&labels, "Todavía no hay carpeta abierta"),
+            "el empty state quedó visible sobre el terminal:\n{labels:#?}"
         );
-        assert!(
-            tree.contains("label: \"Abrir carpeta\""),
-            "el empty state tiene que ofrecer la acción, no solo el texto"
+        let open_folder_actions = labels
+            .iter()
+            .filter(|label| label.as_str() == "Abrir carpeta")
+            .count();
+        assert_eq!(
+            open_folder_actions, 1,
+            "debe existir sólo la acción accesible del sidebar, no otra superpuesta:\n{labels:#?}"
         );
     }
 
     #[test]
     fn the_onboarding_overlay_shows_its_three_steps() {
-        let tree = run_app(3, Vec::new());
+        let labels = run_app(3, Vec::new());
         assert!(
-            tree.contains("Primeros pasos"),
-            "falta el overlay de onboarding:\n{tree}"
+            contains_label(&labels, "Primeros pasos"),
+            "falta el overlay de onboarding:\n{labels:#?}"
         );
-        assert!(tree.contains("1. Abrí una carpeta"));
-        assert!(tree.contains("2. Abrí un terminal"));
-        assert!(tree.contains("3. Revisá los cambios"));
+        assert!(contains_label(&labels, "1. Abrí una carpeta"));
+        assert!(contains_label(&labels, "2. Abrí un terminal"));
+        assert!(contains_label(&labels, "3. Revisá los cambios"));
         assert!(
-            tree.contains("label: \"Entendido\""),
+            contains_label(&labels, "Entendido"),
             "falta el botón de cierre"
         );
     }
@@ -1907,14 +2387,14 @@ mod smoke_e2e {
     fn ctrl_comma_opens_settings() {
         let before = run_app(3, Vec::new());
         assert!(
-            !before.contains("Configuración"),
+            !contains_label(&before, "Configuración"),
             "settings no debería arrancar abierto"
         );
 
         let after = run_app(3, vec![ctrl(egui::Key::Comma)]);
         assert!(
-            after.contains("Configuración"),
-            "Ctrl+, no abrió settings:\n{after}"
+            contains_label(&after, "Configuración"),
+            "Ctrl+, no abrió settings:\n{after:#?}"
         );
     }
 
@@ -1922,7 +2402,7 @@ mod smoke_e2e {
     fn running_many_frames_never_panics_or_deadlocks() {
         // La regresión que esto caza: un frame que se cuelga tomando dos
         // locks, o que paniquea en el frame N por estado acumulado.
-        let tree = run_app(20, Vec::new());
-        assert!(!tree.is_empty());
+        let labels = run_app(20, Vec::new());
+        assert!(!labels.is_empty());
     }
 }

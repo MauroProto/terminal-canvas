@@ -8,6 +8,7 @@
 
 use std::path::PathBuf;
 
+use anyhow::Context as _;
 use serde_json::{json, Map, Value};
 
 /// Marca que identifica los grupos de hooks que administra la app.
@@ -15,6 +16,7 @@ pub const MANAGED_MARKER: &str = "terminalcanvas";
 
 /// Eventos de Claude que nos interesan.
 pub const MANAGED_EVENTS: &[&str] = &[
+    "SessionStart",
     "Stop",
     "UserPromptSubmit",
     "PermissionRequest",
@@ -38,12 +40,13 @@ fn endpoint_file_literal() -> String {
 /// y postea el payload de stdin con timeouts cortos. Nunca falla el hook (el
 /// `|| true` final) para no bloquear al agente si la app está cerrada.
 pub fn hook_command(endpoint_file: &str) -> String {
+    let endpoint_file = crate::terminal::shell_quote::quote_path(endpoint_file);
     format!(
-        ". \"{endpoint_file}\" 2>/dev/null || exit 0\n\
+        ". {endpoint_file} 2>/dev/null || exit 0\n\
          [ -n \"$TC_HOOK_URL\" ] || exit 0\n\
-         curl -sS -m 1.5 --connect-timeout 0.5 -H \"X-TC-Token: $TC_HOOK_TOKEN\" \
+         curl -fsS -m 1.5 --connect-timeout 0.5 -H \"X-TC-Token: $TC_HOOK_TOKEN\" \
 -H 'Content-Type: application/json' -d @- \
-\"$TC_HOOK_URL/hook/claude?panel=$TC_PANEL_ID&workspace=$TC_WORKSPACE_ID\" >/dev/null 2>&1 || true\n"
+\"$TC_HOOK_URL/hook/claude?panel=$TC_PANEL_ID&workspace=$TC_WORKSPACE_ID&leaf=$TC_LEAF_ID\" 2>/dev/null || true\n"
     )
 }
 
@@ -117,13 +120,22 @@ pub fn uninstall_hooks(settings: &mut Value) {
     }
 }
 
-/// Lee el settings.json (o un objeto vacío si no existe / está corrupto).
-fn load_settings(path: &std::path::Path) -> Value {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-        .filter(Value::is_object)
-        .unwrap_or_else(|| Value::Object(Map::new()))
+/// Lee settings sin convertir un archivo corrupto en uno vacío: si ya existe
+/// pero no se puede interpretar, instalar debe fallar sin pisar datos ajenos.
+fn load_settings(path: &std::path::Path) -> anyhow::Result<Value> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Value::Object(Map::new()));
+        }
+        Err(err) => return Err(err).with_context(|| format!("leer {}", path.display())),
+    };
+    let settings: Value = serde_json::from_str(&text)
+        .with_context(|| format!("{} contiene JSON inválido", path.display()))?;
+    if !settings.is_object() {
+        anyhow::bail!("{} no contiene un objeto JSON", path.display());
+    }
+    Ok(settings)
 }
 
 /// Instala los hooks en el settings real del usuario, con escritura durable.
@@ -134,7 +146,7 @@ pub fn install_to_disk() -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let mut settings = load_settings(&path);
+    let mut settings = load_settings(&path)?;
     install_hooks(&mut settings, &endpoint_file_literal());
     let text = serde_json::to_string_pretty(&settings)?;
     crate::state::durable_write::write_durable(&path, text.as_bytes())?;
@@ -149,7 +161,7 @@ pub fn uninstall_from_disk() -> anyhow::Result<()> {
     if !path.exists() {
         return Ok(());
     }
-    let mut settings = load_settings(&path);
+    let mut settings = load_settings(&path)?;
     uninstall_hooks(&mut settings);
     let text = serde_json::to_string_pretty(&settings)?;
     crate::state::durable_write::write_durable(&path, text.as_bytes())?;
@@ -158,7 +170,9 @@ pub fn uninstall_from_disk() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{hook_command, install_hooks, uninstall_hooks, MANAGED_EVENTS, MANAGED_MARKER};
+    use super::{
+        hook_command, install_hooks, load_settings, uninstall_hooks, MANAGED_EVENTS, MANAGED_MARKER,
+    };
     use serde_json::{json, Value};
 
     /// Settings realista con hooks propios del usuario.
@@ -304,9 +318,35 @@ mod tests {
         let command = hook_command("/tmp/endpoint.sh");
         assert_eq!(command.lines().count(), 3, "got {command}");
         assert!(command.contains("-m 1.5"));
+        assert!(command.contains("curl -fsS"));
         assert!(command.contains("--connect-timeout 0.5"));
         assert!(command.contains("X-TC-Token"));
         assert!(command.contains("/hook/claude"));
         assert!(command.ends_with("|| true\n"), "nunca falla el hook");
+    }
+
+    #[test]
+    fn hook_command_shell_quotes_the_endpoint_path() {
+        let command = hook_command("/tmp/$HOME/it's endpoint.sh");
+        assert!(
+            command.starts_with(". '/tmp/$HOME/it'\\''s endpoint.sh'"),
+            "got {command}"
+        );
+    }
+
+    #[test]
+    fn corrupt_existing_settings_are_rejected_without_being_rewritten() {
+        let root = std::env::temp_dir().join(format!(
+            "tc-claude-settings-test-{}",
+            uuid::Uuid::new_v4().as_simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("settings.json");
+        let original = b"{ not-json";
+        std::fs::write(&path, original).unwrap();
+
+        assert!(load_settings(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        let _ = std::fs::remove_dir_all(root);
     }
 }

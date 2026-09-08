@@ -261,6 +261,7 @@ impl TerminalApp {
                     1.0,
                     Color32::from_rgba_premultiplied(244, 244, 244, stroke_alpha),
                 ),
+                egui::StrokeKind::Middle,
             );
         }
     }
@@ -637,6 +638,7 @@ impl TerminalApp {
             if let Some(hit) = hovered_hit {
                 if matches!(hit.area, PanelHitArea::CloseButton) {
                     if let Some(panel_id) = panel_id_for_hit(self.ws(), &hit) {
+                        self.remember_scrollback_layout();
                         self.ws_mut().close_panel(panel_id);
                         self.reconcile_orchestration();
                     }
@@ -701,8 +703,12 @@ impl TerminalApp {
                 14.0,
                 Color32::from_rgba_premultiplied(244, 244, 244, 28),
             );
-            ui.painter()
-                .rect_stroke(preview_screen, 14.0, Stroke::new(1.0, palette::TEXT_STRONG));
+            ui.painter().rect_stroke(
+                preview_screen,
+                14.0,
+                Stroke::new(1.0, palette::TEXT_STRONG),
+                egui::StrokeKind::Middle,
+            );
         }
 
         if let Some(split_rect) = split_preview_rect {

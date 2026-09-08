@@ -31,6 +31,9 @@ pub enum Command {
     ZoomOut,
     ResetZoom,
     ToggleFullscreen,
+    OpenMemory,
+    RememberSelection,
+    CreateHandoff,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -195,5 +198,20 @@ pub const COMMANDS: &[CommandEntry] = &[
         command: Command::ToggleFullscreen,
         label: "Toggle Fullscreen",
         shortcut: "F11",
+    },
+    CommandEntry {
+        command: Command::OpenMemory,
+        label: "Shared Memory",
+        shortcut: "",
+    },
+    CommandEntry {
+        command: Command::RememberSelection,
+        label: "Remember Selection",
+        shortcut: "",
+    },
+    CommandEntry {
+        command: Command::CreateHandoff,
+        label: "Create Handoff",
+        shortcut: "",
     },
 ];

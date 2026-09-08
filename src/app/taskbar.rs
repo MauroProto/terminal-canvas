@@ -380,9 +380,9 @@ impl TerminalApp {
                 .resizable(false)
                 .exact_height(34.0)
                 .frame(
-                    egui::Frame::none()
+                    egui::Frame::NONE
                         .fill(palette::INK)
-                        .inner_margin(egui::Margin::symmetric(14.0, 6.0)),
+                        .inner_margin(egui::Margin::symmetric(14, 6)),
                 )
                 .show_separator_line(false)
                 .show(ctx, |ui| {

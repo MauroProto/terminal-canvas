@@ -12,6 +12,7 @@ use super::SessionSpec;
 pub type SharedPtyHandle = Arc<Mutex<PtyHandle>>;
 pub type SharedRuntimeScheduler = Arc<Mutex<RuntimeScheduler>>;
 const DEFAULT_UI_BATCH_LIMIT: usize = 64;
+const BACKGROUND_READER_DELAY: std::time::Duration = std::time::Duration::from_millis(2);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RuntimeSessionUpdate {
@@ -223,6 +224,21 @@ impl RuntimeScheduler {
         self.priority_session = session_id;
     }
 
+    /// Presupuesto de I/O del lector, no sólo orden de notificaciones. Cuando
+    /// hay una sesión enfocada, los lectores de fondo ceden brevemente CPU y
+    /// dejan que el kernel les aplique contrapresión; el lector interactivo no
+    /// se retrasa.
+    pub fn reader_delay(&self, session_id: Uuid) -> std::time::Duration {
+        if self
+            .priority_session
+            .is_some_and(|priority| priority != session_id)
+        {
+            BACKGROUND_READER_DELAY
+        } else {
+            std::time::Duration::ZERO
+        }
+    }
+
     pub fn drain_ui_updates(&mut self) -> UiUpdateBatch {
         let repaint_requested = self.repaint_queued || !self.pending.is_empty();
         let pending_ids = self.pending.keys().copied().collect::<Vec<_>>();
@@ -333,7 +349,10 @@ impl PtyManager {
             ) {
                 Ok((session_id, handle)) => {
                     let mut managed = ManagedSession::detached(spec_with_cwd);
-                    managed.handle = Some(Arc::new(Mutex::new(handle)));
+                    let shared_handle = Arc::new(Mutex::new(handle));
+                    Self::configure_startup_input(&mut managed, &shared_handle);
+                    managed.handle = Some(shared_handle);
+                    managed.detached_alive = false;
                     self.sessions.insert(session_id, managed);
                     return Ok(session_id);
                 }
@@ -350,8 +369,12 @@ impl PtyManager {
             cwd: spec.cwd.clone().or_else(|| cwd.map(Path::to_path_buf)),
             startup_command: spec.startup_command.clone(),
             startup_input: spec.startup_input.clone(),
-            panel_id: None,
-            workspace_id: None,
+            // El fallback local sigue siendo la misma sesión lógica. Perder
+            // su identidad rompe hooks, diagnóstico y aislamiento por
+            // proyecto precisamente cuando el daemon degrada.
+            panel_id: spec.panel_id,
+            workspace_id: spec.workspace_id,
+            leaf_id: spec.leaf_id,
         };
         self.sessions
             .insert(session_id, ManagedSession::detached(detached_spec));
@@ -372,7 +395,21 @@ impl PtyManager {
             anyhow::bail!("Runtime session not found");
         };
         if session.is_attached() {
-            return Ok(());
+            if session.is_alive() {
+                return Ok(());
+            }
+            let was_remote = session
+                .handle
+                .as_ref()
+                .and_then(|handle| handle.lock().ok())
+                .is_some_and(|handle| handle.is_remote());
+            if !was_remote {
+                // Un proceso local que terminó no se relanza a espaldas del
+                // usuario. La recuperación automática es sólo del transporte
+                // remoto, donde el PTY puede seguir vivo en el daemon.
+                return Ok(());
+            }
+            session.handle = None;
         }
 
         let spec = session.spec.clone();
@@ -413,6 +450,7 @@ impl PtyManager {
                     crate::terminal::pty::HookIdentity {
                         panel_id: spec.panel_id,
                         workspace_id: spec.workspace_id,
+                        leaf_id: spec.leaf_id,
                     },
                 )?,
                 false,
@@ -431,6 +469,14 @@ impl PtyManager {
             }
         }
         let shared_handle = Arc::new(Mutex::new(handle));
+        Self::configure_startup_input(session, &shared_handle);
+        session.handle = Some(shared_handle);
+        session.detached_alive = false;
+        Ok(())
+    }
+
+    fn configure_startup_input(session: &mut ManagedSession, handle: &SharedPtyHandle) {
+        let spec = &session.spec;
         if let Some(input) = spec
             .startup_input
             .as_deref()
@@ -438,7 +484,7 @@ impl PtyManager {
             .filter(|input| !input.is_empty())
             .map(str::to_owned)
         {
-            let baseline_render_revision = shared_handle
+            let baseline_render_revision = handle
                 .lock()
                 .ok()
                 .map(|handle| handle.render_revision())
@@ -454,13 +500,10 @@ impl PtyManager {
                     input,
                     baseline_render_revision,
                 });
-            } else if let Ok(handle) = shared_handle.lock() {
+            } else if let Ok(handle) = handle.lock() {
                 write_startup_input(&handle, &input);
             }
         }
-        session.handle = Some(shared_handle);
-        session.detached_alive = false;
-        Ok(())
     }
 
     pub fn handle(&self, session_id: Uuid) -> Option<SharedPtyHandle> {
@@ -505,6 +548,15 @@ impl PtyManager {
             .values()
             .filter(|session| !session.is_attached() && session.is_alive())
             .count()
+    }
+
+    #[cfg(test)]
+    pub fn startup_command_for_tests(&self, session_id: Uuid) -> Option<&str> {
+        self.sessions
+            .get(&session_id)?
+            .spec
+            .startup_command
+            .as_deref()
     }
 
     /// Declara la sesión del panel enfocado para el carril interactivo.
@@ -636,7 +688,7 @@ fn write_prompt_input(handle: &PtyHandle, input: &str) {
 mod tests {
     use uuid::Uuid;
 
-    use super::{PendingStartupInput, PtyManager};
+    use super::{PendingStartupInput, PtyManager, RuntimeScheduler};
     use crate::runtime::SessionSpec;
 
     #[test]
@@ -665,5 +717,18 @@ mod tests {
         // revision del PTY), no debe paniquear ni adjuntar.
         manager.queue_prompt(session_id, "hello");
         assert!(!manager.is_attached(session_id));
+    }
+
+    #[test]
+    fn focused_session_gets_the_unthrottled_io_lane() {
+        let focused = Uuid::new_v4();
+        let background = Uuid::new_v4();
+        let mut scheduler = RuntimeScheduler::new_for_tests();
+        scheduler.set_priority_session(Some(focused));
+
+        assert!(scheduler.reader_delay(focused).is_zero());
+        assert!(!scheduler.reader_delay(background).is_zero());
+        scheduler.set_priority_session(None);
+        assert!(scheduler.reader_delay(background).is_zero());
     }
 }

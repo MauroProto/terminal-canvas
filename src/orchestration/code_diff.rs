@@ -339,18 +339,22 @@ pub fn list_git_worktrees(repo_root: &Path) -> Vec<WorktreeInfo> {
 pub fn remove_git_worktree(repo_root: &Path, worktree_path: &Path) -> anyhow::Result<()> {
     let root =
         git_toplevel(repo_root).ok_or_else(|| anyhow::anyhow!("No es un repositorio git"))?;
-    let is_managed = worktree_path.components().any(|component| {
-        matches!(component, std::path::Component::Normal(name) if name == ".terminalcanvas")
-    });
-    if !is_managed {
+    if !is_managed_worktree(&root, worktree_path) {
         anyhow::bail!("Solo se limpian worktrees bajo .terminalcanvas/worktrees");
     }
-    let output = Command::new("git")
+    let registered = list_git_worktrees(&root)
+        .into_iter()
+        .map(|info| info.path)
+        .collect::<Vec<_>>();
+    super::worktree_removal_safety::check_recursive_delete(worktree_path, &root, &registered)
+        .map_err(|guard| anyhow::anyhow!("borrado rechazado: {}", guard.0))?;
+    let mut command = Command::new("git");
+    command
         .arg("-C")
         .arg(&root)
         .args(["worktree", "remove", "--force"])
-        .arg(worktree_path)
-        .output()?;
+        .arg(worktree_path);
+    let output = super::git::run_with_timeout(&mut command, std::time::Duration::from_secs(30))?;
     if !output.status.success() {
         anyhow::bail!(
             "git worktree remove failed: {}",
@@ -360,13 +364,27 @@ pub fn remove_git_worktree(repo_root: &Path, worktree_path: &Path) -> anyhow::Re
     Ok(())
 }
 
+/// Autoriza únicamente descendientes reales del directorio administrado del
+/// repo. Buscar un componente llamado `.terminalcanvas` en cualquier parte
+/// del path permitiría ofrecer el borrado de worktrees creados por el usuario
+/// fuera del alcance de TerminalCanvas.
+pub fn is_managed_worktree(repo_root: &Path, worktree_path: &Path) -> bool {
+    let Ok(managed_root) =
+        std::fs::canonicalize(repo_root.join(".terminalcanvas").join("worktrees"))
+    else {
+        return false;
+    };
+    let Ok(worktree) = std::fs::canonicalize(worktree_path) else {
+        return false;
+    };
+    worktree != managed_root && worktree.starts_with(managed_root)
+}
+
 fn git_string(path: &Path, args: &[&str]) -> Option<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(path)
-        .args(args)
-        .output()
-        .ok()?;
+    let mut command = Command::new("git");
+    command.arg("-C").arg(path).args(args);
+    let output =
+        super::git::run_with_timeout(&mut command, std::time::Duration::from_secs(15)).ok()?;
     if !output.status.success() {
         return None;
     }
@@ -715,6 +733,54 @@ index 1..2 100644
         let main_path = after[0].path.clone();
         assert!(super::remove_git_worktree(&dir, &main_path).is_err());
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn removal_rejects_a_linked_worktree_outside_the_managed_root() {
+        use std::process::Command;
+        let dir =
+            std::env::temp_dir().join(format!("worktree-scope-test-{}", uuid::Uuid::new_v4()));
+        let external_parent = std::env::temp_dir()
+            .join(format!("worktree-external-{}", uuid::Uuid::new_v4()))
+            .join(".terminalcanvas");
+        let external = external_parent.join("outside-managed-root");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(args)
+                .output()
+                .expect("run git");
+            assert!(
+                output.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@test.com"]);
+        git(&["config", "user.name", "Test"]);
+        std::fs::write(dir.join("file.txt"), "hello\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "initial"]);
+        git(&[
+            "worktree",
+            "add",
+            "-b",
+            "external-test",
+            external.to_str().unwrap(),
+        ]);
+
+        let result = super::remove_git_worktree(&dir, &external);
+
+        assert!(result.is_err());
+        assert!(external.exists(), "un worktree ajeno no debe tocarse");
+        git(&["worktree", "remove", "--force", external.to_str().unwrap()]);
+        let _ = std::fs::remove_dir_all(&external_parent);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

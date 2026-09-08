@@ -90,22 +90,22 @@ impl TerminalApp {
             .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
             .show(ctx, |ui| {
                 egui::Frame::default()
-                    .fill(palette::INK)
+                    .fill(palette::SURFACE)
                     .stroke(egui::Stroke::new(1.0, palette::LINE))
-                    .rounding(10.0)
-                    .inner_margin(egui::Margin::same(20.0))
+                    .corner_radius(10.0)
+                    .inner_margin(egui::Margin::same(22))
                     .show(ui, |ui| {
-                        ui.set_min_width(440.0);
+                        ui.set_min_width(460.0);
                         ui.label(
                             RichText::new("Configuración")
-                                .size(16.0)
+                                .size(17.0)
                                 .color(palette::TEXT_STRONG)
                                 .strong(),
                         );
                         ui.add_space(4.0);
                         ui.label(
                             RichText::new("Los cambios se guardan en config.toml")
-                                .size(11.0)
+                                .size(11.5)
                                 .color(palette::DIM),
                         );
                         ui.add_space(12.0);
@@ -121,18 +121,14 @@ impl TerminalApp {
                         ui.add_space(8.0);
                         ui.separator();
                         ui.add_space(8.0);
-                        ui.horizontal(|ui| {
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if ui.button("Guardar").clicked() {
-                                        save = true;
-                                    }
-                                    if ui.button("Cancelar").clicked() {
-                                        cancel = true;
-                                    }
-                                },
-                            );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.style_mut().spacing.item_spacing.x = 8.0;
+                            if super::dialogs::dialog_action_button(ui, "Guardar", true) {
+                                save = true;
+                            }
+                            if super::dialogs::dialog_action_button(ui, "Cancelar", false) {
+                                cancel = true;
+                            }
                         });
                     });
             });
@@ -156,28 +152,30 @@ impl TerminalApp {
         ui.horizontal(|ui| {
             ui.label(
                 RichText::new("Tamaño de fuente")
-                    .size(12.0)
+                    .size(13.0)
                     .color(palette::TEXT),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.add(
+                ui.add_sized(
+                    vec2(72.0, 28.0),
                     egui::DragValue::new(&mut draft.font_size)
                         .range(MIN_FONT_SIZE..=MAX_FONT_SIZE)
                         .speed(0.5),
                 );
             });
         });
-        ui.add_space(10.0);
+        ui.add_space(12.0);
 
         // Scrollback.
         ui.horizontal(|ui| {
             ui.label(
                 RichText::new("Líneas de scrollback")
-                    .size(12.0)
+                    .size(13.0)
                     .color(palette::TEXT),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.add(
+                ui.add_sized(
+                    vec2(88.0, 28.0),
                     egui::DragValue::new(&mut draft.scrollback_lines)
                         .range(100..=1_000_000)
                         .speed(500),
@@ -186,26 +184,26 @@ impl TerminalApp {
         });
         ui.label(
             RichText::new("Aplica a terminales nuevos")
-                .size(10.0)
+                .size(11.0)
                 .color(palette::DIM),
         );
-        ui.add_space(10.0);
+        ui.add_space(12.0);
 
         // Shell.
         ui.label(
             RichText::new("Shell personalizada")
-                .size(12.0)
+                .size(13.0)
                 .color(palette::TEXT),
         );
         ui.add_space(4.0);
         let edit = egui::TextEdit::singleline(&mut draft.shell)
             .hint_text("vacío = login shell del sistema")
             .text_color(palette::TEXT_STRONG)
-            .margin(egui::Margin::symmetric(8.0, 5.0));
-        ui.add_sized(vec2(ui.available_width() - 8.0, 26.0), edit);
+            .margin(egui::Margin::symmetric(8, 5));
+        ui.add_sized(vec2(ui.available_width() - 8.0, 30.0), edit);
         ui.label(
             RichText::new("Aplica a terminales nuevos")
-                .size(10.0)
+                .size(11.0)
                 .color(palette::DIM),
         );
         ui.add_space(12.0);
@@ -267,11 +265,11 @@ fn checkbox_row(ui: &mut egui::Ui, value: &mut bool, label: &str, hint: &str) {
     ui.horizontal(|ui| {
         ui.checkbox(value, "");
         ui.vertical(|ui| {
-            ui.label(RichText::new(label).size(12.0).color(palette::TEXT));
-            ui.label(RichText::new(hint).size(10.0).color(palette::DIM));
+            ui.label(RichText::new(label).size(13.0).color(palette::TEXT));
+            ui.label(RichText::new(hint).size(11.0).color(palette::DIM));
         });
     });
-    ui.add_space(6.0);
+    ui.add_space(8.0);
 }
 
 #[cfg(test)]

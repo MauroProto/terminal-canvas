@@ -228,6 +228,8 @@ pub(super) fn parse_diff_stats(raw: Option<String>) -> DiffStats {
 /// puede dejar el lanzamiento colgado para siempre. Vencido el plazo se mata
 /// el child. Why: Orca (`WORKTREE_ADD_TIMEOUT_MS`) usa 180 s con la misma idea.
 const WORKTREE_ADD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+const GIT_INSPECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const MAX_COMMAND_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 
 pub(super) fn create_git_worktree(
     repo_root: &Path,
@@ -285,7 +287,7 @@ fn ensure_push_auto_setup_remote(repo_root: &Path) {
 /// que los pipes nunca bloqueen al hijo. Vencido el plazo mata al child y
 /// devuelve un error `TimedOut`; un proceso colgado jamás deja la llamada
 /// colgando.
-fn run_with_timeout(
+pub(super) fn run_with_timeout(
     command: &mut Command,
     timeout: std::time::Duration,
 ) -> anyhow::Result<std::process::Output> {
@@ -297,8 +299,8 @@ fn run_with_timeout(
         .spawn()?;
     // Drenar en hilos: si el hijo escribe más que el buffer del pipe y nadie
     // lee, se bloquea en write() y el timeout nunca lo vería terminado.
-    let stdout_handle = child.stdout.take().map(drain_pipe);
-    let stderr_handle = child.stderr.take().map(drain_pipe);
+    let stdout_handle = child.stdout.take().and_then(drain_pipe);
+    let stderr_handle = child.stderr.take().and_then(drain_pipe);
 
     let started = std::time::Instant::now();
     loop {
@@ -316,7 +318,7 @@ fn run_with_timeout(
                 if started.elapsed() >= timeout {
                     let _ = child.kill();
                     let _ = child.wait();
-                    anyhow::bail!("git worktree add timed out after {timeout:?}");
+                    anyhow::bail!("command timed out after {timeout:?}");
                 }
                 std::thread::sleep(std::time::Duration::from_millis(25));
             }
@@ -326,17 +328,23 @@ fn run_with_timeout(
 
 fn drain_pipe<R: std::io::Read + Send + 'static>(
     mut reader: R,
-) -> std::thread::JoinHandle<Vec<u8>> {
-    // El unwrap es de spawn: si no se puede crear el hilo de drenaje el
-    // fallback es leer nada, pero worktree add sigue funcionando.
+) -> Option<std::thread::JoinHandle<Vec<u8>>> {
     std::thread::Builder::new()
         .name("git-pipe-drain".to_owned())
         .spawn(move || {
             let mut buffer = Vec::new();
-            let _ = reader.read_to_end(&mut buffer);
+            let mut chunk = [0_u8; 8 * 1024];
+            loop {
+                let read = match reader.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => read,
+                };
+                let remaining = MAX_COMMAND_OUTPUT_BYTES.saturating_sub(buffer.len());
+                buffer.extend_from_slice(&chunk[..read.min(remaining)]);
+            }
             buffer
         })
-        .expect("spawn pipe drain thread")
+        .ok()
 }
 
 fn join_drain(handle: std::thread::JoinHandle<Vec<u8>>) -> Vec<u8> {
@@ -344,12 +352,9 @@ fn join_drain(handle: std::thread::JoinHandle<Vec<u8>>) -> Vec<u8> {
 }
 
 fn git_stdout(path: &Path, args: &[&str]) -> Option<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(path)
-        .args(args)
-        .output()
-        .ok()?;
+    let mut command = Command::new("git");
+    command.arg("-C").arg(path).args(args);
+    let output = run_with_timeout(&mut command, GIT_INSPECT_TIMEOUT).ok()?;
     if !output.status.success() {
         return None;
     }
@@ -366,8 +371,18 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        create_git_worktree, run_with_timeout, GitInspector, WorktreeCreateJob, WorktreeCreator,
+        create_git_worktree, drain_pipe, run_with_timeout, GitInspector, WorktreeCreateJob,
+        WorktreeCreator, MAX_COMMAND_OUTPUT_BYTES,
     };
+
+    #[test]
+    fn command_pipe_is_drained_but_capture_memory_is_bounded() {
+        let input = vec![b'x'; MAX_COMMAND_OUTPUT_BYTES + 64 * 1024];
+        let handle = drain_pipe(std::io::Cursor::new(input)).expect("spawn drain");
+        let captured = handle.join().expect("join drain");
+
+        assert_eq!(captured.len(), MAX_COMMAND_OUTPUT_BYTES);
+    }
 
     #[test]
     fn worktree_creator_reports_failure_outside_a_repo() {

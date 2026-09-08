@@ -2,14 +2,15 @@ use std::borrow::Cow;
 
 use egui::{Align2, FontId, Sense, Ui};
 
-use crate::sidebar::{SidebarResponse, SIDEBAR_BORDER, TEXT_MUTED, TEXT_PRIMARY, TEXT_SECONDARY};
+use crate::sidebar::{SidebarResponse, SIDEBAR_BORDER, TEXT_MUTED, TEXT_PRIMARY};
 use crate::state::Workspace;
 use crate::theme::colors::{DIM, FOCUS, RAISED, TEXT};
 
 const ROW_PAD_X: f32 = 14.0;
-const ITEM_HEIGHT: f32 = 26.0;
-const HEADER_HEIGHT_WITH_PATH: f32 = 44.0;
-const HEADER_HEIGHT_PLAIN: f32 = 30.0;
+const ITEM_HEIGHT: f32 = 28.0;
+const HEADER_HEIGHT_WITH_PATH: f32 = 46.0;
+const HEADER_HEIGHT_PLAIN: f32 = 34.0;
+const HEADER_ACTION_SIZE: f32 = 24.0;
 
 pub fn draw_workspace_tree(
     ui: &mut Ui,
@@ -32,6 +33,14 @@ pub fn draw_workspace_tree(
         );
 
         let active = index == active_ws;
+        header_response.widget_info(|| {
+            egui::WidgetInfo::selected(
+                egui::WidgetType::SelectableLabel,
+                ui.is_enabled(),
+                active,
+                format!("Workspace {}", workspace.name),
+            )
+        });
         if active {
             ui.painter().rect_filled(header_rect, 6.0, FOCUS);
         } else if header_response.hovered() {
@@ -72,32 +81,55 @@ pub fn draw_workspace_tree(
             );
         }
 
+        let can_close = workspace.cwd().is_some() || workspaces.len() > 1;
+        let close_rect = egui::Rect::from_center_size(
+            egui::pos2(header_rect.right() - 16.0, header_rect.center().y),
+            egui::vec2(HEADER_ACTION_SIZE, HEADER_ACTION_SIZE),
+        );
+        let close_response = can_close.then(|| {
+            let response = ui.put(close_rect, egui::Button::new("×").frame(false));
+            response.widget_info(|| {
+                egui::WidgetInfo::labeled(
+                    egui::WidgetType::Button,
+                    ui.is_enabled(),
+                    "Cerrar proyecto",
+                )
+            });
+            response.on_hover_text("Cerrar proyecto y sus terminales")
+        });
         let add_rect = egui::Rect::from_center_size(
-            egui::pos2(header_rect.right() - 14.0, header_rect.center().y),
-            egui::vec2(18.0, 18.0),
+            egui::pos2(
+                header_rect.right() - if can_close { 46.0 } else { 16.0 },
+                header_rect.center().y,
+            ),
+            egui::vec2(HEADER_ACTION_SIZE, HEADER_ACTION_SIZE),
         );
-        let add_response = ui.interact(add_rect, ui.id().with(("ws-add", index)), Sense::click());
-        let add_color = if add_response.hovered() {
-            TEXT_PRIMARY
-        } else {
-            TEXT_SECONDARY
-        };
-        ui.painter().text(
-            add_rect.center(),
-            Align2::CENTER_CENTER,
-            "+",
-            FontId::proportional(15.0),
-            add_color,
-        );
+        let add_response = ui
+            .put(
+                add_rect,
+                egui::Button::new(egui::RichText::new("+").size(15.0)).frame(false),
+            )
+            .on_hover_text("Nuevo terminal en este workspace");
+        add_response.widget_info(|| {
+            egui::WidgetInfo::labeled(
+                egui::WidgetType::Button,
+                ui.is_enabled(),
+                format!("Nuevo terminal en {}", workspace.name),
+            )
+        });
 
-        if header_response.clicked() && !add_response.hovered() {
+        let close_hovered = close_response
+            .as_ref()
+            .map(egui::Response::hovered)
+            .unwrap_or(false);
+        if header_response.clicked() && !add_response.hovered() && !close_hovered {
             responses.push(SidebarResponse::SwitchWorkspace(index));
-        }
-        if header_response.secondary_clicked() && workspaces.len() > 1 {
-            responses.push(SidebarResponse::DeleteWorkspace(index));
         }
         if add_response.clicked() {
             responses.push(SidebarResponse::SpawnTerminal(index));
+        }
+        if close_response.is_some_and(|response| response.clicked()) {
+            responses.push(SidebarResponse::RequestCloseWorkspace(workspace.id));
         }
 
         for panel in &workspace.panels {
@@ -105,6 +137,13 @@ pub fn draw_workspace_tree(
                 egui::vec2(ui.available_width(), ITEM_HEIGHT),
                 Sense::click(),
             );
+            item_response.widget_info(|| {
+                egui::WidgetInfo::labeled(
+                    egui::WidgetType::Button,
+                    ui.is_enabled(),
+                    format!("Abrir terminal {}", panel.title()),
+                )
+            });
             if item_response.hovered() {
                 ui.painter().rect_filled(item_rect, 4.0, RAISED);
             }
@@ -115,7 +154,7 @@ pub fn draw_workspace_tree(
                 egui::pos2(item_rect.left() + 30.0, item_rect.center().y),
                 Align2::LEFT_CENTER,
                 truncate(panel.title(), 24),
-                FontId::proportional(11.0),
+                FontId::proportional(12.0),
                 if panel.is_alive() {
                     TEXT_PRIMARY
                 } else {
@@ -148,10 +187,11 @@ pub fn draw_workspace_tree(
     }
 
     ui.add_space(6.0);
-    let (new_rect, new_response) = ui.allocate_exact_size(
-        egui::vec2(ui.available_width(), ITEM_HEIGHT),
-        Sense::click(),
-    );
+    let (new_rect, new_response) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 30.0), Sense::click());
+    new_response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), "Abrir carpeta")
+    });
     if new_response.hovered() {
         ui.painter().rect_filled(new_rect, 4.0, RAISED);
     }
@@ -164,7 +204,7 @@ pub fn draw_workspace_tree(
         egui::pos2(new_rect.left() + ROW_PAD_X, new_rect.center().y),
         Align2::LEFT_CENTER,
         "+ Open folder",
-        FontId::proportional(11.0),
+        FontId::proportional(12.0),
         new_color,
     );
     if new_response.clicked() {
@@ -198,4 +238,39 @@ fn truncate_middle(text: &str, max_chars: usize) -> Cow<'_, str> {
     result.push_str("...");
     result.extend(text.chars().skip(count - right_count));
     Cow::Owned(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use egui_kittest::kittest::Queryable as _;
+
+    use super::draw_workspace_tree;
+    use crate::sidebar::SidebarResponse;
+    use crate::state::Workspace;
+
+    #[test]
+    fn a_project_has_a_visible_close_button_that_only_requests_confirmation() {
+        let workspace = Workspace::from_folder(std::path::PathBuf::from("/tmp/project"));
+        let workspace_id = workspace.id;
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let captured_from_ui = Arc::clone(&captured);
+        let mut harness = egui_kittest::Harness::new_ui(move |ui| {
+            captured_from_ui.lock().unwrap().extend(draw_workspace_tree(
+                ui,
+                std::slice::from_ref(&workspace),
+                0,
+            ));
+        });
+
+        harness.get_by_label("Cerrar proyecto").click();
+        harness.run();
+
+        assert!(captured
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|response| { response == &SidebarResponse::RequestCloseWorkspace(workspace_id) }));
+    }
 }

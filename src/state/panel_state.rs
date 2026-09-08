@@ -1,5 +1,6 @@
 use crate::collab::PanelShareScope;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
@@ -64,6 +65,10 @@ pub struct PanelState {
     /// huérfana en el historial del CLI.
     #[serde(default)]
     pub agent_command: Option<String>,
+    /// Comando de agente por hoja de split. `agent_command` sigue siendo el
+    /// alias legado de la raíz.
+    #[serde(default)]
+    pub leaf_agent_commands: BTreeMap<String, String>,
     /// El panel produjo atención (bell / agente esperando) mientras no estaba
     /// enfocado y nadie lo interactuó todavía (P1.8). Se limpia al interactuar.
     #[serde(default)]
@@ -74,6 +79,12 @@ pub struct PanelState {
     /// Hoja con el foco de teclado dentro del split (P2.11).
     #[serde(default)]
     pub focused_leaf: Option<String>,
+    /// Identidad estable de la hoja respaldada por la sesión raíz del panel.
+    ///
+    /// Es opcional para poder leer layouts anteriores a la persistencia
+    /// multi-hoja. En ese caso se infiere de la primera hoja válida del árbol.
+    #[serde(default)]
+    pub root_leaf: Option<String>,
     /// Issue de GitHub que este panel está trabajando (P2.13).
     #[serde(default)]
     pub linked_issue: Option<u64>,
@@ -81,15 +92,28 @@ pub struct PanelState {
     /// restore reanuda con `--resume <id>` exacto en vez de `--continue`.
     #[serde(default)]
     pub agent_session_id: Option<String>,
+    /// Id de conversación exacto por hoja. `agent_session_id` conserva
+    /// compatibilidad con layouts anteriores de una sola hoja.
+    #[serde(default)]
+    pub leaf_agent_session_ids: BTreeMap<String, String>,
     /// Id de la sesión de runtime (P3.15, T4). Con el daemon hosteando, esto
     /// deja que al reabrir la app el panel se **reengancha** a su PTY vivo en
     /// vez de arrancar uno nuevo.
     #[serde(default)]
     pub runtime_session_id: Option<String>,
+    /// Sesión de runtime por identidad de hoja. Un `BTreeMap` mantiene estable
+    /// el JSON generado y facilita inspeccionar/diffear el estado persistido.
+    ///
+    /// `runtime_session_id` sigue escribiéndose y leyéndose como alias legado
+    /// de la raíz para que el cambio no requiera una migración destructiva.
+    #[serde(default)]
+    pub leaf_runtime_session_ids: BTreeMap<String, String>,
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use serde_json::json;
 
     use super::{PanelPlacement, PanelState, SavedPanelBounds};
@@ -111,12 +135,16 @@ mod tests {
             restore_bounds: Some(SavedPanelBounds::new([40.0, 72.0], [920.0, 640.0])),
             share_scope: PanelShareScope::VisibleOnly,
             agent_command: None,
+            leaf_agent_commands: BTreeMap::new(),
             unread: false,
             split_tree: None,
             focused_leaf: None,
+            root_leaf: None,
             linked_issue: None,
             agent_session_id: None,
+            leaf_agent_session_ids: BTreeMap::new(),
             runtime_session_id: None,
+            leaf_runtime_session_ids: BTreeMap::new(),
         }
     }
 
@@ -155,5 +183,33 @@ mod tests {
 
         assert_eq!(state.position, [40.0, 72.0]);
         assert_eq!(state.size, [920.0, 640.0]);
+        assert_eq!(state.root_leaf, None);
+        assert!(state.leaf_runtime_session_ids.is_empty());
+    }
+
+    #[test]
+    fn panel_state_round_trips_stable_leaf_runtime_identity() {
+        let root = uuid::Uuid::new_v4();
+        let runtime = uuid::Uuid::new_v4();
+        let root_text = root.to_string();
+        let runtime_text = runtime.to_string();
+        let mut state = sample_panel_state();
+        state.root_leaf = Some(root_text.clone());
+        state
+            .leaf_runtime_session_ids
+            .insert(root_text.clone(), runtime_text.clone());
+
+        let encoded = serde_json::to_value(&state).expect("panel state should serialize");
+        let decoded: PanelState =
+            serde_json::from_value(encoded).expect("panel state should deserialize");
+
+        assert_eq!(decoded.root_leaf.as_deref(), Some(root_text.as_str()));
+        assert_eq!(
+            decoded
+                .leaf_runtime_session_ids
+                .get(&root_text)
+                .map(String::as_str),
+            Some(runtime_text.as_str())
+        );
     }
 }

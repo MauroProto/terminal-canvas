@@ -7,14 +7,16 @@
 //! Si aun así no arranca, quien llama cae al modo in-process (el
 //! `PtyManager` de siempre): el daemon es una mejora, no un requisito.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use uuid::Uuid;
 
-use super::protocol::{decode_line, encode_line, socket_path, Request, Response, PROTOCOL_VERSION};
+use super::protocol::{
+    decode_line, encode_line, read_protocol_line, socket_path, Request, Response, PROTOCOL_VERSION,
+};
 
 /// Cuánto se espera a que el daemon recién lanzado abra el socket.
 pub const SPAWN_WAIT: Duration = Duration::from_secs(5);
@@ -36,6 +38,7 @@ pub fn is_pushed_event(response: &Response) -> bool {
 pub struct DaemonConn {
     reader: BufReader<UnixStream>,
     writer: UnixStream,
+    client_id: Uuid,
     /// Eventos que llegaron mientras se esperaba la respuesta a un pedido.
     /// Sin esta cola, un `Output` en el momento equivocado se leía como si
     /// fuera la respuesta y el pedido devolvía basura.
@@ -46,14 +49,23 @@ impl DaemonConn {
     /// Conecta al daemon, levantándolo si hace falta. `None` si no se pudo
     /// (quien llama cae al modo in-process).
     pub fn connect(dir: &Path, token: &str, daemon_binary: &Path) -> Option<Self> {
-        if let Some(conn) = Self::try_connect(dir, token) {
+        Self::connect_as(dir, token, daemon_binary, Uuid::new_v4())
+    }
+
+    pub fn connect_as(
+        dir: &Path,
+        token: &str,
+        daemon_binary: &Path,
+        client_id: Uuid,
+    ) -> Option<Self> {
+        if let Some(conn) = Self::try_connect_as(dir, token, client_id) {
             return Some(conn);
         }
         // Un solo reintento, después de levantarlo.
         spawn_daemon(daemon_binary, dir).ok()?;
         let deadline = Instant::now() + SPAWN_WAIT;
         while Instant::now() < deadline {
-            if let Some(conn) = Self::try_connect(dir, token) {
+            if let Some(conn) = Self::try_connect_as(dir, token, client_id) {
                 return Some(conn);
             }
             std::thread::sleep(Duration::from_millis(50));
@@ -67,6 +79,10 @@ impl DaemonConn {
     /// **mismo** socket para escribir input y para leer sus eventos `Output`,
     /// así no hace falta multiplexar ni drenar una segunda conexión.
     pub fn connect_raw(dir: &Path, token: &str) -> Option<UnixStream> {
+        Self::connect_raw_as(dir, token, Uuid::new_v4())
+    }
+
+    pub fn connect_raw_as(dir: &Path, token: &str, client_id: Uuid) -> Option<UnixStream> {
         let stream = UnixStream::connect(socket_path(dir)).ok()?;
         let mut writer = stream.try_clone().ok()?;
         let mut reader = BufReader::new(stream.try_clone().ok()?);
@@ -75,13 +91,13 @@ impl DaemonConn {
                 encode_line(&Request::Hello {
                     version: PROTOCOL_VERSION,
                     token: token.to_owned(),
+                    client_id,
                 })
                 .as_bytes(),
             )
             .ok()?;
         writer.flush().ok()?;
-        let mut line = String::new();
-        reader.read_line(&mut line).ok()?;
+        let line = read_protocol_line(&mut reader).ok()??;
         match decode_line::<Response>(&line) {
             Some(Response::Welcome { version }) if version == PROTOCOL_VERSION => Some(stream),
             _ => None,
@@ -90,6 +106,10 @@ impl DaemonConn {
 
     /// Conecta sin levantar nada.
     pub fn try_connect(dir: &Path, token: &str) -> Option<Self> {
+        Self::try_connect_as(dir, token, Uuid::new_v4())
+    }
+
+    pub fn try_connect_as(dir: &Path, token: &str, client_id: Uuid) -> Option<Self> {
         let stream = UnixStream::connect(socket_path(dir)).ok()?;
         stream
             .set_read_timeout(Some(Duration::from_secs(10)))
@@ -98,11 +118,13 @@ impl DaemonConn {
         let mut conn = Self {
             reader: BufReader::new(stream),
             writer,
+            client_id,
             pending_events: std::collections::VecDeque::new(),
         };
         match conn.request(&Request::Hello {
             version: PROTOCOL_VERSION,
             token: token.to_owned(),
+            client_id,
         }) {
             Some(Response::Welcome { version }) if version == PROTOCOL_VERSION => Some(conn),
             _ => None,
@@ -116,10 +138,7 @@ impl DaemonConn {
             .ok()?;
         self.writer.flush().ok()?;
         loop {
-            let mut line = String::new();
-            if self.reader.read_line(&mut line).ok()? == 0 {
-                return None; // el daemon cerró la conexión
-            }
+            let line = read_protocol_line(&mut self.reader).ok()??;
             let Some(response) = decode_line::<Response>(&line) else {
                 continue; // línea corrupta: se ignora, no tumba la conexión
             };
@@ -147,7 +166,7 @@ impl DaemonConn {
 
     /// Reattach caliente: devuelve el historial ya visto y el `seq` desde el
     /// cual los eventos son nuevos.
-    pub fn attach(&mut self, id: Uuid) -> Option<(String, u64)> {
+    pub fn attach(&mut self, id: Uuid) -> Option<(Vec<u8>, u64)> {
         match self.request(&Request::Attach { id })? {
             Response::Attached { snapshot, seq, .. } => Some((snapshot, seq)),
             _ => None,
@@ -168,11 +187,22 @@ impl DaemonConn {
         )
     }
 
+    pub fn set_priority_session(&mut self, id: Option<Uuid>) -> bool {
+        matches!(
+            self.request(&Request::SetPriority { id }),
+            Some(Response::Sessions { .. })
+        )
+    }
+
     pub fn reconcile_live(&mut self, ids: Vec<Uuid>) -> Vec<Uuid> {
         match self.request(&Request::ReconcileLive { ids }) {
             Some(Response::Reconciled { killed }) => killed,
             _ => Vec::new(),
         }
+    }
+
+    pub fn client_id(&self) -> Uuid {
+        self.client_id
     }
 }
 
@@ -267,7 +297,7 @@ mod tests {
         assert!(super::is_pushed_event(&Response::Output {
             id,
             seq: 1,
-            data: "x".to_owned()
+            data: b"x".to_vec()
         }));
         assert!(super::is_pushed_event(&Response::Exit { id }));
         // Lo que contesta a un pedido.

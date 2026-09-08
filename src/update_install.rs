@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 pub const APP_BUNDLE_NAME: &str = "TerminalCanvas.app";
+pub const APP_BUNDLE_ID: &str = "com.terminalcanvas.app";
 const APPLICATIONS_DIR: &str = "/Applications";
 
 /// Salida de `hdiutil attach -plist`: nos quedamos con el primer
@@ -29,9 +30,7 @@ pub fn parse_mount_point(plist: &str) -> Option<PathBuf> {
 /// ¿Es un destino aceptable para el swap? Solo un `.app` dentro de
 /// `/Applications`: nunca se toca nada afuera de ahí.
 pub fn is_safe_swap_target(path: &Path) -> bool {
-    path.starts_with(APPLICATIONS_DIR)
-        && path.extension().is_some_and(|extension| extension == "app")
-        && path.parent() == Some(Path::new(APPLICATIONS_DIR))
+    path == installed_app_path()
 }
 
 /// Dónde vive (o va a vivir) la app instalada.
@@ -47,7 +46,7 @@ pub fn bundle_in_volume(mount_point: &Path) -> PathBuf {
 /// Monta el dmg y devuelve el punto de montaje.
 pub fn mount_dmg(dmg: &Path) -> Option<PathBuf> {
     let output = Command::new("hdiutil")
-        .args(["attach", "-nobrowse", "-readonly", "-plist"])
+        .args(["attach", "-nobrowse", "-readonly", "-noautoopen", "-plist"])
         .arg(dmg)
         .output()
         .ok()?;
@@ -55,9 +54,13 @@ pub fn mount_dmg(dmg: &Path) -> Option<PathBuf> {
         return None;
     }
     parse_mount_point(&String::from_utf8_lossy(&output.stdout))
+        .filter(|path| path.starts_with("/Volumes") && path.parent() == Some(Path::new("/Volumes")))
 }
 
 pub fn detach_dmg(mount_point: &Path) {
+    if !mount_point.starts_with("/Volumes") || mount_point.parent() != Some(Path::new("/Volumes")) {
+        return;
+    }
     let _ = Command::new("hdiutil")
         .args(["detach", "-quiet"])
         .arg(mount_point)
@@ -66,9 +69,20 @@ pub fn detach_dmg(mount_point: &Path) {
 
 /// Verifica la firma del bundle. Sin firma válida, no se instala.
 pub fn verify_bundle_signature(app: &Path) -> bool {
-    Command::new("codesign")
-        .args(["--verify", "--deep", "--strict"])
-        .arg(app)
+    let mut codesign = Command::new("codesign");
+    codesign
+        .args(["--verify", "--deep", "--strict", "-R"])
+        .arg(format!(
+            "=identifier \"{APP_BUNDLE_ID}\" and anchor apple generic and certificate leaf[subject.OU] exists"
+        ))
+        .arg(app);
+    let mut gatekeeper = Command::new("spctl");
+    gatekeeper.args(["--assess", "--type", "execute"]).arg(app);
+    command_succeeds(&mut codesign) && command_succeeds(&mut gatekeeper)
+}
+
+fn command_succeeds(command: &mut Command) -> bool {
+    command
         .output()
         .map(|output| output.status.success())
         .unwrap_or(false)
@@ -82,6 +96,11 @@ pub fn swap_bundle(new_bundle: &Path, target: &Path) -> anyhow::Result<()> {
     }
     if !new_bundle.join("Contents/MacOS").is_dir() {
         anyhow::bail!("el bundle nuevo no tiene Contents/MacOS");
+    }
+    let canonical_new = std::fs::canonicalize(new_bundle)?;
+    let canonical_target = std::fs::canonicalize(APPLICATIONS_DIR)?.join(APP_BUNDLE_NAME);
+    if canonical_new == canonical_target || canonical_new.starts_with(&canonical_target) {
+        anyhow::bail!("el bundle nuevo no puede ser el destino instalado");
     }
     let backup = target.with_extension("app.old");
     let _ = std::fs::remove_dir_all(&backup);
@@ -97,12 +116,12 @@ pub fn swap_bundle(new_bundle: &Path, target: &Path) -> anyhow::Result<()> {
         .output()
         .map(|output| output.status.success())
         .unwrap_or(false);
-    if !copied {
+    if !copied || !verify_bundle_signature(target) {
         let _ = std::fs::remove_dir_all(target);
         if had_previous {
             std::fs::rename(&backup, target)?;
         }
-        anyhow::bail!("no se pudo copiar el bundle nuevo");
+        anyhow::bail!("no se pudo copiar o verificar el bundle nuevo");
     }
     let _ = std::fs::remove_dir_all(&backup);
     Ok(())
@@ -173,6 +192,7 @@ mod tests {
         assert!(!is_safe_swap_target(Path::new(
             "/Users/alguien/Applications/TerminalCanvas.app"
         )));
+        assert!(!is_safe_swap_target(Path::new("/Applications/Otra.app")));
         // Ni directorios que no sean un bundle.
         assert!(!is_safe_swap_target(Path::new("/Applications")));
         assert!(!is_safe_swap_target(Path::new("/Applications/algo")));

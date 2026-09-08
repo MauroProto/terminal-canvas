@@ -7,13 +7,12 @@ cask "terminalcanvas" do
   version "1.2.0"
   sha256 "REEMPLAZAR_CON_EL_SHA256_DEL_DMG"
 
-  url "https://github.com/OWNER/terminalcanvas/releases/download/v#{version}/TerminalCanvas-#{version}.dmg"
+  url "https://github.com/MauroProto/terminal-canvas/releases/download/v#{version}/TerminalCanvas-#{version}.dmg"
   name "TerminalCanvas"
   desc "Canvas de terminales para trabajar con varios agentes de codigo a la vez"
-  homepage "https://github.com/OWNER/terminalcanvas"
+  homepage "https://github.com/MauroProto/terminal-canvas"
 
-  # La app se actualiza sola desde adentro; el cask solo instala.
-  auto_updates true
+  # El checker interno informa y abre la descarga; la instalación es manual.
   depends_on macos: ">= :big_sur"
 
   app "TerminalCanvas.app"

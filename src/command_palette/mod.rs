@@ -52,8 +52,8 @@ impl CommandPalette {
             Frame::default()
                 .fill(palette::SURFACE)
                 .stroke(egui::Stroke::new(1.0, palette::LINE))
-                .rounding(10.0)
-                .inner_margin(egui::Margin::same(10.0))
+                .corner_radius(10.0)
+                .inner_margin(egui::Margin::same(10))
                 .show(ui, |ui: &mut egui::Ui| {
                     ui.set_min_width(width);
                     let search = ui.add_sized(

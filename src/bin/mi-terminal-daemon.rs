@@ -34,16 +34,6 @@ fn main() {
         }
     };
 
-    // Pid-file con nonce: distingue este daemon de un proceso que reusó el pid.
-    let pid_file = protocol::PidFile::new(std::process::id());
-    if let Err(err) = protocol::write_pid_file(&dir, &pid_file) {
-        log::warn!("no se pudo escribir el pid-file: {err}");
-    }
-
-    log::info!(
-        "daemon escuchando en {}",
-        protocol::socket_path(&dir).display()
-    );
     if let Err(err) = server::serve(&dir, token) {
         eprintln!("el daemon terminó con error: {err}");
         std::process::exit(1);

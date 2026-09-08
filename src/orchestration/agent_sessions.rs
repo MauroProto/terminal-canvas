@@ -26,10 +26,11 @@ const MAX_SESSION_ID_CHARS: usize = 512;
 /// Valida un id de sesión antes de usarlo como argumento de un comando
 /// (`claude --resume <id>`). Devuelve `None` si el id no es seguro.
 ///
-/// Reglas (las mismas que aplica Orca en `agent-session-resume.ts`):
+/// Reglas:
 /// - vacío o más largo que [`MAX_SESSION_ID_CHARS`] → rechazado;
 /// - cualquier control char (incluye `\n` y ESC) → rechazado;
 /// - prefijo `-` → rechazado: un id `-rf` sería parseado como flag por el CLI.
+/// - sólo se aceptan tokens ASCII opacos: letras, números, `-`, `_` y `.`.
 pub fn sanitize_session_id(id: &str) -> Option<String> {
     if id.is_empty() || id.chars().count() > MAX_SESSION_ID_CHARS {
         return None;
@@ -37,7 +38,14 @@ pub fn sanitize_session_id(id: &str) -> Option<String> {
     if id.starts_with('-') {
         return None;
     }
-    if id.chars().any(char::is_control) {
+    // Los comandos de resume se escriben en un shell interactivo. Los ids de
+    // los proveedores soportados son tokens opacos (UUIDs o strings
+    // alfanuméricos con `-`/`_`); aceptar espacios, comillas o metacaracteres
+    // convertiría el nombre de un archivo de historial en código de shell.
+    if !id
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+    {
         return None;
     }
     Some(id.to_owned())
@@ -337,6 +345,24 @@ mod tests {
         // Regresión: un id "-rf /" sería parseado como flag por el CLI.
         assert_eq!(sanitize_session_id("-rf /"), None);
         assert_eq!(sanitize_session_id("--help"), None);
+    }
+
+    #[test]
+    fn shell_metacharacters_are_rejected() {
+        for id in [
+            "safe; touch /tmp/pwned",
+            "safe && echo pwned",
+            "$(echo pwned)",
+            "`echo pwned`",
+            "id with spaces",
+            "id'quoted",
+        ] {
+            assert_eq!(
+                sanitize_session_id(id),
+                None,
+                "session id with shell syntax passed: {id:?}"
+            );
+        }
     }
 
     #[test]

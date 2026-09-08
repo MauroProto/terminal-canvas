@@ -164,7 +164,12 @@ impl TerminalApp {
                 .show(ctx, |ui| {
                     let painter = ui.painter();
                     painter.rect_filled(rect, 10.0, fade(palette::RAISED));
-                    painter.rect_stroke(rect, 10.0, egui::Stroke::new(1.0, fade(palette::LINE)));
+                    painter.rect_stroke(
+                        rect,
+                        10.0,
+                        egui::Stroke::new(1.0, fade(palette::LINE)),
+                        egui::StrokeKind::Middle,
+                    );
                     // Barra de acento a la izquierda: color según el tipo.
                     let accent = Rect::from_min_size(rect.min, vec2(3.0, rect.height()));
                     painter.rect_filled(accent, 2.0, fade(toast.kind.accent()));

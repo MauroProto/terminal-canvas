@@ -1,10 +1,13 @@
+use egui::scroll_area::ScrollBarVisibility;
 use egui::{Align2, FontId, RichText, ScrollArea, Sense, Stroke, Ui};
 
 use crate::collab::{CollabMode, CollabSessionState};
 use crate::sidebar::workspace_list::draw_workspace_tree;
 use crate::state::Workspace;
-use crate::theme::colors::{DIM, FOCUS, INK, LINE, RAISED, SURFACE, TEXT, TEXT_STRONG};
-use crate::update::UpdateState;
+use crate::theme::colors::{
+    DIM, FOCUS, HOVER, INK, LINE, RAISED, RING, SURFACE, TEXT, TEXT_STRONG,
+};
+use crate::update::{UpdateState, UpdateStatus};
 
 pub mod file_tree;
 pub mod tasks;
@@ -38,7 +41,7 @@ pub enum SidebarResponse {
     StartWorkOnLinearIssue(String),
     SwitchWorkspace(usize),
     OpenFolder,
-    DeleteWorkspace(usize),
+    RequestCloseWorkspace(uuid::Uuid),
     OpenShareWorkspace,
     OpenJoinSession,
     OpenCollabSession,
@@ -50,6 +53,7 @@ pub enum SidebarResponse {
     OpenSettings,
     OpenBroadcast,
     ExportScrollback,
+    OpenUpdate(String),
     /// Abrir este archivo en el visor interno (desde el explorador).
     OpenFileInViewer(std::path::PathBuf),
 }
@@ -158,8 +162,11 @@ impl Sidebar {
             divider_color,
         );
 
-        let _ = update_state;
         ui.add_space(8.0);
+        if let Some(response) = draw_update_notice(ui, update_state) {
+            responses.push(response);
+            ui.add_space(8.0);
+        }
         responses.extend(self.show_tabs(ui));
         ui.add_space(8.0);
 
@@ -168,13 +175,20 @@ impl Sidebar {
         let scroll_height = (ui.available_height() - footer_height).max(0.0);
 
         ui.scope(|ui| {
-            // Ocultamos el thumb del scrollbar (la "barrita blanca") manteniendo
-            // el track. El usuario sigue pudiendo scrollear con rueda/trackpad.
+            // El usuario puede seguir scrolleando con rueda/trackpad, sin una
+            // barra que reserve 11 px y mueva el canvas al cambiar de pestaña.
             let visuals = ui.visuals_mut();
             visuals.widgets.inactive.bg_fill = egui::Color32::TRANSPARENT;
             visuals.widgets.hovered.bg_fill = egui::Color32::TRANSPARENT;
             visuals.widgets.active.bg_fill = egui::Color32::TRANSPARENT;
+            // El contenido de una pestaña no debe cambiar el ancho del sidebar.
+            // Sin este límite, textos largos de Files/Tasks/Online hacían que el
+            // panel saltara de 228 px al máximo de 320 px al cambiar de pestaña.
+            let content_width = ui.available_width();
             ScrollArea::vertical()
+                .scroll_bar_visibility(ScrollBarVisibility::AlwaysHidden)
+                .max_width(content_width)
+                .auto_shrink([false, true])
                 .max_height(scroll_height)
                 .show(ui, |ui| match self.active_tab {
                     SidebarTab::Workspaces => {
@@ -206,11 +220,10 @@ impl Sidebar {
     fn show_tabs(&mut self, ui: &mut Ui) -> Vec<SidebarResponse> {
         let responses = Vec::new();
         let total = ui.available_width();
-        let row_height = 28.0;
+        let row_height = 32.0;
         let (rect, _) = ui.allocate_exact_size(egui::vec2(total, row_height), Sense::hover());
 
         let label_pad_left = 12.0;
-        let item_gap = 18.0;
 
         let entries = [
             (
@@ -224,7 +237,7 @@ impl Sidebar {
         ];
 
         let painter = ui.painter().clone();
-        let font = FontId::proportional(11.5);
+        let font = FontId::proportional(12.0);
 
         // Pre-medir cada label para construir hit-rects ajustados al texto.
         let measure = |text: &str| -> f32 {
@@ -236,14 +249,25 @@ impl Sidebar {
             })
         };
 
+        let text_widths = entries.map(|(_, label, _)| measure(label));
+        let labels_width: f32 = text_widths.iter().sum();
+        let item_gap = ((total - label_pad_left * 2.0 - labels_width) / 3.0).clamp(8.0, 18.0);
+
         let mut cursor_x = rect.left() + label_pad_left;
-        for (tab, label, id_seed) in entries {
-            let text_width = measure(label);
+        for ((tab, label, id_seed), text_width) in entries.into_iter().zip(text_widths) {
             let hit_rect = egui::Rect::from_min_size(
                 egui::pos2(cursor_x - 6.0, rect.top()),
                 egui::vec2(text_width + 12.0, row_height),
             );
             let response = ui.interact(hit_rect, ui.id().with(id_seed), Sense::click());
+            response.widget_info(|| {
+                egui::WidgetInfo::selected(
+                    egui::WidgetType::SelectableLabel,
+                    ui.is_enabled(),
+                    self.active_tab == tab,
+                    label,
+                )
+            });
             if response.clicked() {
                 self.active_tab = tab;
             }
@@ -257,7 +281,7 @@ impl Sidebar {
             };
             let baseline = egui::pos2(cursor_x, rect.center().y);
             painter.text(baseline, Align2::LEFT_CENTER, label, font.clone(), color);
-            if active {
+            if active || response.has_focus() {
                 let underline_y = rect.bottom() - 4.0;
                 painter.line_segment(
                     [
@@ -303,7 +327,7 @@ impl Sidebar {
                     .circle_filled(dot_rect.center(), 3.0, dot_color);
                 ui.label(
                     RichText::new(controls.state_label)
-                        .size(11.0)
+                        .size(11.5)
                         .color(if status_alive { TEXT_PRIMARY } else { TEXT }),
                 );
             });
@@ -312,9 +336,10 @@ impl Sidebar {
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             ui.add_space(14.0);
-            ui.style_mut().spacing.item_spacing.x = 0.0;
+            ui.style_mut().spacing.item_spacing.x = 8.0;
             let avail = (ui.available_width() - 14.0).max(120.0);
-            let primary = render_text_link(ui, controls.primary_label, avail * 0.5, true);
+            let slot_width = ((avail - 8.0) * 0.5).max(60.0);
+            let primary = render_action_button(ui, controls.primary_label, slot_width, true);
             if primary {
                 responses.push(match collab_mode {
                     CollabMode::Inactive => SidebarResponse::OpenShareWorkspace,
@@ -322,7 +347,7 @@ impl Sidebar {
                 });
             }
             if let Some(label) = controls.secondary_label {
-                let secondary = render_text_link(ui, label, avail * 0.5, false);
+                let secondary = render_action_button(ui, label, slot_width, false);
                 if secondary {
                     responses.push(match collab_mode {
                         CollabMode::Inactive => SidebarResponse::OpenJoinSession,
@@ -336,10 +361,53 @@ impl Sidebar {
         ui.horizontal(|ui| {
             ui.add_space(14.0);
             ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
-            ui.label(RichText::new(description).size(10.5).color(TEXT_MUTED));
+            ui.label(RichText::new(description).size(11.0).color(TEXT_MUTED));
         });
 
         responses
+    }
+}
+
+fn update_download_target(state: &UpdateState) -> Option<&str> {
+    if matches!(state.status, UpdateStatus::Available) {
+        state.download_url.as_deref()
+    } else {
+        None
+    }
+}
+
+fn draw_update_notice(ui: &mut Ui, state: &UpdateState) -> Option<SidebarResponse> {
+    if !matches!(state.status, UpdateStatus::Available) {
+        return None;
+    }
+    let version = state.latest_version.as_deref().unwrap_or("new");
+    let target = update_download_target(state);
+    let mut open = false;
+    egui::Frame::new()
+        .fill(SURFACE)
+        .corner_radius(6.0)
+        .inner_margin(egui::Margin::symmetric(10, 7))
+        .show(ui, |ui| {
+            ui.set_width((ui.available_width() - 20.0).max(80.0));
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(format!("TerminalCanvas v{version}"))
+                        .size(10.5)
+                        .color(TEXT_PRIMARY),
+                );
+                if target.is_some()
+                    && ui
+                        .button(RichText::new("Download").size(10.0).color(TEXT_PRIMARY))
+                        .clicked()
+                {
+                    open = true;
+                }
+            });
+        });
+    if open {
+        target.map(|url| SidebarResponse::OpenUpdate(url.to_owned()))
+    } else {
+        None
     }
 }
 
@@ -407,8 +475,12 @@ fn draw_attention_section(ui: &mut Ui, attention: &[AttentionItem]) -> Vec<Sideb
         } else {
             TEXT_MUTED
         };
-        ui.painter()
-            .rect_stroke(diff_rect, 4.0, Stroke::new(1.0, diff_color));
+        ui.painter().rect_stroke(
+            diff_rect,
+            4.0,
+            Stroke::new(1.0, diff_color),
+            egui::StrokeKind::Middle,
+        );
         ui.painter().text(
             diff_rect.center(),
             Align2::CENTER_CENTER,
@@ -441,7 +513,7 @@ fn truncate_sidebar_label(label: &str, max_chars: usize) -> String {
     }
 }
 
-const FOOTER_ROW_HEIGHT: f32 = 26.0;
+const FOOTER_ROW_HEIGHT: f32 = 30.0;
 
 /// Fila de acciones al pie del sidebar. `bottom_up` hace que se dibujen de
 /// abajo hacia arriba, así que iteramos al revés para que queden en el orden
@@ -463,6 +535,9 @@ fn footer_button(ui: &mut Ui, icon: &str, label: &str, width: f32) -> bool {
         egui::vec2(width.max(60.0), FOOTER_ROW_HEIGHT),
         Sense::click(),
     );
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
+    });
     if response.hovered() {
         ui.painter()
             .rect_filled(rect.shrink2(egui::vec2(4.0, 2.0)), 5.0, RAISED);
@@ -476,63 +551,50 @@ fn footer_button(ui: &mut Ui, icon: &str, label: &str, width: f32) -> bool {
         egui::pos2(rect.left() + 10.0, rect.center().y),
         Align2::LEFT_CENTER,
         icon,
-        FontId::proportional(12.5),
+        FontId::proportional(13.0),
         color,
     );
     ui.painter().text(
         egui::pos2(rect.left() + 28.0, rect.center().y),
         Align2::LEFT_CENTER,
         label,
-        FontId::proportional(11.5),
+        FontId::proportional(12.0),
         color,
     );
     response.clicked()
 }
 
-fn render_text_link(ui: &mut Ui, label: &str, slot_width: f32, primary: bool) -> bool {
-    let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(slot_width.max(60.0), 26.0), Sense::click());
-    let color = if primary {
-        if response.hovered() {
-            TEXT_PRIMARY
-        } else {
-            TEXT
-        }
-    } else if response.hovered() {
-        TEXT
-    } else {
-        TEXT_MUTED
-    };
-    ui.painter().text(
-        egui::pos2(rect.left(), rect.center().y),
-        Align2::LEFT_CENTER,
-        label,
-        FontId::proportional(11.5),
-        color,
-    );
-    if response.hovered() {
-        let underline_y = rect.bottom() - 6.0;
-        let text_w = ui.fonts(|f| {
-            f.layout_no_wrap(label.to_owned(), FontId::proportional(11.5), color)
-                .size()
-                .x
-        });
-        ui.painter().line_segment(
-            [
-                egui::pos2(rect.left(), underline_y),
-                egui::pos2(rect.left() + text_w, underline_y),
-            ],
-            Stroke::new(1.0, color),
-        );
-    }
-    response.clicked()
+fn render_action_button(ui: &mut Ui, label: &str, slot_width: f32, primary: bool) -> bool {
+    ui.scope(|ui| {
+        let widgets = &mut ui.visuals_mut().widgets;
+        widgets.inactive.bg_fill = if primary { RAISED } else { INK };
+        widgets.inactive.bg_stroke = Stroke::new(1.0, LINE);
+        widgets.inactive.fg_stroke.color = if primary { TEXT_PRIMARY } else { TEXT };
+        widgets.hovered.bg_fill = HOVER;
+        widgets.hovered.bg_stroke = Stroke::new(1.0, RING);
+        widgets.hovered.fg_stroke.color = TEXT_PRIMARY;
+        widgets.active.bg_fill = FOCUS;
+        widgets.active.bg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
+        widgets.active.fg_stroke.color = TEXT_PRIMARY;
+
+        ui.add_sized(
+            egui::vec2(slot_width.max(60.0), 32.0),
+            egui::Button::new(RichText::new(label).size(12.0)).corner_radius(6.0),
+        )
+    })
+    .inner
+    .clicked()
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::collab::{CollabMode, CollabSessionState};
+    use std::sync::{Arc, Mutex};
 
-    use super::sidebar_collab_controls;
+    use crate::collab::{CollabMode, CollabSessionState};
+    use egui_kittest::kittest::Queryable as _;
+
+    use super::{sidebar_collab_controls, update_download_target, Sidebar, SidebarTab};
+    use crate::update::{UpdateState, UpdateStatus};
 
     #[test]
     fn inactive_sidebar_collab_controls_match_share_join_flow() {
@@ -551,5 +613,36 @@ mod tests {
         assert_eq!(controls.state_label, "Live");
         assert_eq!(controls.primary_label, "Session");
         assert_eq!(controls.secondary_label, Some("Leave"));
+    }
+
+    #[test]
+    fn update_notice_only_exposes_a_verified_release_asset() {
+        let available = UpdateState {
+            latest_version: Some("1.3.0".to_owned()),
+            download_url: Some("https://github.com/example/release.dmg".to_owned()),
+            installer_path: None,
+            status: UpdateStatus::Available,
+        };
+        assert_eq!(
+            update_download_target(&available),
+            Some("https://github.com/example/release.dmg")
+        );
+
+        let disabled = UpdateState::default();
+        assert!(update_download_target(&disabled).is_none());
+    }
+
+    #[test]
+    fn sidebar_tabs_are_accessible_and_keyboard_clickable() {
+        let sidebar = Arc::new(Mutex::new(Sidebar::default()));
+        let sidebar_from_ui = Arc::clone(&sidebar);
+        let mut harness = egui_kittest::Harness::new_ui(move |ui| {
+            sidebar_from_ui.lock().unwrap().show_tabs(ui);
+        });
+
+        harness.get_by_label("Files").click();
+        harness.run();
+
+        assert_eq!(sidebar.lock().unwrap().active_tab, SidebarTab::Files);
     }
 }

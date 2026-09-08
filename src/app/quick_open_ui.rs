@@ -147,8 +147,8 @@ impl TerminalApp {
                 egui::Frame::default()
                     .fill(palette::INK)
                     .stroke(egui::Stroke::new(1.0, palette::LINE))
-                    .rounding(10.0)
-                    .inner_margin(egui::Margin::same(14.0))
+                    .corner_radius(10.0)
+                    .inner_margin(egui::Margin::same(14))
                     .show(ui, |ui| {
                         ui.set_min_width(460.0);
                         ui.label(
@@ -162,7 +162,7 @@ impl TerminalApp {
                         )
                         .hint_text("archivo · > comando · @ panel")
                         .text_color(palette::TEXT_STRONG)
-                        .margin(egui::Margin::symmetric(10.0, 6.0));
+                        .margin(egui::Margin::symmetric(10, 6));
                         let response = ui.add_sized(vec2(432.0, 30.0), edit);
                         if response.changed() {
                             self.quick_open.as_mut().unwrap().selected = 0;

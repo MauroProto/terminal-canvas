@@ -7,12 +7,13 @@ use activity::*;
 use chrome::*;
 pub use chrome::{normalize_snapped_rect, snap_slot_rect};
 
-use std::path::Path;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use egui::{
-    pos2, vec2, Align2, Color32, FontId, Modifiers, PointerButton, Pos2, Rect, Rounding, Sense,
+    pos2, vec2, Align2, Color32, CornerRadius, FontId, Modifiers, PointerButton, Pos2, Rect, Sense,
     Stroke, Vec2,
 };
 use uuid::Uuid;
@@ -182,6 +183,9 @@ pub struct TerminalPanel {
     share_scope: PanelShareScope,
     /// Comando de agente con el que se lanzó el panel, para poder reanudarlo.
     agent_command: Option<String>,
+    /// Comando por identidad estable de hoja. El campo anterior es el alias
+    /// legado de la raíz para layouts de una sola sesión.
+    leaf_agent_commands: HashMap<crate::terminal::split_tree::LeafId, String>,
     /// Atención pendiente de ver (P1.8): bell / agente esperando mientras el
     /// panel no estaba enfocado. Se limpia al interactuar con el panel.
     unread: bool,
@@ -190,16 +194,22 @@ pub struct TerminalPanel {
     linked_issue: Option<u64>,
     /// Id de sesión del agente reportado por su hook (P2.12, T3).
     agent_session_id: Option<String>,
+    /// Id exacto de conversación por hoja.
+    leaf_agent_session_ids: HashMap<crate::terminal::split_tree::LeafId, String>,
     /// Árbol de splits (P2.11). `None` = una sola sesión (comportamiento
     /// clásico). Cuando existe, cada hoja tiene su propia sesión.
     split_tree: Option<crate::terminal::split_tree::SplitNode>,
     /// Id de la hoja raíz (la sesión clásica `self.session`).
     root_leaf: crate::terminal::split_tree::LeafId,
     /// Sesiones de las hojas no raíz.
-    leaf_sessions:
-        std::collections::HashMap<crate::terminal::split_tree::LeafId, SessionController>,
+    leaf_sessions: HashMap<crate::terminal::split_tree::LeafId, SessionController>,
     /// Hoja con el foco de teclado dentro del panel.
     focused_leaf: crate::terminal::split_tree::LeafId,
+    /// Contexto durable que deben heredar nuevas hojas. El cwd vivo de la
+    /// hoja enfocada tiene prioridad, pero estos valores permiten dividir una
+    /// sesión todavía detached sin perder el proyecto al que pertenece.
+    session_cwd: Option<PathBuf>,
+    workspace_id: Option<Uuid>,
     render_cache: TerminalGridCache,
     #[cfg(feature = "ghostty-vt")]
     ghostty_render_cache: GhosttyGridCache,
@@ -207,6 +217,182 @@ pub struct TerminalPanel {
     scroll_accumulator: ScrollAccumulator,
     last_mouse_cell: Option<(usize, usize)>,
     search: Option<PanelSearch>,
+    /// Evita reinyectar dos veces una hoja mientras el resto del split sigue
+    /// detached y la app reintenta la restauración pendiente.
+    restored_history_leaves: HashSet<crate::terminal::split_tree::LeafId>,
+}
+
+/// Estado multi-hoja validado antes de crear controladores de sesión.
+/// Mantener esta decodificación separada evita que JSON parcialmente corrupto
+/// deje un árbol apuntando a sesiones inexistentes.
+struct RestoredLeafState {
+    split_tree: Option<crate::terminal::split_tree::SplitNode>,
+    root_leaf: crate::terminal::split_tree::LeafId,
+    focused_leaf: crate::terminal::split_tree::LeafId,
+    runtime_session_ids: HashMap<crate::terminal::split_tree::LeafId, Uuid>,
+    agent_commands: HashMap<crate::terminal::split_tree::LeafId, String>,
+    agent_session_ids: HashMap<crate::terminal::split_tree::LeafId, String>,
+}
+
+fn restored_leaf_state(
+    saved_tree: Option<&serde_json::Value>,
+    saved_root: Option<&str>,
+    saved_focused: Option<&str>,
+    saved_runtime_session_ids: &BTreeMap<String, String>,
+    legacy_runtime_session_id: Option<&str>,
+    saved_agent_commands: &BTreeMap<String, String>,
+    legacy_agent_command: Option<&str>,
+    saved_agent_session_ids: &BTreeMap<String, String>,
+    legacy_agent_session_id: Option<&str>,
+    generated_root: crate::terminal::split_tree::LeafId,
+) -> RestoredLeafState {
+    let parsed_tree = saved_tree.and_then(|value| {
+        serde_json::from_value::<crate::terminal::split_tree::SplitNode>(value.clone())
+            .map_err(|err| log::warn!("Ignoring invalid saved split tree: {err}"))
+            .ok()
+    });
+    let valid_tree = parsed_tree.and_then(|tree| {
+        let leaves = tree.leaves();
+        let unique: HashSet<_> = leaves.iter().copied().collect();
+        if leaves.is_empty() || leaves.iter().any(Uuid::is_nil) || unique.len() != leaves.len() {
+            log::warn!("Ignoring saved split tree with nil or duplicate leaf ids");
+            None
+        } else {
+            Some(tree)
+        }
+    });
+    let tree_leaves = valid_tree
+        .as_ref()
+        .map(crate::terminal::split_tree::SplitNode::leaves)
+        .unwrap_or_default();
+
+    let parsed_root = parse_saved_uuid("root_leaf", saved_root);
+    let root_leaf = match parsed_root {
+        Some(root) if tree_leaves.is_empty() || tree_leaves.contains(&root) => root,
+        Some(root) => {
+            log::warn!("Ignoring root leaf {root} because it is not present in the split tree");
+            tree_leaves.first().copied().unwrap_or(generated_root)
+        }
+        None => tree_leaves.first().copied().unwrap_or(generated_root),
+    };
+    let active_leaves: HashSet<_> = if tree_leaves.is_empty() {
+        [root_leaf].into_iter().collect()
+    } else {
+        tree_leaves.iter().copied().collect()
+    };
+
+    let focused_leaf = parse_saved_uuid("focused_leaf", saved_focused)
+        .filter(|leaf| {
+            if active_leaves.contains(leaf) {
+                true
+            } else {
+                log::warn!("Ignoring focused leaf {leaf} because it is not present in the panel");
+                false
+            }
+        })
+        .unwrap_or(root_leaf);
+
+    let mut runtime_session_ids = HashMap::new();
+    let mut claimed_runtime_ids = HashSet::new();
+    for (leaf_text, runtime_text) in saved_runtime_session_ids {
+        let Some(leaf) = parse_saved_uuid("leaf_runtime_session_ids key", Some(leaf_text)) else {
+            continue;
+        };
+        let Some(runtime_id) =
+            parse_saved_uuid("leaf_runtime_session_ids value", Some(runtime_text))
+        else {
+            continue;
+        };
+        if !active_leaves.contains(&leaf) {
+            log::warn!("Ignoring runtime session for unknown leaf {leaf}");
+            continue;
+        }
+        if !claimed_runtime_ids.insert(runtime_id) {
+            log::warn!("Ignoring duplicate runtime session id {runtime_id}");
+            continue;
+        }
+        runtime_session_ids.insert(leaf, runtime_id);
+    }
+
+    // Alias de compatibilidad: layouts anteriores sólo conocen la sesión raíz.
+    if let std::collections::hash_map::Entry::Vacant(root_entry) =
+        runtime_session_ids.entry(root_leaf)
+    {
+        if let Some(runtime_id) = parse_saved_uuid("runtime_session_id", legacy_runtime_session_id)
+        {
+            if claimed_runtime_ids.insert(runtime_id) {
+                root_entry.insert(runtime_id);
+            } else {
+                log::warn!("Ignoring duplicate legacy runtime session id {runtime_id}");
+            }
+        }
+    }
+
+    let mut agent_commands =
+        restored_leaf_strings("leaf_agent_commands", saved_agent_commands, &active_leaves);
+    if let Some(command) = legacy_agent_command.filter(|command| !command.trim().is_empty()) {
+        agent_commands
+            .entry(root_leaf)
+            .or_insert_with(|| command.to_owned());
+    }
+    let mut agent_session_ids = restored_leaf_strings(
+        "leaf_agent_session_ids",
+        saved_agent_session_ids,
+        &active_leaves,
+    );
+    if let Some(session_id) =
+        legacy_agent_session_id.filter(|session_id| !session_id.trim().is_empty())
+    {
+        agent_session_ids
+            .entry(root_leaf)
+            .or_insert_with(|| session_id.to_owned());
+    }
+
+    RestoredLeafState {
+        split_tree: valid_tree.filter(|tree| tree.leaf_count() > 1),
+        root_leaf,
+        focused_leaf,
+        runtime_session_ids,
+        agent_commands,
+        agent_session_ids,
+    }
+}
+
+fn restored_leaf_strings(
+    field: &str,
+    saved: &BTreeMap<String, String>,
+    active_leaves: &HashSet<Uuid>,
+) -> HashMap<Uuid, String> {
+    saved
+        .iter()
+        .filter_map(|(leaf_text, value)| {
+            let leaf = parse_saved_uuid(field, Some(leaf_text))?;
+            if !active_leaves.contains(&leaf) {
+                log::warn!("Ignoring {field} value for unknown leaf {leaf}");
+                return None;
+            }
+            let value = value.trim();
+            if value.is_empty() {
+                return None;
+            }
+            Some((leaf, value.to_owned()))
+        })
+        .collect()
+}
+
+fn parse_saved_uuid(field: &str, value: Option<&str>) -> Option<Uuid> {
+    let value = value?;
+    match Uuid::parse_str(value) {
+        Ok(id) if !id.is_nil() => Some(id),
+        Ok(_) => {
+            log::warn!("Ignoring nil UUID in {field}");
+            None
+        }
+        Err(err) => {
+            log::warn!("Ignoring invalid UUID in {field}: {err}");
+            None
+        }
+    }
 }
 
 impl TerminalPanel {
@@ -236,13 +422,17 @@ impl TerminalPanel {
             last_activity_scan_at: 0.0,
             share_scope: PanelShareScope::VisibleOnly,
             agent_command: None,
+            leaf_agent_commands: HashMap::new(),
             unread: false,
             linked_issue: None,
             agent_session_id: None,
+            leaf_agent_session_ids: HashMap::new(),
             split_tree: None,
             root_leaf: uuid::Uuid::new_v4(),
-            leaf_sessions: std::collections::HashMap::new(),
+            leaf_sessions: HashMap::new(),
             focused_leaf: uuid::Uuid::nil(),
+            session_cwd: None,
+            workspace_id: None,
             render_cache: TerminalGridCache::default(),
             #[cfg(feature = "ghostty-vt")]
             ghostty_render_cache: GhosttyGridCache::default(),
@@ -250,6 +440,7 @@ impl TerminalPanel {
             scroll_accumulator: ScrollAccumulator::default(),
             last_mouse_cell: None,
             search: None,
+            restored_history_leaves: HashSet::new(),
         };
         this.focused_leaf = this.root_leaf;
         this
@@ -259,6 +450,7 @@ impl TerminalPanel {
         saved: PanelState,
         _ctx: &egui::Context,
         cwd: Option<&Path>,
+        workspace_id: Uuid,
         pty_manager: Arc<Mutex<PtyManager>>,
     ) -> Self {
         let mut panel = Self::new(
@@ -267,21 +459,38 @@ impl TerminalPanel {
             Color32::from_rgb(saved.color[0], saved.color[1], saved.color[2]),
             saved.z_index,
         );
+        let restored_leaves = restored_leaf_state(
+            saved.split_tree.as_ref(),
+            saved.root_leaf.as_deref(),
+            saved.focused_leaf.as_deref(),
+            &saved.leaf_runtime_session_ids,
+            saved.runtime_session_id.as_deref(),
+            &saved.leaf_agent_commands,
+            saved.agent_command.as_deref(),
+            &saved.leaf_agent_session_ids,
+            saved.agent_session_id.as_deref(),
+            panel.root_leaf,
+        );
         panel.id = Uuid::parse_str(&saved.id).unwrap_or_else(|_| Uuid::new_v4());
+        panel.session_cwd = cwd.map(Path::to_path_buf);
+        panel.workspace_id = Some(workspace_id);
         panel.custom_title = saved.custom_title;
         panel.title = panel
             .custom_title
             .clone()
             .unwrap_or_else(|| saved.title.clone());
-        panel.agent_command = saved.agent_command.clone();
+        panel.leaf_agent_commands = restored_leaves.agent_commands.clone();
+        panel.agent_command = panel
+            .leaf_agent_commands
+            .get(&restored_leaves.root_leaf)
+            .cloned();
         panel.unread = saved.unread;
         panel.linked_issue = saved.linked_issue;
-        panel.agent_session_id = saved.agent_session_id.clone();
-        panel.restore_split_tree(
-            saved.split_tree.as_ref(),
-            saved.focused_leaf.as_deref(),
-            &pty_manager,
-        );
+        panel.leaf_agent_session_ids = restored_leaves.agent_session_ids.clone();
+        panel.agent_session_id = panel
+            .leaf_agent_session_ids
+            .get(&restored_leaves.root_leaf)
+            .cloned();
         panel.focused = saved.focused && !saved.minimized;
         panel.minimized = saved.minimized;
         panel.placement = saved.placement.clone();
@@ -296,37 +505,17 @@ impl TerminalPanel {
         // la bandera de continuación para retomar la conversación. Antes se
         // pasaba `None` acá: el panel volvía como shell pelado y la sesión
         // anterior quedaba huérfana en el historial del CLI.
-        let startup_command = panel.agent_command.as_deref().map(|command| {
-            let provider = AgentProvider::detect(command).unwrap_or_default();
-            // Con el id que reportó el hook se reanuda la conversación exacta
-            // (`--resume <id>`); sin él solo queda `--continue` (P2.12, T3).
-            match panel.agent_session_id.as_deref() {
-                Some(session_id) => {
-                    crate::orchestration::resume_invocation(provider, command, session_id)
-                        .unwrap_or_else(|| crate::orchestration::resume_command(provider, command))
-                }
-                None => crate::orchestration::resume_command(provider, command),
-            }
-        });
-        // El id de la corrida anterior: con daemon, el panel se reengancha a
-        // su PTY vivo en vez de arrancar uno nuevo (P3.15, T4).
-        let existing_session_id = saved
-            .runtime_session_id
-            .as_deref()
-            .and_then(|id| Uuid::parse_str(id).ok());
-        panel.session.restore_detached_with_spec(
-            pty_manager,
-            session_spec(
-                panel.title.clone(),
-                cwd.map(Path::to_path_buf),
-                startup_command,
-                None,
-                Some(panel.id),
-            ),
-            cols,
-            rows,
-            existing_session_id,
+        let startup_command = panel.resume_command_for_leaf(restored_leaves.root_leaf);
+        let root_spec = session_spec(
+            panel.title.clone(),
+            cwd.map(Path::to_path_buf),
+            startup_command,
+            None,
+            Some(panel.id),
+            Some(restored_leaves.root_leaf),
+            Some(workspace_id),
         );
+        panel.restore_split_tree(restored_leaves, pty_manager, root_spec, cols, rows);
         panel
     }
 
@@ -339,6 +528,8 @@ impl TerminalPanel {
         let (cols, rows) = compute_grid_size(self.size.x, self.size.y - TITLE_BAR_HEIGHT);
         self.cwd_label = cwd_label(cwd);
         self.shell_label = shell_label();
+        self.session_cwd = spec.cwd.clone().or_else(|| cwd.map(Path::to_path_buf));
+        self.workspace_id = spec.workspace_id;
         self.session
             .attach_new_with_spec(pty_manager, spec, cwd, cols, rows);
     }
@@ -347,8 +538,23 @@ impl TerminalPanel {
         self.session.runtime_session_id()
     }
 
+    /// Todas las sesiones de runtime activas del panel, en el mismo orden DFS
+    /// estable que el árbol de splits. No incluye controladores huérfanos.
+    pub fn all_runtime_session_ids(&self) -> Vec<Uuid> {
+        self.active_leaf_ids()
+            .into_iter()
+            .filter_map(|leaf| self.leaf_session(leaf)?.runtime_session_id())
+            .collect()
+    }
+
+    /// Sesión que debe recibir prioridad de input/render en este momento.
+    pub fn focused_runtime_session_id(&self) -> Option<Uuid> {
+        self.leaf_session(self.focused_leaf)?.runtime_session_id()
+    }
+
     pub fn runtime_session_attached(&self) -> bool {
-        self.session.is_attached()
+        self.focused_session()
+            .is_some_and(SessionController::is_attached)
     }
 
     /// Último cwd reportado por el shell vía OSC 7, si el shell lo emite.
@@ -373,13 +579,16 @@ impl TerminalPanel {
     }
 
     fn session_handle(&self) -> Option<SharedPtyHandle> {
-        self.session.session_handle()
+        self.focused_session()?.session_handle()
     }
 
     /// Suelta la sesión (no mata la del daemon): es lo que corre al dropear el
     /// panel, incluido el cierre de la app.
     fn close_runtime_session(&mut self) {
         self.session.close();
+        for session in self.leaf_sessions.values_mut() {
+            session.close();
+        }
     }
 
     /// Cierra el panel **para siempre** (lo cerró el usuario): mata también la
@@ -394,7 +603,7 @@ impl TerminalPanel {
     fn with_pty<R>(&self, f: impl FnOnce(&PtyHandle) -> R) -> Option<R> {
         // En un split, las operaciones de input/scroll/scrollback van a la
         // hoja enfocada; sin splits, focused_leaf == root_leaf.
-        self.leaf_session(self.focused_leaf).with_pty(f)
+        self.leaf_session(self.focused_leaf)?.with_pty(f)
     }
 
     pub fn apply_resize(&mut self, rect: Rect) {
@@ -407,7 +616,10 @@ impl TerminalPanel {
     }
 
     pub fn is_alive(&self) -> bool {
-        self.session.is_alive()
+        self.active_leaf_ids().into_iter().any(|leaf| {
+            self.leaf_session(leaf)
+                .is_some_and(SessionController::is_alive)
+        })
     }
 
     pub fn to_saved(&self) -> PanelState {
@@ -428,15 +640,43 @@ impl TerminalPanel {
             )),
             share_scope: self.share_scope,
             agent_command: self.agent_command.clone(),
+            leaf_agent_commands: self
+                .active_leaf_ids()
+                .into_iter()
+                .filter_map(|leaf| {
+                    self.leaf_agent_commands
+                        .get(&leaf)
+                        .map(|command| (leaf.to_string(), command.clone()))
+                })
+                .collect(),
             unread: self.unread,
             linked_issue: self.linked_issue,
             agent_session_id: self.agent_session_id.clone(),
+            leaf_agent_session_ids: self
+                .active_leaf_ids()
+                .into_iter()
+                .filter_map(|leaf| {
+                    self.leaf_agent_session_ids
+                        .get(&leaf)
+                        .map(|session_id| (leaf.to_string(), session_id.clone()))
+                })
+                .collect(),
             runtime_session_id: self.runtime_session_id().map(|id| id.to_string()),
+            leaf_runtime_session_ids: self
+                .active_leaf_ids()
+                .into_iter()
+                .filter_map(|leaf| {
+                    self.leaf_session(leaf)
+                        .and_then(SessionController::runtime_session_id)
+                        .map(|runtime| (leaf.to_string(), runtime.to_string()))
+                })
+                .collect(),
             split_tree: self
                 .split_tree
                 .as_ref()
                 .and_then(|tree| serde_json::to_value(tree).ok()),
             focused_leaf: Some(self.focused_leaf.to_string()),
+            root_leaf: Some(self.root_leaf.to_string()),
         }
     }
 
@@ -456,11 +696,37 @@ impl TerminalPanel {
 
     /// Id de sesión del agente (P2.12, T3), para el resume exacto.
     pub fn agent_session_id(&self) -> Option<&str> {
-        self.agent_session_id.as_deref()
+        self.leaf_agent_session_ids
+            .get(&self.focused_leaf)
+            .map(String::as_str)
+            .or_else(|| {
+                (self.focused_leaf == self.root_leaf)
+                    .then_some(self.agent_session_id.as_deref())
+                    .flatten()
+            })
     }
 
     pub fn set_agent_session_id(&mut self, session_id: Option<String>) {
-        self.agent_session_id = session_id;
+        self.set_agent_session_id_for_leaf(self.focused_leaf, session_id);
+    }
+
+    pub fn set_agent_session_id_for_leaf(
+        &mut self,
+        leaf: crate::terminal::split_tree::LeafId,
+        session_id: Option<String>,
+    ) {
+        if !self.active_leaf_ids().contains(&leaf) {
+            return;
+        }
+        match session_id {
+            Some(session_id) => {
+                self.leaf_agent_session_ids.insert(leaf, session_id);
+            }
+            None => {
+                self.leaf_agent_session_ids.remove(&leaf);
+            }
+        }
+        self.sync_legacy_agent_metadata();
     }
 
     /// Issue de GitHub vinculado a este panel (P2.13).
@@ -487,24 +753,46 @@ impl TerminalPanel {
             .unwrap_or(1)
     }
 
-    fn leaf_session(&self, id: crate::terminal::split_tree::LeafId) -> &SessionController {
+    fn active_leaf_ids(&self) -> Vec<crate::terminal::split_tree::LeafId> {
+        self.split_tree
+            .as_ref()
+            .map(crate::terminal::split_tree::SplitNode::leaves)
+            .unwrap_or_else(|| vec![self.root_leaf])
+    }
+
+    pub fn leaf_ids(&self) -> Vec<crate::terminal::split_tree::LeafId> {
+        self.active_leaf_ids()
+    }
+
+    fn leaf_session(&self, id: crate::terminal::split_tree::LeafId) -> Option<&SessionController> {
         if id == self.root_leaf {
-            &self.session
+            Some(&self.session)
         } else {
-            self.leaf_sessions.get(&id).unwrap_or(&self.session)
+            self.leaf_sessions.get(&id)
+        }
+    }
+
+    fn leaf_session_mut(
+        &mut self,
+        id: crate::terminal::split_tree::LeafId,
+    ) -> Option<&mut SessionController> {
+        if id == self.root_leaf {
+            Some(&mut self.session)
+        } else {
+            self.leaf_sessions.get_mut(&id)
         }
     }
 
     /// Sesión de la hoja con foco de teclado.
-    pub fn focused_session(&self) -> &SessionController {
+    pub fn focused_session(&self) -> Option<&SessionController> {
         self.leaf_session(self.focused_leaf)
     }
 
-    fn focused_session_mut(&mut self) -> &mut SessionController {
+    fn focused_session_mut(&mut self) -> Option<&mut SessionController> {
         if self.focused_leaf == self.root_leaf {
-            &mut self.session
+            Some(&mut self.session)
         } else {
-            self.leaf_sessions.entry(self.focused_leaf).or_default()
+            self.leaf_sessions.get_mut(&self.focused_leaf)
         }
     }
 
@@ -515,9 +803,20 @@ impl TerminalPanel {
         axis: crate::terminal::split_tree::Axis,
         pty_manager: Arc<Mutex<PtyManager>>,
         cwd: Option<&Path>,
+        workspace_id: Option<Uuid>,
         cols: u16,
         rows: u16,
     ) {
+        let inherited_cwd = self
+            .current_cwd()
+            .map(PathBuf::from)
+            .filter(|path| path.is_dir())
+            .or_else(|| cwd.map(Path::to_path_buf))
+            .or_else(|| self.session_cwd.clone());
+        let inherited_workspace_id = self.workspace_id.or(workspace_id);
+        if self.workspace_id.is_none() {
+            self.workspace_id = inherited_workspace_id;
+        }
         let tree = self
             .split_tree
             .get_or_insert_with(|| crate::terminal::split_tree::SplitNode::leaf(self.root_leaf));
@@ -529,12 +828,14 @@ impl TerminalPanel {
             pty_manager,
             session_spec(
                 "Terminal".to_owned(),
-                cwd.map(Path::to_path_buf),
+                inherited_cwd.clone(),
                 None,
                 None,
                 Some(self.id),
+                Some(new_leaf),
+                inherited_workspace_id,
             ),
-            cwd,
+            inherited_cwd.as_deref(),
             cols.max(1) / 2,
             rows,
         );
@@ -549,32 +850,57 @@ impl TerminalPanel {
             // Sin splits: cerrar el panel completo lo decide quien llama.
             return true;
         };
-        match tree.close(self.focused_leaf) {
+        let original_tree = tree.clone();
+        let closing_leaf = self.focused_leaf;
+        match tree.close(closing_leaf) {
             crate::terminal::split_tree::CloseResult::Emptied => {
                 // Se cerró la última hoja: el panel se va.
                 self.session.close_for_good();
                 true
             }
             crate::terminal::split_tree::CloseResult::Closed { next_focus } => {
-                // Sacamos la sesión cerrada (si no era la raíz).
-                if self.focused_leaf != self.root_leaf {
-                    if let Some(mut closed_session) = self.leaf_sessions.remove(&self.focused_leaf)
-                    {
-                        closed_session.close_for_good();
-                    }
-                } else {
+                let Some(next_focus) = next_focus else {
+                    log::error!("Split tree closed a leaf without selecting a survivor");
+                    self.split_tree = Some(original_tree);
+                    return false;
+                };
+
+                if closing_leaf == self.root_leaf {
+                    // `self.session` siempre representa exactamente
+                    // `root_leaf`. Al cerrar la raíz promovemos una sesión
+                    // sobreviviente antes de volver a publicar el árbol.
+                    let Some(promoted_session) = self.leaf_sessions.remove(&next_focus) else {
+                        log::error!(
+                            "Cannot close root leaf {closing_leaf}: survivor {next_focus} has no session"
+                        );
+                        self.split_tree = Some(original_tree);
+                        return false;
+                    };
                     self.session.close_for_good();
+                    self.session = promoted_session;
+                    self.root_leaf = next_focus;
+                } else {
+                    let Some(mut closed_session) = self.leaf_sessions.remove(&closing_leaf) else {
+                        log::error!(
+                            "Cannot close leaf {closing_leaf}: it has no matching session controller"
+                        );
+                        self.split_tree = Some(original_tree);
+                        return false;
+                    };
+                    closed_session.close_for_good();
                 }
-                if let Some(next) = next_focus {
-                    self.focused_leaf = next;
-                }
+                self.leaf_agent_commands.remove(&closing_leaf);
+                self.leaf_agent_session_ids.remove(&closing_leaf);
+                self.focused_leaf = next_focus;
                 // Si quedó una sola hoja, volvemos al modo sin splits.
                 if tree.leaf_count() <= 1 {
                     self.split_tree = None;
                     self.focused_leaf = self.root_leaf;
                 } else {
+                    debug_assert!(tree.contains(self.root_leaf));
                     self.split_tree = Some(tree);
                 }
+                self.sync_legacy_agent_metadata();
                 false
             }
             crate::terminal::split_tree::CloseResult::NotFound => {
@@ -610,11 +936,15 @@ impl TerminalPanel {
         &self,
         id: crate::terminal::split_tree::LeafId,
     ) -> Option<SharedPtyHandle> {
-        self.leaf_session(id).session_handle()
+        self.leaf_session(id)?.session_handle()
     }
 
     pub fn focused_leaf_id(&self) -> crate::terminal::split_tree::LeafId {
         self.focused_leaf
+    }
+
+    pub fn root_leaf_id(&self) -> crate::terminal::split_tree::LeafId {
+        self.root_leaf
     }
 
     /// Posición (0-based) de la hoja enfocada en el orden DFS, para mostrar
@@ -630,51 +960,52 @@ impl TerminalPanel {
             .unwrap_or(0)
     }
 
-    /// Restaura el árbol de splits persistido y respawnea una sesión por hoja
-    /// no raíz (P2.11, T4). Si el árbol es inválido o tiene una sola hoja, el
-    /// panel queda sin splits.
+    /// Materializa controladores detached desde un estado ya validado. Cada
+    /// hoja recibe su runtime id previo cuando existe; si no, el manager crea
+    /// uno nuevo sin alterar la identidad durable de la hoja.
     fn restore_split_tree(
         &mut self,
-        saved_tree: Option<&serde_json::Value>,
-        saved_focused: Option<&str>,
-        pty_manager: &Arc<Mutex<PtyManager>>,
+        restored: RestoredLeafState,
+        pty_manager: Arc<Mutex<PtyManager>>,
+        root_spec: SessionSpec,
+        cols: u16,
+        rows: u16,
     ) {
-        let Some(value) = saved_tree else {
-            return;
-        };
-        let Ok(tree) =
-            serde_json::from_value::<crate::terminal::split_tree::SplitNode>(value.clone())
-        else {
-            return;
-        };
-        // El árbol restaurado debe contener la hoja raíz; si no, lo ignoramos.
-        if !tree.contains(self.root_leaf) || tree.leaf_count() <= 1 {
-            return;
-        }
-        for leaf in tree.leaves() {
+        self.root_leaf = restored.root_leaf;
+        self.focused_leaf = restored.focused_leaf;
+        self.split_tree = restored.split_tree;
+        self.leaf_sessions.clear();
+
+        self.session.restore_detached_with_spec(
+            Arc::clone(&pty_manager),
+            root_spec,
+            cols,
+            rows,
+            restored.runtime_session_ids.get(&self.root_leaf).copied(),
+        );
+
+        for leaf in self.active_leaf_ids() {
             if leaf == self.root_leaf {
                 continue;
             }
             let mut controller = SessionController::default();
-            controller.attach_new_with_spec(
-                Arc::clone(pty_manager),
-                session_spec("Terminal".to_owned(), None, None, None, Some(self.id)),
-                None,
-                40,
-                24,
+            let startup_command = self.resume_command_for_leaf(leaf);
+            controller.restore_detached_with_spec(
+                Arc::clone(&pty_manager),
+                session_spec(
+                    "Terminal".to_owned(),
+                    self.session_cwd.clone(),
+                    startup_command,
+                    None,
+                    Some(self.id),
+                    Some(leaf),
+                    self.workspace_id,
+                ),
+                (cols / 2).max(1),
+                rows,
+                restored.runtime_session_ids.get(&leaf).copied(),
             );
             self.leaf_sessions.insert(leaf, controller);
-        }
-        self.split_tree = Some(tree);
-        if let Some(focused) = saved_focused
-            .and_then(|text| uuid::Uuid::parse_str(text).ok())
-            .filter(|id| {
-                self.split_tree
-                    .as_ref()
-                    .is_some_and(|tree| tree.contains(*id))
-            })
-        {
-            self.focused_leaf = focused;
         }
     }
 
@@ -777,7 +1108,9 @@ impl TerminalPanel {
     }
 
     pub fn sync_title(&mut self) {
-        let shell_title = self.session.title_snapshot();
+        let shell_title = self
+            .focused_session()
+            .and_then(SessionController::title_snapshot);
         if let Some(shell_title) = shell_title {
             self.apply_shell_title(shell_title);
             if let Some(activity_label) = infer_activity_label(&self.title, &self.shell_title, "") {
@@ -802,7 +1135,7 @@ impl TerminalPanel {
 
         PanelRuntimeObservation {
             panel_id: self.id,
-            runtime_session_id: self.runtime_session_id(),
+            runtime_session_id: self.focused_runtime_session_id(),
             workspace_id,
             title: self.title.clone(),
             visible_text: if self.minimized || !attached {
@@ -832,8 +1165,14 @@ impl TerminalPanel {
         }
 
         let _ = ctx;
-        self.focused_session_mut().ensure_attached();
-        let mode = self.focused_session().input_mode();
+        let Some(session) = self.focused_session_mut() else {
+            log::error!("Focused leaf has no runtime session controller");
+            return;
+        };
+        session.ensure_attached();
+        let Some(mode) = self.focused_session().map(SessionController::input_mode) else {
+            return;
+        };
         let has_selection = self
             .with_pty(|pty| pty.with_term(|term| term.selection.is_some()))
             .flatten()
@@ -908,8 +1247,12 @@ impl TerminalPanel {
             return;
         }
 
-        self.session.ensure_attached();
-        let mode = self.session.input_mode();
+        let Some(session) = self.focused_session_mut() else {
+            log::error!("Cannot apply remote input to an unknown focused leaf");
+            return;
+        };
+        session.ensure_attached();
+        let mode = session.input_mode();
         for event in events {
             match event {
                 TerminalInputEvent::Text(text) => {
@@ -960,13 +1303,18 @@ impl TerminalPanel {
             .unwrap_or(self.focused_leaf);
 
         {
-            let session = self.leaf_session_mut_by_id(leaf);
+            let Some(session) = self.leaf_session_mut_by_id(leaf) else {
+                log::error!("Cannot scroll unknown split leaf {leaf}");
+                return;
+            };
             session.ensure_attached();
             if !session.is_attached() {
                 return;
             }
         }
-        let mode = self.leaf_session(leaf).input_mode();
+        let Some(mode) = self.leaf_session(leaf).map(SessionController::input_mode) else {
+            return;
+        };
         let point = pointer
             .and_then(|pointer| self.mouse_cell_from_pointer(pointer, viewport, canvas_rect));
 
@@ -974,12 +1322,12 @@ impl TerminalPanel {
             Some(WheelAction::Pty(bytes)) => {
                 let _ = self
                     .leaf_session(leaf)
-                    .with_pty(|pty| pty.write_all(&bytes));
+                    .and_then(|session| session.with_pty(|pty| pty.write_all(&bytes)));
             }
             Some(WheelAction::Scrollback(lines)) => {
-                let _ = self
-                    .leaf_session(leaf)
-                    .with_pty(|pty| pty.scroll_display(Scroll::Delta(lines)));
+                let _ = self.leaf_session(leaf).and_then(|session| {
+                    session.with_pty(|pty| pty.scroll_display(Scroll::Delta(lines)))
+                });
             }
             None => {}
         }
@@ -1003,11 +1351,11 @@ impl TerminalPanel {
     fn leaf_session_mut_by_id(
         &mut self,
         id: crate::terminal::split_tree::LeafId,
-    ) -> &mut SessionController {
+    ) -> Option<&mut SessionController> {
         if id == self.root_leaf {
-            &mut self.session
+            Some(&mut self.session)
         } else {
-            self.leaf_sessions.entry(id).or_default()
+            self.leaf_sessions.get_mut(&id)
         }
     }
 
@@ -1030,7 +1378,7 @@ impl TerminalPanel {
 
     pub fn search_close(&mut self) {
         if self.search.take().is_some() {
-            self.session.with_pty(PtyHandle::mark_render_dirty);
+            let _ = self.with_pty(PtyHandle::mark_render_dirty);
         }
     }
 
@@ -1114,7 +1462,10 @@ impl TerminalPanel {
         if text.is_empty() {
             return;
         }
-        self.session.ensure_attached();
+        let Some(session) = self.focused_session_mut() else {
+            return;
+        };
+        session.ensure_attached();
         let _ = self.with_pty(|pty| pty.write_all(text.as_bytes()));
     }
 
@@ -1122,16 +1473,19 @@ impl TerminalPanel {
         if text.trim().is_empty() {
             return;
         }
-        let was_attached = self.session.is_attached();
-        self.session.ensure_attached();
+        let Some(session) = self.focused_session_mut() else {
+            return;
+        };
+        let was_attached = session.is_attached();
+        session.ensure_attached();
         if was_attached {
             // Ya está corriendo: inyectá directo.
-            let mode = self.session.input_mode();
+            let mode = session.input_mode();
             let bytes = agent_prompt_bytes(text, &mode);
             let _ = self.with_pty(|pty| pty.write_all(&bytes));
         } else {
             // Recién spawneado: diferí hasta que renderice.
-            self.session.queue_prompt(text);
+            session.queue_prompt(text);
         }
     }
 
@@ -1213,11 +1567,82 @@ impl TerminalPanel {
     }
 
     pub fn set_agent_command(&mut self, command: Option<String>) {
-        self.agent_command = command;
+        match command {
+            Some(command) => {
+                self.leaf_agent_commands.insert(self.focused_leaf, command);
+            }
+            None => {
+                self.leaf_agent_commands.remove(&self.focused_leaf);
+            }
+        }
+        self.sync_legacy_agent_metadata();
     }
 
     pub fn agent_command(&self) -> Option<&str> {
-        self.agent_command.as_deref()
+        self.leaf_agent_commands
+            .get(&self.focused_leaf)
+            .map(String::as_str)
+            .or_else(|| {
+                (self.focused_leaf == self.root_leaf)
+                    .then_some(self.agent_command.as_deref())
+                    .flatten()
+            })
+    }
+
+    fn resume_command_for_leaf(&self, leaf: crate::terminal::split_tree::LeafId) -> Option<String> {
+        let command = self.leaf_agent_commands.get(&leaf)?;
+        let provider = AgentProvider::detect(command).unwrap_or_default();
+        match self.leaf_agent_session_ids.get(&leaf) {
+            Some(session_id) => {
+                crate::orchestration::resume_invocation(provider, command, session_id)
+                    .or_else(|| Some(crate::orchestration::resume_command(provider, command)))
+            }
+            None => Some(crate::orchestration::resume_command(provider, command)),
+        }
+    }
+
+    fn sync_legacy_agent_metadata(&mut self) {
+        self.agent_command = self.leaf_agent_commands.get(&self.root_leaf).cloned();
+        self.agent_session_id = self.leaf_agent_session_ids.get(&self.root_leaf).cloned();
+    }
+
+    /// Sustituye la sesión enfocada por un shell nuevo que ejecuta un comando
+    /// de reanudación. El proceso anterior se cierra explícitamente; escribir
+    /// el comando con `send_prompt` lo mandaría al TUI como texto de chat.
+    pub fn replace_focused_session(
+        &mut self,
+        pty_manager: Arc<Mutex<PtyManager>>,
+        cwd: Option<&Path>,
+        workspace_id: Uuid,
+        startup_command: String,
+        agent_command: String,
+    ) -> bool {
+        let leaf = self.focused_leaf;
+        let (cols, rows) = self
+            .leaf_session(leaf)
+            .map(SessionController::last_grid_size)
+            .unwrap_or_else(|| compute_grid_size(self.size.x, self.size.y - TITLE_BAR_HEIGHT));
+        let spec = session_spec(
+            self.title.clone(),
+            cwd.map(Path::to_path_buf),
+            Some(startup_command.clone()),
+            None,
+            Some(self.id),
+            Some(leaf),
+            Some(workspace_id),
+        );
+        let Some(session) = self.leaf_session_mut(leaf) else {
+            return false;
+        };
+        session.close_for_good();
+        session.attach_new_with_spec(pty_manager, spec, cwd, cols, rows);
+        let started = session.spawn_error().is_none();
+        self.leaf_agent_commands.insert(leaf, agent_command);
+        self.leaf_agent_session_ids.remove(&leaf);
+        self.sync_legacy_agent_metadata();
+        self.render_cache = TerminalGridCache::default();
+        self.restored_history_leaves.remove(&leaf);
+        started
     }
 
     /// Reinyecta el historial guardado de una corrida anterior en el grid.
@@ -1235,24 +1660,25 @@ impl TerminalPanel {
             .flatten()
     }
 
-    /// Historial ANSI de **cada hoja** (P2.11, T4). La hoja raíz se reporta
-    /// como `None` para que use el nombre de archivo histórico.
-    pub fn leaf_scrollbacks(&self) -> Vec<(Option<crate::terminal::split_tree::LeafId>, String)> {
+    /// Historial ANSI de **cada hoja** (P2.11, T4). Todas las hojas se reportan
+    /// con su identidad estable, incluida la raíz. Al restaurar todavía se
+    /// acepta `None` como alias legado de la raíz.
+    pub fn leaf_scrollbacks(
+        &self,
+    ) -> Vec<(Option<crate::terminal::split_tree::LeafId>, String, usize)> {
         let mut out = Vec::new();
-        let leaves = match self.split_tree.as_ref() {
-            Some(tree) => tree.leaves(),
-            None => vec![self.root_leaf],
-        };
-        for leaf in leaves {
-            let key = (leaf != self.root_leaf).then_some(leaf);
-            let ansi = self
-                .leaf_session(leaf)
-                .with_pty(|pty| {
-                    pty.with_term(|term| crate::terminal::export::scrollback_to_ansi(term))
+        for leaf in self.active_leaf_ids() {
+            let ansi = self.leaf_session(leaf).and_then(|session| {
+                if session.is_remote() {
+                    return None;
+                }
+                session.with_pty(|pty| {
+                    pty.checkpoint_snapshot(crate::terminal::export::scrollback_to_ansi)
                 })
-                .flatten();
-            if let Some(text) = ansi {
-                out.push((key, text));
+            });
+            let ansi = ansi.flatten();
+            if let Some((text, pending_bytes)) = ansi {
+                out.push((Some(leaf), text, pending_bytes));
             }
         }
         out
@@ -1262,26 +1688,64 @@ impl TerminalPanel {
     /// panel todavía no tiene terminal.
     pub fn restore_leaf_histories(
         &mut self,
-        histories: &[(Option<crate::terminal::split_tree::LeafId>, String)],
+        histories: &[(
+            Option<crate::terminal::split_tree::LeafId>,
+            String,
+            Vec<crate::state::scrollback_log::Frame>,
+        )],
     ) -> bool {
-        let mut restored_any = false;
-        for (key, text) in histories {
+        let stable_root_present = histories
+            .iter()
+            .any(|(key, _, _)| *key == Some(self.root_leaf));
+        let active_leaves: HashSet<_> = self.active_leaf_ids().into_iter().collect();
+        let mut all_restored = true;
+        for (key, text, frames) in histories {
+            // Durante la migración pueden coexistir el archivo histórico de
+            // raíz (`None`) y el nuevo archivo estable (`Some(root_leaf)`). El
+            // estable gana y el historial nunca se replaya dos veces.
+            if key.is_none() && stable_root_present {
+                continue;
+            }
             let leaf = key.unwrap_or(self.root_leaf);
-            let bytes = crate::state::scrollback_store::replay_bytes(text);
-            if self
-                .leaf_session(leaf)
-                .with_pty(|pty| pty.replay_history(&bytes))
-                .is_some()
-            {
-                restored_any = true;
+            if !active_leaves.contains(&leaf) || self.restored_history_leaves.contains(&leaf) {
+                continue;
+            }
+            let Some(session) = self.leaf_session(leaf) else {
+                all_restored = false;
+                continue;
+            };
+            if session.was_hot_reattached() {
+                // El snapshot del daemon ya contiene este historial. Reinyectar
+                // además el checkpoint local lo duplicaría visualmente.
+                self.restored_history_leaves.insert(leaf);
+                continue;
+            }
+            let bytes = crate::state::scrollback_store::replay_body(text);
+            let restored = session
+                .with_pty(|pty| {
+                    pty.replay_session_preserving_live(&bytes, frames, |term| {
+                        crate::terminal::export::scrollback_to_ansi(term).into_bytes()
+                    })
+                })
+                .is_some();
+            if restored {
+                self.restored_history_leaves.insert(leaf);
+            } else {
+                all_restored = false;
             }
         }
-        restored_any
+        all_restored
     }
 
     /// Historial completo con colores ANSI (SGR mínimo), para persistir y
     /// restaurar con estilo. `None` si la sesión está detached.
     pub fn scrollback_ansi(&self) -> Option<String> {
+        if self
+            .focused_session()
+            .is_some_and(SessionController::is_remote)
+        {
+            return None;
+        }
         self.with_pty(|pty| pty.with_term(|term| crate::terminal::export::scrollback_to_ansi(term)))
             .flatten()
     }
@@ -1289,7 +1753,44 @@ impl TerminalPanel {
     /// Drena los frames de log incremental pendientes (P1.7). `None` si está
     /// detached.
     pub fn drain_pending_log(&self) -> Option<Vec<u8>> {
+        if self
+            .focused_session()
+            .is_some_and(SessionController::is_remote)
+        {
+            return None;
+        }
         self.with_pty(|pty| pty.drain_pending_log())
+    }
+
+    /// Copia de forma independiente el log incremental no confirmado de cada
+    /// hoja activa. El ACK durable lo retira después por identidad de hoja.
+    pub fn pending_leaf_logs(&self) -> Vec<(crate::terminal::split_tree::LeafId, Vec<u8>)> {
+        self.active_leaf_ids()
+            .into_iter()
+            .filter_map(|leaf| {
+                self.leaf_session(leaf)
+                    .and_then(|session| {
+                        if session.is_remote() {
+                            None
+                        } else {
+                            session.with_pty(|pty| pty.pending_log_snapshot())
+                        }
+                    })
+                    .map(|frames| (leaf, frames))
+            })
+            .collect()
+    }
+
+    pub fn acknowledge_leaf_log(
+        &self,
+        leaf: crate::terminal::split_tree::LeafId,
+        written_bytes: usize,
+    ) {
+        if let Some(session) = self.leaf_session(leaf) {
+            if !session.is_remote() {
+                session.with_pty(|pty| pty.acknowledge_pending_log(written_bytes));
+            }
+        }
     }
 
     /// Restaura checkpoint + frames del log incremental (P1.7). Devuelve
@@ -1299,9 +1800,17 @@ impl TerminalPanel {
         checkpoint: &str,
         frames: &[crate::state::scrollback_log::Frame],
     ) -> bool {
+        if self
+            .focused_session()
+            .is_some_and(SessionController::was_hot_reattached)
+        {
+            return true;
+        }
         let bytes = crate::state::scrollback_store::replay_body(checkpoint);
         self.with_pty(|pty| {
-            pty.replay_session(&bytes, frames);
+            pty.replay_session_preserving_live(&bytes, frames, |term| {
+                crate::terminal::export::scrollback_to_ansi(term).into_bytes()
+            });
         })
         .is_some()
     }
@@ -1365,7 +1874,10 @@ impl TerminalPanel {
             .content_screen_rect(viewport, canvas_rect)
             .intersect(canvas_rect);
         let (column, row) = terminal_mouse_cell_from_pointer(content_rect, pointer, viewport.zoom)?;
-        let (last_cols, last_rows) = self.session.last_grid_size();
+        let (last_cols, last_rows) = self
+            .focused_session()
+            .map(SessionController::last_grid_size)
+            .unwrap_or((1, 1));
         let max_column = last_cols as usize - 1;
         let max_row = last_rows as usize - 1;
         Some(crate::terminal::input::GridPoint {
@@ -1546,7 +2058,10 @@ impl TerminalPanel {
                 ui.id().with(("body", self.id)),
                 Sense::click_and_drag(),
             );
-            let input_mode = self.session.input_mode();
+            let input_mode = self
+                .focused_session()
+                .map(SessionController::input_mode)
+                .unwrap_or_default();
             let pointer_in_body = ui
                 .ctx()
                 .input(|input| input.pointer.latest_pos())
@@ -1556,7 +2071,9 @@ impl TerminalPanel {
             // en vez de iniciar selección local.
             let mouse_reporting = input_mode.mouse_mode && pointer_in_body.is_some();
             if mouse_reporting {
-                self.session.ensure_attached();
+                if let Some(session) = self.focused_session_mut() {
+                    session.ensure_attached();
+                }
                 if let Some(pointer) = pointer_in_body {
                     let modifiers = ui.ctx().input(|input| input.modifiers);
                     let button_events: Vec<(u8, bool, bool)> = ui.ctx().input(|input| {
@@ -1633,7 +2150,9 @@ impl TerminalPanel {
                     }
                     interaction.clicked = true;
                     if !opened_url {
-                        self.session.clear_selection();
+                        if let Some(session) = self.focused_session() {
+                            session.clear_selection();
+                        }
                     }
                 }
                 if body_response.double_clicked() {
@@ -1726,7 +2245,10 @@ impl TerminalPanel {
             self.resize_virtual_rect = None;
         }
 
-        if self.session.take_bell() {
+        if self.active_leaf_ids().into_iter().any(|leaf| {
+            self.leaf_session(leaf)
+                .is_some_and(SessionController::take_bell)
+        }) {
             self.bell_flash_until = ui.ctx().input(|i| i.time) + 0.15;
         }
 
@@ -1876,6 +2398,17 @@ impl TerminalPanel {
         let content_painter = painter.with_clip_rect(content_clip_rect);
         let content_rounding = roundings.body;
         let now = ui.ctx().input(|i| i.time);
+        let render_tier =
+            render_tier_for_panel(content_rect, zoom, lod, fast_path_render, self.focused);
+        interaction.render_tier = Some(render_tier);
+        if matches!(render_tier, RenderTier::Full | RenderTier::ReducedLive) {
+            let (cols, rows) = compute_grid_size(content_rect.width(), content_rect.height());
+            let defer_resize =
+                should_defer_terminal_resize(fast_path_render, self.resize_virtual_rect);
+            if let Some(session) = self.focused_session_mut() {
+                session.sync_grid_size(cols, rows, defer_resize);
+            }
+        }
         let title_snapshot: &str = &self.title;
         let shell_title_snapshot: &str = &self.shell_title;
         let fallback_preview_title: &str = if let Some(overlay) = overlay {
@@ -1890,15 +2423,6 @@ impl TerminalPanel {
         let mut updated_activity_label: Option<Option<String>> = None;
         let mut activity_label_scan_at = None;
         let mut scrollbar_state = self.last_scrollbar_state;
-        let render_tier =
-            render_tier_for_panel(content_rect, zoom, lod, fast_path_render, self.focused);
-        interaction.render_tier = Some(render_tier);
-        if matches!(render_tier, RenderTier::Full | RenderTier::ReducedLive) {
-            let (cols, rows) = compute_grid_size(self.size.x, self.size.y - TITLE_BAR_HEIGHT);
-            let defer_resize =
-                should_defer_terminal_resize(fast_path_render, self.resize_virtual_rect);
-            self.session.sync_grid_size(cols, rows, defer_resize);
-        }
 
         if let Some(handle) = self.session_handle() {
             if let Ok(pty) = handle.lock() {
@@ -2049,7 +2573,10 @@ impl TerminalPanel {
                     Some(preview_label.as_str()),
                 );
             }
-        } else if let Some(error) = self.session.spawn_error() {
+        } else if let Some(error) = self
+            .focused_session()
+            .and_then(SessionController::spawn_error)
+        {
             scrollbar_state = None;
             painter.text(
                 content_rect.left_top() + vec2(12.0, 12.0),
@@ -2067,7 +2594,12 @@ impl TerminalPanel {
         }
         self.last_scrollbar_state = scrollbar_state;
 
-        chrome_painter.rect_stroke(stroke_rect, panel_rounding, Stroke::new(0.75, border_color));
+        chrome_painter.rect_stroke(
+            stroke_rect,
+            panel_rounding,
+            Stroke::new(0.75, border_color),
+            egui::StrokeKind::Middle,
+        );
         if matches!(lod, PanelLod::Full) {
             chrome_painter.line_segment(
                 [
@@ -2098,12 +2630,16 @@ impl TerminalPanel {
         leaves: &[crate::terminal::split_tree::LeafLayout],
         dividers: &[crate::terminal::split_tree::DividerHit],
         zoom: f32,
-        content_rounding: Rounding,
+        content_rounding: CornerRadius,
     ) {
         let now = ui.ctx().input(|input| input.time);
         for leaf in leaves {
             if leaf.id == self.focused_leaf {
                 continue;
+            }
+            let (cols, rows) = compute_grid_size(leaf.rect.width(), leaf.rect.height());
+            if let Some(session) = self.leaf_session_mut_by_id(leaf.id) {
+                session.sync_grid_size(cols, rows, false);
             }
             if let Some(handle) = self.leaf_session_handle(leaf.id) {
                 if let Ok(pty) = handle.lock() {
@@ -2126,7 +2662,12 @@ impl TerminalPanel {
         }
         // Borde de foco sobre la hoja activa.
         if let Some(focused) = leaves.iter().find(|leaf| leaf.id == self.focused_leaf) {
-            painter.rect_stroke(focused.rect, 0.0, Stroke::new(1.5, palette::FOCUS));
+            painter.rect_stroke(
+                focused.rect,
+                0.0,
+                Stroke::new(1.5, palette::FOCUS),
+                egui::StrokeKind::Middle,
+            );
         }
         // Divisores: arrastrar actualiza el ratio del split padre.
         for divider in dividers {
@@ -2177,8 +2718,9 @@ impl TerminalPanel {
         self.refresh_display_title();
     }
 
-    fn selected_text(&self) -> Option<String> {
-        self.session.selected_text()
+    pub(crate) fn selected_text(&self) -> Option<String> {
+        self.focused_session()
+            .and_then(SessionController::selected_text)
     }
 
     /// Copia la selección al portapapeles si `copy_on_select` está activo.
@@ -2304,6 +2846,9 @@ impl TerminalPanel {
             .clone()
             .unwrap_or_else(|| self.shell_title.clone());
         self.session.update_session_title_hint(&self.title);
+        for session in self.leaf_sessions.values() {
+            session.update_session_title_hint(&self.title);
+        }
     }
 
     fn window_title(&self, screen_width: f32) -> String {
@@ -2423,6 +2968,250 @@ impl Drop for TerminalPanel {
     }
 }
 
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod persistence_tests {
+    use std::collections::BTreeMap;
+    use std::path::Path;
+    use std::sync::{Arc, Mutex};
+
+    use egui::{pos2, vec2, Color32};
+    use uuid::Uuid;
+
+    use super::{restored_leaf_state, TerminalPanel};
+    use crate::runtime::PtyManager;
+    use crate::terminal::split_tree::{Axis, SplitNode};
+
+    fn split_state(
+        root_leaf: Uuid,
+        focused_leaf: Uuid,
+        tree: &SplitNode,
+        runtime_ids: &[(Uuid, Uuid)],
+    ) -> crate::state::PanelState {
+        let panel = TerminalPanel::new(pos2(10.0, 20.0), vec2(640.0, 420.0), Color32::WHITE, 1);
+        let mut saved = panel.to_saved();
+        saved.root_leaf = Some(root_leaf.to_string());
+        saved.focused_leaf = Some(focused_leaf.to_string());
+        saved.split_tree = Some(serde_json::to_value(tree).expect("serialize split tree"));
+        saved.leaf_runtime_session_ids = runtime_ids
+            .iter()
+            .map(|(leaf, runtime)| (leaf.to_string(), runtime.to_string()))
+            .collect();
+        saved.runtime_session_id = runtime_ids
+            .iter()
+            .find_map(|(leaf, runtime)| (*leaf == root_leaf).then(|| runtime.to_string()));
+        saved
+    }
+
+    #[test]
+    fn legacy_split_infers_root_and_keeps_root_runtime_alias() {
+        let legacy_root = Uuid::new_v4();
+        let mut tree = SplitNode::leaf(legacy_root);
+        let second = tree
+            .split(legacy_root, Axis::Horizontal)
+            .expect("split should create leaf");
+        let root_runtime = Uuid::new_v4();
+        let second_runtime = Uuid::new_v4();
+        let mut per_leaf = BTreeMap::new();
+        per_leaf.insert(second.to_string(), second_runtime.to_string());
+        let encoded = serde_json::to_value(&tree).expect("serialize split tree");
+
+        let restored = restored_leaf_state(
+            Some(&encoded),
+            None,
+            Some(&second.to_string()),
+            &per_leaf,
+            Some(&root_runtime.to_string()),
+            &BTreeMap::new(),
+            None,
+            &BTreeMap::new(),
+            None,
+            Uuid::new_v4(),
+        );
+
+        assert_eq!(restored.root_leaf, legacy_root);
+        assert_eq!(restored.focused_leaf, second);
+        assert_eq!(
+            restored.runtime_session_ids.get(&legacy_root),
+            Some(&root_runtime)
+        );
+        assert_eq!(
+            restored.runtime_session_ids.get(&second),
+            Some(&second_runtime)
+        );
+    }
+
+    #[test]
+    fn split_round_trip_restores_every_runtime_id_and_focus() {
+        let root_leaf = Uuid::new_v4();
+        let mut tree = SplitNode::leaf(root_leaf);
+        let second_leaf = tree
+            .split(root_leaf, Axis::Vertical)
+            .expect("split should create leaf");
+        let root_runtime = Uuid::new_v4();
+        let second_runtime = Uuid::new_v4();
+        let workspace_id = Uuid::new_v4();
+        let saved = split_state(
+            root_leaf,
+            second_leaf,
+            &tree,
+            &[(root_leaf, root_runtime), (second_leaf, second_runtime)],
+        );
+        let manager = Arc::new(Mutex::new(PtyManager::new_for_tests()));
+
+        let panel = TerminalPanel::from_saved(
+            saved,
+            &egui::Context::default(),
+            Some(Path::new("/tmp")),
+            workspace_id,
+            Arc::clone(&manager),
+        );
+
+        assert_eq!(panel.root_leaf_id(), root_leaf);
+        assert_eq!(panel.focused_leaf_id(), second_leaf);
+        assert_eq!(
+            panel.all_runtime_session_ids(),
+            vec![root_runtime, second_runtime]
+        );
+        assert_eq!(panel.focused_runtime_session_id(), Some(second_runtime));
+        let resaved = panel.to_saved();
+        assert_eq!(resaved.root_leaf, Some(root_leaf.to_string()));
+        assert_eq!(resaved.leaf_runtime_session_ids.len(), 2);
+        assert_eq!(
+            manager
+                .lock()
+                .expect("manager lock")
+                .detached_session_count(),
+            2
+        );
+    }
+
+    #[test]
+    fn split_round_trip_keeps_agent_resume_metadata_per_leaf() {
+        let root_leaf = Uuid::new_v4();
+        let mut tree = SplitNode::leaf(root_leaf);
+        let second_leaf = tree
+            .split(root_leaf, Axis::Vertical)
+            .expect("split should create leaf");
+        let mut saved = split_state(root_leaf, second_leaf, &tree, &[]);
+        saved.agent_command = Some("claude --model sonnet".to_owned());
+        saved.agent_session_id = Some("claude-root".to_owned());
+        saved.leaf_agent_commands = [
+            (root_leaf.to_string(), "claude --model sonnet".to_owned()),
+            (second_leaf.to_string(), "gemini --model pro".to_owned()),
+        ]
+        .into_iter()
+        .collect();
+        saved.leaf_agent_session_ids = [
+            (root_leaf.to_string(), "claude-root".to_owned()),
+            (second_leaf.to_string(), "gemini-second".to_owned()),
+        ]
+        .into_iter()
+        .collect();
+
+        let manager = Arc::new(Mutex::new(PtyManager::new_for_tests()));
+        let mut panel = TerminalPanel::from_saved(
+            saved,
+            &egui::Context::default(),
+            Some(Path::new("/tmp")),
+            Uuid::new_v4(),
+            Arc::clone(&manager),
+        );
+
+        assert_eq!(panel.agent_command(), Some("gemini --model pro"));
+        assert_eq!(panel.agent_session_id(), Some("gemini-second"));
+        let runtime_ids = panel.all_runtime_session_ids();
+        let manager_guard = manager.lock().expect("manager lock");
+        assert_eq!(
+            manager_guard.startup_command_for_tests(runtime_ids[0]),
+            Some("claude --model sonnet --resume claude-root")
+        );
+        assert_eq!(
+            manager_guard.startup_command_for_tests(runtime_ids[1]),
+            Some("gemini --model pro --resume gemini-second")
+        );
+        drop(manager_guard);
+        panel.focus_next_leaf();
+        assert_eq!(panel.focused_leaf_id(), root_leaf);
+        assert_eq!(panel.agent_command(), Some("claude --model sonnet"));
+        assert_eq!(panel.agent_session_id(), Some("claude-root"));
+
+        let resaved = panel.to_saved();
+        assert_eq!(resaved.leaf_agent_commands.len(), 2);
+        assert_eq!(resaved.leaf_agent_session_ids.len(), 2);
+        assert_eq!(
+            resaved
+                .leaf_agent_commands
+                .get(&second_leaf.to_string())
+                .map(String::as_str),
+            Some("gemini --model pro")
+        );
+    }
+
+    #[test]
+    fn closing_root_promotes_surviving_controller_and_runtime_identity() {
+        let root_leaf = Uuid::new_v4();
+        let mut tree = SplitNode::leaf(root_leaf);
+        let survivor_leaf = tree
+            .split(root_leaf, Axis::Horizontal)
+            .expect("split should create leaf");
+        let root_runtime = Uuid::new_v4();
+        let survivor_runtime = Uuid::new_v4();
+        let mut saved = split_state(
+            root_leaf,
+            root_leaf,
+            &tree,
+            &[(root_leaf, root_runtime), (survivor_leaf, survivor_runtime)],
+        );
+        saved.leaf_agent_commands = [
+            (root_leaf.to_string(), "claude".to_owned()),
+            (survivor_leaf.to_string(), "opencode".to_owned()),
+        ]
+        .into_iter()
+        .collect();
+        saved.leaf_agent_session_ids = [
+            (root_leaf.to_string(), "claude-root".to_owned()),
+            (survivor_leaf.to_string(), "opencode-survivor".to_owned()),
+        ]
+        .into_iter()
+        .collect();
+        let manager = Arc::new(Mutex::new(PtyManager::new_for_tests()));
+        let mut panel = TerminalPanel::from_saved(
+            saved,
+            &egui::Context::default(),
+            Some(Path::new("/tmp")),
+            Uuid::new_v4(),
+            Arc::clone(&manager),
+        );
+
+        assert!(!panel.close_focused_leaf());
+
+        assert_eq!(panel.leaf_count(), 1);
+        assert_eq!(panel.root_leaf_id(), survivor_leaf);
+        assert_eq!(panel.focused_leaf_id(), survivor_leaf);
+        assert_eq!(panel.runtime_session_id(), Some(survivor_runtime));
+        assert_eq!(panel.all_runtime_session_ids(), vec![survivor_runtime]);
+        assert_eq!(panel.agent_command(), Some("opencode"));
+        assert_eq!(panel.agent_session_id(), Some("opencode-survivor"));
+        let resaved = panel.to_saved();
+        assert_eq!(resaved.root_leaf, Some(survivor_leaf.to_string()));
+        assert_eq!(resaved.leaf_runtime_session_ids.len(), 1);
+        assert_eq!(resaved.agent_command.as_deref(), Some("opencode"));
+        assert_eq!(
+            resaved.agent_session_id.as_deref(),
+            Some("opencode-survivor")
+        );
+        assert_eq!(resaved.leaf_agent_commands.len(), 1);
+        assert_eq!(
+            manager
+                .lock()
+                .expect("manager lock")
+                .detached_session_count(),
+            1
+        );
+    }
+}
+
 const SEARCH_HIGHLIGHT: Color32 = Color32::from_rgb(212, 160, 60);
 
 /// Resalta el match de búsqueda visible: un rect por línea del rango que
@@ -2472,7 +3261,12 @@ fn draw_search_highlight(
                     70,
                 ),
             );
-            painter.rect_stroke(rect, 2.0, Stroke::new(1.0, SEARCH_HIGHLIGHT));
+            painter.rect_stroke(
+                rect,
+                2.0,
+                Stroke::new(1.0, SEARCH_HIGHLIGHT),
+                egui::StrokeKind::Middle,
+            );
         }
         drawn_lines += 1;
         if line == end.line || drawn_lines >= MAX_HIGHLIGHT_LINES {

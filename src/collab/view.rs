@@ -77,6 +77,7 @@ pub fn draw_remote_workspace(
                     BORDER
                 },
             ),
+            egui::StrokeKind::Middle,
         );
 
         painter.text(
@@ -163,7 +164,12 @@ pub fn draw_remote_workspace(
                 13.0,
                 Color32::from_rgba_premultiplied(10, 10, 10, 220),
             );
-            painter.rect_stroke(cta_rect, 13.0, Stroke::new(1.0, ACCENT));
+            painter.rect_stroke(
+                cta_rect,
+                13.0,
+                Stroke::new(1.0, ACCENT),
+                egui::StrokeKind::Middle,
+            );
             painter.text(
                 cta_rect.center(),
                 Align2::CENTER_CENTER,

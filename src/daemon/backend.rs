@@ -19,7 +19,12 @@ use super::server::resolve_dir;
 /// Estado de la adopción del daemon.
 pub enum DaemonBackend {
     /// Conectado: el daemon está vivo y adoptado.
-    Connected { conn: DaemonConn, dir: PathBuf },
+    Connected {
+        conn: DaemonConn,
+        dir: PathBuf,
+        client_id: Uuid,
+        priority_session: Option<Uuid>,
+    },
     /// Sin daemon: la app corre las sesiones ella misma.
     Fallback { reason: String },
 }
@@ -37,8 +42,14 @@ impl DaemonBackend {
         let Some(binary) = daemon_binary_path() else {
             return Self::fallback("no se encontró el binario del daemon");
         };
-        match DaemonConn::connect(&dir, &token, &binary) {
-            Some(conn) => Self::Connected { conn, dir },
+        let client_id = Uuid::new_v4();
+        match DaemonConn::connect_as(&dir, &token, &binary, client_id) {
+            Some(conn) => Self::Connected {
+                conn,
+                dir,
+                client_id,
+                priority_session: None,
+            },
             None => Self::fallback("el daemon no arrancó"),
         }
     }
@@ -56,9 +67,9 @@ impl DaemonBackend {
     /// Endpoint para abrir conexiones nuevas (una por sesión remota).
     pub fn endpoint(&self) -> Option<super::sessions::DaemonEndpoint> {
         match self {
-            Self::Connected { dir, .. } => super::protocol::ensure_token(dir)
+            Self::Connected { dir, client_id, .. } => super::protocol::ensure_token(dir)
                 .ok()
-                .map(|token| super::sessions::DaemonEndpoint::new(dir.clone(), token)),
+                .map(|token| super::sessions::DaemonEndpoint::new(dir.clone(), token, *client_id)),
             Self::Fallback { .. } => None,
         }
     }
@@ -77,6 +88,25 @@ impl DaemonBackend {
         match self {
             Self::Connected { conn, .. } => conn.reconcile_live(live),
             Self::Fallback { .. } => Vec::new(),
+        }
+    }
+
+    /// Propaga el foco sólo cuando cambia: hacerlo en cada frame convertiría
+    /// una optimización de I/O en round-trips síncronos innecesarios.
+    pub fn set_priority_session(&mut self, focused: Option<Uuid>) {
+        let Self::Connected {
+            conn,
+            priority_session,
+            ..
+        } = self
+        else {
+            return;
+        };
+        if *priority_session == focused {
+            return;
+        }
+        if conn.set_priority_session(focused) {
+            *priority_session = focused;
         }
     }
 

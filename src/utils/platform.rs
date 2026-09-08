@@ -142,6 +142,47 @@ pub fn open_path_external(path: &Path) -> anyhow::Result<()> {
     spawn_detached("open", &mut command)
 }
 
+/// Abre una URL web con el navegador del sistema. La validación explícita
+/// evita que datos provenientes de GitHub Releases activen esquemas locales o
+/// ejecutables (`file:`, `javascript:`, etc.).
+pub fn open_url_external(raw_url: &str) -> anyhow::Result<()> {
+    let url = validated_external_url(raw_url)?;
+
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = Command::new("open");
+        command.arg(url.as_str());
+        command
+    };
+
+    #[cfg(target_os = "linux")]
+    let mut command = {
+        let mut command = Command::new("xdg-open");
+        command.arg(url.as_str());
+        command
+    };
+
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        // `rundll32` evita pasar la URL por `cmd.exe`, donde caracteres como
+        // `&` tienen semántica de shell aunque provengan de un argumento.
+        let mut command = Command::new("rundll32");
+        command.arg("url.dll,FileProtocolHandler");
+        command.arg(url.as_str());
+        command
+    };
+
+    spawn_detached("open-url", &mut command)
+}
+
+fn validated_external_url(raw_url: &str) -> anyhow::Result<url::Url> {
+    let url = url::Url::parse(raw_url)?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        anyhow::bail!("unsupported external URL");
+    }
+    Ok(url)
+}
+
 /// Notificación del sistema best-effort (macOS: osascript, Linux: notify-send).
 /// El fallo es silencioso: nunca debe romper la app.
 pub fn notify(title: &str, message: &str) {
@@ -314,6 +355,14 @@ mod tests {
         let url = default_share_base_url(8787).expect("share url");
         assert!(url.starts_with("https://"));
         assert!(url.ends_with(":8787"));
+    }
+
+    #[test]
+    fn external_url_validation_only_accepts_web_origins() {
+        assert!(super::validated_external_url("https://github.com/example/release").is_ok());
+        assert!(super::validated_external_url("http://localhost:8787/session").is_ok());
+        assert!(super::validated_external_url("file:///tmp/payload").is_err());
+        assert!(super::validated_external_url("javascript:alert(1)").is_err());
     }
     #[test]
     #[cfg(unix)]

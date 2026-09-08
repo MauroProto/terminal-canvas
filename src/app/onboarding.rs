@@ -21,12 +21,15 @@ pub(super) enum EmptyState {
 
 /// Decide el empty state a partir del estado del workspace. Puro y testeable.
 pub(super) fn empty_state(has_folder: bool, panel_count: usize) -> EmptyState {
-    if !has_folder {
-        EmptyState::NoFolder
-    } else if panel_count == 0 {
+    // Un terminal abierto en HOME (sin carpeta de proyecto) ya es contenido
+    // válido del canvas. Los mensajes vacíos sólo corresponden cuando no hay
+    // ningún panel que puedan tapar o contradecir.
+    if panel_count > 0 {
+        EmptyState::None
+    } else if has_folder {
         EmptyState::NoPanels
     } else {
-        EmptyState::None
+        EmptyState::NoFolder
     }
 }
 
@@ -123,8 +126,8 @@ impl TerminalApp {
                 egui::Frame::default()
                     .fill(palette::INK)
                     .stroke(egui::Stroke::new(1.0, palette::LINE))
-                    .rounding(10.0)
-                    .inner_margin(egui::Margin::same(16.0))
+                    .corner_radius(10.0)
+                    .inner_margin(egui::Margin::same(16))
                     .show(ui, |ui| {
                         ui.set_max_width(440.0);
                         ui.label(
@@ -167,10 +170,15 @@ mod tests {
     use super::{empty_state, EmptyState, ONBOARDING_STEPS};
 
     #[test]
-    fn without_a_folder_the_first_step_is_opening_one() {
+    fn without_a_folder_or_panels_the_first_step_is_opening_one() {
         assert_eq!(empty_state(false, 0), EmptyState::NoFolder);
-        // Aunque hubiera paneles, sin carpeta lo que falta es la carpeta.
-        assert_eq!(empty_state(false, 3), EmptyState::NoFolder);
+    }
+
+    #[test]
+    fn a_live_terminal_hides_the_empty_state_even_without_a_folder() {
+        // Un shell abierto en HOME es un estado válido: no debe quedar tapado
+        // por una invitación a abrir una carpeta.
+        assert_eq!(empty_state(false, 1), EmptyState::None);
     }
 
     #[test]

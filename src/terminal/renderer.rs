@@ -4,7 +4,9 @@ use alacritty_terminal::term::{point_to_viewport, RenderableCursor, Term};
 use alacritty_terminal::vte::ansi::{
     Color as AnsiColor, CursorShape as VteCursorShape, NamedColor,
 };
-use egui::{pos2, vec2, Align2, Color32, FontFamily, FontId, Pos2, Rect, Rounding, Shape, Stroke};
+use egui::{
+    pos2, vec2, Align2, Color32, CornerRadius, FontFamily, FontId, Pos2, Rect, Shape, Stroke,
+};
 
 use crate::terminal::colors::{brighten, dim_color, indexed_to_egui};
 #[cfg(feature = "ghostty-vt")]
@@ -200,7 +202,7 @@ pub fn render_terminal(
     focused: bool,
     time: f64,
     zoom: f32,
-    background_rounding: Rounding,
+    background_rounding: CornerRadius,
     cache: Option<&mut TerminalGridCache>,
     revision: u64,
 ) -> bool {
@@ -225,7 +227,7 @@ pub fn render_terminal_reduced(
     focused: bool,
     time: f64,
     zoom: f32,
-    background_rounding: Rounding,
+    background_rounding: CornerRadius,
     cache: Option<&mut TerminalGridCache>,
     revision: u64,
 ) -> bool {
@@ -288,7 +290,7 @@ pub fn render_ghostty_text_snapshot(
     focused: bool,
     time: f64,
     zoom: f32,
-    background_rounding: Rounding,
+    background_rounding: CornerRadius,
     mut cache: Option<&mut GhosttyGridCache>,
 ) -> bool {
     if content_rect.width() <= 0.0 || content_rect.height() <= 0.0 {
@@ -589,7 +591,12 @@ fn draw_ghostty_cursor(
             );
         }
         GhosttyCursorShape::BlockHollow => {
-            painter.rect_stroke(rect, 0.0, Stroke::new((1.0 * metrics.zoom).max(1.0), color));
+            painter.rect_stroke(
+                rect,
+                0.0,
+                Stroke::new((1.0 * metrics.zoom).max(1.0), color),
+                egui::StrokeKind::Middle,
+            );
         }
     }
 }
@@ -607,7 +614,7 @@ fn render_terminal_with_row_stride(
     focused: bool,
     time: f64,
     zoom: f32,
-    background_rounding: Rounding,
+    background_rounding: CornerRadius,
     row_stride: usize,
     mut cache: Option<&mut TerminalGridCache>,
     revision: u64,
@@ -1142,6 +1149,7 @@ pub fn render_terminal_preview(
             badge_rect,
             badge_height * 0.5,
             Stroke::new(1.0, Color32::from_rgba_premultiplied(110, 110, 110, 120)),
+            egui::StrokeKind::Middle,
         );
         painter.text(
             badge_rect.center(),
@@ -1201,7 +1209,12 @@ fn draw_cursor(
             );
         }
         VteCursorShape::HollowBlock => {
-            painter.rect_stroke(rect, 0.0, Stroke::new(stroke_width, CURSOR_COLOR));
+            painter.rect_stroke(
+                rect,
+                0.0,
+                Stroke::new(stroke_width, CURSOR_COLOR),
+                egui::StrokeKind::Middle,
+            );
         }
         VteCursorShape::Hidden => {}
     }
@@ -1317,7 +1330,7 @@ mod tests {
     use alacritty_terminal::term::test::TermSize;
     use alacritty_terminal::term::{Config as TermConfig, Term};
     use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
-    use egui::{pos2, vec2, CentralPanel, RawInput, Rect, Rounding};
+    use egui::{pos2, vec2, CentralPanel, CornerRadius, RawInput, Rect};
 
     #[cfg(feature = "ghostty-vt")]
     use crate::terminal::ghostty_backend::{
@@ -1432,7 +1445,7 @@ mod tests {
                     false,
                     0.0,
                     1.0,
-                    Rounding::ZERO,
+                    CornerRadius::ZERO,
                     None,
                     0,
                 );
@@ -1453,11 +1466,11 @@ mod tests {
             ..Default::default()
         };
         let content_rect = Rect::from_min_size(pos2(20.0, 20.0), vec2(220.0, 120.0));
-        let body_rounding = Rounding {
-            nw: 0.0,
-            ne: 0.0,
-            sw: 14.0,
-            se: 14.0,
+        let body_rounding = CornerRadius {
+            nw: 0,
+            ne: 0,
+            sw: 14,
+            se: 14,
         };
         let term = sample_term("hello");
         let expected_fill = terminal_background_color(term.renderable_content().colors);
@@ -1491,7 +1504,7 @@ mod tests {
             })
             .expect("expected terminal background rect");
 
-        assert_eq!(background.rounding, body_rounding);
+        assert_eq!(background.corner_radius, body_rounding);
     }
 
     #[test]
@@ -1639,7 +1652,7 @@ mod tests {
                     true,
                     0.0,
                     1.0,
-                    Rounding::ZERO,
+                    CornerRadius::ZERO,
                     Some(&mut cache),
                     7,
                 );
@@ -1655,7 +1668,7 @@ mod tests {
                     true,
                     0.0,
                     1.0,
-                    Rounding::ZERO,
+                    CornerRadius::ZERO,
                     Some(&mut cache),
                     7,
                 );
@@ -1689,7 +1702,7 @@ mod tests {
                     true,
                     0.0,
                     1.0,
-                    Rounding::ZERO,
+                    CornerRadius::ZERO,
                     Some(&mut cache),
                     7,
                 );
@@ -1707,7 +1720,7 @@ mod tests {
                     true,
                     0.0,
                     1.0,
-                    Rounding::ZERO,
+                    CornerRadius::ZERO,
                     Some(&mut cache),
                     7,
                 );
@@ -1741,7 +1754,7 @@ mod tests {
                     true,
                     0.0,
                     1.0,
-                    Rounding::ZERO,
+                    CornerRadius::ZERO,
                     Some(&mut cache),
                 );
             });
@@ -1756,7 +1769,7 @@ mod tests {
                     true,
                     0.0,
                     1.0,
-                    Rounding::ZERO,
+                    CornerRadius::ZERO,
                     Some(&mut cache),
                 );
             });
@@ -1787,7 +1800,7 @@ mod tests {
                     false,
                     0.0,
                     1.0,
-                    Rounding::ZERO,
+                    CornerRadius::ZERO,
                     None,
                     0,
                 );
@@ -1824,7 +1837,7 @@ mod tests {
                     false,
                     0.0,
                     1.0,
-                    Rounding::ZERO,
+                    CornerRadius::ZERO,
                     None,
                     0,
                 );
@@ -1876,7 +1889,7 @@ mod tests {
                     false,
                     0.0,
                     1.0,
-                    Rounding::ZERO,
+                    CornerRadius::ZERO,
                     None,
                     0,
                 );

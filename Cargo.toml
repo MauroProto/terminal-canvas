@@ -4,17 +4,26 @@ version = "1.2.0"
 edition = "2021"
 description = "A native desktop terminal and agent workspace manager, GPU-accelerated, cross-platform"
 license = "MIT"
+repository = "https://github.com/MauroProto/terminal-canvas"
 
 [features]
 default = []
 ghostty-vt = ["dep:libghostty-vt"]
-# Adopción del daemon de PTYs (P3.15). Off por defecto: la app funciona
-# in-process y el daemon se activa de forma gradual.
+# El daemon queda opt-in en builds de desarrollo: Cargo no admite defaults por
+# target. El bundle de macOS activa este feature y distribuye ambos binarios.
 daemon = []
 
 [[bin]]
 name = "mi-terminal"
 path = "src/main.rs"
+
+[[bin]]
+name = "tc-memory"
+path = "src/bin/tc-memory.rs"
+
+[[bin]]
+name = "tc-memory-mcp"
+path = "src/bin/tc-memory-mcp.rs"
 
 [[test]]
 name = "perf_budget"
@@ -49,8 +58,8 @@ name = "runtime_perf_scenarios"
 path = "tests/runtime/perf_scenarios.rs"
 
 [dependencies]
-eframe = { version = "0.30", features = ["wgpu"] }
-egui = "0.30"
+eframe = { version = "0.32.3", features = ["wgpu"] }
+egui = "0.32.3"
 alacritty_terminal = "0.25.1"
 libghostty-vt = { version = "0.1.1", optional = true }
 portable-pty = "0.9"
@@ -78,6 +87,7 @@ rcgen = "0.13"
 url = "2"
 sha2 = "0.10"
 anyhow = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
 log = "0.4"
 env_logger = "0.11"
 rustls = "0.23"
@@ -92,7 +102,7 @@ zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 tower = { version = "0.5", features = ["util"] }
 tokio-tungstenite = "0.24"
 criterion = { version = "0.8.2", features = ["html_reports"] }
-egui_kittest = "0.30"
+egui_kittest = "0.32.3"
 
 [profile.dev]
 opt-level = 1

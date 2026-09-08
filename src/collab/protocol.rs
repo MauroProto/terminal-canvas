@@ -1,7 +1,7 @@
 use std::fmt;
 
 use base64::Engine;
-use chacha20poly1305::aead::{Aead, KeyInit};
+use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -16,7 +16,6 @@ const INVITE_PREFIX: &str = "terminalcanvas://join/";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateShareSessionRequest {
-    pub session_secret: String,
     pub invite_secret: String,
     #[serde(default)]
     pub invite_expires_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -245,8 +244,15 @@ pub fn encode_envelope(
     let nonce = XNonce::from_slice(&nonce_bytes);
     let encoded_payload =
         rmp_serde::to_vec_named(payload).map_err(|_| ProtocolError::EncodeFailed)?;
+    let aad = envelope_aad(session_id, sender_id, message_seq)?;
     let ciphertext = cipher
-        .encrypt(nonce, encoded_payload.as_ref())
+        .encrypt(
+            nonce,
+            Payload {
+                msg: encoded_payload.as_ref(),
+                aad: &aad,
+            },
+        )
         .map_err(|_| ProtocolError::EncryptFailed)?;
 
     Ok(CollabEnvelope {
@@ -279,10 +285,30 @@ pub fn decode_envelope(
         .map_err(|_| ProtocolError::DecryptFailed)?;
     let cipher = XChaCha20Poly1305::new_from_slice(&key_bytes)
         .map_err(|_| ProtocolError::InvalidKeyLength)?;
+    let aad = envelope_aad(
+        envelope.session_id,
+        envelope.sender_id,
+        envelope.message_seq,
+    )?;
     let plaintext = cipher
-        .decrypt(XNonce::from_slice(&nonce_bytes), ciphertext.as_ref())
+        .decrypt(
+            XNonce::from_slice(&nonce_bytes),
+            Payload {
+                msg: ciphertext.as_ref(),
+                aad: &aad,
+            },
+        )
         .map_err(|_| ProtocolError::DecryptFailed)?;
     rmp_serde::from_slice(&plaintext).map_err(|_| ProtocolError::DecodeFailed)
+}
+
+fn envelope_aad(
+    session_id: ShareSessionId,
+    sender_id: ParticipantId,
+    message_seq: u64,
+) -> Result<Vec<u8>, ProtocolError> {
+    rmp_serde::to_vec_named(&(session_id, sender_id, message_seq))
+        .map_err(|_| ProtocolError::EncodeFailed)
 }
 
 #[cfg(test)]
@@ -347,6 +373,40 @@ mod tests {
         let decoded = decode_envelope(&envelope, &secret).unwrap();
 
         assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn collab_envelope_authenticates_routing_metadata() {
+        let secret = session_secret();
+        let envelope = encode_envelope(
+            ShareSessionId(Uuid::new_v4()),
+            ParticipantId::Host,
+            7,
+            &secret,
+            &SessionPayload::WorkspaceSnapshot {
+                snapshot: SharedWorkspaceSnapshot {
+                    workspace_id: Uuid::new_v4(),
+                    workspace_name: "Demo".to_owned(),
+                    generated_at: Utc::now(),
+                    guests: Vec::new(),
+                    terminal_controls: Vec::new(),
+                    panels: Vec::new(),
+                },
+            },
+        )
+        .unwrap();
+
+        let mut changed_sender = envelope.clone();
+        changed_sender.sender_id = ParticipantId::Guest(GuestId(Uuid::new_v4()));
+        assert!(decode_envelope(&changed_sender, &secret).is_err());
+
+        let mut changed_sequence = envelope.clone();
+        changed_sequence.message_seq += 1;
+        assert!(decode_envelope(&changed_sequence, &secret).is_err());
+
+        let mut changed_session = envelope;
+        changed_session.session_id = ShareSessionId(Uuid::new_v4());
+        assert!(decode_envelope(&changed_session, &secret).is_err());
     }
 
     #[test]

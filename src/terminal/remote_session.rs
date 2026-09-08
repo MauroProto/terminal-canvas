@@ -6,13 +6,15 @@
 //! socket en vez del fd) y a dónde van (`Write` en vez del writer del PTY).
 //! Así el render, la selección, el scrollback y la búsqueda no se enteran.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
 
 use uuid::Uuid;
 
-use crate::daemon::protocol::{decode_line, encode_line, Request, Response};
+use crate::daemon::protocol::{
+    decode_line, encode_line, read_protocol_line, Request, Response, MAX_WIRE_INPUT_BYTES,
+};
 
 /// Enlace con la sesión del daemon: por acá salen resize y kill, que no pasan
 /// por el stream de bytes.
@@ -34,15 +36,17 @@ impl RemoteLink {
         self.session_id
     }
 
-    fn send(&self, request: &Request) {
-        if let Ok(mut control) = self.control.lock() {
-            let _ = control.write_all(encode_line(request).as_bytes());
-            let _ = control.flush();
-        }
+    fn send(&self, request: &Request) -> std::io::Result<()> {
+        let mut control = self
+            .control
+            .lock()
+            .map_err(|_| std::io::Error::other("canal remoto envenenado"))?;
+        control.write_all(encode_line(request).as_bytes())?;
+        control.flush()
     }
 
     pub fn resize(&self, cols: u16, rows: u16) {
-        self.send(&Request::Resize {
+        let _ = self.send(&Request::Resize {
             id: self.session_id,
             cols,
             rows,
@@ -50,7 +54,7 @@ impl RemoteLink {
     }
 
     pub fn kill(&self) {
-        self.send(&Request::Kill {
+        let _ = self.send(&Request::Kill {
             id: self.session_id,
         });
     }
@@ -70,14 +74,12 @@ impl RemoteWriter {
 
 impl Write for RemoteWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        // El protocolo es JSON, así que los bytes viajan como texto. Lo que no
-        // es UTF-8 válido se reemplaza en vez de descartar la escritura: es lo
-        // mismo que hace el terminal al mostrarlo.
-        let data = String::from_utf8_lossy(buf).into_owned();
-        self.link.send(&Request::Write {
-            id: self.link.session_id(),
-            data,
-        });
+        for chunk in buf.chunks(MAX_WIRE_INPUT_BYTES) {
+            self.link.send(&Request::Write {
+                id: self.link.session_id(),
+                data: chunk.to_vec(),
+            })?;
+        }
         Ok(buf.len())
     }
 
@@ -87,8 +89,8 @@ impl Write for RemoteWriter {
 }
 
 /// Bytes de salida de **una** sesión, leídos del socket. Filtra los eventos de
-/// las otras sesiones (el daemon difunde todo a todos los clientes) y descarta
-/// los que ya venían en el snapshot del attach (dedup por `seq`, T4).
+/// la sesión adjunta y descarta los que ya venían en el snapshot del attach
+/// (dedup por `seq`, T4).
 pub struct RemoteReader {
     lines: BufReader<UnixStream>,
     session_id: Uuid,
@@ -115,16 +117,15 @@ impl RemoteReader {
     /// o la sesión terminó.
     pub fn next_output(&mut self) -> Option<Vec<u8>> {
         loop {
-            let mut line = String::new();
-            match self.lines.read_line(&mut line) {
-                Ok(0) | Err(_) => return None,
-                Ok(_) => {}
-            }
+            let line = match read_protocol_line(&mut self.lines) {
+                Ok(Some(line)) => line,
+                Ok(None) | Err(_) => return None,
+            };
             match decode_line::<Response>(&line) {
                 Some(Response::Output { id, seq, data })
                     if id == self.session_id && seq > self.attached_seq =>
                 {
-                    return Some(data.into_bytes());
+                    return Some(data);
                 }
                 Some(Response::Exit { id }) if id == self.session_id => {
                     self.exited = true;
@@ -141,7 +142,9 @@ impl RemoteReader {
 #[cfg(test)]
 mod tests {
     use super::{RemoteLink, RemoteReader, RemoteWriter};
-    use crate::daemon::protocol::{decode_line, encode_line, Request, Response};
+    use crate::daemon::protocol::{
+        decode_line, encode_line, Request, Response, MAX_WIRE_INPUT_BYTES,
+    };
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixStream;
     use uuid::Uuid;
@@ -165,10 +168,41 @@ mod tests {
         match decode_line::<Request>(&line) {
             Some(Request::Write { id: got, data }) => {
                 assert_eq!(got, id);
-                assert_eq!(data, "echo hola\n");
+                assert_eq!(data, b"echo hola\n");
             }
             other => panic!("esperaba Write, got {other:?} / {line}"),
         }
+    }
+
+    #[test]
+    fn a_large_write_is_split_into_bounded_protocol_messages() {
+        let (ours, theirs) = socket_pair();
+        let id = Uuid::new_v4();
+        let mut writer = RemoteWriter::new(RemoteLink::new(id, ours));
+        let payload = vec![b'x'; MAX_WIRE_INPUT_BYTES + 17];
+        let payload_for_writer = payload.clone();
+        let writer_thread = std::thread::spawn(move || {
+            writer.write_all(&payload_for_writer).expect("escribe todo");
+        });
+
+        let mut reader = BufReader::new(theirs);
+        let mut rebuilt = Vec::new();
+        for expected_len in [MAX_WIRE_INPUT_BYTES, 17] {
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("lee chunk");
+            match decode_line::<Request>(&line) {
+                Some(Request::Write { id: got, data }) => {
+                    assert_eq!(got, id);
+                    assert_eq!(data.len(), expected_len);
+                    rebuilt.extend_from_slice(&data);
+                }
+                other => panic!("esperaba Write, got {other:?}"),
+            }
+        }
+        writer_thread
+            .join()
+            .expect("writer no debe entrar en pánico");
+        assert_eq!(rebuilt, payload);
     }
 
     #[test]
@@ -211,13 +245,13 @@ mod tests {
             Response::Output {
                 id: other,
                 seq: 1,
-                data: "de otra".to_owned(),
+                data: b"de otra".to_vec(),
             },
             Response::Sessions { ids: vec![mine] },
             Response::Output {
                 id: mine,
                 seq: 1,
-                data: "mia".to_owned(),
+                data: b"mia".to_vec(),
             },
         ] {
             theirs.write_all(encode_line(&event).as_bytes()).unwrap();
@@ -239,7 +273,7 @@ mod tests {
                     encode_line(&Response::Output {
                         id,
                         seq,
-                        data: format!("linea{seq}"),
+                        data: format!("linea{seq}").into_bytes(),
                     })
                     .as_bytes(),
                 )
@@ -263,7 +297,7 @@ mod tests {
                 encode_line(&Response::Output {
                     id,
                     seq: 1,
-                    data: "x".to_owned(),
+                    data: b"x".to_vec(),
                 })
                 .as_bytes(),
             )
@@ -288,7 +322,7 @@ mod tests {
                 encode_line(&Response::Output {
                     id,
                     seq: 1,
-                    data: "ok".to_owned(),
+                    data: b"ok".to_vec(),
                 })
                 .as_bytes(),
             )

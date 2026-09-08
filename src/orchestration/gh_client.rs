@@ -5,7 +5,7 @@
 //! 60 s. Si `gh` no está instalado o no hay sesión iniciada, el estado queda en
 //! [`GhAvailability::Unavailable`] con el motivo, en vez de fallar en silencio.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
@@ -232,7 +232,8 @@ pub fn fetch_snapshot(repo_root: &PathBuf) -> GhResult {
 pub struct GhClient {
     worker: Option<GhWorker>,
     last_fetch_at: Option<Instant>,
-    in_flight: bool,
+    last_repo_root: Option<PathBuf>,
+    in_flight_repo: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -244,10 +245,10 @@ struct GhWorker {
 impl GhClient {
     /// Pide un refresh. Respeta el cache salvo que `force` sea true.
     pub fn request(&mut self, repo_root: PathBuf, force: bool) {
-        if self.in_flight {
+        if self.in_flight_repo.is_some() {
             return;
         }
-        if !force && !self.cache_expired(Instant::now()) {
+        if !force && !self.cache_expired(&repo_root, Instant::now()) {
             return;
         }
         if self.worker.is_none() {
@@ -256,18 +257,26 @@ impl GhClient {
         let Some(worker) = self.worker.as_ref() else {
             return;
         };
-        if worker.request_tx.send(repo_root).is_err() {
+        if worker.request_tx.send(repo_root.clone()).is_err() {
             self.worker = None;
             return;
         }
-        self.in_flight = true;
+        self.in_flight_repo = Some(repo_root);
     }
 
-    fn cache_expired(&self, now: Instant) -> bool {
-        match self.last_fetch_at {
-            Some(at) => now.duration_since(at) >= GH_CACHE_TTL,
-            None => true,
+    fn cache_expired(&self, repo_root: &Path, now: Instant) -> bool {
+        match (self.last_repo_root.as_deref(), self.last_fetch_at) {
+            (Some(cached_root), Some(at)) if cached_root == repo_root => {
+                now.duration_since(at) >= GH_CACHE_TTL
+            }
+            _ => true,
         }
+    }
+
+    /// Indica carga sólo para el repo visible. Una consulta vieja de otro
+    /// workspace no debe dejar un spinner engañoso en el actual.
+    pub fn is_loading_for(&self, repo_root: &Path) -> bool {
+        self.in_flight_repo.as_deref() == Some(repo_root)
     }
 
     pub fn poll(&mut self) -> Vec<GhResult> {
@@ -278,9 +287,10 @@ impl GhClient {
         while let Ok(result) = worker.result_rx.try_recv() {
             out.push(result);
         }
-        if !out.is_empty() {
-            self.in_flight = false;
+        if let Some(last) = out.last() {
+            self.last_repo_root = Some(last.repo_root.clone());
             self.last_fetch_at = Some(Instant::now());
+            self.in_flight_repo = None;
         }
         out
     }
@@ -311,6 +321,7 @@ mod tests {
         auth_failure_reason, issue_branch_name, issue_prompt, parse_issues, parse_pull_requests,
         GhClient, GH_CACHE_TTL,
     };
+    use std::path::{Path, PathBuf};
     use std::time::Instant;
 
     const PR_FIXTURE: &str = r#"[
@@ -402,13 +413,22 @@ mod tests {
     #[test]
     fn the_cache_blocks_a_second_request_within_the_ttl() {
         let mut client = GhClient::default();
+        let repo = PathBuf::from("/tmp/example-repo");
         // Sin fetch previo, el cache está vencido.
-        assert!(client.cache_expired(Instant::now()));
+        assert!(client.cache_expired(&repo, Instant::now()));
+        client.last_repo_root = Some(repo.clone());
         client.last_fetch_at = Some(Instant::now());
-        assert!(!client.cache_expired(Instant::now()), "recién consultado");
         assert!(
-            client.cache_expired(Instant::now() + GH_CACHE_TTL),
+            !client.cache_expired(&repo, Instant::now()),
+            "recién consultado"
+        );
+        assert!(
+            client.cache_expired(&repo, Instant::now() + GH_CACHE_TTL),
             "pasado el TTL vuelve a consultar"
+        );
+        assert!(
+            client.cache_expired(Path::new("/tmp/otro-repo"), Instant::now()),
+            "el cache de un repo no debe bloquear otro workspace"
         );
     }
 }

@@ -105,6 +105,7 @@ impl Workspace {
                 panel,
                 ctx,
                 cwd.as_deref(),
+                workspace_id,
                 Arc::clone(&pty_manager),
             )));
         }
@@ -126,6 +127,7 @@ impl Workspace {
             split_x: 0.5,
             split_y: 0.5,
         };
+        workspace.reconcile_order_counters();
         if workspace
             .panels
             .iter()
@@ -160,34 +162,15 @@ impl Workspace {
             .panel_id
     }
 
-    pub fn can_spawn_terminal(&self) -> bool {
-        const MAX_TERMINALS: usize = 4;
-        self.panels.len() < MAX_TERMINALS
-    }
-
     pub fn spawn_terminal_with_request(
         &mut self,
         ctx: &egui::Context,
         request: TerminalSpawnRequest,
     ) -> SpawnedTerminal {
-        if !self.can_spawn_terminal() {
-            if let Some(focused) = self.focused_panel() {
-                return SpawnedTerminal {
-                    panel_id: focused.id(),
-                    runtime_session_id: None,
-                };
-            }
-            if let Some(first) = self.panels.first() {
-                return SpawnedTerminal {
-                    panel_id: first.id(),
-                    runtime_session_id: None,
-                };
-            }
-        }
         let _ = ctx;
         let size = normalize_panel_size(egui::vec2(DEFAULT_PANEL_WIDTH, DEFAULT_PANEL_HEIGHT));
         let position = self.find_free_position(size);
-        let color = PANEL_COLORS[self.next_color % PANEL_COLORS.len()];
+        let color = self.take_panel_color();
         let mut panel = TerminalPanel::new(position, size, color, self.next_z);
         if let Some(title) = request
             .title
@@ -224,13 +207,13 @@ impl Workspace {
                 startup_input: request.startup_input.clone(),
                 panel_id: Some(panel.id),
                 workspace_id: Some(self.id),
+                leaf_id: Some(panel.root_leaf_id()),
             },
         );
         let id = panel.id;
         let runtime_session_id = panel.runtime_session_id();
         self.panels.push(CanvasPanel::Terminal(panel));
-        self.next_z += 1;
-        self.next_color += 1;
+        self.advance_z_index();
         self.bring_to_front(id);
         SpawnedTerminal {
             panel_id: id,
@@ -256,15 +239,62 @@ impl Workspace {
         {
             return;
         }
-        self.next_z += 1;
+        let next_z = self.advance_z_index();
         for panel in &mut self.panels {
             if panel.id() == panel_id {
-                panel.set_z_index(self.next_z);
+                panel.set_z_index(next_z);
                 panel.set_focused(true);
             } else {
                 panel.set_focused(false);
             }
         }
+    }
+
+    /// Mantiene los contadores persistidos en un rango seguro. Un archivo de
+    /// estado puede venir de una versión anterior, estar editado a mano o haber
+    /// quedado corrupto; ninguna de esas situaciones debe provocar overflow al
+    /// abrir/focalizar un panel.
+    fn reconcile_order_counters(&mut self) {
+        self.next_color %= PANEL_COLORS.len();
+        let max_panel_z = self
+            .panels
+            .iter()
+            .map(CanvasPanel::z_index)
+            .max()
+            .unwrap_or(0);
+        if self.next_z == u32::MAX || max_panel_z == u32::MAX {
+            self.compact_z_indices();
+        } else {
+            self.next_z = self.next_z.max(max_panel_z);
+        }
+    }
+
+    fn take_panel_color(&mut self) -> Color32 {
+        let index = self.next_color % PANEL_COLORS.len();
+        self.next_color = (index + 1) % PANEL_COLORS.len();
+        PANEL_COLORS[index]
+    }
+
+    fn advance_z_index(&mut self) -> u32 {
+        if self.next_z == u32::MAX {
+            self.compact_z_indices();
+        }
+        // `compact_z_indices` leaves at most one z slot per resident panel. A
+        // Vec cannot contain u32::MAX panels in a viable process, but retain a
+        // checked fallback so even an artificial state fails without panic.
+        self.next_z = self.next_z.saturating_add(1);
+        self.next_z
+    }
+
+    fn compact_z_indices(&mut self) {
+        let mut order = (0..self.panels.len()).collect::<Vec<_>>();
+        order.sort_by_key(|index| (self.panels[*index].z_index(), *index));
+        for (rank, index) in order.into_iter().enumerate() {
+            let compact_z = u32::try_from(rank).unwrap_or(u32::MAX.saturating_sub(1));
+            self.panels[index].set_z_index(compact_z);
+        }
+        self.next_z = u32::try_from(self.panels.len().saturating_sub(1))
+            .unwrap_or(u32::MAX.saturating_sub(1));
     }
 
     pub fn unfocus_all(&mut self) {
@@ -284,6 +314,16 @@ impl Workspace {
         self.focus_topmost_visible_panel();
     }
 
+    /// Cierra definitivamente todas las terminales del workspace, incluidas
+    /// sus sesiones remotas en el daemon. Se usa al cerrar un proyecto desde
+    /// la UI; dropear el `Workspace` sin pasar por acá dejaría PTYs huérfanos.
+    pub fn close_all_panels(&mut self) {
+        for panel in &mut self.panels {
+            panel.close_for_good();
+        }
+        self.panels.clear();
+    }
+
     /// Handle al manager de PTYs (para espawnear hojas de split, P2.11).
     pub fn pty_manager(&self) -> Arc<Mutex<PtyManager>> {
         Arc::clone(&self.pty_manager)
@@ -292,8 +332,17 @@ impl Workspace {
     /// Divide la hoja enfocada del panel enfocado (P2.11).
     pub fn split_focused_panel(&mut self, axis: crate::terminal::split_tree::Axis) {
         let pty_manager = Arc::clone(&self.pty_manager);
+        let cwd = self.cwd.clone();
+        let workspace_id = self.id;
         if let Some(panel) = self.focused_panel_mut() {
-            panel.split_focused(axis, pty_manager, None, 80, 24);
+            panel.split_focused(
+                axis,
+                pty_manager,
+                cwd.as_deref(),
+                Some(workspace_id),
+                80,
+                24,
+            );
         }
     }
 
@@ -438,12 +487,26 @@ impl Workspace {
             .unwrap_or((0, 0))
     }
 
+    /// Todas las sesiones que pertenecen a los paneles de este workspace,
+    /// incluidas las hojas no enfocadas de cada split.
+    pub fn all_runtime_session_ids(&self) -> Vec<Uuid> {
+        self.panels
+            .iter()
+            .flat_map(CanvasPanel::all_runtime_session_ids)
+            .collect()
+    }
+
+    pub fn focused_runtime_session_id(&self) -> Option<Uuid> {
+        self.focused_panel()
+            .and_then(CanvasPanel::focused_runtime_session_id)
+    }
+
     pub fn drain_runtime_updates(&self) -> UiUpdateBatch {
         // Carril interactivo (P3.16): la sesión del panel enfocado se drena
         // antes que el resto del batch.
         let focused_session = self
             .focused_panel()
-            .and_then(|panel| panel.runtime_session_id());
+            .and_then(CanvasPanel::focused_runtime_session_id);
         self.pty_manager
             .lock()
             .ok()
@@ -669,6 +732,53 @@ mod tests {
     use crate::terminal::panel::TerminalPanel;
 
     #[test]
+    fn corrupted_order_counters_are_compacted_without_overflow() {
+        let mut workspace = Workspace::new("Corrupted", None);
+        let first = TerminalPanel::new(
+            pos2(0.0, 0.0),
+            vec2(400.0, 240.0),
+            egui::Color32::WHITE,
+            u32::MAX - 1,
+        );
+        let first_id = first.id;
+        workspace.add_restored_terminal(first);
+        workspace.add_restored_terminal(TerminalPanel::new(
+            pos2(20.0, 20.0),
+            vec2(400.0, 240.0),
+            egui::Color32::GRAY,
+            u32::MAX,
+        ));
+        workspace.next_z = u32::MAX;
+
+        workspace.reconcile_order_counters();
+        workspace.bring_to_front(first_id);
+
+        let first_z = workspace.panel(first_id).expect("first panel").z_index();
+        let other_z = workspace
+            .panels
+            .iter()
+            .find(|panel| panel.id() != first_id)
+            .expect("other panel")
+            .z_index();
+        assert!(first_z > other_z, "focused panel must remain topmost");
+        assert!(workspace.next_z < u32::MAX);
+    }
+
+    #[test]
+    fn panel_color_counter_wraps_inside_the_palette() {
+        let mut workspace = Workspace::new("Colors", None);
+        workspace.next_color = usize::MAX;
+
+        let color = workspace.take_panel_color();
+
+        assert_eq!(
+            color,
+            super::PANEL_COLORS[usize::MAX % super::PANEL_COLORS.len()]
+        );
+        assert!(workspace.next_color < super::PANEL_COLORS.len());
+    }
+
+    #[test]
     fn gap_filling_returns_non_overlapping_candidate() {
         let mut workspace = Workspace::new("Default", None);
         workspace.add_restored_terminal(TerminalPanel::new(
@@ -782,12 +892,16 @@ mod tests {
                 restore_bounds: Some(SavedPanelBounds::new([20.0, 30.0], [420.0, 260.0])),
                 share_scope: PanelShareScope::VisibleOnly,
                 agent_command: None,
+                leaf_agent_commands: Default::default(),
                 unread: false,
                 split_tree: None,
                 focused_leaf: None,
+                root_leaf: None,
                 linked_issue: None,
                 agent_session_id: None,
+                leaf_agent_session_ids: Default::default(),
                 runtime_session_id: None,
+                leaf_runtime_session_ids: Default::default(),
             }],
             desktop: WorkspaceDesktopState {
                 next_z: 2,
@@ -832,12 +946,16 @@ mod tests {
                 restore_bounds: Some(SavedPanelBounds::new([20.0, 30.0], [420.0, 260.0])),
                 share_scope: PanelShareScope::VisibleOnly,
                 agent_command: None,
+                leaf_agent_commands: Default::default(),
                 unread: false,
                 split_tree: None,
                 focused_leaf: None,
+                root_leaf: None,
                 linked_issue: None,
                 agent_session_id: None,
+                leaf_agent_session_ids: Default::default(),
                 runtime_session_id: None,
+                leaf_runtime_session_ids: Default::default(),
             }],
             desktop: WorkspaceDesktopState {
                 next_z: 2,
@@ -883,12 +1001,16 @@ mod tests {
                 )),
                 share_scope: PanelShareScope::VisibleOnly,
                 agent_command: None,
+                leaf_agent_commands: Default::default(),
                 unread: false,
                 split_tree: None,
                 focused_leaf: None,
+                root_leaf: None,
                 linked_issue: None,
                 agent_session_id: None,
+                leaf_agent_session_ids: Default::default(),
                 runtime_session_id: None,
+                leaf_runtime_session_ids: Default::default(),
             })
             .collect();
         let state = WorkspaceState {

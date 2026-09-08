@@ -68,7 +68,12 @@ pub fn show(
         11.0,
         Color32::from_rgba_premultiplied(10, 10, 10, 220),
     );
-    painter.rect_stroke(reset_rect, 11.0, Stroke::new(1.0, palette::LINE));
+    painter.rect_stroke(
+        reset_rect,
+        11.0,
+        Stroke::new(1.0, palette::LINE),
+        egui::StrokeKind::Middle,
+    );
     painter.text(
         reset_rect.center(),
         Align2::CENTER_CENTER,
@@ -117,7 +122,12 @@ pub fn show(
 
     let visible = viewport.visible_canvas_rect(canvas_rect);
     let visible_rect = Rect::from_min_max(to_minimap(visible.min), to_minimap(visible.max));
-    painter.rect_stroke(visible_rect, 2.0, Stroke::new(1.0, MINIMAP_VIEWPORT_BORDER));
+    painter.rect_stroke(
+        visible_rect,
+        2.0,
+        Stroke::new(1.0, MINIMAP_VIEWPORT_BORDER),
+        egui::StrokeKind::Middle,
+    );
 
     let hide_rect = Rect::from_min_size(rect.right_top() - vec2(22.0, -4.0), vec2(18.0, 18.0));
     if ui

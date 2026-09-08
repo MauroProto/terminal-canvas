@@ -10,8 +10,12 @@ use std::time::{Duration, Instant};
 use sha2::{Digest, Sha256};
 
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
-const RELEASES_URL: &str = "https://api.github.com/repos/owner/repo/releases/latest";
+const RELEASES_URL: &str =
+    "https://api.github.com/repos/MauroProto/terminal-canvas/releases/latest";
 const REQUEST_TIMEOUT: u64 = 15;
+const MAX_RELEASE_METADATA_BYTES: u64 = 2 * 1024 * 1024;
+const RELEASE_ASSET_PREFIX: &str =
+    "https://github.com/MauroProto/terminal-canvas/releases/download/";
 // La terminal enfocada tiene prioridad de repintado sobre el fondo: el
 // usuario percibe el throughput del stream enfocado, así que su ventana es
 // más corta (~60 fps) que la de fondo (~30 fps). Antes era al revés (80 ms
@@ -128,13 +132,22 @@ pub struct UpdateChecker {
 }
 
 impl UpdateChecker {
+    /// Checker inerte para tests, previews y cualquier construcción que haya
+    /// prometido no iniciar red ni workers de fondo.
+    pub fn disabled() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(UpdateState::default())),
+        }
+    }
+
     pub fn new(ctx: &egui::Context) -> Self {
         if update_checker_disabled() {
-            return Self {
-                state: Arc::new(Mutex::new(UpdateState::default())),
-            };
+            return Self::disabled();
         }
         let state = Arc::new(Mutex::new(UpdateState::default()));
+        if let Ok(mut current) = state.lock() {
+            current.status = UpdateStatus::Checking;
+        }
         let state_clone = Arc::clone(&state);
         let ctx = ctx.clone();
         thread::spawn(move || {
@@ -162,17 +175,24 @@ impl UpdateChecker {
 }
 
 fn update_checker_disabled() -> bool {
-    RELEASES_URL.contains("/owner/repo/")
+    std::env::var_os("TERMINALCANVAS_DISABLE_UPDATE_CHECK").is_some()
 }
 
 pub fn version_newer(latest: &str, current: &str) -> bool {
-    let parse = |version: &str| -> Vec<u32> {
-        version
-            .split('.')
-            .map(|part| part.parse::<u32>().unwrap_or(0))
-            .collect()
-    };
-    parse(latest) > parse(current)
+    match (parse_version(latest), parse_version(current)) {
+        (Some(latest), Some(current)) => latest > current,
+        _ => false,
+    }
+}
+
+fn parse_version(version: &str) -> Option<Vec<u64>> {
+    let version = version.strip_prefix('v').unwrap_or(version);
+    let core = version.split_once('-').map_or(version, |(core, _)| core);
+    let parts: Vec<_> = core
+        .split('.')
+        .map(|part| part.parse::<u64>().ok())
+        .collect::<Option<_>>()?;
+    (!parts.is_empty()).then_some(parts)
 }
 
 fn http_client() -> Result<reqwest::blocking::Client, String> {
@@ -195,11 +215,21 @@ pub fn check_latest_release() -> Result<UpdateState, String> {
         return Err(format!("GitHub API returned {}", resp.status().as_u16()));
     }
 
-    let body = resp
-        .text()
+    if resp
+        .content_length()
+        .is_some_and(|len| len > MAX_RELEASE_METADATA_BYTES)
+    {
+        return Err("GitHub release metadata is too large".to_owned());
+    }
+    let mut body = Vec::new();
+    resp.take(MAX_RELEASE_METADATA_BYTES + 1)
+        .read_to_end(&mut body)
         .map_err(|e| format!("Failed to read response body: {e}"))?;
+    if body.len() as u64 > MAX_RELEASE_METADATA_BYTES {
+        return Err("GitHub release metadata is too large".to_owned());
+    }
     let json: serde_json::Value =
-        serde_json::from_str(&body).map_err(|e| format!("JSON parse failed: {e}"))?;
+        serde_json::from_slice(&body).map_err(|e| format!("JSON parse failed: {e}"))?;
 
     let tag = json
         .get("tag_name")
@@ -207,6 +237,9 @@ pub fn check_latest_release() -> Result<UpdateState, String> {
         .ok_or_else(|| "No tag_name in response".to_owned())?;
 
     let latest = tag.strip_prefix('v').unwrap_or(tag);
+    if parse_version(latest).is_none() {
+        return Err("GitHub release tag is not a valid version".to_owned());
+    }
     let update_available = version_newer(latest, CURRENT_VERSION);
     let download_url = find_platform_asset(&json);
 
@@ -224,10 +257,20 @@ pub fn check_latest_release() -> Result<UpdateState, String> {
 
 pub fn find_platform_asset(json: &serde_json::Value) -> Option<String> {
     let assets = json.get("assets")?.as_array()?;
-    let arch = if cfg!(target_arch = "aarch64") {
-        "aarch64"
+    #[cfg(target_os = "macos")]
+    let expected_macos_name = format!(
+        "terminalcanvas-{}.dmg",
+        json.get("tag_name")?
+            .as_str()?
+            .strip_prefix('v')
+            .unwrap_or(json.get("tag_name")?.as_str()?)
+            .to_ascii_lowercase()
+    );
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    let arch_aliases: &[&str] = if cfg!(target_arch = "aarch64") {
+        &["aarch64", "arm64"]
     } else {
-        "x86_64"
+        &["x86_64", "amd64"]
     };
 
     assets.iter().find_map(|asset| {
@@ -235,32 +278,48 @@ pub fn find_platform_asset(json: &serde_json::Value) -> Option<String> {
         let url = asset
             .get("browser_download_url")
             .and_then(|value| value.as_str())
+            .filter(|url| allowed_release_asset_url(url))
             .map(str::to_owned);
-
-        if !name.contains(arch) || !name.contains("setup") {
-            return None;
-        }
 
         #[cfg(target_os = "windows")]
         {
-            if name.ends_with(".exe") {
+            if name.ends_with(".exe")
+                && (arch_aliases.iter().any(|arch| name.contains(arch)) || !name.contains("arm"))
+            {
                 return url;
             }
         }
         #[cfg(target_os = "macos")]
         {
-            if name.ends_with(".dmg") && (name.contains("darwin") || name.contains("apple")) {
+            // El bundle oficial se llama `TerminalCanvas-<version>.dmg`; un
+            // artefacto universal no lleva arquitectura en el nombre.
+            if name == expected_macos_name {
                 return url;
             }
         }
         #[cfg(target_os = "linux")]
         {
-            if name.contains("linux") && name.ends_with(".tar.gz") {
+            if name.contains("linux")
+                && name.ends_with(".tar.gz")
+                && arch_aliases.iter().any(|arch| name.contains(arch))
+            {
                 return url;
             }
         }
 
         None
+    })
+}
+
+fn allowed_release_asset_url(raw_url: &str) -> bool {
+    url::Url::parse(raw_url).is_ok_and(|url| {
+        url.scheme() == "https"
+            && url.host_str() == Some("github.com")
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none()
+            && raw_url.starts_with(RELEASE_ASSET_PREFIX)
     })
 }
 
@@ -282,6 +341,9 @@ pub fn verify_checksum(file_path: &Path, expected_hash: &str) -> bool {
 }
 
 pub fn download_checksum(url: &str) -> Option<String> {
+    if !allowed_release_asset_url(url) || !url.ends_with(".sha256") {
+        return None;
+    }
     let resp = http_client().ok()?.get(url).send().ok()?;
 
     if resp.status() != reqwest::StatusCode::OK {
@@ -310,13 +372,15 @@ pub fn checksum_string(bytes: &[u8]) -> String {
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use super::{checksum_string, update_checker_disabled, verify_checksum, version_newer};
+    use super::{checksum_string, find_platform_asset, verify_checksum, version_newer};
 
     #[test]
     fn version_comparison() {
         assert!(version_newer("1.3.0", "1.2.0"));
         assert!(!version_newer("1.2.0", "1.2.0"));
         assert!(!version_newer("1.1.9", "1.2.0"));
+        assert!(!version_newer("1.x.0", "1.2.0"));
+        assert!(!version_newer("release", "1.2.0"));
     }
 
     #[test]
@@ -348,8 +412,56 @@ mod tests {
     }
 
     #[test]
-    fn placeholder_release_url_disables_update_checker() {
-        assert!(update_checker_disabled());
+    fn configured_release_url_enables_update_checker() {
+        assert!(super::RELEASES_URL.contains("MauroProto/terminal-canvas"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_selects_the_bundle_asset_published_by_the_release_script() {
+        let release = serde_json::json!({
+            "tag_name": "v1.3.0",
+            "assets": [{
+                "name": "TerminalCanvas-1.3.0.dmg",
+                "browser_download_url": "https://github.com/MauroProto/terminal-canvas/releases/download/v1.3.0/TerminalCanvas-1.3.0.dmg"
+            }]
+        });
+        assert_eq!(
+            find_platform_asset(&release).as_deref(),
+            Some("https://github.com/MauroProto/terminal-canvas/releases/download/v1.3.0/TerminalCanvas-1.3.0.dmg")
+        );
+    }
+
+    #[test]
+    fn release_assets_reject_plaintext_and_untrusted_hosts() {
+        assert!(!super::allowed_release_asset_url(
+            "http://github.com/example/release.dmg"
+        ));
+        assert!(!super::allowed_release_asset_url(
+            "https://example.test/release.dmg"
+        ));
+        assert!(!super::allowed_release_asset_url(
+            "https://github.com/example/release.dmg"
+        ));
+        assert!(!super::allowed_release_asset_url(
+            "https://objects.githubusercontent.com/release.dmg"
+        ));
+        assert!(super::allowed_release_asset_url(
+            "https://github.com/MauroProto/terminal-canvas/releases/download/v1.3.0/TerminalCanvas-1.3.0.dmg"
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_rejects_an_asset_whose_version_does_not_match_the_release_tag() {
+        let release = serde_json::json!({
+            "tag_name": "v1.3.0",
+            "assets": [{
+                "name": "TerminalCanvas-9.9.9.dmg",
+                "browser_download_url": "https://github.com/MauroProto/terminal-canvas/releases/download/v1.3.0/TerminalCanvas-9.9.9.dmg"
+            }]
+        });
+        assert!(find_platform_asset(&release).is_none());
     }
 
     fn tempfile_dir() -> PathBuf {

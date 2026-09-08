@@ -16,6 +16,7 @@ cd "$REPO_ROOT"
 APP_NAME="TerminalCanvas"
 BUNDLE_ID="com.terminalcanvas.app"
 BINARY_NAME="mi-terminal"
+DAEMON_BINARY_NAME="mi-terminal-daemon"
 DIST_DIR="dist"
 APP_DIR="$DIST_DIR/$APP_NAME.app"
 MAKE_DMG=false
@@ -29,13 +30,21 @@ fi
 echo "== $APP_NAME $VERSION =="
 
 echo "-- build release"
-cargo build --release --locked
+cargo build --release --locked --features daemon --bins
 
 echo "-- estructura del bundle"
 rm -rf "$APP_DIR"
 mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
 cp "target/release/$BINARY_NAME" "$APP_DIR/Contents/MacOS/$APP_NAME"
-chmod +x "$APP_DIR/Contents/MacOS/$APP_NAME"
+cp "target/release/$DAEMON_BINARY_NAME" \
+  "$APP_DIR/Contents/MacOS/$DAEMON_BINARY_NAME"
+cp "target/release/tc-memory" "$APP_DIR/Contents/MacOS/tc-memory"
+cp "target/release/tc-memory-mcp" "$APP_DIR/Contents/MacOS/tc-memory-mcp"
+chmod +x \
+  "$APP_DIR/Contents/MacOS/$APP_NAME" \
+  "$APP_DIR/Contents/MacOS/$DAEMON_BINARY_NAME" \
+  "$APP_DIR/Contents/MacOS/tc-memory" \
+  "$APP_DIR/Contents/MacOS/tc-memory-mcp"
 
 echo "-- icono .icns"
 ICONSET="$(mktemp -d)/icon.iconset"
@@ -72,8 +81,16 @@ cat > "$APP_DIR/Contents/Info.plist" <<PLIST
 PLIST
 
 if [[ -n "${CODESIGN_IDENTITY:-}" ]]; then
-  echo "-- firma (hardened runtime)"
-  codesign --force --deep --options runtime --timestamp \
+  echo "-- firma de helpers (hardened runtime)"
+  for helper in "$DAEMON_BINARY_NAME" tc-memory tc-memory-mcp; do
+    codesign --force --options runtime --timestamp \
+      --sign "$CODESIGN_IDENTITY" \
+      "$APP_DIR/Contents/MacOS/$helper"
+    codesign --verify --strict --verbose=2 \
+      "$APP_DIR/Contents/MacOS/$helper"
+  done
+  echo "-- firma de la app (hardened runtime)"
+  codesign --force --options runtime --timestamp \
     --sign "$CODESIGN_IDENTITY" "$APP_DIR"
   codesign --verify --deep --strict --verbose=2 "$APP_DIR"
 else

@@ -7,8 +7,8 @@ fn dialog_frame() -> egui::Frame {
     egui::Frame::default()
         .fill(palette::INK)
         .stroke(egui::Stroke::new(1.0, palette::LINE))
-        .rounding(8.0)
-        .inner_margin(egui::Margin::same(22.0))
+        .corner_radius(10.0)
+        .inner_margin(egui::Margin::same(22))
 }
 
 fn dialog_backdrop(ctx: &egui::Context) {
@@ -25,20 +25,21 @@ fn dialog_backdrop(ctx: &egui::Context) {
 fn dialog_title(ui: &mut egui::Ui, text: &str) {
     ui.label(
         egui::RichText::new(text)
-            .size(15.0)
-            .color(palette::TEXT_STRONG),
+            .size(16.0)
+            .color(palette::TEXT_STRONG)
+            .strong(),
     );
 }
 
 fn dialog_subtitle(ui: &mut egui::Ui, text: &str) {
     ui.add_space(4.0);
     ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
-    ui.label(egui::RichText::new(text).size(11.5).color(palette::DIM));
+    ui.label(egui::RichText::new(text).size(12.0).color(palette::DIM));
 }
 
 fn dialog_field_label(ui: &mut egui::Ui, text: &str) {
     ui.add_space(14.0);
-    ui.label(egui::RichText::new(text).size(11.0).color(palette::TEXT));
+    ui.label(egui::RichText::new(text).size(11.5).color(palette::TEXT));
     ui.add_space(4.0);
 }
 
@@ -67,7 +68,7 @@ fn dialog_input_visuals(ui: &mut egui::Ui) {
 fn dialog_singleline(ui: &mut egui::Ui, value: &mut String, password: bool) -> Response {
     dialog_input_visuals(ui);
     let mut edit = egui::TextEdit::singleline(value)
-        .margin(egui::Margin::symmetric(10.0, 6.0))
+        .margin(egui::Margin::symmetric(10, 6))
         .text_color(palette::TEXT_STRONG)
         .desired_width(f32::INFINITY);
     if password {
@@ -79,68 +80,60 @@ fn dialog_singleline(ui: &mut egui::Ui, value: &mut String, password: bool) -> R
 fn dialog_multiline(ui: &mut egui::Ui, value: &mut String, height: f32) -> Response {
     dialog_input_visuals(ui);
     let edit = egui::TextEdit::multiline(value)
-        .margin(egui::Margin::symmetric(10.0, 6.0))
+        .margin(egui::Margin::symmetric(10, 6))
         .text_color(palette::TEXT_STRONG)
         .desired_width(f32::INFINITY);
     ui.add_sized(egui::vec2(ui.available_width(), height), edit)
 }
 
-fn dialog_link(ui: &mut egui::Ui, label: &str, primary: bool) -> bool {
+pub(super) fn dialog_action_button(ui: &mut egui::Ui, label: &str, primary: bool) -> bool {
     let font = FontId::proportional(12.0);
     let text_w = ui.fonts(|f| {
         f.layout_no_wrap(label.to_owned(), font.clone(), palette::TEXT)
             .size()
             .x
     });
-    let pad_x = 14.0;
-    let height = 30.0;
-    let (rect, response) = ui.allocate_exact_size(
-        egui::vec2(text_w + pad_x * 2.0, height),
-        egui::Sense::click(),
-    );
-    let hovered = response.hovered();
-    if hovered {
-        ui.painter().rect_filled(rect, 4.0, palette::RAISED);
-    }
-    let color = if primary {
-        palette::TEXT_STRONG
-    } else if hovered {
-        palette::TEXT
-    } else {
-        palette::DIM
-    };
-    ui.painter().text(
-        rect.center(),
-        egui::Align2::CENTER_CENTER,
-        label,
-        font,
-        color,
-    );
-    if primary {
-        let underline_y = rect.center().y + 8.0;
-        let half = text_w * 0.5;
-        ui.painter().line_segment(
-            [
-                pos2(rect.center().x - half, underline_y),
-                pos2(rect.center().x + half, underline_y),
-            ],
-            egui::Stroke::new(1.0, palette::TEXT_STRONG),
-        );
-    }
-    response.clicked()
+    let width = (text_w + 28.0).max(82.0);
+    ui.scope(|ui| {
+        let widgets = &mut ui.visuals_mut().widgets;
+        widgets.inactive.bg_fill = if primary {
+            palette::RAISED
+        } else {
+            palette::INK
+        };
+        widgets.inactive.bg_stroke = egui::Stroke::new(1.0, palette::LINE);
+        widgets.inactive.fg_stroke.color = if primary {
+            palette::TEXT_STRONG
+        } else {
+            palette::TEXT
+        };
+        widgets.hovered.bg_fill = palette::HOVER;
+        widgets.hovered.bg_stroke = egui::Stroke::new(1.0, palette::RING);
+        widgets.hovered.fg_stroke.color = palette::TEXT_STRONG;
+        widgets.active.bg_fill = palette::FOCUS;
+        widgets.active.bg_stroke = egui::Stroke::new(1.0, palette::TEXT_STRONG);
+        widgets.active.fg_stroke.color = palette::TEXT_STRONG;
+
+        ui.add_sized(
+            egui::vec2(width, 32.0),
+            egui::Button::new(egui::RichText::new(label).size(12.0)).corner_radius(6.0),
+        )
+    })
+    .inner
+    .clicked()
 }
 
 fn dialog_button_row(ui: &mut egui::Ui, secondary: &str, primary: &str) -> (bool, bool) {
     ui.add_space(20.0);
     let mut sec = false;
     let mut pri = false;
-    ui.horizontal(|ui| {
-        ui.style_mut().spacing.item_spacing.x = 4.0;
-        if dialog_link(ui, secondary, false) {
-            sec = true;
-        }
-        if dialog_link(ui, primary, true) {
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        ui.style_mut().spacing.item_spacing.x = 8.0;
+        if dialog_action_button(ui, primary, true) {
             pri = true;
+        }
+        if dialog_action_button(ui, secondary, false) {
+            sec = true;
         }
     });
     (sec, pri)
@@ -218,6 +211,66 @@ impl TerminalApp {
         }
     }
 
+    pub(super) fn show_close_workspace_dialog(&mut self, ctx: &egui::Context) {
+        let Some(workspace_id) = self.closing_workspace else {
+            return;
+        };
+        let Some(workspace) = self
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == workspace_id)
+        else {
+            self.closing_workspace = None;
+            return;
+        };
+        let name = workspace.name.clone();
+        let terminal_count = workspace.panels.len();
+        let is_project = workspace.cwd().is_some();
+        let title = if is_project {
+            "¿Cerrar proyecto?"
+        } else {
+            "¿Cerrar workspace?"
+        };
+        let confirm_label = if is_project {
+            "Cerrar proyecto"
+        } else {
+            "Cerrar workspace"
+        };
+        let noun = if terminal_count == 1 {
+            "terminal"
+        } else {
+            "terminales"
+        };
+        let description = format!(
+            "Se cerrará “{name}” junto con {terminal_count} {noun}. Esta acción termina esas sesiones, pero no elimina ni modifica ningún archivo de la carpeta."
+        );
+
+        dialog_backdrop(ctx);
+        let mut cancel = ctx.input(|input| input.key_pressed(Key::Escape));
+        let mut confirm = false;
+        Area::new(Id::new("close-workspace-dialog"))
+            .order(Order::Foreground)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                dialog_frame().show(ui, |ui| {
+                    ui.set_width(420.0);
+                    dialog_title(ui, title);
+                    dialog_subtitle(ui, &description);
+                    let (clicked_cancel, clicked_confirm) =
+                        dialog_button_row(ui, "Cancelar", confirm_label);
+                    cancel |= clicked_cancel;
+                    confirm |= clicked_confirm;
+                });
+            });
+
+        if confirm {
+            self.closing_workspace = None;
+            self.close_workspace_confirmed(workspace_id);
+        } else if cancel {
+            self.closing_workspace = None;
+        }
+    }
+
     pub(super) fn open_search_bar(&mut self) {
         if matches!(self.collab.mode(), CollabMode::Guest) {
             return;
@@ -270,15 +323,15 @@ impl TerminalApp {
                 egui::Frame::default()
                     .fill(palette::INK)
                     .stroke(egui::Stroke::new(1.0, palette::LINE))
-                    .rounding(8.0)
-                    .inner_margin(egui::Margin::symmetric(12.0, 8.0))
+                    .corner_radius(8.0)
+                    .inner_margin(egui::Margin::symmetric(12, 8))
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.style_mut().spacing.item_spacing.x = 8.0;
                             ui.label(egui::RichText::new("Buscar").size(11.0).color(palette::DIM));
                             dialog_input_visuals(ui);
                             let edit = egui::TextEdit::singleline(&mut self.search_buf)
-                                .margin(egui::Margin::symmetric(8.0, 4.0))
+                                .margin(egui::Margin::symmetric(8, 4))
                                 .text_color(palette::TEXT_STRONG)
                                 .hint_text("regex o texto…")
                                 .desired_width(220.0);
@@ -424,19 +477,23 @@ impl TerminalApp {
                                 .color(palette::TEXT_STRONG),
                         );
                     }
-                    if draft.pending_session.is_some() {
+                    if draft.pending_memory.is_some() || draft.pending_session.is_some() {
                         ui.add_space(10.0);
                         ui.label(
-                            egui::RichText::new("Creando worktree…")
-                                .size(11.0)
-                                .color(palette::DIM),
+                            egui::RichText::new(if draft.pending_memory.is_some() {
+                                "Preparando contexto…"
+                            } else {
+                                "Creando worktree…"
+                            })
+                            .size(11.0)
+                            .color(palette::DIM),
                         );
                     }
                     let (sec, pri) = dialog_button_row(ui, "Cancel", "Launch");
                     if sec {
                         cancel = true;
                     }
-                    if pri && draft.pending_session.is_none() {
+                    if pri && draft.pending_session.is_none() && draft.pending_memory.is_none() {
                         submit = true;
                     }
                 });
@@ -553,7 +610,7 @@ impl TerminalApp {
                                     egui::TextEdit::multiline(&mut invite_text)
                                         .interactive(false)
                                         .text_color(palette::TEXT_STRONG)
-                                        .margin(egui::Margin::symmetric(10.0, 6.0)),
+                                        .margin(egui::Margin::symmetric(10, 6)),
                                 );
                                 ui.add_space(6.0);
                                 if dialog_inline_link(ui, "Copy invite") {
@@ -863,5 +920,30 @@ pub(super) fn collab_state_badge(state: CollabSessionState) -> (&'static str, Co
         CollabSessionState::Live => ("Sharing live", palette::TEXT_STRONG),
         CollabSessionState::Disconnected => ("Connection issue", palette::TEXT_STRONG),
         CollabSessionState::Ended => ("Ended", palette::DIM),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use egui_kittest::kittest::Queryable as _;
+
+    use super::dialog_action_button;
+
+    #[test]
+    fn dialog_actions_are_real_accessible_buttons() {
+        let clicked = Arc::new(Mutex::new(false));
+        let clicked_from_ui = Arc::clone(&clicked);
+        let mut harness = egui_kittest::Harness::new_ui(move |ui| {
+            if dialog_action_button(ui, "Guardar", true) {
+                *clicked_from_ui.lock().unwrap() = true;
+            }
+        });
+
+        harness.get_by_label("Guardar").click();
+        harness.run();
+
+        assert!(*clicked.lock().unwrap());
     }
 }

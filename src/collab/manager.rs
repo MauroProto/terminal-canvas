@@ -1,6 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use base64::Engine;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -32,6 +33,18 @@ use crate::utils::platform::default_share_base_url;
 
 const DEFAULT_SHARE_URL: &str = "https://127.0.0.1:8787";
 const DEFAULT_INVITE_TTL_HOURS: i64 = 24;
+const MAX_SHARED_PANELS: usize = 256;
+const MAX_SHARED_GUESTS: usize = 128;
+const MAX_SHARED_CONTROLS: usize = 512;
+const MAX_CONTROL_QUEUE: usize = 128;
+const MAX_SHARED_TEXT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_INPUT_EVENTS: usize = 1_024;
+const MAX_INPUT_TEXT_BYTES: usize = 256 * 1024;
+const MAX_COLLAB_LABEL_BYTES: usize = 512;
+const MAX_CONTROL_REASON_BYTES: usize = 4 * 1024;
+const SNAPSHOT_HEARTBEAT: Duration = Duration::from_secs(2);
+const REKEY_RECOVERY_INTERVAL: Duration = Duration::from_secs(2);
+const REKEY_RECOVERY_WINDOW: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone)]
 pub struct HostShareOptions {
@@ -94,6 +107,9 @@ struct HostSessionContext {
     pending_control_requests: Vec<ControlRequest>,
     terminal_controls: HashMap<Uuid, TerminalControlState>,
     last_snapshot: Option<SharedWorkspaceSnapshot>,
+    last_snapshot_sent_at: Option<Instant>,
+    rekey_recovery_until: Option<Instant>,
+    last_rekey_recovery_at: Option<Instant>,
     next_message_seq: u64,
 }
 
@@ -261,7 +277,6 @@ impl CollabManager {
         let response: CreateShareSessionResponse = json_post(
             &format!("{}/v1/share-sessions", local_api_url.trim_end_matches('/')),
             &CreateShareSessionRequest {
-                session_secret: session_secret.clone(),
                 invite_secret: invite_secret.clone(),
                 invite_expires_at,
                 passphrase_hash,
@@ -284,10 +299,12 @@ impl CollabManager {
             &response.host_token,
             SessionRole::Host,
         )?;
-        self.transport.send(TransportCommand::Connect {
+        if !self.transport.send(TransportCommand::Connect {
             websocket_url,
             tls_cert_pem: Some(tls_material.cert_pem.clone()),
-        });
+        }) {
+            anyhow::bail!("el transporte de colaboración está saturado");
+        }
         self.broker_url = reachable_url;
         self.embedded_server = Some(server);
         self.host = Some(HostSessionContext {
@@ -306,6 +323,9 @@ impl CollabManager {
             pending_control_requests: Vec::new(),
             terminal_controls: HashMap::new(),
             last_snapshot: None,
+            last_snapshot_sent_at: None,
+            rekey_recovery_until: None,
+            last_rekey_recovery_at: None,
             next_message_seq: 1,
         });
         self.mode = CollabMode::Host;
@@ -524,6 +544,7 @@ impl CollabManager {
     }
 
     pub fn publish_snapshot(&mut self, mut snapshot: SharedWorkspaceSnapshot) {
+        self.send_rekey_recovery_if_due(Instant::now());
         let Some(host) = &mut self.host else {
             return;
         };
@@ -536,16 +557,24 @@ impl CollabManager {
                 panel.queue_len = control.queue.len();
             }
         }
-        if host
-            .last_snapshot
-            .as_ref()
-            .map(|last| snapshots_equivalent(last, &snapshot))
-            .unwrap_or(false)
-        {
+        if let Err(error) = validate_snapshot_limits(&snapshot) {
+            self.last_error = Some(error);
             return;
         }
-        host.last_snapshot = Some(snapshot.clone());
+        let now = Instant::now();
+        if !snapshot_needs_publish(
+            host.last_snapshot.as_ref(),
+            host.last_snapshot_sent_at,
+            &snapshot,
+            now,
+        ) {
+            return;
+        }
         let payload = SessionPayload::WorkspaceSnapshot { snapshot };
+        let Some(next_message_seq) = host.next_message_seq.checked_add(1) else {
+            self.last_error = Some("Collaboration message sequence exhausted".to_owned());
+            return;
+        };
         if let Ok(envelope) = encode_envelope(
             host.session_id,
             super::models::ParticipantId::Host,
@@ -553,9 +582,17 @@ impl CollabManager {
             &host.session_secret,
             &payload,
         ) {
-            host.next_message_seq += 1;
             if let Ok(bytes) = rmp_serde::to_vec_named(&envelope) {
-                self.transport.send(TransportCommand::SendBinary(bytes));
+                if self.transport.send(TransportCommand::SendBinary(bytes)) {
+                    host.next_message_seq = next_message_seq;
+                    if let SessionPayload::WorkspaceSnapshot { snapshot } = payload {
+                        host.last_snapshot = Some(snapshot);
+                        host.last_snapshot_sent_at = Some(now);
+                    }
+                } else {
+                    self.last_error =
+                        Some("Collaboration transport rejected a snapshot under load".to_owned());
+                }
             }
         }
     }
@@ -564,15 +601,67 @@ impl CollabManager {
     /// clave vieja, que aún comparten) y recién después cambia la propia.
     /// La clave vieja queda como `previous_session_secret` para descifrar
     /// mensajes en vuelo durante la transición.
-    fn send_session_rekeyed(&mut self, new_session_secret: &str) {
-        self.send_host_payload(SessionPayload::SessionRekeyed {
+    fn send_session_rekeyed(&mut self, new_session_secret: &str) -> bool {
+        if !self.send_host_payload(SessionPayload::SessionRekeyed {
             new_session_secret: new_session_secret.to_owned(),
-        });
+        }) {
+            return false;
+        }
+        let now = Instant::now();
         if let Some(host) = &mut self.host {
             host.previous_session_secret = Some(std::mem::replace(
                 &mut host.session_secret,
                 new_session_secret.to_owned(),
             ));
+            host.rekey_recovery_until = Some(now + REKEY_RECOVERY_WINDOW);
+            host.last_rekey_recovery_at = Some(now);
+        }
+        true
+    }
+
+    fn send_rekey_recovery_if_due(&mut self, now: Instant) {
+        let Some(host) = &mut self.host else {
+            return;
+        };
+        let Some(until) = host.rekey_recovery_until else {
+            return;
+        };
+        if now >= until {
+            host.previous_session_secret = None;
+            host.rekey_recovery_until = None;
+            host.last_rekey_recovery_at = None;
+            return;
+        }
+        if host
+            .last_rekey_recovery_at
+            .is_some_and(|last| now.saturating_duration_since(last) < REKEY_RECOVERY_INTERVAL)
+        {
+            return;
+        }
+        let Some(previous_secret) = host.previous_session_secret.as_deref() else {
+            host.rekey_recovery_until = None;
+            return;
+        };
+        let Some(next_message_seq) = host.next_message_seq.checked_add(1) else {
+            self.last_error = Some("Collaboration message sequence exhausted".to_owned());
+            return;
+        };
+        let payload = SessionPayload::SessionRekeyed {
+            new_session_secret: host.session_secret.clone(),
+        };
+        let queued = encode_envelope(
+            host.session_id,
+            ParticipantId::Host,
+            host.next_message_seq,
+            previous_secret,
+            &payload,
+        )
+        .ok()
+        .and_then(|envelope| rmp_serde::to_vec_named(&envelope).ok())
+        .is_some_and(|bytes| self.transport.send(TransportCommand::SendBinary(bytes)));
+        if queued {
+            host.next_message_seq = next_message_seq;
+            host.last_rekey_recovery_at = Some(now);
         }
     }
 
@@ -591,6 +680,10 @@ impl CollabManager {
                 requested_at: Utc::now(),
             },
         };
+        let Some(next_message_seq) = guest.next_message_seq.checked_add(1) else {
+            self.last_error = Some("Collaboration message sequence exhausted".to_owned());
+            return;
+        };
         if let Ok(envelope) = encode_envelope(
             guest.session_id,
             super::models::ParticipantId::Guest(guest.guest_id),
@@ -598,9 +691,13 @@ impl CollabManager {
             &guest.session_secret,
             &payload,
         ) {
-            guest.next_message_seq += 1;
             if let Ok(bytes) = rmp_serde::to_vec_named(&envelope) {
-                self.transport.send(TransportCommand::SendBinary(bytes));
+                if self.transport.send(TransportCommand::SendBinary(bytes)) {
+                    guest.next_message_seq = next_message_seq;
+                } else {
+                    self.last_error =
+                        Some("Collaboration transport rejected a control request".to_owned());
+                }
             }
         }
     }
@@ -709,6 +806,14 @@ impl CollabManager {
                 events,
             },
         };
+        if let Err(error) = validate_payload_limits(&payload) {
+            self.last_error = Some(error);
+            return;
+        }
+        let Some(next_message_seq) = guest.next_message_seq.checked_add(1) else {
+            self.last_error = Some("Collaboration message sequence exhausted".to_owned());
+            return;
+        };
         if let Ok(envelope) = encode_envelope(
             guest.session_id,
             super::models::ParticipantId::Guest(guest.guest_id),
@@ -716,9 +821,13 @@ impl CollabManager {
             &guest.session_secret,
             &payload,
         ) {
-            guest.next_message_seq += 1;
             if let Ok(bytes) = rmp_serde::to_vec_named(&envelope) {
-                self.transport.send(TransportCommand::SendBinary(bytes));
+                if self.transport.send(TransportCommand::SendBinary(bytes)) {
+                    guest.next_message_seq = next_message_seq;
+                } else {
+                    self.last_error =
+                        Some("Collaboration transport rejected terminal input".to_owned());
+                }
             }
         }
     }
@@ -737,6 +846,10 @@ impl CollabManager {
                 reason: "Released by guest".to_owned(),
             },
         };
+        let Some(next_message_seq) = guest.next_message_seq.checked_add(1) else {
+            self.last_error = Some("Collaboration message sequence exhausted".to_owned());
+            return;
+        };
         if let Ok(envelope) = encode_envelope(
             guest.session_id,
             super::models::ParticipantId::Guest(guest.guest_id),
@@ -744,9 +857,13 @@ impl CollabManager {
             &guest.session_secret,
             &payload,
         ) {
-            guest.next_message_seq += 1;
             if let Ok(bytes) = rmp_serde::to_vec_named(&envelope) {
-                self.transport.send(TransportCommand::SendBinary(bytes));
+                if self.transport.send(TransportCommand::SendBinary(bytes)) {
+                    guest.next_message_seq = next_message_seq;
+                } else {
+                    self.last_error =
+                        Some("Collaboration transport rejected control release".to_owned());
+                }
             }
         }
     }
@@ -863,10 +980,15 @@ impl CollabManager {
                         });
                     match completed {
                         Ok((response, websocket_url)) => {
-                            self.transport.send(TransportCommand::Connect {
+                            if !self.transport.send(TransportCommand::Connect {
                                 websocket_url,
                                 tls_cert_pem: invite.tls_cert_pem.clone(),
-                            });
+                            }) {
+                                self.session_state = CollabSessionState::NotSharing;
+                                self.last_error =
+                                    Some("El transporte de colaboración está saturado".to_owned());
+                                continue;
+                            }
                             self.guest = Some(GuestSessionContext {
                                 session_id: invite.session_id,
                                 guest_id: response.guest_id,
@@ -917,6 +1039,14 @@ impl CollabManager {
                 super::transport::TransportEvent::Connected => {
                     if matches!(self.mode, CollabMode::Host) {
                         self.session_state = CollabSessionState::Live;
+                        self.last_error = None;
+                        // A reconnect may have lost queued frames. Force the
+                        // next UI tick to publish a complete snapshot even if
+                        // the workspace itself did not change.
+                        if let Some(host) = &mut self.host {
+                            host.last_snapshot = None;
+                            host.last_rekey_recovery_at = None;
+                        }
                     }
                 }
                 super::transport::TransportEvent::Disconnected => {
@@ -944,6 +1074,11 @@ impl CollabManager {
             BrokerControlMessage::Connected { .. } => {
                 if matches!(self.mode, CollabMode::Host) {
                     self.session_state = CollabSessionState::Live;
+                    self.last_error = None;
+                    if let Some(host) = &mut self.host {
+                        host.last_snapshot = None;
+                        host.last_rekey_recovery_at = None;
+                    }
                 }
             }
             BrokerControlMessage::JoinRequested { request } => {
@@ -1032,6 +1167,15 @@ impl CollabManager {
                 return;
             }
         };
+        let expected_session = self
+            .host
+            .as_ref()
+            .map(|host| host.session_id)
+            .or_else(|| self.guest.as_ref().map(|guest| guest.session_id));
+        if expected_session != Some(envelope.session_id) {
+            self.last_error = Some("Collaboration envelope belongs to another session".to_owned());
+            return;
+        }
         let (secret, previous_secret) = if let Some(host) = &self.host {
             (
                 host.session_secret.clone(),
@@ -1054,6 +1198,10 @@ impl CollabManager {
             self.last_error = Some("Failed to decode collab envelope".to_owned());
             return;
         };
+        if let Err(err) = self.validate_inbound_payload(envelope.sender_id, &payload) {
+            self.last_error = Some(err);
+            return;
+        }
         if let Err(err) = self.validate_message_sequence(envelope.sender_id, envelope.message_seq) {
             self.last_error = Some(err);
             return;
@@ -1097,10 +1245,12 @@ impl CollabManager {
             SessionPayload::SessionRekeyed { new_session_secret } => {
                 // Solo el invitado recibe el aviso de rekey del host.
                 if let Some(guest) = &mut self.guest {
-                    guest.previous_session_secret = Some(std::mem::replace(
-                        &mut guest.session_secret,
-                        new_session_secret,
-                    ));
+                    if guest.session_secret != new_session_secret {
+                        guest.previous_session_secret = Some(std::mem::replace(
+                            &mut guest.session_secret,
+                            new_session_secret,
+                        ));
+                    }
                 }
             }
         }
@@ -1136,21 +1286,38 @@ impl CollabManager {
         }
     }
 
-    fn send_host_payload(&mut self, payload: SessionPayload) {
+    fn send_host_payload(&mut self, payload: SessionPayload) -> bool {
         let Some(host) = &mut self.host else {
-            return;
+            return false;
         };
-        if let Ok(envelope) = encode_envelope(
+        let Some(next_message_seq) = host.next_message_seq.checked_add(1) else {
+            self.last_error = Some("Collaboration message sequence exhausted".to_owned());
+            return false;
+        };
+        let bytes = match encode_envelope(
             host.session_id,
             super::models::ParticipantId::Host,
             host.next_message_seq,
             &host.session_secret,
             &payload,
-        ) {
-            host.next_message_seq += 1;
-            if let Ok(bytes) = rmp_serde::to_vec_named(&envelope) {
-                self.transport.send(TransportCommand::SendBinary(bytes));
+        )
+        .and_then(|envelope| {
+            rmp_serde::to_vec_named(&envelope)
+                .map_err(|_| super::protocol::ProtocolError::EncodeFailed)
+        }) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.last_error = Some(error.to_string());
+                return false;
             }
+        };
+        if self.transport.send(TransportCommand::SendBinary(bytes)) {
+            host.next_message_seq = next_message_seq;
+            true
+        } else {
+            self.last_error =
+                Some("Collaboration transport rejected an outbound message".to_owned());
+            false
         }
     }
 
@@ -1165,7 +1332,11 @@ impl CollabManager {
             .copied()
             .unwrap_or(0)
             .saturating_add(1);
-        if message_seq != expected {
+        // WebSocket preserves the frames it delivers, but bounded queues may
+        // intentionally shed stale data under overload. Monotonicity is the
+        // replay-security invariant; requiring contiguity would permanently
+        // brick that participant after any dropped frame.
+        if message_seq < expected {
             return Err(format!(
                 "Invalid message sequence for {:?}: expected {}, got {}",
                 sender_id, expected, message_seq
@@ -1174,6 +1345,147 @@ impl CollabManager {
         self.received_message_seq.insert(sender_id, message_seq);
         Ok(())
     }
+
+    fn validate_inbound_payload(
+        &self,
+        sender_id: ParticipantId,
+        payload: &SessionPayload,
+    ) -> Result<(), String> {
+        validate_payload_limits(payload)?;
+        match (self.mode, sender_id, payload) {
+            (
+                CollabMode::Guest,
+                ParticipantId::Host,
+                SessionPayload::WorkspaceSnapshot { .. }
+                | SessionPayload::ControlGrant { .. }
+                | SessionPayload::ControlRevoke { .. }
+                | SessionPayload::SessionRekeyed { .. },
+            ) => Ok(()),
+            (
+                CollabMode::Host,
+                ParticipantId::Guest(sender),
+                SessionPayload::ControlRequest { request },
+            ) if request.guest_id == sender
+                && self
+                    .host
+                    .as_ref()
+                    .and_then(|host| host.guests.get(&sender))
+                    .is_some_and(|guest| guest.display_name == request.display_name) =>
+            {
+                Ok(())
+            }
+            (
+                CollabMode::Host,
+                ParticipantId::Guest(sender),
+                SessionPayload::ControlRevoke { revoke },
+            ) if revoke.guest_id == Some(sender) => Ok(()),
+            (CollabMode::Host, ParticipantId::Guest(_), SessionPayload::GuestInput { .. }) => {
+                Ok(())
+            }
+            _ => Err("Collaboration payload is not authorized for the claimed sender".to_owned()),
+        }
+    }
+}
+
+fn validate_payload_limits(payload: &SessionPayload) -> Result<(), String> {
+    match payload {
+        SessionPayload::WorkspaceSnapshot { snapshot } => validate_snapshot_limits(snapshot)?,
+        SessionPayload::ControlRequest { request } => {
+            if request.display_name.is_empty()
+                || request.display_name.len() > MAX_COLLAB_LABEL_BYTES
+                || request.display_name.chars().any(char::is_control)
+            {
+                return Err("Collaboration control request has an invalid name".to_owned());
+            }
+        }
+        SessionPayload::ControlRevoke { revoke } => {
+            if revoke.reason.len() > MAX_CONTROL_REASON_BYTES {
+                return Err("Collaboration control reason is too large".to_owned());
+            }
+        }
+        SessionPayload::GuestInput { input } => {
+            if input.events.len() > MAX_INPUT_EVENTS {
+                return Err("Collaboration input contains too many events".to_owned());
+            }
+            let mut text_bytes = 0_usize;
+            for event in &input.events {
+                match event {
+                    TerminalInputEvent::Text(text) | TerminalInputEvent::Paste(text) => {
+                        text_bytes = text_bytes
+                            .checked_add(text.len())
+                            .ok_or_else(|| "Collaboration input size overflow".to_owned())?;
+                    }
+                    TerminalInputEvent::Scroll { delta } if !delta.is_finite() => {
+                        return Err("Collaboration input contains an invalid scroll".to_owned());
+                    }
+                    _ => {}
+                }
+            }
+            if text_bytes > MAX_INPUT_TEXT_BYTES {
+                return Err("Collaboration input text is too large".to_owned());
+            }
+        }
+        SessionPayload::SessionRekeyed { new_session_secret } => {
+            let valid_secret = base64::engine::general_purpose::STANDARD_NO_PAD
+                .decode(new_session_secret)
+                .is_ok_and(|bytes| bytes.len() == 32);
+            if !valid_secret {
+                return Err("Collaboration rekey contains an invalid traffic key".to_owned());
+            }
+        }
+        SessionPayload::ControlGrant { .. } => {}
+    }
+    Ok(())
+}
+
+fn validate_snapshot_limits(snapshot: &SharedWorkspaceSnapshot) -> Result<(), String> {
+    if snapshot.workspace_name.len() > MAX_COLLAB_LABEL_BYTES
+        || snapshot.panels.len() > MAX_SHARED_PANELS
+        || snapshot.guests.len() > MAX_SHARED_GUESTS
+        || snapshot.terminal_controls.len() > MAX_SHARED_CONTROLS
+    {
+        return Err("Collaboration snapshot exceeds structural limits".to_owned());
+    }
+    let mut panel_ids = HashSet::with_capacity(snapshot.panels.len());
+    let mut text_bytes = 0_usize;
+    for panel in &snapshot.panels {
+        if !panel_ids.insert(panel.panel_id)
+            || panel.title.len() > MAX_COLLAB_LABEL_BYTES
+            || panel.preview_label.len() > MAX_COLLAB_LABEL_BYTES
+            || panel
+                .controller_name
+                .as_ref()
+                .is_some_and(|name| name.len() > MAX_COLLAB_LABEL_BYTES)
+            || panel
+                .position
+                .iter()
+                .chain(panel.size.iter())
+                .any(|value| !value.is_finite() || value.abs() > 1_000_000.0)
+            || panel.size.iter().any(|value| *value < 0.0)
+        {
+            return Err("Collaboration snapshot contains an invalid panel".to_owned());
+        }
+        text_bytes = text_bytes
+            .checked_add(panel.visible_text.len())
+            .and_then(|total| total.checked_add(panel.history_text.len()))
+            .ok_or_else(|| "Collaboration snapshot text size overflow".to_owned())?;
+    }
+    if text_bytes > MAX_SHARED_TEXT_BYTES
+        || snapshot.guests.iter().any(|guest| {
+            guest.display_name.len() > MAX_COLLAB_LABEL_BYTES
+                || guest.display_name.chars().any(char::is_control)
+        })
+        || snapshot.terminal_controls.iter().any(|control| {
+            control.queue.len() > MAX_CONTROL_QUEUE
+                || control
+                    .controller_name
+                    .as_ref()
+                    .is_some_and(|name| name.len() > MAX_COLLAB_LABEL_BYTES)
+        })
+    {
+        return Err("Collaboration snapshot exceeds content limits".to_owned());
+    }
+    Ok(())
 }
 
 fn broker_ws_url(
@@ -1299,6 +1611,18 @@ fn snapshots_equivalent(left: &SharedWorkspaceSnapshot, right: &SharedWorkspaceS
         && left.panels == right.panels
 }
 
+fn snapshot_needs_publish(
+    previous: Option<&SharedWorkspaceSnapshot>,
+    last_sent_at: Option<Instant>,
+    next: &SharedWorkspaceSnapshot,
+    now: Instant,
+) -> bool {
+    !previous.is_some_and(|last| snapshots_equivalent(last, next))
+        || last_sent_at
+            .map(|last| now.saturating_duration_since(last) >= SNAPSHOT_HEARTBEAT)
+            .unwrap_or(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1325,6 +1649,25 @@ mod tests {
         let mut right = left.clone();
         right.generated_at = left.generated_at + Duration::seconds(5);
         assert!(snapshots_equivalent(&left, &right));
+    }
+
+    #[test]
+    fn unchanged_snapshot_is_periodically_republished_for_loss_recovery() {
+        let snapshot = sample_snapshot(0);
+        let now = Instant::now();
+
+        assert!(!snapshot_needs_publish(
+            Some(&snapshot),
+            Some(now),
+            &snapshot,
+            now,
+        ));
+        assert!(snapshot_needs_publish(
+            Some(&snapshot),
+            Some(now - std::time::Duration::from_secs(3)),
+            &snapshot,
+            now,
+        ));
     }
 
     #[test]
@@ -1503,6 +1846,183 @@ mod tests {
     }
 
     #[test]
+    fn guest_accepts_a_forward_sequence_gap_but_still_rejects_replay() {
+        let secret = random_secret();
+        let session_id = ShareSessionId(Uuid::new_v4());
+        let mut manager = CollabManager::new();
+        manager.mode = CollabMode::Guest;
+        manager.session_state = CollabSessionState::Live;
+        manager.guest = Some(GuestSessionContext {
+            session_id,
+            guest_id: GuestId(Uuid::new_v4()),
+            session_secret: secret.clone(),
+            previous_session_secret: None,
+            display_name: "Guest".to_owned(),
+            next_message_seq: 1,
+        });
+        let envelope = encode_envelope(
+            session_id,
+            ParticipantId::Host,
+            42,
+            &secret,
+            &SessionPayload::WorkspaceSnapshot {
+                snapshot: sample_snapshot(0),
+            },
+        )
+        .unwrap();
+        let binary = rmp_serde::to_vec_named(&envelope).unwrap();
+
+        manager.handle_binary_message(&binary);
+        assert!(manager.guest_view.snapshot.is_some());
+        assert!(manager.last_error.is_none());
+
+        manager.handle_binary_message(&binary);
+        assert!(manager
+            .last_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("sequence"));
+    }
+
+    #[test]
+    fn guest_rejects_a_snapshot_claimed_by_another_guest() {
+        let secret = random_secret();
+        let session_id = ShareSessionId(Uuid::new_v4());
+        let my_guest_id = GuestId(Uuid::new_v4());
+        let mut manager = CollabManager::new();
+        manager.mode = CollabMode::Guest;
+        manager.session_state = CollabSessionState::Live;
+        manager.guest = Some(GuestSessionContext {
+            session_id,
+            guest_id: my_guest_id,
+            session_secret: secret.clone(),
+            previous_session_secret: None,
+            display_name: "Guest".to_owned(),
+            next_message_seq: 1,
+        });
+        let envelope = encode_envelope(
+            session_id,
+            ParticipantId::Guest(GuestId(Uuid::new_v4())),
+            1,
+            &secret,
+            &SessionPayload::WorkspaceSnapshot {
+                snapshot: sample_snapshot(0),
+            },
+        )
+        .unwrap();
+
+        manager.handle_binary_message(&rmp_serde::to_vec_named(&envelope).unwrap());
+
+        assert!(manager.guest_view.snapshot.is_none());
+        assert!(manager
+            .last_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("not authorized"));
+    }
+
+    #[test]
+    fn host_rejects_a_control_request_with_a_spoofed_guest_id() {
+        let secret = random_secret();
+        let session_id = ShareSessionId(Uuid::new_v4());
+        let authenticated_guest = GuestId(Uuid::new_v4());
+        let claimed_guest = GuestId(Uuid::new_v4());
+        let mut manager = CollabManager::new();
+        manager.mode = CollabMode::Host;
+        manager.session_state = CollabSessionState::Live;
+        manager.host = Some(HostSessionContext {
+            session_id,
+            workspace_id: Uuid::new_v4(),
+            host_token: "token".to_owned(),
+            session_secret: secret.clone(),
+            previous_session_secret: None,
+            invite_secret: "invite".to_owned(),
+            invite_expires_at: None,
+            requires_passphrase: false,
+            tls_cert_pem: String::new(),
+            invite_code: String::new(),
+            guests: HashMap::new(),
+            pending_joins: Vec::new(),
+            pending_control_requests: Vec::new(),
+            terminal_controls: HashMap::new(),
+            last_snapshot: None,
+            last_snapshot_sent_at: None,
+            rekey_recovery_until: None,
+            last_rekey_recovery_at: None,
+            next_message_seq: 1,
+        });
+        let envelope = encode_envelope(
+            session_id,
+            ParticipantId::Guest(authenticated_guest),
+            1,
+            &secret,
+            &SessionPayload::ControlRequest {
+                request: ControlRequest {
+                    terminal_id: Uuid::new_v4(),
+                    guest_id: claimed_guest,
+                    display_name: "Spoofed".to_owned(),
+                    requested_at: Utc::now(),
+                },
+            },
+        )
+        .unwrap();
+
+        manager.handle_binary_message(&rmp_serde::to_vec_named(&envelope).unwrap());
+
+        assert!(manager.pending_control_requests().is_empty());
+        assert!(manager
+            .last_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("not authorized"));
+    }
+
+    #[test]
+    fn collaboration_input_limits_reject_oversized_remote_paste() {
+        let payload = SessionPayload::GuestInput {
+            input: GuestTerminalInput {
+                terminal_id: Uuid::new_v4(),
+                events: vec![TerminalInputEvent::Paste(
+                    "x".repeat(MAX_INPUT_TEXT_BYTES + 1),
+                )],
+            },
+        };
+
+        assert!(validate_payload_limits(&payload)
+            .unwrap_err()
+            .contains("too large"));
+    }
+
+    #[test]
+    fn collaboration_snapshot_limits_reject_non_finite_geometry() {
+        let mut snapshot = sample_snapshot(0);
+        snapshot
+            .panels
+            .push(crate::collab::models::SharedPanelSnapshot {
+                panel_id: Uuid::new_v4(),
+                title: "Terminal".to_owned(),
+                position: [f32::NAN, 0.0],
+                size: [800.0, 600.0],
+                color: [0, 0, 0],
+                z_index: 0,
+                focused: true,
+                minimized: false,
+                alive: true,
+                preview_label: String::new(),
+                share_scope: crate::collab::PanelShareScope::VisibleOnly,
+                visible_text: String::new(),
+                history_text: String::new(),
+                controller: None,
+                controller_name: None,
+                queue_len: 0,
+            });
+
+        assert!(validate_snapshot_limits(&snapshot)
+            .unwrap_err()
+            .contains("invalid panel"));
+    }
+
+    #[test]
     fn guest_switches_traffic_key_on_session_rekeyed() {
         let old_secret = random_secret();
         let new_secret = random_secret();
@@ -1615,6 +2135,9 @@ mod tests {
             pending_control_requests: Vec::new(),
             terminal_controls: HashMap::new(),
             last_snapshot: None,
+            last_snapshot_sent_at: None,
+            rekey_recovery_until: None,
+            last_rekey_recovery_at: None,
             next_message_seq: 1,
         });
 
@@ -1638,5 +2161,19 @@ mod tests {
         assert!(manager.last_error.is_none());
         let events = manager.drain_events();
         assert_eq!(events.len(), 1);
+
+        let now = Instant::now();
+        {
+            let host = manager.host.as_mut().unwrap();
+            host.rekey_recovery_until = Some(now + REKEY_RECOVERY_WINDOW);
+            host.last_rekey_recovery_at = None;
+        }
+        manager.send_rekey_recovery_if_due(now);
+        let host = manager.host.as_ref().unwrap();
+        assert_eq!(host.next_message_seq, 2);
+        assert_eq!(
+            host.previous_session_secret.as_deref(),
+            Some(old_secret.as_str())
+        );
     }
 }

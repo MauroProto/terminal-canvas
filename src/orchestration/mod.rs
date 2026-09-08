@@ -22,8 +22,8 @@ pub use claude_hooks::{
 };
 #[allow(unused_imports)]
 pub use code_diff::{
-    list_git_worktrees, parse_unified_diff, remove_git_worktree, DiffLine, DiffLineKind,
-    DiffLoader, FileDiff, RepoDiff, WorktreeInfo, WorktreeJob, WorktreeOps,
+    is_managed_worktree, list_git_worktrees, parse_unified_diff, remove_git_worktree, DiffLine,
+    DiffLineKind, DiffLoader, FileDiff, RepoDiff, WorktreeInfo, WorktreeJob, WorktreeOps,
 };
 #[allow(unused_imports)]
 pub use diff_notes::{format_note, load_notes, save_notes, DiffNote, DiffNotes};
@@ -41,11 +41,12 @@ pub use linear_client::{
 };
 #[allow(unused_imports)]
 pub use manager::{
-    launch_presets, resume_command, resume_invocation, AgentLaunchPlan, AgentLaunchRequest,
-    AgentProvider, AgentSessionMeta, AgentStatus, CommandSummary, DependencyEdge, DependencyKind,
-    DiffStats, InboxEvent, InboxEventKind, LaunchOutcome, LaunchPreparation, OrchestrationState,
-    Orchestrator, PanelOverlay, PanelRuntimeObservation, ReviewSummary, SceneTemplate,
-    SceneTemplateKind, SessionListItem, TaskCard, TaskState, TestStatus, WorktreeMode,
+    launch_presets, resume_command, resume_invocation, supports_latest_resume, AgentLaunchPlan,
+    AgentLaunchRequest, AgentProvider, AgentSessionMeta, AgentStatus, CommandSummary,
+    DependencyEdge, DependencyKind, DiffStats, InboxEvent, InboxEventKind, LaunchOutcome,
+    LaunchPreparation, OrchestrationState, Orchestrator, PanelOverlay, PanelRuntimeObservation,
+    ReviewSummary, SceneTemplate, SceneTemplateKind, SessionListItem, TaskCard, TaskState,
+    TestStatus, WorktreeMode,
 };
 #[allow(unused_imports)]
 pub use worktree_removal_safety::{check_recursive_delete, RemovalGuard};

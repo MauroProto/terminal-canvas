@@ -200,8 +200,8 @@ impl TerminalApp {
                 egui::Frame::default()
                     .fill(palette::INK)
                     .stroke(Stroke::new(1.0, palette::LINE))
-                    .rounding(10.0)
-                    .inner_margin(egui::Margin::same(0.0))
+                    .corner_radius(10.0)
+                    .inner_margin(egui::Margin::same(0))
                     .show(ui, |ui| {
                         ui.set_min_size(size);
                         self.code_review_header(ui, &mut close);
@@ -687,7 +687,7 @@ impl TerminalApp {
                         .hint_text("Ej: \"cambiá el manejo de errores de esta función…\"")
                         .text_color(palette::TEXT_STRONG)
                         .desired_rows(2)
-                        .margin(egui::Margin::symmetric(8.0, 5.0));
+                        .margin(egui::Margin::symmetric(8, 5));
                 ui.add_sized(vec2(ui.available_width() - 130.0, 44.0), edit);
             });
             ui.vertical(|ui| {
@@ -733,9 +733,13 @@ impl TerminalApp {
     /// Sección de ciclo de vida de worktrees: lista los worktrees del repo y
     /// permite limpiar los gestionados (`.terminalcanvas/worktrees`).
     fn code_review_worktrees(&mut self, ui: &mut egui::Ui) {
-        let (worktrees, error) = {
+        let (repo_root, worktrees, error) = {
             let state = self.code_review.as_ref().unwrap();
-            (state.worktrees.clone(), state.worktree_error.clone())
+            (
+                state.repo_root.clone(),
+                state.worktrees.clone(),
+                state.worktree_error.clone(),
+            )
         };
 
         ui.horizontal(|ui| {
@@ -782,16 +786,18 @@ impl TerminalApp {
                                     .color(palette::DIM),
                             );
                         }
-                        let is_managed = worktree.path.components().any(|component| {
-                            matches!(component, std::path::Component::Normal(name) if name == ".terminalcanvas")
-                        });
+                        let is_managed =
+                            crate::orchestration::is_managed_worktree(&repo_root, &worktree.path);
                         if !worktree.is_main && is_managed {
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                ui.add_space(14.0);
-                                if ui.small_button("Limpiar").clicked() {
-                                    to_remove = Some(worktree.path.clone());
-                                }
-                            });
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.add_space(14.0);
+                                    if ui.small_button("Limpiar").clicked() {
+                                        to_remove = Some(worktree.path.clone());
+                                    }
+                                },
+                            );
                         }
                     });
                 }
@@ -929,10 +935,14 @@ impl TerminalApp {
         rect: egui::Rect,
         actions: &mut Vec<NoteAction>,
     ) {
-        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(rect), |ui| {
+        ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
             ui.painter().rect_filled(rect, 0.0, palette::RAISED);
-            ui.painter()
-                .rect_stroke(rect, 0.0, Stroke::new(1.0, NOTE_ACCENT));
+            ui.painter().rect_stroke(
+                rect,
+                0.0,
+                Stroke::new(1.0, NOTE_ACCENT),
+                egui::StrokeKind::Middle,
+            );
             ui.horizontal_centered(|ui| {
                 ui.add_space(GUTTER_W * 2.0 + 18.0);
                 let Some(state) = self.code_review.as_mut() else {
@@ -945,7 +955,7 @@ impl TerminalApp {
                     .hint_text("Nota para el agente…")
                     .font(FontId::monospace(MONO_SIZE))
                     .text_color(palette::TEXT_STRONG)
-                    .margin(egui::Margin::symmetric(6.0, 4.0));
+                    .margin(egui::Margin::symmetric(6, 4));
                 let response = ui.add_sized(
                     vec2(
                         (rect.width() - GUTTER_W * 2.0 - 220.0).max(80.0),

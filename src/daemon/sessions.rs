@@ -11,7 +11,7 @@ use std::path::Path;
 use uuid::Uuid;
 
 use super::client::DaemonConn;
-use super::protocol::{decode_line, encode_line, Request, Response, WireSpec};
+use super::protocol::{decode_line, encode_line, read_protocol_line, Request, Response, WireSpec};
 use crate::runtime::SharedRuntimeScheduler;
 use crate::terminal::pty::PtyHandle;
 
@@ -20,13 +20,19 @@ use crate::terminal::pty::PtyHandle;
 pub struct DaemonEndpoint {
     pub dir: std::path::PathBuf,
     pub token: String,
+    pub client_id: Uuid,
 }
 
 impl DaemonEndpoint {
-    pub fn new(dir: impl Into<std::path::PathBuf>, token: impl Into<String>) -> Self {
+    pub fn new(
+        dir: impl Into<std::path::PathBuf>,
+        token: impl Into<String>,
+        client_id: Uuid,
+    ) -> Self {
         Self {
             dir: dir.into(),
             token: token.into(),
+            client_id,
         }
     }
 }
@@ -42,6 +48,7 @@ pub fn wire_spec_from(spec: &crate::runtime::SessionSpec, cols: u16, rows: u16) 
         startup_command: spec.startup_command.clone(),
         panel_id: spec.panel_id,
         workspace_id: spec.workspace_id,
+        leaf_id: spec.leaf_id,
         cols: cols.max(1),
         rows: rows.max(1),
     }
@@ -56,7 +63,7 @@ pub fn spawn_remote(
     scheduler: SharedRuntimeScheduler,
     desired_id: Option<Uuid>,
 ) -> anyhow::Result<(Uuid, PtyHandle)> {
-    let stream = DaemonConn::connect_raw(&endpoint.dir, &endpoint.token)
+    let stream = DaemonConn::connect_raw_as(&endpoint.dir, &endpoint.token, endpoint.client_id)
         .ok_or_else(|| anyhow::anyhow!("no se pudo conectar al daemon"))?;
     let mut writer = stream
         .try_clone()
@@ -88,6 +95,7 @@ pub fn spawn_remote(
             stream,
             &snapshot,
             seq,
+            true,
             cols.max(1),
             rows.max(1),
             scheduler,
@@ -129,6 +137,7 @@ pub fn spawn_remote(
         stream,
         &snapshot,
         seq,
+        false,
         cols.max(1),
         rows.max(1),
         scheduler,
@@ -145,7 +154,7 @@ pub fn attach_existing(
     rows: u16,
     scheduler: SharedRuntimeScheduler,
 ) -> anyhow::Result<PtyHandle> {
-    let stream = DaemonConn::connect_raw(&endpoint.dir, &endpoint.token)
+    let stream = DaemonConn::connect_raw_as(&endpoint.dir, &endpoint.token, endpoint.client_id)
         .ok_or_else(|| anyhow::anyhow!("no se pudo conectar al daemon"))?;
     let mut writer = stream.try_clone()?;
     let mut reader = BufReader::new(stream.try_clone()?);
@@ -164,6 +173,7 @@ pub fn attach_existing(
         stream,
         &snapshot,
         seq,
+        true,
         cols.max(1),
         rows.max(1),
         scheduler,
@@ -179,10 +189,9 @@ fn request(
     writer.write_all(encode_line(request).as_bytes())?;
     writer.flush()?;
     loop {
-        let mut line = String::new();
-        if reader.read_line(&mut line)? == 0 {
+        let Some(line) = read_protocol_line(reader)? else {
             anyhow::bail!("el daemon cerró la conexión");
-        }
+        };
         let Some(response) = decode_line::<Response>(&line) else {
             continue;
         };
@@ -200,7 +209,7 @@ fn request(
 pub fn endpoint_from_env() -> Option<DaemonEndpoint> {
     let dir = super::server::resolve_dir()?;
     let token = super::protocol::ensure_token(&dir).ok()?;
-    Some(DaemonEndpoint::new(dir, token))
+    Some(DaemonEndpoint::new(dir, token, Uuid::new_v4()))
 }
 
 /// ¿Existe un socket de daemon al que valga la pena intentar conectarse?
@@ -225,6 +234,7 @@ mod tests {
             startup_input: None,
             panel_id: Some(panel),
             workspace_id: Some(workspace),
+            leaf_id: Some(Uuid::new_v4()),
         };
         let wire = wire_spec_from(&spec, 120, 40);
         assert_eq!(wire.title, "Claude");
@@ -249,8 +259,10 @@ mod tests {
 
     #[test]
     fn the_endpoint_keeps_dir_and_token() {
-        let endpoint = DaemonEndpoint::new("/tmp/x", "tok");
+        let client_id = Uuid::new_v4();
+        let endpoint = DaemonEndpoint::new("/tmp/x", "tok", client_id);
         assert_eq!(endpoint.dir, std::path::PathBuf::from("/tmp/x"));
         assert_eq!(endpoint.token, "tok");
+        assert_eq!(endpoint.client_id, client_id);
     }
 }

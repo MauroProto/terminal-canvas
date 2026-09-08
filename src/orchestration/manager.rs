@@ -512,7 +512,9 @@ pub fn hook_agent_status(kind: super::HookKind, alive: bool) -> AgentStatus {
             }
         }
         super::HookKind::PermissionRequest => AgentStatus::WaitingApproval,
-        super::HookKind::UserPromptSubmit | super::HookKind::PreToolUse => AgentStatus::Running,
+        super::HookKind::SessionStart
+        | super::HookKind::UserPromptSubmit
+        | super::HookKind::PreToolUse => AgentStatus::Running,
     }
 }
 
@@ -812,6 +814,9 @@ impl Orchestrator {
         };
 
         let now = Utc::now();
+        // La app enriquece el brief con memoria en un worker antes de llamar
+        // acá. `prepare_launch` corre en handlers de UI y no puede abrir ni
+        // consultar SQLite en el frame.
         let bootstrap = provider_bootstrap(request.provider, &request.brief);
 
         self.state.sessions.push(AgentSessionMeta {
@@ -1998,31 +2003,30 @@ pub fn resume_command(provider: AgentProvider, launch_command: &str) -> String {
     if command.is_empty() {
         return String::new();
     }
-    let Some(flag) = resume_flag(provider) else {
-        return command.to_owned();
-    };
-    if already_resuming(command) {
+    if already_resuming(provider, command) {
         return command.to_owned();
     }
-    format!("{command} {flag}")
+    let Some(suffix) = latest_resume_suffix(provider) else {
+        return command.to_owned();
+    };
+    format!("{command} {suffix}")
 }
 
-/// Bandera de continuación por proveedor, o `None` si no se conoce una (en ese
-/// caso se relanza el comando tal cual: mejor una sesión nueva que un flag
-/// inventado que haga fallar el arranque).
-///
-/// Los proveedores cuyo resume exige un **id** (codex usa el subcomando
-/// `codex resume <id>`, gemini usa `--resume <id>`) no entran acá: sin id no
-/// hay forma segura de continuar; los maneja [`resume_invocation`].
-fn resume_flag(provider: AgentProvider) -> Option<&'static str> {
+pub fn supports_latest_resume(provider: AgentProvider) -> bool {
+    latest_resume_suffix(provider).is_some()
+}
+
+/// Invocación verificada para retomar la conversación más reciente cuando no
+/// hay un id exacto capturado por hooks.
+fn latest_resume_suffix(provider: AgentProvider) -> Option<&'static str> {
     match provider {
         AgentProvider::ClaudeCode => Some("--continue"),
+        AgentProvider::CodexCli => Some("resume --last"),
+        AgentProvider::GeminiCli => Some("--resume latest"),
         AgentProvider::OpenCode => Some("--continue"),
-        AgentProvider::CodexCli
-        | AgentProvider::GeminiCli
-        | AgentProvider::Aider
+        AgentProvider::Copilot => Some("--resume"),
+        AgentProvider::Aider
         | AgentProvider::CursorAgent
-        | AgentProvider::Copilot
         | AgentProvider::Goose
         | AgentProvider::Amp
         | AgentProvider::Crush
@@ -2052,23 +2056,14 @@ pub fn resume_invocation(
         AgentProvider::ClaudeCode => Some(format!("{command} --resume {id}")),
         AgentProvider::GeminiCli => Some(format!("{command} --resume {id}")),
         AgentProvider::OpenCode => Some(format!("{command} --session {id}")),
-        AgentProvider::CodexCli => {
-            // `codex resume <id>`: el subcomando va después del binario y
-            // antes de cualquier flag que ya traiga el launch command.
-            let mut tokens = command.split_whitespace();
-            let bin = tokens.next()?;
-            let rest = tokens.collect::<Vec<_>>().join(" ");
-            Some(if rest.is_empty() {
-                format!("{bin} resume {id}")
-            } else {
-                format!("{bin} resume {id} {rest}")
-            })
-        }
+        // Append preserves the exact quoting of global options already in the
+        // launch command; split_whitespace used to corrupt quoted --config.
+        AgentProvider::CodexCli => Some(format!("{command} resume {id}")),
+        AgentProvider::Copilot => Some(format!("{command} --resume {id}")),
         // El resto no tiene resume por id verificado: sesión nueva antes que
         // un flag inventado.
         AgentProvider::Aider
         | AgentProvider::CursorAgent
-        | AgentProvider::Copilot
         | AgentProvider::Goose
         | AgentProvider::Amp
         | AgentProvider::Crush
@@ -2076,10 +2071,31 @@ pub fn resume_invocation(
     }
 }
 
-fn already_resuming(command: &str) -> bool {
-    command.split_whitespace().any(|token| {
-        matches!(token, "--continue" | "-c" | "--resume" | "-r") || token.starts_with("--resume=")
-    })
+fn already_resuming(provider: AgentProvider, command: &str) -> bool {
+    let tokens = command.split_whitespace().collect::<Vec<_>>();
+    match provider {
+        AgentProvider::ClaudeCode => tokens.iter().any(|token| {
+            matches!(token, &"--continue" | &"-c" | &"--resume" | &"-r")
+                || token.starts_with("--resume=")
+        }),
+        AgentProvider::CodexCli => tokens.contains(&"resume"),
+        AgentProvider::GeminiCli => tokens
+            .iter()
+            .any(|token| matches!(token, &"--resume" | &"-r") || token.starts_with("--resume=")),
+        AgentProvider::OpenCode => tokens.iter().any(|token| {
+            matches!(token, &"--continue" | &"-c" | &"--session" | &"-s")
+                || token.starts_with("--session=")
+        }),
+        AgentProvider::Copilot => tokens
+            .iter()
+            .any(|token| *token == "--resume" || token.starts_with("--resume=")),
+        AgentProvider::Aider
+        | AgentProvider::CursorAgent
+        | AgentProvider::Goose
+        | AgentProvider::Amp
+        | AgentProvider::Crush
+        | AgentProvider::Unknown => false,
+    }
 }
 
 #[cfg(test)]
@@ -2606,14 +2622,26 @@ mod tests {
     }
 
     #[test]
-    fn claude_and_opencode_resume_instead_of_starting_fresh() {
+    fn providers_with_verified_latest_flags_resume_instead_of_starting_fresh() {
         assert_eq!(
             resume_command(AgentProvider::ClaudeCode, "claude"),
             "claude --continue"
         );
         assert_eq!(
+            resume_command(AgentProvider::CodexCli, "codex"),
+            "codex resume --last"
+        );
+        assert_eq!(
+            resume_command(AgentProvider::GeminiCli, "gemini"),
+            "gemini --resume latest"
+        );
+        assert_eq!(
             resume_command(AgentProvider::OpenCode, "opencode"),
             "opencode --continue"
+        );
+        assert_eq!(
+            resume_command(AgentProvider::Copilot, "copilot"),
+            "copilot --resume"
         );
     }
 
@@ -2640,11 +2668,8 @@ mod tests {
         // Inventar una bandera haría fallar el arranque; preferimos sesión
         // nueva antes que un agente que no levanta.
         for provider in [
-            AgentProvider::CodexCli,
-            AgentProvider::GeminiCli,
             AgentProvider::Aider,
             AgentProvider::CursorAgent,
-            AgentProvider::Copilot,
             AgentProvider::Goose,
             AgentProvider::Amp,
             AgentProvider::Crush,
@@ -2683,12 +2708,17 @@ mod tests {
             resume_invocation(AgentProvider::OpenCode, "opencode", id),
             Some(format!("opencode --session {id}"))
         );
+        assert_eq!(
+            resume_invocation(AgentProvider::Copilot, "copilot", id),
+            Some(format!("copilot --resume {id}"))
+        );
     }
 
     #[test]
     fn codex_resume_inserts_the_subcommand_after_the_binary() {
-        // codex usa subcomando (`codex resume <id>`), no un flag al final:
-        // debe ir tras el binario y antes de los flags existentes.
+        // Los argumentos ya presentes conservan exactamente su quoting. El
+        // parser del shell y Codex ubican el subcomando después de las
+        // opciones globales.
         let id = "abc123";
         assert_eq!(
             resume_invocation(AgentProvider::CodexCli, "codex", id),
@@ -2696,7 +2726,15 @@ mod tests {
         );
         assert_eq!(
             resume_invocation(AgentProvider::CodexCli, "codex --model gpt-5", id),
-            Some("codex resume abc123 --model gpt-5".to_owned())
+            Some("codex --model gpt-5 resume abc123".to_owned())
+        );
+        assert_eq!(
+            resume_invocation(
+                AgentProvider::CodexCli,
+                "codex --config 'model_reasoning_effort=\"high\"'",
+                id
+            ),
+            Some("codex --config 'model_reasoning_effort=\"high\"' resume abc123".to_owned())
         );
     }
 
@@ -2705,12 +2743,22 @@ mod tests {
         // Regresión de inyección: ningún id puede entrar a argv sin pasar la
         // sanitización (prefijo '-', control chars, largo excesivo).
         let overlong = "a".repeat(600);
-        let hostile = ["-rf /", "--help", "id\x1b[31m", "", overlong.as_str()];
+        let hostile = [
+            "-rf /",
+            "--help",
+            "id\x1b[31m",
+            "safe; touch /tmp/pwned",
+            "$(echo pwned)",
+            "id with spaces",
+            "",
+            overlong.as_str(),
+        ];
         for provider in [
             AgentProvider::ClaudeCode,
             AgentProvider::CodexCli,
             AgentProvider::GeminiCli,
             AgentProvider::OpenCode,
+            AgentProvider::Copilot,
         ] {
             for id in hostile {
                 assert_eq!(
@@ -2727,7 +2775,6 @@ mod tests {
         for provider in [
             AgentProvider::Aider,
             AgentProvider::CursorAgent,
-            AgentProvider::Copilot,
             AgentProvider::Goose,
             AgentProvider::Amp,
             AgentProvider::Crush,
@@ -2766,7 +2813,9 @@ mod tests {
             kind,
             panel_id: Some(panel_id),
             workspace_id: None,
+            leaf_id: None,
             session_id: Some("sess-42".to_owned()),
+            cwd: None,
         }
     }
 

@@ -9,17 +9,139 @@ use super::taskbar::{
 };
 use super::windowing::slot_drag_started;
 use super::{
-    desktop_canvas_rect, interpolate_viewport, overview_viewport_for_panels,
-    panel_scroll_capture_active, split_resize_hit, top_panel_hit, top_panel_scroll_hit,
-    upsert_workspace_for_folder, SplitResizeAxis, WindowTransition, WindowTransitionKind,
+    close_workspace_for_good, desktop_canvas_rect, interpolate_viewport,
+    overview_viewport_for_panels, panel_scroll_capture_active,
+    should_stop_collaboration_on_workspace_close, split_resize_hit, top_panel_hit,
+    top_panel_scroll_hit, upsert_workspace_for_folder, SplitResizeAxis, WindowTransition,
+    WindowTransitionKind,
 };
 use crate::canvas::config::{MINIMAP_BG, MINIMAP_HEIGHT, MINIMAP_PADDING, MINIMAP_WIDTH};
 use crate::canvas::minimap;
 use crate::canvas::viewport::Viewport;
+use crate::collab::CollabMode;
 use crate::orchestration::AgentProvider;
 use crate::panel::CanvasPanel;
 use crate::state::{SnapSlot, Workspace};
 use crate::terminal::panel::{PanelHitArea, TerminalPanel, PANEL_BG};
+
+#[test]
+fn test_app_never_owns_the_users_run_marker() {
+    let ctx = egui::Context::default();
+    let app = super::TerminalApp::new_for_tests(&ctx);
+
+    assert!(!app.run_marker_active);
+    assert!(!app.persistence_writes_enabled);
+}
+
+#[test]
+fn test_app_never_starts_the_network_update_checker() {
+    let ctx = egui::Context::default();
+    let app = super::TerminalApp::new_for_tests(&ctx);
+
+    assert!(matches!(
+        app.update_checker.snapshot().status,
+        crate::update::UpdateStatus::Disabled
+    ));
+}
+
+#[test]
+fn modal_collaboration_dialogs_capture_terminal_input() {
+    let ctx = egui::Context::default();
+    let mut app = super::TerminalApp::new_for_tests(&ctx);
+    assert!(app.terminal_input_is_routable());
+
+    app.share_workspace_open = true;
+    assert!(!app.terminal_input_is_routable());
+    app.share_workspace_open = false;
+
+    app.join_session_open = true;
+    assert!(!app.terminal_input_is_routable());
+}
+
+#[test]
+fn memory_dialog_captures_terminal_input() {
+    let ctx = egui::Context::default();
+    let mut app = super::TerminalApp::new_for_tests(&ctx);
+    assert!(app.terminal_input_is_routable());
+
+    app.open_memory_hub();
+
+    assert!(app.memory_ui.is_some());
+    assert!(!app.terminal_input_is_routable());
+}
+
+#[test]
+fn closing_a_project_requires_confirmation_and_captures_terminal_input() {
+    let ctx = egui::Context::default();
+    let mut app = super::TerminalApp::new_for_tests(&ctx);
+    let workspace_id = app.workspaces[0].id;
+
+    app.handle_sidebar_responses(
+        vec![crate::sidebar::SidebarResponse::RequestCloseWorkspace(
+            workspace_id,
+        )],
+        &ctx,
+    );
+
+    assert_eq!(app.closing_workspace, Some(workspace_id));
+    assert!(!app.terminal_input_is_routable());
+    assert_eq!(app.workspaces.len(), 1, "todavía no debe cerrarse");
+}
+
+#[test]
+fn confirming_close_terminates_the_project_terminals_and_leaves_a_clean_workspace() {
+    let ctx = egui::Context::default();
+    let mut app = super::TerminalApp::new_for_tests(&ctx);
+    let workspace_id = app.workspaces[0].id;
+    assert_eq!(app.workspaces[0].panels.len(), 1);
+
+    app.close_workspace_confirmed(workspace_id);
+
+    assert_eq!(app.workspaces.len(), 1);
+    assert!(app.workspaces[0].cwd().is_none());
+    assert!(app.workspaces[0].panels.is_empty());
+}
+
+#[test]
+fn closing_a_shared_background_project_stops_its_collaboration_session() {
+    assert!(should_stop_collaboration_on_workspace_close(
+        CollabMode::Host,
+        false,
+        true,
+    ));
+    assert!(!should_stop_collaboration_on_workspace_close(
+        CollabMode::Host,
+        false,
+        false,
+    ));
+}
+
+#[test]
+fn consumed_app_shortcut_is_removed_from_the_pty_event_stream() {
+    let ctx = egui::Context::default();
+    let modifiers = Modifiers {
+        ctrl: true,
+        shift: true,
+        ..Modifiers::NONE
+    };
+    let shortcut = egui::Event::Key {
+        key: egui::Key::T,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers,
+    };
+    ctx.begin_pass(RawInput {
+        events: vec![shortcut, egui::Event::Text("keep".to_owned())],
+        ..Default::default()
+    });
+
+    super::consume_key_event(&ctx, modifiers, egui::Key::T);
+
+    let remaining = ctx.input(|input| input.events.clone());
+    let _ = ctx.end_pass();
+    assert_eq!(remaining, vec![egui::Event::Text("keep".to_owned())]);
+}
 
 #[test]
 fn top_panel_hit_prefers_frontmost_panel() {
@@ -457,6 +579,38 @@ fn upsert_workspace_for_folder_creates_workspace_for_new_folder() {
 }
 
 #[test]
+fn closing_the_last_project_leaves_one_empty_workspace() {
+    let project = Workspace::from_folder(unique_temp_dir("close-last-project"));
+    let project_id = project.id;
+    let mut workspaces = vec![project];
+    let mut active_ws = 0;
+
+    let closed_terminals =
+        close_workspace_for_good(&mut workspaces, &mut active_ws, project_id).unwrap();
+
+    assert_eq!(closed_terminals, 0);
+    assert_eq!(active_ws, 0);
+    assert_eq!(workspaces.len(), 1);
+    assert!(workspaces[0].cwd().is_none());
+    assert!(workspaces[0].panels.is_empty());
+}
+
+#[test]
+fn closing_a_workspace_before_the_active_one_keeps_the_same_project_selected() {
+    let first = Workspace::from_folder(unique_temp_dir("close-first"));
+    let first_id = first.id;
+    let second = Workspace::from_folder(unique_temp_dir("keep-second"));
+    let second_id = second.id;
+    let mut workspaces = vec![first, second];
+    let mut active_ws = 1;
+
+    close_workspace_for_good(&mut workspaces, &mut active_ws, first_id).unwrap();
+
+    assert_eq!(active_ws, 0);
+    assert_eq!(workspaces[active_ws].id, second_id);
+}
+
+#[test]
 fn overview_viewport_contains_all_panels() {
     let panels = vec![
         CanvasPanel::Terminal(TerminalPanel::new(
@@ -586,7 +740,7 @@ fn session_frames_replay_when_generation_matches() {
     let panel = Uuid::new_v4();
 
     let mut bytes = crate::state::scrollback_log::encode_header(0);
-    bytes.extend_from_slice(&encode_frame(FrameKind::Output, b"hola\r\n"));
+    bytes.extend_from_slice(&encode_frame(1, FrameKind::Output, b"hola\r\n"));
     std::fs::write(dir.join(scrollback_log_file_name(panel)), &bytes).unwrap();
 
     let frames = super::load_session_frames(&dir, panel);
@@ -605,12 +759,39 @@ fn session_frames_ignored_on_generation_mismatch() {
     // Checkpoint de generation 3 pero log viejo de generation 2: se ignora.
     super::write_generation(&dir, panel, 3).unwrap();
     let mut bytes = crate::state::scrollback_log::encode_header(2);
-    bytes.extend_from_slice(&encode_frame(FrameKind::Output, b"viejo\r\n"));
+    bytes.extend_from_slice(&encode_frame(1, FrameKind::Output, b"viejo\r\n"));
     std::fs::write(dir.join(scrollback_log_file_name(panel)), &bytes).unwrap();
 
     let frames = super::load_session_frames(&dir, panel);
     let _ = std::fs::remove_dir_all(&dir);
     assert!(frames.is_empty(), "mismatch de generation descarta el log");
+}
+
+#[test]
+fn atomic_checkpoint_generation_ignores_an_old_log_left_by_a_crash() {
+    use crate::state::scrollback_log::{encode_frame, FrameKind};
+    use crate::state::scrollback_store::scrollback_log_file_name;
+    let dir = unique_temp_dir("tc-atomic-checkpoint");
+    let panel = Uuid::new_v4();
+
+    crate::state::scrollback_store::save_leaf_scrollback_versioned(
+        &dir,
+        panel,
+        None,
+        3,
+        "checkpoint nuevo\r\n",
+    )
+    .unwrap();
+    let mut stale_log = crate::state::scrollback_log::encode_header(2);
+    stale_log.extend_from_slice(&encode_frame(7, FrameKind::Output, b"duplicado\r\n"));
+    std::fs::write(dir.join(scrollback_log_file_name(panel)), stale_log).unwrap();
+
+    assert!(super::load_session_frames(&dir, panel).is_empty());
+    assert_eq!(
+        crate::state::scrollback_store::load_leaf_scrollback(&dir, panel, None).as_deref(),
+        Some("checkpoint nuevo\r\n")
+    );
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]
@@ -622,7 +803,7 @@ fn session_frames_survive_a_truncated_tail() {
     let panel = Uuid::new_v4();
 
     let mut bytes = crate::state::scrollback_log::encode_header(0);
-    bytes.extend_from_slice(&encode_frame(FrameKind::Output, b"completo\r\n"));
+    bytes.extend_from_slice(&encode_frame(1, FrameKind::Output, b"completo\r\n"));
     bytes.push(FrameKind::Output as u8);
     bytes.extend_from_slice(&999u32.to_le_bytes());
     bytes.extend_from_slice(b"trun"); // crash a mitad de frame
@@ -632,4 +813,75 @@ fn session_frames_survive_a_truncated_tail() {
     let _ = std::fs::remove_dir_all(&dir);
     assert_eq!(frames.len(), 1, "solo llega el frame completo");
     assert_eq!(frames[0].payload, b"completo\r\n".to_vec());
+}
+
+#[test]
+fn split_logs_restore_without_a_prior_checkpoint_and_never_mix_leaves() {
+    use crate::state::scrollback_log::{encode_frame, FrameKind};
+
+    let dir = std::env::temp_dir().join(format!("tc-leaf-logs-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let panel = Uuid::new_v4();
+    let first = Uuid::new_v4();
+    let second = Uuid::new_v4();
+
+    assert_eq!(
+        super::persist_incremental_frames(
+            &dir,
+            panel,
+            Some(first),
+            &encode_frame(1, FrameKind::Output, b"primera\r\n"),
+        ),
+        Some(false)
+    );
+    assert_eq!(
+        super::persist_incremental_frames(
+            &dir,
+            panel,
+            Some(second),
+            &encode_frame(1, FrameKind::Output, b"segunda\r\n"),
+        ),
+        Some(false)
+    );
+
+    let histories = super::collect_leaf_histories(&dir, panel);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(histories.len(), 2);
+    assert_eq!(histories[0].0, Some(first.min(second)));
+    for (leaf, checkpoint, frames) in histories {
+        assert!(checkpoint.is_empty(), "el test no creó checkpoints");
+        assert_eq!(frames.len(), 1);
+        let expected = if leaf == Some(first) {
+            b"primera\r\n".as_slice()
+        } else {
+            b"segunda\r\n".as_slice()
+        };
+        assert_eq!(frames[0].payload, expected);
+    }
+}
+
+#[test]
+fn empty_canonical_root_marker_suppresses_stale_legacy_history() {
+    let dir = unique_temp_dir("tc-empty-root-marker");
+    let panel = Uuid::new_v4();
+    let root = Uuid::new_v4();
+
+    crate::state::scrollback_store::save_leaf_scrollback(
+        &dir,
+        panel,
+        None,
+        "historial legado que ya no debe volver\n",
+    )
+    .unwrap();
+    super::write_leaf_generation(&dir, panel, Some(root), 1).unwrap();
+
+    let histories = super::collect_leaf_histories(&dir, panel);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(histories.iter().any(|(leaf, text, frames)| {
+        *leaf == Some(root) && text.is_empty() && frames.is_empty()
+    }));
+    assert!(histories.iter().any(|(leaf, _, _)| leaf.is_none()));
+    // `TerminalPanel::restore_leaf_histories` da precedencia a Some(root),
+    // por lo que el alias legado se omite y no resucita contenido obsoleto.
 }

@@ -416,7 +416,12 @@ pub(super) fn draw_guest_session_banner(
         14.0,
         Color32::from_rgba_premultiplied(10, 10, 10, 232),
     );
-    painter.rect_stroke(banner_rect, 14.0, Stroke::new(1.0, palette::LINE));
+    painter.rect_stroke(
+        banner_rect,
+        14.0,
+        Stroke::new(1.0, palette::LINE),
+        egui::StrokeKind::Middle,
+    );
     painter.text(
         banner_rect.left_top() + vec2(14.0, 12.0),
         Align2::LEFT_TOP,

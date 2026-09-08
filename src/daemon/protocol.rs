@@ -4,16 +4,30 @@
 //! un binario propio porque el daemon es un proceso separado que sobrevive a
 //! la app y hay que poder debuggearlo con `nc` cuando algo va mal.
 //!
-//! La **versión va en el nombre del socket** (`daemon-v1.sock`): un daemon
+//! La **versión va en el nombre del socket** (`daemon-v3.sock`): un daemon
 //! viejo y una app nueva no se pueden ni conectar, en vez de hablar mal.
 
+use std::io::{BufRead, Read};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// Versión del protocolo. Cambiarla obliga a un socket nuevo.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 3;
+
+/// Tope duro de una línea NDJSON completa, incluido el salto final.
+///
+/// Tanto el socket como el token son locales, pero una conexión defectuosa o
+/// un proceso del mismo usuario nunca debe poder hacer crecer un `String` sin
+/// límite dentro de la app o del daemon. Ocho MiB deja margen amplio para
+/// snapshots y ráfagas de salida, que hoy están acotados muy por debajo.
+pub const MAX_PROTOCOL_LINE_BYTES: usize = 8 * 1024 * 1024;
+
+/// Tamaño máximo de cada bloque crudo de input que se encapsula en un
+/// `Request::Write`. Mantenerlo pequeño garantiza que hasta un paste enorme se
+/// divida en líneas holgadamente inferiores al límite del protocolo.
+pub const MAX_WIRE_INPUT_BYTES: usize = 64 * 1024;
 
 /// Nombre del socket, con la versión adentro.
 pub fn socket_file_name() -> String {
@@ -65,6 +79,8 @@ pub struct WireSpec {
     pub panel_id: Option<Uuid>,
     #[serde(default)]
     pub workspace_id: Option<Uuid>,
+    #[serde(default)]
+    pub leaf_id: Option<Uuid>,
     #[serde(default = "default_cols")]
     pub cols: u16,
     #[serde(default = "default_rows")]
@@ -87,6 +103,10 @@ pub enum Request {
     Hello {
         version: u32,
         token: String,
+        /// Identidad de la instancia de app. Todas sus conexiones (control y
+        /// una por PTY remoto) comparten este id para que el daemon nunca
+        /// reconcilie sesiones pertenecientes a otra ventana/proceso.
+        client_id: Uuid,
     },
     Spawn {
         spec: WireSpec,
@@ -101,7 +121,11 @@ pub enum Request {
     },
     Write {
         id: Uuid,
-        data: String,
+        /// Bytes crudos del PTY, codificados como base64 dentro del JSON.
+        /// Un terminal no es un stream UTF-8: convertirlo a `String` puede
+        /// corromper tanto input binario como secuencias multibyte partidas.
+        #[serde(with = "wire_bytes")]
+        data: Vec<u8>,
     },
     Resize {
         id: Uuid,
@@ -110,6 +134,12 @@ pub enum Request {
     },
     Kill {
         id: Uuid,
+    },
+    /// Sesión enfocada en la UI. El daemon usa esta señal para no retrasar su
+    /// reader PTY mientras aplica contrapresión breve a los readers de fondo.
+    SetPriority {
+        #[serde(default)]
+        id: Option<Uuid>,
     },
     List,
     /// Paneles que la app todavía tiene vivos; el daemon mata los huérfanos.
@@ -135,7 +165,8 @@ pub enum Response {
     /// hasta el que llega. Los eventos con `seq` ≤ este se descartan.
     Attached {
         id: Uuid,
-        snapshot: String,
+        #[serde(with = "wire_bytes")]
+        snapshot: Vec<u8>,
         seq: u64,
     },
     Sessions {
@@ -145,7 +176,8 @@ pub enum Response {
     Output {
         id: Uuid,
         seq: u64,
-        data: String,
+        #[serde(with = "wire_bytes")]
+        data: Vec<u8>,
     },
     Exit {
         id: Uuid,
@@ -160,6 +192,29 @@ pub enum Response {
     Error {
         message: String,
     },
+}
+
+/// Adaptador binario para mantener NDJSON observable sin fingir que el PTY es
+/// texto UTF-8. El formato de wire es una cadena base64 estable.
+mod wire_bytes {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine as _;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&STANDARD.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let encoded = String::deserialize(deserializer)?;
+        STANDARD.decode(encoded).map_err(serde::de::Error::custom)
+    }
 }
 
 /// Serializa un mensaje como una línea NDJSON (con el `\n` final).
@@ -177,6 +232,43 @@ pub fn decode_line<T: for<'de> Deserialize<'de>>(line: &str) -> Option<T> {
         return None;
     }
     serde_json::from_str(line).ok()
+}
+
+/// Lee una línea del protocolo con un límite de memoria estricto.
+///
+/// `BufRead::read_line` no impone ningún tope: ante un peer que nunca envía
+/// `\n`, el buffer crecería hasta agotar el proceso. La conexión debe cerrarse
+/// cuando este helper devuelve `InvalidData`.
+pub fn read_protocol_line(reader: &mut impl BufRead) -> std::io::Result<Option<String>> {
+    read_protocol_line_with_limit(reader, MAX_PROTOCOL_LINE_BYTES)
+}
+
+fn read_protocol_line_with_limit(
+    reader: &mut impl BufRead,
+    max_bytes: usize,
+) -> std::io::Result<Option<String>> {
+    let mut bytes = Vec::with_capacity(max_bytes.min(8 * 1024));
+    let limit = max_bytes
+        .checked_add(1)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "límite inválido"))?;
+    let read = (&mut *reader)
+        .take(limit as u64)
+        .read_until(b'\n', &mut bytes)?;
+    if read == 0 {
+        return Ok(None);
+    }
+    if bytes.len() > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "línea del protocolo demasiado grande",
+        ));
+    }
+    String::from_utf8(bytes).map(Some).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "línea del protocolo no es UTF-8",
+        )
+    })
 }
 
 /// ¿El handshake es aceptable? Versión exacta y token igual.
@@ -202,6 +294,9 @@ pub fn ensure_token(dir: &Path) -> std::io::Result<String> {
     if let Ok(existing) = std::fs::read_to_string(&path) {
         let existing = existing.trim().to_owned();
         if !existing.is_empty() {
+            // Reparar permisos también al reutilizarlo. Un backup, una copia
+            // manual o una versión anterior pudo haberlos ensanchado.
+            restrict_to_owner(&path)?;
             return Ok(existing);
         }
     }
@@ -232,6 +327,10 @@ pub fn restrict_to_owner(path: &Path) -> std::io::Result<()> {
 pub struct PidFile {
     pub pid: u32,
     pub nonce: String,
+    /// Inicio de esta encarnación del proceso. El PID solo puede reciclarse;
+    /// `(pid, start_ticks, nonce)` identifica al daemon exacto.
+    #[serde(default)]
+    pub start_ticks: Option<u64>,
 }
 
 impl PidFile {
@@ -239,8 +338,49 @@ impl PidFile {
         Self {
             pid,
             nonce: Uuid::new_v4().simple().to_string(),
+            start_ticks: process_start_ticks(pid),
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn process_start_ticks(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after_name = stat.rsplit_once(')')?.1.trim();
+    // El resto empieza en el campo 3 (`state`); starttime es el campo 22.
+    after_name.split_whitespace().nth(19)?.parse().ok()
+}
+
+#[cfg(target_os = "macos")]
+fn process_start_ticks(pid: u32) -> Option<u64> {
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    // SAFETY: `info` apunta a un buffer del tamaño exacto solicitado por
+    // PROC_PIDTBSDINFO y sólo se asume inicializado si proc_pidinfo lo llenó.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int,
+        )
+    };
+    if written != std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int {
+        return None;
+    }
+    // SAFETY: el tamaño devuelto arriba confirma que toda la estructura fue
+    // inicializada por el kernel.
+    let info = unsafe { info.assume_init() };
+    Some(
+        info.pbi_start_tvsec
+            .saturating_mul(1_000_000)
+            .saturating_add(info.pbi_start_tvusec),
+    )
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn process_start_ticks(_pid: u32) -> Option<u64> {
+    None
 }
 
 pub fn write_pid_file(dir: &Path, pid_file: &PidFile) -> std::io::Result<()> {
@@ -258,9 +398,11 @@ pub fn read_pid_file(dir: &Path) -> Option<PidFile> {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_line, encode_line, ensure_token, handshake_ok, read_pid_file, socket_file_name,
-        write_pid_file, PidFile, Request, Response, WireSpec, PROTOCOL_VERSION,
+        decode_line, encode_line, ensure_token, handshake_ok, read_pid_file,
+        read_protocol_line_with_limit, socket_file_name, write_pid_file, PidFile, Request,
+        Response, WireSpec, PROTOCOL_VERSION,
     };
+    use std::io::{Cursor, ErrorKind};
     use uuid::Uuid;
 
     fn temp_dir(tag: &str) -> std::path::PathBuf {
@@ -282,6 +424,7 @@ mod tests {
             Request::Hello {
                 version: PROTOCOL_VERSION,
                 token: "abc".to_owned(),
+                client_id: Uuid::new_v4(),
             },
             Request::Spawn {
                 id: None,
@@ -291,14 +434,16 @@ mod tests {
                     startup_command: Some("claude".to_owned()),
                     panel_id: Some(id),
                     workspace_id: None,
+                    leaf_id: Some(Uuid::new_v4()),
                     cols: 120,
                     rows: 40,
                 },
             },
             Request::Attach { id },
+            Request::SetPriority { id: Some(id) },
             Request::Write {
                 id,
-                data: "echo hola\n".to_owned(),
+                data: b"echo hola\n".to_vec(),
             },
             Request::Resize {
                 id,
@@ -329,14 +474,14 @@ mod tests {
             Response::Spawned { id },
             Response::Attached {
                 id,
-                snapshot: "hola\n".to_owned(),
+                snapshot: b"hola\n".to_vec(),
                 seq: 42,
             },
             Response::Sessions { ids: vec![id] },
             Response::Output {
                 id,
                 seq: 43,
-                data: "salida".to_owned(),
+                data: b"salida".to_vec(),
             },
             Response::Exit { id },
             Response::Killed { id },
@@ -353,12 +498,12 @@ mod tests {
     }
 
     #[test]
-    fn payloads_with_newlines_stay_on_one_line() {
-        // Lo que rompería NDJSON: bytes con \n adentro del payload.
+    fn arbitrary_binary_payloads_stay_on_one_line_and_round_trip_exactly() {
+        // Incluye saltos, NUL y bytes que no son UTF-8 válido.
         let message = Response::Output {
             id: Uuid::new_v4(),
             seq: 1,
-            data: "linea1\nlinea2\r\n".to_owned(),
+            data: vec![b'l', b'1', b'\n', 0, 0xff, 0x80, b'\r', b'\n'],
         };
         let line = encode_line(&message);
         assert_eq!(line.lines().count(), 1, "got {line:?}");
@@ -371,6 +516,30 @@ mod tests {
         assert_eq!(decode_line::<Request>("").as_ref(), None);
         assert_eq!(decode_line::<Request>("{}").as_ref(), None);
         assert_eq!(decode_line::<Request>(r#"{"type":"nope"}"#).as_ref(), None);
+    }
+
+    #[test]
+    fn protocol_reader_rejects_a_line_over_its_limit() {
+        let mut reader = Cursor::new(b"123456789\n");
+        let err = read_protocol_line_with_limit(&mut reader, 8).expect_err("debe rechazarla");
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn protocol_reader_accepts_a_bounded_line_and_clean_eof() {
+        let mut reader = Cursor::new(b"1234567\n");
+        assert_eq!(
+            read_protocol_line_with_limit(&mut reader, 8).unwrap(),
+            Some("1234567\n".to_owned())
+        );
+        assert_eq!(read_protocol_line_with_limit(&mut reader, 8).unwrap(), None);
+    }
+
+    #[test]
+    fn protocol_reader_rejects_non_utf8_input() {
+        let mut reader = Cursor::new([0xff, b'\n']);
+        let err = read_protocol_line_with_limit(&mut reader, 8).expect_err("debe rechazarla");
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
     }
 
     #[test]
@@ -409,6 +578,22 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn reusing_a_token_repairs_overly_broad_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_dir("token-mode-repair");
+        let token = ensure_token(&dir).expect("crea");
+        let path = super::token_path(&dir);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert_eq!(ensure_token(&dir).expect("reusa"), token);
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "el reuse debe reparar el modo");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn the_pid_file_round_trips_with_its_nonce() {
         let dir = temp_dir("pid");
@@ -422,6 +607,16 @@ mod tests {
     fn two_pid_files_never_share_a_nonce() {
         // Sin esto, un pid reciclado por el SO parecería nuestro daemon.
         assert_ne!(PidFile::new(1).nonce, PidFile::new(1).nonce);
+    }
+
+    #[test]
+    fn the_current_process_pid_file_records_its_start_time() {
+        let pid_file = PidFile::new(std::process::id());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        assert!(
+            pid_file.start_ticks.is_some(),
+            "la identidad no puede depender sólo de un PID reciclable"
+        );
     }
 
     #[test]

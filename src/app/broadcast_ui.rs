@@ -128,10 +128,10 @@ impl TerminalApp {
             .order(egui::Order::Foreground)
             .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
             .show(ctx, |ui| {
-                egui::Frame::none()
+                egui::Frame::NONE
                     .fill(palette::SURFACE)
                     .stroke(egui::Stroke::new(1.0, palette::LINE))
-                    .rounding(12.0)
+                    .corner_radius(12.0)
                     .inner_margin(18.0)
                     .show(ui, |ui| {
                         ui.set_width(520.0);

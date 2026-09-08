@@ -41,7 +41,7 @@ Para no planear en el aire: esto ya existe en terminalcanvas (38 commits recient
 |---|---|
 | Paneles de terminal en canvas | Sí: flotantes, snap, minimizar, taskbar |
 | Scrollback persistente | Básico: texto plano por panel, 256 KB, replay con marcador |
-| Resume de agentes | Sí: `--continue` al restaurar panel + selector `Ctrl+Shift+R` que lee `~/.claude/projects` |
+| Resume de agentes | Sí: sesión exacta de Claude desde `Ctrl+Shift+R`; latest nativo para Claude/Codex/Gemini/OpenCode/Copilot; restore exacto cuando hay id de hook |
 | Code review con diff | Sí: parser unified diff, UI virtualizada, feedback al agente (texto libre, no por línea) |
 | Worktrees | Crear/listar/borrar (borrado en worker) |
 | Visor de código | Sí: dockeado a la derecha, syntect (213 lenguajes), worker thread |
@@ -237,22 +237,14 @@ conocimiento por proveedor. Lo importante está en
 Y sanitización de ids antes de usarlos como argv: máx 512 chars, sin control
 chars, **rechazar ids que empiezan con `-`** (inyección de flags).
 
-**Qué tenemos.** 5 proveedores (`AgentProvider` en `orchestration/manager.rs`)
-con detección por texto, `resume_command()` con `--continue` para
-claude/opencode, y `Unknown` como fallback genérico que ya permite correr
-cualquier CLI.
-
-**Plan paso a paso.**
-1. Ampliar la tabla de `resume_flag()` con lo verificado de Orca (codex usa
-   subcomando: requiere que `resume_command` soporte insertar antes de los
-   flags). Gemini: `--resume <id>` — pero solo con id capturado, no a ciegas.
-2. Portar la sanitización de ids (512 chars, control chars, guion inicial) a
-   `agent_sessions.rs`. Test con id malicioso `-rf /`.
-3. Sumar providers al enum con su comando de lanzamiento y color de taskbar
-   (hoy: 5; Orca: ~30). Empezar por los que uses: cursor-agent, copilot, goose.
-4. La captura del **session id real** (no "la más reciente") viene con los
-   hooks de la sección 2.2 — ahí el resume pasa de "probablemente la última" a
-   "exactamente esta".
+**Qué tenemos.** 10 proveedores (`AgentProvider` en
+`orchestration/manager.rs`) con detección por texto y `Unknown` como fallback.
+Claude, Codex, Gemini, OpenCode y Copilot tienen comandos verificados tanto
+para retomar la sesión más reciente como por id exacto. Los ids sólo aceptan
+tokens opacos seguros antes de convertirse en un comando de shell. El hook de
+Claude captura el id real; cuando no hay id, se usa el mecanismo “latest” del
+provider. `Ctrl+Shift+R` reemplaza la sesión enfocada y ejecuta el resume en un
+shell nuevo, en vez de enviarlo como prompt al agente activo.
 
 **Esfuerzo**: chico por proveedor. La tabla es conocimiento, no código.
 
@@ -912,8 +904,8 @@ exacto). Enter ejecuta según tipo. Query vacío = paneles por recencia de foco.
 
 ### P3.15 — Daemon de PTYs (5–8 tandas, después de P1.7)
 **T1**: `src/bin/mi-terminal-daemon.rs` + `src/daemon/protocol.rs`: NDJSON
-sobre unix socket `<data>/daemon/daemon-v1.sock` (versión en el nombre), token
-en archivo 0600, mensajes `Hello{version,token}`, `Spawn{spec}`, `Attach{id}`,
+sobre unix socket `<data>/daemon/daemon-v3.sock` (versión en el nombre), token
+en archivo 0600, mensajes `Hello{version,token,client_id}`, `Spawn{spec}`, `Attach{id}`,
 `Write`, `Resize`, `Kill`, `List`, eventos `Output{id,seq,bytes}`, `Exit{id}`.
 **T2**: mover la posesión del PTY: el daemon linkea `terminal/pty.rs` (los
 harness de tests ya montan módulos por `#[path]` — mismo truco) y mantiene

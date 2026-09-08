@@ -3,8 +3,8 @@
 //! sintaxis real vía `syntect`.
 //!
 //! Dos decisiones de fluidez:
-//! - El archivo se muestra en texto plano al instante y el coloreado llega
-//!   después desde el worker (`code_highlight`), así abrir nunca traba el frame.
+//! - La lectura y el coloreado corren en workers separados, así ni un volumen
+//!   lento ni syntect pueden trabar el frame de egui.
 //! - La lista se dibuja virtualizada (`show_rows`): sólo se pintan las líneas
 //!   visibles, así un archivo de 20k líneas cuesta lo mismo que uno de 50.
 
@@ -20,6 +20,9 @@ use super::TerminalApp;
 
 /// Tope de bytes a leer para no bloquear la UI con archivos enormes.
 const MAX_VIEW_BYTES: u64 = 2 * 1024 * 1024;
+/// Evita la amplificación de memoria de un archivo compuesto por millones de
+/// líneas vacías: cada `String` tiene overhead aunque el archivo pese poco.
+const MAX_VIEW_LINES: usize = 100_000;
 const DEFAULT_WIDTH: f32 = 620.0;
 const MIN_WIDTH: f32 = 320.0;
 const MAX_WIDTH: f32 = 1200.0;
@@ -62,6 +65,7 @@ pub(super) struct FileViewerState {
     /// Token del pedido en curso, para descartar resultados viejos.
     pub(super) highlight_token: Option<u64>,
     pub(super) language: Option<String>,
+    pub(super) loading: bool,
 }
 
 impl FileViewerState {
@@ -81,7 +85,30 @@ impl FileViewerState {
 
 impl TerminalApp {
     pub(super) fn open_file_viewer(&mut self, path: PathBuf) {
-        let mut state = load_file_for_view(&path);
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let worker_path = path.clone();
+        let repaint = self.ctx.clone();
+        let spawned = std::thread::Builder::new()
+            .name("file-viewer-reader".to_owned())
+            .spawn(move || {
+                let state = load_file_for_view(&worker_path);
+                let _ = sender.send(state);
+                if let Some(ctx) = repaint {
+                    ctx.request_repaint();
+                }
+            })
+            .is_ok();
+        self.file_viewer = Some(loading_file_state(path));
+        self.file_viewer_rx = spawned.then_some(receiver);
+        if !spawned {
+            if let Some(viewer) = self.file_viewer.as_mut() {
+                viewer.loading = false;
+                viewer.lines = vec!["(no se pudo iniciar la lectura del archivo)".to_owned()];
+            }
+        }
+    }
+
+    fn activate_loaded_file(&mut self, mut state: FileViewerState) {
         if !state.binary && !state.lines.is_empty() {
             let name = state.file_name();
             state.language = super::code_highlight::detect_language(&name, state.lines[0].as_str());
@@ -91,6 +118,36 @@ impl TerminalApp {
             state.highlight_token = Some(self.highlighter.request(name, text));
         }
         self.file_viewer = Some(state);
+    }
+
+    fn poll_file_viewer_load(&mut self, ctx: &egui::Context) {
+        let result = self
+            .file_viewer_rx
+            .as_ref()
+            .map(std::sync::mpsc::Receiver::try_recv);
+        match result {
+            Some(Ok(state)) => {
+                self.file_viewer_rx = None;
+                let still_expected = self
+                    .file_viewer
+                    .as_ref()
+                    .is_some_and(|viewer| viewer.path == state.path);
+                if still_expected {
+                    self.activate_loaded_file(state);
+                }
+            }
+            Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+                self.file_viewer_rx = None;
+                if let Some(viewer) = self.file_viewer.as_mut() {
+                    viewer.loading = false;
+                    viewer.lines = vec!["(no se pudo leer el archivo)".to_owned()];
+                }
+            }
+            Some(Err(std::sync::mpsc::TryRecvError::Empty)) => {
+                ctx.request_repaint_after(std::time::Duration::from_millis(50));
+            }
+            None => {}
+        }
     }
 
     /// Recoge el resultado del worker de resaltado, si llegó.
@@ -107,12 +164,14 @@ impl TerminalApp {
     }
 
     pub(super) fn show_file_viewer(&mut self, ctx: &egui::Context) {
+        self.poll_file_viewer_load(ctx);
         self.poll_highlighter();
         if self.file_viewer.is_none() {
             return;
         }
         if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
             self.file_viewer = None;
+            self.file_viewer_rx = None;
             return;
         }
 
@@ -125,9 +184,9 @@ impl TerminalApp {
             .default_width(DEFAULT_WIDTH)
             .width_range(MIN_WIDTH..=MAX_WIDTH)
             .frame(
-                egui::Frame::none()
+                egui::Frame::NONE
                     .fill(code_bg())
-                    .inner_margin(egui::Margin::same(0.0)),
+                    .inner_margin(egui::Margin::same(0)),
             )
             .show(ctx, |ui| {
                 let Some(viewer) = self.file_viewer.as_ref() else {
@@ -172,11 +231,22 @@ impl TerminalApp {
                     return;
                 }
 
+                if viewer.loading {
+                    ui.add_space(16.0);
+                    ui.label(
+                        RichText::new("Leyendo archivo…")
+                            .size(11.0)
+                            .color(palette::DIM),
+                    );
+                    return;
+                }
+
                 draw_code(ui, viewer);
             });
 
         if close {
             self.file_viewer = None;
+            self.file_viewer_rx = None;
         }
         if let Some(path) = open_dropped {
             self.open_file_viewer(path);
@@ -186,6 +256,19 @@ impl TerminalApp {
                 self.toast_error(format!("No se pudo abrir en el editor: {err}"));
             }
         }
+    }
+}
+
+fn loading_file_state(path: PathBuf) -> FileViewerState {
+    FileViewerState {
+        path,
+        lines: Vec::new(),
+        truncated: false,
+        binary: false,
+        highlighted: Vec::new(),
+        highlight_token: None,
+        language: None,
+        loading: true,
     }
 }
 
@@ -226,7 +309,7 @@ fn draw_header(
         ui.add_space(10.0);
         let mut status = format!("{} líneas", viewer.lines.len());
         if viewer.truncated {
-            status.push_str(" · truncado a 2 MB");
+            status.push_str(" · truncado por límite seguro");
         }
         if viewer.highlighted.is_empty() && !viewer.lines.is_empty() {
             status.push_str(" · coloreando…");
@@ -337,6 +420,7 @@ fn load_file_for_view(path: &Path) -> FileViewerState {
         highlighted: Vec::new(),
         highlight_token: None,
         language: None,
+        loading: false,
     };
 
     // Lectura acotada: leemos como máximo un byte más que el tope para poder
@@ -368,10 +452,17 @@ fn load_file_for_view(path: &Path) -> FileViewerState {
             highlighted: Vec::new(),
             highlight_token: None,
             language: None,
+            loading: false,
         };
     }
     let text = String::from_utf8_lossy(&bytes);
-    let lines: Vec<String> = text.lines().map(|line| line.to_owned()).collect();
+    let mut source_lines = text.lines();
+    let lines: Vec<String> = source_lines
+        .by_ref()
+        .take(MAX_VIEW_LINES)
+        .map(str::to_owned)
+        .collect();
+    let truncated = truncated || source_lines.next().is_some();
     FileViewerState {
         path: path.to_path_buf(),
         lines,
@@ -380,12 +471,13 @@ fn load_file_for_view(path: &Path) -> FileViewerState {
         highlighted: Vec::new(),
         highlight_token: None,
         language: None,
+        loading: false,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{load_file_for_view, FileViewerState, MAX_VIEW_BYTES};
+    use super::{load_file_for_view, FileViewerState, MAX_VIEW_BYTES, MAX_VIEW_LINES};
 
     fn temp_path(tag: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("file-viewer-{tag}-{}", uuid::Uuid::new_v4()))
@@ -448,6 +540,19 @@ mod tests {
         let total: usize = state.lines.iter().map(String::len).sum();
         assert_eq!(total, MAX_VIEW_BYTES as usize);
     }
+
+    #[test]
+    fn many_tiny_lines_are_capped_to_avoid_memory_amplification() {
+        let path = temp_path("many-lines");
+        let body = "x\n".repeat(MAX_VIEW_LINES + 10);
+        std::fs::write(&path, body).expect("write");
+        let state = load_file_for_view(&path);
+        let _ = std::fs::remove_file(&path);
+
+        assert!(state.truncated);
+        assert_eq!(state.lines.len(), MAX_VIEW_LINES);
+    }
+
     fn viewer_with(lines: &[&str], highlighted: Vec<super::HighlightedLine>) -> FileViewerState {
         FileViewerState {
             path: std::path::PathBuf::from("/tmp/demo.rs"),
@@ -457,6 +562,7 @@ mod tests {
             highlighted,
             highlight_token: None,
             language: Some("Rust".to_owned()),
+            loading: false,
         }
     }
 

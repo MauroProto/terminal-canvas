@@ -150,7 +150,6 @@ mod tests {
         let create: CreateShareSessionResponse = json_post(
             &format!("{}/v1/share-sessions", server.local_api_url()),
             &CreateShareSessionRequest {
-                session_secret: "secret".to_owned(),
                 invite_secret: "invite-secret".to_owned(),
                 invite_expires_at: None,
                 passphrase_hash: None,
@@ -200,7 +199,6 @@ mod tests {
         let create: CreateShareSessionResponse = json_post(
             &format!("{}/v1/share-sessions", server.local_api_url()),
             &CreateShareSessionRequest {
-                session_secret: "secret".to_owned(),
                 invite_secret: "invite-secret".to_owned(),
                 invite_expires_at: None,
                 passphrase_hash: None,
@@ -233,7 +231,6 @@ mod tests {
         let create: CreateShareSessionResponse = json_post(
             &format!("{}/v1/share-sessions", server.local_api_url()),
             &CreateShareSessionRequest {
-                session_secret: "secret".to_owned(),
                 invite_secret: "invite-secret".to_owned(),
                 invite_expires_at: None,
                 passphrase_hash: Some(hash_passphrase("clave-super-segura").expect("hash")),
@@ -283,7 +280,6 @@ mod tests {
         let create: CreateShareSessionResponse = json_post(
             &format!("{}/v1/share-sessions", server.local_api_url()),
             &CreateShareSessionRequest {
-                session_secret: "secret".to_owned(),
                 invite_secret: "invite-secret".to_owned(),
                 invite_expires_at: None,
                 passphrase_hash: Some(hash_passphrase("clave-super-segura").expect("hash")),
@@ -327,7 +323,6 @@ mod tests {
         let create: CreateShareSessionResponse = json_post(
             &format!("{}/v1/share-sessions", server.local_api_url()),
             &CreateShareSessionRequest {
-                session_secret: "session-secret".to_owned(),
                 invite_secret: "invite-secret".to_owned(),
                 invite_expires_at: Some(Utc::now() - chrono::Duration::minutes(1)),
                 passphrase_hash: None,
@@ -358,7 +353,6 @@ mod tests {
         let create: CreateShareSessionResponse = json_post(
             &format!("{}/v1/share-sessions", server.local_api_url()),
             &CreateShareSessionRequest {
-                session_secret: "session-secret".to_owned(),
                 invite_secret: "invite-secret-1".to_owned(),
                 invite_expires_at: None,
                 passphrase_hash: None,
@@ -421,7 +415,6 @@ mod tests {
         let create: CreateShareSessionResponse = json_post(
             &format!("{}/v1/share-sessions", server.local_api_url()),
             &CreateShareSessionRequest {
-                session_secret: "session-secret".to_owned(),
                 invite_secret: "invite-secret".to_owned(),
                 invite_expires_at: None,
                 passphrase_hash: None,

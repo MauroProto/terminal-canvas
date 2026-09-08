@@ -16,6 +16,15 @@ use anyhow::Context as _;
 use portable_pty::{native_pty_system, Child, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use uuid::Uuid;
 
+fn next_log_sequence(counter: &AtomicU64) -> Option<u64> {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .ok()
+        .and_then(|previous| previous.checked_add(1))
+}
+
 use crate::runtime::SharedRuntimeScheduler;
 use crate::terminal::agent_status::{AgentStatusReport, AgentStatusStream};
 #[cfg(feature = "ghostty-vt")]
@@ -65,6 +74,22 @@ pub(crate) fn pty_clock_now_ms() -> i64 {
         .as_millis() as i64
 }
 
+fn wait_for_history_restore(restoring: &AtomicBool) {
+    while restoring.load(Ordering::Acquire) {
+        thread::sleep(Duration::from_millis(2));
+    }
+}
+
+fn yield_for_reader_priority(scheduler: &SharedRuntimeScheduler, session_id: Uuid) {
+    let delay = scheduler
+        .lock()
+        .map(|scheduler| scheduler.reader_delay(session_id))
+        .unwrap_or_default();
+    if !delay.is_zero() {
+        thread::sleep(delay);
+    }
+}
+
 pub struct PtyHandle {
     pub term: Arc<Mutex<Term<EventProxy>>>,
     title: Arc<ArcSwap<String>>,
@@ -78,8 +103,11 @@ pub struct PtyHandle {
     /// Último cwd reportado por el shell vía OSC 7 (si el shell lo emite).
     cwd: Arc<ArcSwap<Option<String>>>,
     /// Frames de log incremental pendientes de appendear al disco (P1.7).
-    /// El hilo lector y `resize` empujan frames; el autosave los drena.
+    /// El hilo lector y `resize` empujan frames; el autosave los confirma sólo
+    /// después de que el worker durable responde.
     pending_log: Arc<Mutex<Vec<u8>>>,
+    log_seq: Arc<AtomicU64>,
+    restoring_history: Arc<AtomicBool>,
     scrollback_limit: usize,
     #[cfg(feature = "ghostty-vt")]
     backend_kind: TerminalBackendKind,
@@ -93,6 +121,9 @@ pub struct PtyHandle {
     /// Sesión del daemon a la que este handle está atado, si es remota.
     #[cfg(all(unix, feature = "daemon"))]
     remote: Option<RemoteLink>,
+    /// El daemon ya replayó el historial de una sesión preexistente. El store
+    /// local no debe inyectar además el mismo checkpoint.
+    hot_reattached: bool,
     _reader_thread: thread::JoinHandle<()>,
 }
 
@@ -141,6 +172,8 @@ impl PtyHandle {
         let agent_status = Arc::new(ArcSwap::from_pointee(None));
         let cwd = Arc::new(ArcSwap::from_pointee(None));
         let pending_log = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let log_seq = Arc::new(AtomicU64::new(0));
+        let restoring_history = Arc::new(AtomicBool::new(false));
         let (event_tx, event_rx) = mpsc::channel::<Event>();
         let term_config = TermConfig {
             scrolling_history: crate::config::runtime_config().scrollback_lines,
@@ -188,6 +221,8 @@ impl PtyHandle {
         let agent_status_for_reader = Arc::clone(&agent_status);
         let cwd_for_reader = Arc::clone(&cwd);
         let pending_log_for_reader = Arc::clone(&pending_log);
+        let log_seq_for_reader = Arc::clone(&log_seq);
+        let restoring_for_reader = Arc::clone(&restoring_history);
         let scheduler_for_reader = Arc::clone(&scheduler);
         let reader_thread = thread::spawn(move || {
             // The parser processes untrusted terminal output; if it ever
@@ -202,6 +237,8 @@ impl PtyHandle {
                 // y el kernel bloquea al hijo.
                 let mut gate = crate::terminal::flow_control::FlowGate::new();
                 loop {
+                    wait_for_history_restore(&restoring_for_reader);
+                    yield_for_reader_priority(&scheduler_for_reader, session_id);
                     let pending_len = pending_log_for_reader
                         .lock()
                         .map(|pending| pending.len())
@@ -216,6 +253,10 @@ impl PtyHandle {
                     match reader.read(&mut buf) {
                         Ok(0) => break,
                         Ok(read) => {
+                            // La lectura puede haberse desbloqueado justo
+                            // después de iniciar el restore. Conservamos estos
+                            // bytes, pero no los parseamos hasta terminarlo.
+                            wait_for_history_restore(&restoring_for_reader);
                             let now_ms = pty_clock_now_ms();
                             let (clean, agent_reports, cwd_reports) =
                                 agent_stream.process(&buf[..read], now_ms);
@@ -232,12 +273,17 @@ impl PtyHandle {
                             // alimenta el grid queda pendiente de appendear.
                             if !clean.is_empty() {
                                 if let Ok(mut pending) = pending_log_for_reader.lock() {
-                                    pending.extend_from_slice(
-                                        &crate::state::scrollback_log::encode_frame(
-                                            crate::state::scrollback_log::FrameKind::Output,
-                                            &clean,
-                                        ),
-                                    );
+                                    if let Some(seq) = next_log_sequence(&log_seq_for_reader) {
+                                        pending.extend_from_slice(
+                                            &crate::state::scrollback_log::encode_frame(
+                                                seq,
+                                                crate::state::scrollback_log::FrameKind::Output,
+                                                &clean,
+                                            ),
+                                        );
+                                    } else {
+                                        log::error!("se agotó la secuencia incremental del PTY");
+                                    }
                                 }
                             }
                             #[cfg(feature = "ghostty-vt")]
@@ -295,6 +341,8 @@ impl PtyHandle {
             agent_status,
             cwd,
             pending_log,
+            log_seq,
+            restoring_history,
             scrollback_limit,
             #[cfg(feature = "ghostty-vt")]
             backend_kind,
@@ -305,6 +353,7 @@ impl PtyHandle {
             child: Some(child),
             #[cfg(all(unix, feature = "daemon"))]
             remote: None,
+            hot_reattached: false,
             _reader_thread: reader_thread,
         })
     }
@@ -320,8 +369,9 @@ impl PtyHandle {
         session_id: Uuid,
         control: std::os::unix::net::UnixStream,
         events: std::os::unix::net::UnixStream,
-        snapshot: &str,
+        snapshot: &[u8],
         attached_seq: u64,
+        hot_reattached: bool,
         cols: u16,
         rows: u16,
         scheduler: SharedRuntimeScheduler,
@@ -343,6 +393,8 @@ impl PtyHandle {
         let agent_status = Arc::new(ArcSwap::from_pointee(None));
         let cwd = Arc::new(ArcSwap::from_pointee(None));
         let pending_log = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let log_seq = Arc::new(AtomicU64::new(0));
+        let restoring_history = Arc::new(AtomicBool::new(false));
         let (event_tx, event_rx) = mpsc::channel::<Event>();
         let term_config = TermConfig {
             scrolling_history: crate::config::runtime_config().scrollback_lines,
@@ -360,7 +412,7 @@ impl PtyHandle {
         if !snapshot.is_empty() {
             if let Ok(mut term) = term.lock() {
                 let mut processor = Processor::<StdSyncHandler>::new();
-                processor.advance(&mut *term, snapshot.as_bytes());
+                processor.advance(&mut *term, snapshot);
             }
         }
 
@@ -377,13 +429,20 @@ impl PtyHandle {
         let agent_status_for_reader = Arc::clone(&agent_status);
         let cwd_for_reader = Arc::clone(&cwd);
         let scheduler_for_reader = Arc::clone(&scheduler);
+        let restoring_for_reader = Arc::clone(&restoring_history);
 
         let reader_thread = thread::spawn(move || {
             let loop_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let mut processor = Processor::<StdSyncHandler>::new();
                 let mut agent_stream = AgentStatusStream::new();
                 let mut reader = RemoteReader::new(events, session_id, attached_seq);
-                while let Some(bytes) = reader.next_output() {
+                loop {
+                    wait_for_history_restore(&restoring_for_reader);
+                    yield_for_reader_priority(&scheduler_for_reader, session_id);
+                    let Some(bytes) = reader.next_output() else {
+                        break;
+                    };
+                    wait_for_history_restore(&restoring_for_reader);
                     let now_ms = pty_clock_now_ms();
                     let (clean, agent_reports, cwd_reports) = agent_stream.process(&bytes, now_ms);
                     if let Some(report) = agent_reports.into_iter().next_back() {
@@ -433,6 +492,8 @@ impl PtyHandle {
             agent_status,
             cwd,
             pending_log,
+            log_seq,
+            restoring_history,
             scrollback_limit,
             #[cfg(feature = "ghostty-vt")]
             backend_kind: TerminalBackendKind::Alacritty,
@@ -442,6 +503,7 @@ impl PtyHandle {
             killer: None,
             child: None,
             remote: Some(link),
+            hot_reattached,
             _reader_thread: reader_thread,
         })
     }
@@ -479,10 +541,15 @@ impl PtyHandle {
         // replay reaplique el tamaño antes de seguir con el output.
         if size_changed {
             if let Ok(mut pending) = self.pending_log.lock() {
-                pending.extend_from_slice(&crate::state::scrollback_log::encode_frame(
-                    crate::state::scrollback_log::FrameKind::Resize,
-                    &crate::state::scrollback_log::resize_payload(cols, rows),
-                ));
+                if let Some(seq) = next_log_sequence(&self.log_seq) {
+                    pending.extend_from_slice(&crate::state::scrollback_log::encode_frame(
+                        seq,
+                        crate::state::scrollback_log::FrameKind::Resize,
+                        &crate::state::scrollback_log::resize_payload(cols, rows),
+                    ));
+                } else {
+                    log::error!("se agotó la secuencia incremental del PTY");
+                }
             }
         }
         #[cfg(feature = "ghostty-vt")]
@@ -511,6 +578,12 @@ impl PtyHandle {
         {
             false
         }
+    }
+
+    /// `true` sólo cuando este grid ya recibió el snapshot de una sesión que
+    /// sobrevivió a una corrida anterior de la app.
+    pub fn was_hot_reattached(&self) -> bool {
+        self.hot_reattached
     }
 
     pub fn write_all(&self, bytes: &[u8]) {
@@ -585,6 +658,9 @@ impl PtyHandle {
     }
 
     pub fn with_term<R>(&self, f: impl FnOnce(&mut Term<EventProxy>) -> R) -> Option<R> {
+        if self.restoring_history.load(Ordering::Acquire) {
+            return None;
+        }
         let mut term = self.term.try_lock().ok()?;
         Some(f(&mut term))
     }
@@ -613,8 +689,100 @@ impl PtyHandle {
     pub fn drain_pending_log(&self) -> Vec<u8> {
         self.pending_log
             .lock()
-            .map(|mut p| p.split_off(0))
+            .map(|mut pending| {
+                let drained = std::mem::take(&mut *pending);
+                self.log_seq.store(0, Ordering::Relaxed);
+                drained
+            })
             .unwrap_or_default()
+    }
+
+    /// Como `drain_pending_log`, pero drena como máximo `max_bytes` del
+    /// prefijo, cortando solo en fronteras de frame completas. Los frames
+    /// restantes quedan para el próximo drenado.
+    /// Se usa para el carril interactivo (P3.16, T2): la sesión enfocada
+    /// tiene un presupuesto de 32 KB por pump y el resto espera al siguiente.
+    pub fn drain_pending_log_capped(&self, max_bytes: usize) -> Vec<u8> {
+        self.pending_log
+            .lock()
+            .map(|mut pending| {
+                // Caminar frames completos hasta agotar el presupuesto.
+                // Cada frame: 8B seq + 1B kind + 4B len + payload.
+                let mut cut = 0;
+                while cut + 13 <= pending.len() && cut + 13 <= max_bytes {
+                    let payload_len = u32::from_le_bytes([
+                        pending[cut + 9],
+                        pending[cut + 10],
+                        pending[cut + 11],
+                        pending[cut + 12],
+                    ]) as usize;
+                    let frame_end = cut + 13 + payload_len;
+                    if frame_end > max_bytes || frame_end > pending.len() {
+                        break;
+                    }
+                    cut = frame_end;
+                }
+                let drained = pending.drain(..cut).collect();
+                if pending.is_empty() {
+                    self.log_seq.store(0, Ordering::Relaxed);
+                }
+                drained
+            })
+            .unwrap_or_default()
+    }
+
+    /// Copia el lote todavía no confirmado. No se quita de RAM hasta que el
+    /// worker durable confirma exactamente este prefijo.
+    pub fn pending_log_snapshot(&self) -> Vec<u8> {
+        self.pending_log
+            .lock()
+            .map(|pending| pending.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn acknowledge_pending_log(&self, written_bytes: usize) {
+        if let Ok(mut pending) = self.pending_log.lock() {
+            let acknowledged = written_bytes.min(pending.len());
+            pending.drain(..acknowledged);
+            if pending.is_empty() {
+                self.log_seq.store(0, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Snapshot consistente para checkpoint: el orden de locks coincide con
+    /// el lector (`term` y luego `pending_log`), así todo byte confirmado por
+    /// el ACK ya está representado en el texto exportado.
+    pub fn checkpoint_snapshot<R>(
+        &self,
+        export: impl FnOnce(&Term<EventProxy>) -> R,
+    ) -> Option<(R, usize)> {
+        if self.restoring_history.load(Ordering::Acquire) {
+            return None;
+        }
+        let term = self.term.lock().ok()?;
+        let pending_bytes = self.pending_log.lock().ok()?.len();
+        let text = export(&term);
+        Some((text, pending_bytes))
+    }
+
+    /// Crea la frontera atómica de un hot attach. El snapshot del grid y los
+    /// frames que todavía no recibieron `seq` se toman bajo el mismo orden de
+    /// locks que usa el reader (`term` → `pending_log`), de modo que ningún
+    /// byte pueda aparecer en el snapshot con un `seq` anterior.
+    pub fn attach_snapshot_and_drain<R>(
+        &self,
+        export: impl FnOnce(&Term<EventProxy>) -> R,
+    ) -> Option<(R, Vec<u8>)> {
+        if self.restoring_history.load(Ordering::Acquire) {
+            return None;
+        }
+        let term = self.term.lock().ok()?;
+        let mut pending = self.pending_log.lock().ok()?;
+        let snapshot = export(&term);
+        let frames = std::mem::take(&mut *pending);
+        self.log_seq.store(0, Ordering::Relaxed);
+        Some((snapshot, frames))
     }
 
     /// Restaura checkpoint + frames del log incremental en orden (P1.7).
@@ -625,38 +793,114 @@ impl PtyHandle {
         checkpoint: &[u8],
         frames: &[crate::state::scrollback_log::Frame],
     ) {
-        if !checkpoint.is_empty() {
-            self.replay_history(checkpoint);
-        }
-        if frames.is_empty() {
+        self.replay_session_preserving_live(checkpoint, frames, |_| Vec::new());
+    }
+
+    /// Variante usada por la app real: recibe el exportador semántico desde
+    /// el módulo host para que los harness que montan `pty.rs` por `#[path]`
+    /// no tengan que incluir todo `terminal::export`.
+    pub fn replay_session_preserving_live(
+        &self,
+        checkpoint: &[u8],
+        frames: &[crate::state::scrollback_log::Frame],
+        export_live: impl FnOnce(&Term<EventProxy>) -> Vec<u8> + Send + 'static,
+    ) {
+        if checkpoint.is_empty() && frames.is_empty() {
             return;
         }
-        let Ok(mut term) = self.term.lock() else {
+        if self
+            .restoring_history
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
             return;
-        };
-        let mut processor = Processor::<StdSyncHandler>::new();
-        for frame in frames {
-            match frame.kind {
-                crate::state::scrollback_log::FrameKind::Output => {
-                    processor.advance(&mut *term, &frame.payload);
-                }
-                crate::state::scrollback_log::FrameKind::Resize => {
-                    if let Some((cols, rows)) =
-                        crate::state::scrollback_log::parse_resize(&frame.payload)
-                    {
-                        term.resize(TermSize::new(cols as usize, rows as usize));
+        }
+        let checkpoint = checkpoint.to_vec();
+        let frames = frames.to_vec();
+        let term = Arc::clone(&self.term);
+        let restoring = Arc::clone(&self.restoring_history);
+        let restoring_for_thread = Arc::clone(&restoring);
+        let render_revision = Arc::clone(&self.render_revision);
+        let spawn_result = thread::Builder::new()
+            .name("scrollback-replay".to_owned())
+            .spawn(move || {
+                let replay_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    const CHUNK_BYTES: usize = 16 * 1024;
+                    let mut processor = Processor::<StdSyncHandler>::new();
+                    // El shell puede haber emitido prompt/salida mientras el
+                    // checkpoint se leía en el worker. Capturamos ese grid,
+                    // limpiamos y lo reinyectamos al final: historial viejo
+                    // primero, salida viva después, sin perder ninguna de las
+                    // dos ni congelar el frame durante I/O de disco.
+                    let live_output = {
+                        let Ok(mut term) = term.lock() else {
+                            return;
+                        };
+                        let live = export_live(&term);
+                        processor.advance(&mut *term, b"\x1b[2J\x1b[3J");
+                        live
+                    };
+                    for chunk in checkpoint.chunks(CHUNK_BYTES) {
+                        let Ok(mut term) = term.lock() else {
+                            return;
+                        };
+                        processor.advance(&mut *term, chunk);
+                        drop(term);
+                        thread::yield_now();
                     }
+                    for frame in frames {
+                        match frame.kind {
+                            crate::state::scrollback_log::FrameKind::Output => {
+                                for chunk in frame.payload.chunks(CHUNK_BYTES) {
+                                    let Ok(mut term) = term.lock() else {
+                                        return;
+                                    };
+                                    processor.advance(&mut *term, chunk);
+                                    drop(term);
+                                    thread::yield_now();
+                                }
+                            }
+                            crate::state::scrollback_log::FrameKind::Resize => {
+                                if let Some((cols, rows)) =
+                                    crate::state::scrollback_log::parse_resize(&frame.payload)
+                                {
+                                    let Ok(mut term) = term.lock() else {
+                                        return;
+                                    };
+                                    term.resize(TermSize::new(cols as usize, rows as usize));
+                                }
+                            }
+                            crate::state::scrollback_log::FrameKind::Clear => {
+                                let Ok(mut term) = term.lock() else {
+                                    return;
+                                };
+                                processor.advance(&mut *term, b"\x1b[2J\x1b[3J");
+                            }
+                        }
+                    }
+                    if let Ok(mut term) = term.lock() {
+                        processor
+                            .advance(&mut *term, &crate::state::scrollback_store::replay_marker());
+                    }
+                    for chunk in live_output.chunks(CHUNK_BYTES) {
+                        let Ok(mut term) = term.lock() else {
+                            return;
+                        };
+                        processor.advance(&mut *term, chunk);
+                        drop(term);
+                        thread::yield_now();
+                    }
+                }));
+                if replay_result.is_err() {
+                    log::error!("el replay de scrollback paniqueó");
                 }
-                crate::state::scrollback_log::FrameKind::Clear => {
-                    // Equivalente ANSI de un clear: pantalla + scrollback.
-                    processor.advance(&mut *term, b"\x1b[2J\x1b[3J");
-                }
-            }
+                render_revision.fetch_add(1, Ordering::Release);
+                restoring_for_thread.store(false, Ordering::Release);
+            });
+        if let Err(err) = spawn_result {
+            restoring.store(false, Ordering::Release);
+            log::warn!("no se pudo iniciar el replay de scrollback: {err}");
         }
-        // El marcador de "sesión anterior" va al final de todo el replay.
-        processor.advance(&mut *term, &crate::state::scrollback_store::replay_marker());
-        drop(term);
-        self.mark_render_dirty();
     }
 
     pub fn title_snapshot(&self) -> Option<String> {
@@ -739,6 +983,9 @@ fn shell_command(cwd: Option<&Path>, hooks: HookIdentity) -> CommandBuilder {
 
     if let Some(cwd) = cwd {
         cmd.cwd(cwd);
+        // El bridge MCP hereda esta raíz desde el shell y la usa como
+        // frontera confiable, en vez de aceptar cualquier cwd del agente.
+        cmd.env("TC_MEMORY_ROOT", cwd.as_os_str());
     }
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
@@ -751,6 +998,9 @@ fn shell_command(cwd: Option<&Path>, hooks: HookIdentity) -> CommandBuilder {
     if let Some(workspace_id) = hooks.workspace_id {
         cmd.env("TC_WORKSPACE_ID", workspace_id.to_string());
     }
+    if let Some(leaf_id) = hooks.leaf_id {
+        cmd.env("TC_LEAF_ID", leaf_id.to_string());
+    }
     cmd
 }
 
@@ -760,6 +1010,7 @@ fn shell_command(cwd: Option<&Path>, hooks: HookIdentity) -> CommandBuilder {
 pub struct HookIdentity {
     pub panel_id: Option<Uuid>,
     pub workspace_id: Option<Uuid>,
+    pub leaf_id: Option<Uuid>,
 }
 
 fn drain_terminal_events(
@@ -910,8 +1161,17 @@ impl Drop for PtyHandle {
 mod tests {
     use std::ffi::OsString;
     use std::path::Path;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::shell_command;
+
+    #[test]
+    fn incremental_sequence_fails_closed_at_u64_max() {
+        let sequence = AtomicU64::new(u64::MAX);
+
+        assert_eq!(super::next_log_sequence(&sequence), None);
+        assert_eq!(sequence.load(Ordering::Relaxed), u64::MAX);
+    }
 
     #[cfg(unix)]
     #[test]
@@ -939,5 +1199,82 @@ mod tests {
         assert_eq!(command.get_env("TERM"), Some("xterm-256color".as_ref()));
         assert_eq!(command.get_env("COLORTERM"), Some("truecolor".as_ref()));
         assert_eq!(command.get_env("MI_TERMINAL"), Some("1".as_ref()));
+        assert_eq!(command.get_env("TC_MEMORY_ROOT"), Some(cwd.as_os_str()));
+    }
+
+    #[test]
+    fn drain_pending_log_capped_respects_frame_boundaries() {
+        use crate::state::scrollback_log::{encode_frame, read_frames, FrameKind};
+
+        let frame_a = encode_frame(1, FrameKind::Output, b"aaaa"); // 13 + 4 = 17 bytes
+        let frame_b = encode_frame(2, FrameKind::Output, b"bbbb"); // 17 bytes
+        let frame_c = encode_frame(3, FrameKind::Output, b"cccc"); // 17 bytes
+        let mut all = Vec::new();
+        all.extend_from_slice(&frame_a);
+        all.extend_from_slice(&frame_b);
+        all.extend_from_slice(&frame_c);
+        assert_eq!(all.len(), 51);
+
+        // Drenar solo 20 bytes: cabe el frame_a (17B) pero no el frame_b.
+        let pending = std::sync::Arc::new(std::sync::Mutex::new(all.clone()));
+        let drained = {
+            let mut pending = pending.lock().unwrap();
+            let mut cut = 0;
+            let max_bytes = 20;
+            while cut + 13 <= pending.len() && cut + 13 <= max_bytes {
+                let payload_len = u32::from_le_bytes([
+                    pending[cut + 9],
+                    pending[cut + 10],
+                    pending[cut + 11],
+                    pending[cut + 12],
+                ]) as usize;
+                let frame_end = cut + 13 + payload_len;
+                if frame_end > max_bytes || frame_end > pending.len() {
+                    break;
+                }
+                cut = frame_end;
+            }
+            let drained: Vec<u8> = pending.drain(..cut).collect();
+            drained
+        };
+        assert_eq!(drained.len(), 17, "solo cabe el primer frame en 20 bytes");
+        let (_, frames) = read_frames(
+            &[
+                crate::state::scrollback_log::encode_header(0),
+                drained.clone(),
+            ]
+            .concat(),
+        )
+        .unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].payload, b"aaaa");
+    }
+
+    #[test]
+    fn shell_command_exports_panel_workspace_and_leaf_identity() {
+        let panel = uuid::Uuid::new_v4();
+        let workspace = uuid::Uuid::new_v4();
+        let leaf = uuid::Uuid::new_v4();
+        let command = shell_command(
+            None,
+            super::HookIdentity {
+                panel_id: Some(panel),
+                workspace_id: Some(workspace),
+                leaf_id: Some(leaf),
+            },
+        );
+
+        assert_eq!(
+            command.get_env("TC_PANEL_ID"),
+            Some(std::ffi::OsStr::new(&panel.to_string()))
+        );
+        assert_eq!(
+            command.get_env("TC_WORKSPACE_ID"),
+            Some(std::ffi::OsStr::new(&workspace.to_string()))
+        );
+        assert_eq!(
+            command.get_env("TC_LEAF_ID"),
+            Some(std::ffi::OsStr::new(&leaf.to_string()))
+        );
     }
 }

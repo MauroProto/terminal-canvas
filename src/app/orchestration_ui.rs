@@ -3,6 +3,8 @@
 //! lanzamiento de agentes (con worktree asíncrono).
 
 use std::collections::HashSet;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use uuid::Uuid;
@@ -16,6 +18,82 @@ use crate::state::{TerminalSpawnRequest, Workspace};
 use super::TerminalApp;
 
 pub(super) const ORCHESTRATION_REFRESH_INTERVAL: Duration = Duration::from_millis(750);
+
+enum LaunchSource {
+    Manual(Uuid),
+    GithubIssue(u64),
+    LinearIssue(String),
+}
+
+struct MemoryLaunchJob {
+    request: AgentLaunchRequest,
+    source: LaunchSource,
+}
+
+struct MemoryLaunchCompletion {
+    request: AgentLaunchRequest,
+    source: LaunchSource,
+}
+
+pub(super) struct LaunchMemoryWorker {
+    jobs: Sender<MemoryLaunchJob>,
+    completions: Receiver<MemoryLaunchCompletion>,
+    in_flight: usize,
+}
+
+impl LaunchMemoryWorker {
+    pub(super) fn new() -> Self {
+        let (jobs_tx, jobs_rx) = mpsc::channel::<MemoryLaunchJob>();
+        let (completion_tx, completion_rx) = mpsc::channel();
+        thread::Builder::new()
+            .name("launch-memory-worker".to_owned())
+            .spawn(move || {
+                while let Ok(mut job) = jobs_rx.recv() {
+                    job.request.brief = crate::memory::launch_brief_with_memory_scoped(
+                        &job.request.brief,
+                        job.request.base_cwd.as_deref(),
+                        crate::memory::process_store().as_ref(),
+                        job.request.task_id,
+                        Some(job.request.workspace_id),
+                    );
+                    if completion_tx
+                        .send(MemoryLaunchCompletion {
+                            request: job.request,
+                            source: job.source,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+            .expect("launch memory worker");
+        Self {
+            jobs: jobs_tx,
+            completions: completion_rx,
+            in_flight: 0,
+        }
+    }
+
+    fn submit(&mut self, job: MemoryLaunchJob) -> bool {
+        if self.jobs.send(job).is_err() {
+            return false;
+        }
+        self.in_flight += 1;
+        true
+    }
+
+    fn poll(&mut self) -> Vec<MemoryLaunchCompletion> {
+        let completions = self.completions.try_iter().collect::<Vec<_>>();
+        self.in_flight = self.in_flight.saturating_sub(completions.len());
+        completions
+    }
+
+    fn in_flight(&self) -> bool {
+        self.in_flight > 0
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct LaunchAgentDraft {
     pub(super) workspace_id: Uuid,
@@ -27,6 +105,9 @@ pub(super) struct LaunchAgentDraft {
     // El worktree del agente se crea en un worker; mientras tanto el diálogo
     // queda abierto mostrando progreso.
     pub(super) pending_session: Option<Uuid>,
+    // El contexto de memoria se resuelve fuera del frame antes de preparar el
+    // launch. El id evita que una respuesta vieja lance un diálogo cancelado.
+    pub(super) pending_memory: Option<Uuid>,
 }
 
 impl TerminalApp {
@@ -39,7 +120,7 @@ impl TerminalApp {
                     workspace.id,
                     workspace.cwd.clone(),
                     panel.id(),
-                    panel.runtime_session_id(),
+                    panel.focused_runtime_session_id(),
                     panel.title(),
                 );
             }
@@ -62,7 +143,7 @@ impl TerminalApp {
             .workspaces
             .iter()
             .flat_map(|workspace| workspace.panels.iter())
-            .filter_map(|panel| panel.runtime_session_id())
+            .flat_map(|panel| panel.all_runtime_session_ids())
             .collect();
         retain_seen_sessions(&mut self.agent_status_seen, &live_sessions);
     }
@@ -117,7 +198,7 @@ impl TerminalApp {
                 .workspaces
                 .iter()
                 .flat_map(|workspace| workspace.panels.iter())
-                .find(|panel| panel.runtime_session_id() == Some(session_id))
+                .find(|panel| panel.all_runtime_session_ids().contains(&session_id))
                 .map(|panel| (panel.focused(), panel.is_alive()));
             let Some((focused, alive)) = panel_state else {
                 continue;
@@ -128,7 +209,7 @@ impl TerminalApp {
             if !focused || !self.window_focused {
                 for workspace in &mut self.workspaces {
                     for panel in &mut workspace.panels {
-                        if panel.runtime_session_id() == Some(session_id) {
+                        if panel.all_runtime_session_ids().contains(&session_id) {
                             panel.set_unread(true);
                         }
                     }
@@ -182,10 +263,12 @@ impl TerminalApp {
             if let Some(session_id) = event.session_id.clone() {
                 for workspace in &mut self.workspaces {
                     for panel in &mut workspace.panels {
-                        if panel.id() == panel_id
-                            && panel.agent_session_id() != Some(session_id.as_str())
-                        {
-                            panel.set_agent_session_id(Some(session_id.clone()));
+                        if panel.id() == panel_id {
+                            // Hooks previos a la identidad multi-hoja no
+                            // mandaban `leaf`; su metadata pertenecía a la
+                            // sesión raíz del panel.
+                            let leaf_id = event.leaf_id.unwrap_or_else(|| panel.root_leaf_id());
+                            panel.set_agent_session_id_for_leaf(leaf_id, Some(session_id.clone()));
                         }
                     }
                 }
@@ -200,10 +283,22 @@ impl TerminalApp {
     /// Pide (o refresca) PRs e issues del repo del workspace activo.
     pub(super) fn refresh_github_tasks(&mut self, force: bool) {
         let Some(repo_root) = self.ws().cwd.clone() else {
+            self.tasks_state.repo_root = None;
+            self.tasks_state.availability = None;
+            self.tasks_state.snapshot = Default::default();
+            self.tasks_state.loading = false;
             return;
         };
-        self.tasks_state.loading = true;
-        self.gh_client.request(repo_root, force);
+        let repo_changed = self.tasks_state.repo_root.as_deref() != Some(repo_root.as_path());
+        if repo_changed {
+            self.tasks_state.repo_root = Some(repo_root.clone());
+            self.tasks_state.availability = None;
+            self.tasks_state.snapshot = Default::default();
+            self.tasks_state.loading = false;
+        }
+        self.gh_client
+            .request(repo_root.clone(), force || repo_changed);
+        self.tasks_state.loading = self.gh_client.is_loading_for(&repo_root);
         // Linear es opt-in: sin token en config.toml el worker ni se toca, y
         // la sección no se dibuja.
         let linear_token = crate::config::runtime_config().linear_token;
@@ -215,6 +310,9 @@ impl TerminalApp {
     /// Drena los resultados de los workers de `gh` y Linear hacia la pestaña.
     pub(super) fn poll_gh_client(&mut self) {
         for result in self.gh_client.poll() {
+            if self.tasks_state.repo_root.as_deref() != Some(result.repo_root.as_path()) {
+                continue;
+            }
             self.tasks_state.loading = false;
             self.tasks_state.availability = Some(result.availability);
             self.tasks_state.snapshot = result.snapshot;
@@ -251,17 +349,7 @@ impl TerminalApp {
             ),
             worktree_mode: WorktreeMode::Auto,
         };
-        match self.orchestrator.prepare_launch(request) {
-            Ok(LaunchPreparation::Ready(plan)) => {
-                if let Some(ctx) = self.ctx.clone() {
-                    self.spawn_agent_panel(&ctx, &plan);
-                }
-            }
-            // El worktree se crea en el worker; poll_pending_launches lo
-            // aterriza (Linear no tiene badge numérico que enganchar).
-            Ok(LaunchPreparation::PendingWorktree { .. }) => {}
-            Err(err) => self.toast_error(format!("No se pudo arrancar {identifier}: {err}")),
-        }
+        self.queue_launch_with_memory(request, LaunchSource::LinearIssue(identifier.to_owned()));
     }
 
     /// Abre el PR/issue en el navegador con `gh browse`, que resuelve la URL
@@ -305,21 +393,7 @@ impl TerminalApp {
             brief: crate::orchestration::issue_prompt(number, &issue.title, &issue.body),
             worktree_mode: WorktreeMode::Auto,
         };
-        match self.orchestrator.prepare_launch(request) {
-            Ok(LaunchPreparation::Ready(plan)) => {
-                if let Some(ctx) = self.ctx.clone() {
-                    if self.spawn_agent_panel(&ctx, &plan) {
-                        self.link_issue_to_panel(plan.session_id, number);
-                    }
-                }
-            }
-            Ok(LaunchPreparation::PendingWorktree { session_id }) => {
-                // El worktree se crea en el worker; al aterrizar el panel se
-                // le pega el issue.
-                self.pending_issue_links.insert(session_id, number);
-            }
-            Err(err) => self.toast_error(format!("No se pudo arrancar el issue #{number}: {err}")),
-        }
+        self.queue_launch_with_memory(request, LaunchSource::GithubIssue(number));
     }
 
     /// Asocia el issue al panel recién creado, para el badge `#N`.
@@ -402,6 +476,7 @@ impl TerminalApp {
             worktree_mode: WorktreeMode::Auto,
             error: None,
             pending_session: None,
+            pending_memory: None,
         });
     }
     pub(super) fn submit_launch_agent(&mut self, ctx: &egui::Context) {
@@ -420,33 +495,23 @@ impl TerminalApp {
             brief: draft.brief.clone(),
             worktree_mode: draft.worktree_mode,
         };
-        let preparation = match self.orchestrator.prepare_launch(request) {
-            Ok(preparation) => preparation,
-            Err(err) => {
-                if let Some(current) = self.launch_agent.as_mut() {
-                    current.error = Some(err.to_string());
-                }
-                return;
+        let request_id = Uuid::new_v4();
+        if let Some(current) = self.launch_agent.as_mut() {
+            current.error = None;
+            current.pending_memory = Some(request_id);
+        }
+        if !self.queue_launch_with_memory(request, LaunchSource::Manual(request_id)) {
+            if let Some(current) = self.launch_agent.as_mut() {
+                current.pending_memory = None;
+                current.error = Some("No se pudo iniciar el worker de memoria".to_owned());
             }
-        };
-        match preparation {
-            LaunchPreparation::Ready(plan) => {
-                if self.spawn_agent_panel(ctx, &plan) {
-                    self.launch_agent = None;
-                }
-            }
-            LaunchPreparation::PendingWorktree { session_id } => {
-                // El worktree se está creando en el worker; el diálogo queda
-                // abierto con progreso y poll_pending_launches lo cierra.
-                if let Some(current) = self.launch_agent.as_mut() {
-                    current.error = None;
-                    current.pending_session = Some(session_id);
-                }
-            }
+        } else {
+            ctx.request_repaint_after(Duration::from_millis(16));
         }
     }
 
     pub(super) fn poll_pending_launches(&mut self, ctx: &egui::Context) {
+        self.poll_memory_launches(ctx);
         if self.orchestrator.has_pending_launches() {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
@@ -483,6 +548,79 @@ impl TerminalApp {
                     }
                 }
             }
+        }
+    }
+
+    fn queue_launch_with_memory(
+        &mut self,
+        request: AgentLaunchRequest,
+        source: LaunchSource,
+    ) -> bool {
+        self.launch_memory_worker
+            .submit(MemoryLaunchJob { request, source })
+    }
+
+    fn poll_memory_launches(&mut self, ctx: &egui::Context) {
+        for completion in self.launch_memory_worker.poll() {
+            if let LaunchSource::Manual(request_id) = &completion.source {
+                let current = self
+                    .launch_agent
+                    .as_ref()
+                    .and_then(|draft| draft.pending_memory);
+                if current != Some(*request_id) {
+                    continue;
+                }
+                if let Some(draft) = self.launch_agent.as_mut() {
+                    draft.pending_memory = None;
+                }
+            }
+
+            let preparation = self.orchestrator.prepare_launch(completion.request);
+            match (completion.source, preparation) {
+                (LaunchSource::Manual(_), Ok(LaunchPreparation::Ready(plan))) => {
+                    if self.spawn_agent_panel(ctx, &plan) {
+                        self.launch_agent = None;
+                    }
+                }
+                (
+                    LaunchSource::Manual(_),
+                    Ok(LaunchPreparation::PendingWorktree { session_id }),
+                ) => {
+                    if let Some(draft) = self.launch_agent.as_mut() {
+                        draft.error = None;
+                        draft.pending_session = Some(session_id);
+                    }
+                }
+                (LaunchSource::Manual(_), Err(err)) => {
+                    if let Some(draft) = self.launch_agent.as_mut() {
+                        draft.error = Some(err.to_string());
+                    }
+                }
+                (LaunchSource::GithubIssue(number), Ok(LaunchPreparation::Ready(plan))) => {
+                    if self.spawn_agent_panel(ctx, &plan) {
+                        self.link_issue_to_panel(plan.session_id, number);
+                    }
+                }
+                (
+                    LaunchSource::GithubIssue(number),
+                    Ok(LaunchPreparation::PendingWorktree { session_id }),
+                ) => {
+                    self.pending_issue_links.insert(session_id, number);
+                }
+                (LaunchSource::GithubIssue(number), Err(err)) => {
+                    self.toast_error(format!("No se pudo arrancar el issue #{number}: {err}"));
+                }
+                (LaunchSource::LinearIssue(_), Ok(LaunchPreparation::Ready(plan))) => {
+                    self.spawn_agent_panel(ctx, &plan);
+                }
+                (LaunchSource::LinearIssue(_), Ok(LaunchPreparation::PendingWorktree { .. })) => {}
+                (LaunchSource::LinearIssue(identifier), Err(err)) => {
+                    self.toast_error(format!("No se pudo arrancar {identifier}: {err}"));
+                }
+            }
+        }
+        if self.launch_memory_worker.in_flight() {
+            ctx.request_repaint_after(Duration::from_millis(16));
         }
     }
 

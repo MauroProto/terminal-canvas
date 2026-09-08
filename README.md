@@ -40,10 +40,12 @@ Native desktop workspace for terminals and coding agents.
   capture's path is pasted into the agent's prompt
 - Git branch badge in each panel's title bar, with a dot when the repo is dirty (drawn only
   when it fits without covering the title)
-- Resume past agent conversations: the app does not store them, it reads the history the CLI
-  already wrote (Claude Code keeps one JSONL per session under `~/.claude/projects/<cwd-slug>/`)
-  and relaunches the one you pick with `--resume <id>`. A restored panel also re-enters its
-  agent with the provider's continue flag, so a restart no longer orphans the conversation
+- Resume agent conversations (`Ctrl+Shift+R`): Claude Code gets an exact-session picker backed by
+  its own history; Codex, Gemini, OpenCode and Copilot use their verified native “latest session”
+  command. Resume replaces the focused runtime in a fresh shell, so the command is never submitted
+  as chat text. Restored panels use an exact hook-captured session id when available, otherwise the
+  provider's native latest-session command. Split leaves persist their command and session id
+  independently, so each terminal resumes its own conversation
 - Toast notices confirming actions that have no other visible feedback
 - Project file explorer (sidebar "Files" tab): lazy tree of the active workspace, click a file
   to read it in the built-in viewer, heavy directories (`.git`, `node_modules`, `target`) skipped
@@ -121,10 +123,15 @@ cargo build --release
 ./target/release/mi-terminal
 ```
 
-### PTY daemon (opt-in)
+### PTY daemon
 
-With the `daemon` feature the terminals live in a separate process, so closing
-(or crashing) the app no longer kills the agents that are working:
+The macOS bundle is built with the `daemon` feature and includes
+`Contents/MacOS/mi-terminal-daemon`. Terminals can therefore live in a separate
+process, so closing (or crashing) the UI does not kill the agents that are
+working. The app starts and reconnects to the bundled helper automatically.
+
+Source and development builds keep the feature opt-in. To exercise the same
+path on Unix:
 
 ```bash
 cargo build --features daemon --bins
@@ -135,13 +142,39 @@ The app spawns the daemon on first run (`fork+setsid`), reattaches to its own
 sessions on restart — same shell, same history, same running processes — and
 asks it to shut down once the last app closes and no sessions are left. If the
 daemon cannot start, the app falls back to in-process terminals and says why in
-the log. It is off by default on purpose: the migration is gradual.
+the log. A plain `cargo run --bin mi-terminal` does not enable the feature and
+uses the in-process runtime.
 
-On macOS you can also launch the bundled helper:
+Daemon clients use bounded output queues: a stalled UI is disconnected instead
+of growing memory without limit, then reattaches from the latest snapshot and
+sequence number. Scrollback checkpoints are written outside the global session
+lock so disk latency cannot block input, resize or attach operations.
+
+The daemon protocol is versioned (currently v3). Each app identifies itself
+with a `client_id` at handshake so the daemon can track session ownership: a
+live app cannot reconcile away another live app's sessions, and orphaned
+sessions are only cleaned up after their owner disconnects. A second daemon
+cannot steal an active socket — the existing socket is probed for liveness and
+refused connections leave the pid-file untouched. Hot reattach exports a
+semantic ANSI snapshot from the live terminal grid (history + visible screen)
+instead of a raw byte tail that can start mid-UTF-8 or miss scrollback still in
+the grid. Incremental scrollback logs carry monotonic sequence numbers and the
+decoder rejects gaps, so a torn append cannot silently corrupt history.
+Persistence uses non-destructive snapshots with durable acknowledgements: the
+pending log is only trimmed after the worker confirms the append, and failed
+appends stay in RAM for retry. Scrollback restore and SQLite memory operations
+run on background workers so the UI frame never blocks on file I/O.
+
+Build the distributable macOS app (and, optionally, its DMG) with:
 
 ```bash
-./abrir-mi-terminal.command
+scripts/bundle.sh
+scripts/bundle.sh --dmg
 ```
+
+Signing and notarization require external Apple credentials; producing a local
+bundle is not evidence that a public release has been signed or published. See
+[`docs/RELEASE.md`](docs/RELEASE.md) for the current release status.
 
 ## Current architecture direction
 
@@ -151,6 +184,28 @@ The current product shape is:
 
 There is still legacy `canvas` naming inside the repo. That is implementation debt, not the intended product identity.
 
+Shared project memory and task handoffs now have an MVP backed by a private
+local SQLite database. The app exposes review/approve/forget UI, `tc-memory`
+provides a provider-neutral CLI, and `tc-memory-mcp` exposes read/propose tools:
+
+```bash
+cargo run --bin tc-memory -- health
+cargo run --bin tc-memory -- remember --cwd "$PWD" \
+  --key architecture/auth --content "Use HttpOnly cookies"
+cargo run --bin tc-memory -- context --cwd "$PWD"
+```
+
+Agent proposals stay pending until a human approves them. Different projects
+are isolated by default; worktrees of the same repository share project memory
+but keep task handoffs separate. The implemented MVP and the remaining
+single-writer daemon / memory-space roadmap are documented in:
+[`docs/architecture/shared-agent-memory.md`](docs/architecture/shared-agent-memory.md).
+
+The bundled MCP bridge is project/worktree-scoped through `TC_MEMORY_ROOT`
+(exported by TerminalCanvas terminals). Automatic Codex and OpenCode MCP/plugin
+registration is not shipped yet; current automatic integration is launch-time
+context for providers plus managed lifecycle hooks for Claude Code.
+
 ## Development status
 
 The repository is in active consolidation. The main priorities are:
@@ -159,6 +214,8 @@ The repository is in active consolidation. The main priorities are:
 - harden collaboration privacy and protocol guarantees
 - finish splitting shell/runtime responsibilities
 - reconcile performance budget docs with the actual UI behavior
+- execute the externally credentialed signed/notarized release and publish the Homebrew cask
+- connect the existing release checker to a verified download/install flow
 
 ## Verification
 
@@ -171,6 +228,11 @@ cargo test --quiet
 ```
 
 Optional Ghostty VT backend spike:
+
+> Experimental: requires Zig 0.15.2 and a compatible full Xcode/SDK toolchain.
+> It is not part of the production release matrix. On the currently validated
+> macOS 26 Command Line Tools-only host, `libghostty-vt-sys 0.1.1` fails while
+> linking its Zig build runner before the Rust tests can start.
 
 ```bash
 PATH=/opt/homebrew/opt/zig@0.15/bin:$PATH \
