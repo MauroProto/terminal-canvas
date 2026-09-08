@@ -931,14 +931,14 @@ impl PtyHandle {
     /// byte pueda aparecer en el snapshot con un `seq` anterior.
     pub fn attach_snapshot_and_drain<R>(
         &self,
-        export: impl FnOnce(&Term<EventProxy>) -> R,
+        export: impl FnOnce(&mut Term<EventProxy>) -> R,
     ) -> Option<(R, Vec<u8>)> {
         if self.restoring_history.load(Ordering::Acquire) {
             return None;
         }
-        let term = self.term.lock().ok()?;
+        let mut term = self.term.lock().ok()?;
         let mut pending = self.pending_log.lock().ok()?;
-        let snapshot = export(&term);
+        let snapshot = export(&mut term);
         let frames = std::mem::take(&mut *pending);
         self.log_seq.store(0, Ordering::Relaxed);
         Some((snapshot, frames))
@@ -950,14 +950,14 @@ impl PtyHandle {
         &self,
         max_bytes: usize,
         was_alternate: bool,
-        export: impl FnOnce(&Term<EventProxy>) -> String,
+        export: impl FnOnce(&mut Term<EventProxy>) -> String,
     ) -> Option<(Vec<u8>, bool, Option<String>)> {
         if self.restoring_history.load(Ordering::Acquire) {
             return None;
         }
-        let term = self.term.lock().ok()?;
+        let mut term = self.term.lock().ok()?;
         let alternate = term.mode().contains(TermMode::ALT_SCREEN);
-        let snapshot = (was_alternate && !alternate).then(|| export(&term));
+        let snapshot = (was_alternate && !alternate).then(|| export(&mut term));
         let mut pending = self.pending_log.lock().ok()?;
         let frames = drain_log_prefix(
             &mut pending,

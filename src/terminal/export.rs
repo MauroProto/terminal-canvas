@@ -53,6 +53,48 @@ pub fn scrollback_to_ansi(term: &Term<EventProxy>) -> String {
 /// input modes so subsequent PTY bytes continue at the same visible state.
 /// This deliberately differs from the compact durable history export.
 pub fn live_snapshot_to_ansi(term: &Term<EventProxy>) -> String {
+    live_snapshot_with_options(term, 0, term.grid().screen_lines() - 1, None)
+}
+
+/// The public VT handler exposes cursor movement constrained by DECSTBM.
+/// Probe those bounds and tab stops under the caller's terminal lock, then
+/// restore the exact cursor and origin flag. No text, saved cursor, screen,
+/// parser state, or selection is modified; only repaint damage is broadened.
+pub fn live_snapshot_with_terminal_state(term: &mut Term<EventProxy>) -> String {
+    use alacritty_terminal::vte::ansi::{Handler, NamedPrivateMode, PrivateMode};
+    let cursor = term.grid().cursor.clone();
+    let origin = term.mode().contains(TermMode::ORIGIN);
+    let mode = PrivateMode::Named(NamedPrivateMode::Origin);
+    term.set_private_mode(mode);
+    let top = term.grid().cursor.point.line.0 as usize;
+    term.goto(term.grid().screen_lines() as i32, 0);
+    let bottom = term.grid().cursor.point.line.0 as usize;
+    let mut tabs = Vec::new();
+    if term.grid().columns() > 1 {
+        term.grid_mut().cursor.point.column.0 = 1;
+        term.move_backward_tabs(1);
+        if term.grid().cursor.point.column.0 == 0 {
+            tabs.push(0);
+        }
+    }
+    term.grid_mut().cursor.point.column.0 = 0;
+    while term.grid().cursor.point.column.0 + 1 < term.grid().columns() {
+        term.move_forward_tabs(1);
+        tabs.push(term.grid().cursor.point.column.0);
+    }
+    if !origin {
+        term.unset_private_mode(mode);
+    }
+    term.grid_mut().cursor = cursor;
+    live_snapshot_with_options(term, top, bottom, Some(&tabs))
+}
+
+fn live_snapshot_with_options(
+    term: &Term<EventProxy>,
+    top: usize,
+    bottom: usize,
+    tabs: Option<&[usize]>,
+) -> String {
     use std::fmt::Write as _;
     let grid = term.grid();
     let mut out = String::from("\x1bc");
@@ -92,8 +134,13 @@ pub fn live_snapshot_to_ansi(term: &Term<EventProxy>) -> String {
         }
     }
     out.push_str("\x1b[0m");
-    // Origin mode homes the cursor, so apply modes before restoring positions.
-    out.push_str(&live_mode_sequence(*term.mode()));
+    let _ = write!(out, "\x1b[{};{}r", top + 1, bottom + 1);
+    if let Some(tabs) = tabs {
+        out.push_str("\x1b[3g");
+        for column in tabs {
+            let _ = write!(out, "\x1b[1;{}H\x1bH", column + 1);
+        }
+    }
     let saved = &grid.saved_cursor;
     let _ = write!(
         out,
@@ -103,17 +150,31 @@ pub fn live_snapshot_to_ansi(term: &Term<EventProxy>) -> String {
         live_cell_style(&saved.template)
     );
     let cursor = &grid.cursor;
+    // Restore the saved cursor with origin disabled so absolute saved
+    // positions outside the current scroll region remain representable.
+    out.push_str(&live_mode_sequence(*term.mode()));
+    let cursor_line = cursor.point.line.0
+        - if term.mode().contains(TermMode::ORIGIN) {
+            top as i32
+        } else {
+            0
+        };
     let _ = write!(
         out,
         "\x1b[{};{}H",
-        cursor.point.line.0 + 1,
+        cursor_line.max(0) + 1,
         cursor.point.column.0 + 1
     );
     if cursor.input_needs_wrap {
         let mut point = cursor.point;
         if grid[point].flags.contains(Flags::WIDE_CHAR_SPACER) && point.column.0 > 0 {
             point.column.0 -= 1;
-            let _ = write!(out, "\x1b[{};{}H", point.line.0 + 1, point.column.0 + 1);
+            let _ = write!(
+                out,
+                "\x1b[{};{}H",
+                cursor_line.max(0) + 1,
+                point.column.0 + 1
+            );
         }
         let cell = &grid[point];
         out.push_str(&live_cell_style(cell));
@@ -521,6 +582,32 @@ mod tests {
             assert_eq!(scrollback_to_text(&original), scrollback_to_text(&replayed));
             assert_eq!(original.grid().cursor.point, replayed.grid().cursor.point);
             assert_eq!(original.mode(), replayed.mode());
+        }
+    }
+
+    #[test]
+    fn live_snapshot_preserves_custom_scroll_margins_and_tab_stops() {
+        for origin in ["", "\x1b[?6h"] {
+            let input = format!("one\r\ntwo\r\nthree\r\nfour\r\nfive\x1b[3g\x1b[1;5H\x1bH\x1b[2;4r{origin}\x1b[3;1H");
+            let mut original = term_with(&input, 5, 12);
+            let before = original.grid().cursor.clone();
+            let mode = *original.mode();
+            let snapshot = super::live_snapshot_with_terminal_state(&mut original);
+            assert_eq!(original.grid().cursor.point, before.point);
+            assert_eq!(
+                original.grid().cursor.input_needs_wrap,
+                before.input_needs_wrap
+            );
+            assert_eq!(*original.mode(), mode);
+            let mut replayed = term_with(&snapshot, 5, 12);
+            for bytes in [b"\r\nNEW\r\nLINE".as_slice(), b"\x1b[1;1H\tTAB"] {
+                let mut parser = Processor::<StdSyncHandler>::new();
+                parser.advance(&mut original, bytes);
+                let mut parser = Processor::<StdSyncHandler>::new();
+                parser.advance(&mut replayed, bytes);
+                assert_eq!(scrollback_to_text(&original), scrollback_to_text(&replayed));
+                assert_eq!(original.grid().cursor.point, replayed.grid().cursor.point);
+            }
         }
     }
 
