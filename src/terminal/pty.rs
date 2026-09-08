@@ -25,6 +25,34 @@ fn next_log_sequence(counter: &AtomicU64) -> Option<u64> {
         .and_then(|previous| previous.checked_add(1))
 }
 
+/// Drain whole frames, allowing one oversized frame so a byte budget can
+/// never prevent forward progress. A zero budget still drains nothing.
+fn drain_log_prefix(pending: &mut Vec<u8>, max_bytes: usize) -> Vec<u8> {
+    if max_bytes == 0 {
+        return Vec::new();
+    }
+    let mut cut = 0usize;
+    while pending.len().saturating_sub(cut) >= 13 {
+        let payload_len =
+            u32::from_le_bytes(pending[cut + 9..cut + 13].try_into().expect("frame header"))
+                as usize;
+        let Some(end) = cut
+            .checked_add(13)
+            .and_then(|offset| offset.checked_add(payload_len))
+        else {
+            break;
+        };
+        if end > pending.len() || (cut != 0 && end > max_bytes) {
+            break;
+        }
+        cut = end;
+        if cut >= max_bytes {
+            break;
+        }
+    }
+    pending.drain(..cut).collect()
+}
+
 use crate::runtime::SharedRuntimeScheduler;
 use crate::terminal::agent_status::{AgentStatusReport, AgentStatusStream};
 #[cfg(feature = "ghostty-vt")]
@@ -706,23 +734,7 @@ impl PtyHandle {
         self.pending_log
             .lock()
             .map(|mut pending| {
-                // Caminar frames completos hasta agotar el presupuesto.
-                // Cada frame: 8B seq + 1B kind + 4B len + payload.
-                let mut cut = 0;
-                while cut + 13 <= pending.len() && cut + 13 <= max_bytes {
-                    let payload_len = u32::from_le_bytes([
-                        pending[cut + 9],
-                        pending[cut + 10],
-                        pending[cut + 11],
-                        pending[cut + 12],
-                    ]) as usize;
-                    let frame_end = cut + 13 + payload_len;
-                    if frame_end > max_bytes || frame_end > pending.len() {
-                        break;
-                    }
-                    cut = frame_end;
-                }
-                let drained = pending.drain(..cut).collect();
+                let drained = drain_log_prefix(&mut pending, max_bytes);
                 if pending.is_empty() {
                     self.log_seq.store(0, Ordering::Relaxed);
                 }
@@ -1216,27 +1228,7 @@ mod tests {
         assert_eq!(all.len(), 51);
 
         // Drenar solo 20 bytes: cabe el frame_a (17B) pero no el frame_b.
-        let pending = std::sync::Arc::new(std::sync::Mutex::new(all.clone()));
-        let drained = {
-            let mut pending = pending.lock().unwrap();
-            let mut cut = 0;
-            let max_bytes = 20;
-            while cut + 13 <= pending.len() && cut + 13 <= max_bytes {
-                let payload_len = u32::from_le_bytes([
-                    pending[cut + 9],
-                    pending[cut + 10],
-                    pending[cut + 11],
-                    pending[cut + 12],
-                ]) as usize;
-                let frame_end = cut + 13 + payload_len;
-                if frame_end > max_bytes || frame_end > pending.len() {
-                    break;
-                }
-                cut = frame_end;
-            }
-            let drained: Vec<u8> = pending.drain(..cut).collect();
-            drained
-        };
+        let drained = super::drain_log_prefix(&mut all, 20);
         assert_eq!(drained.len(), 17, "solo cabe el primer frame en 20 bytes");
         let (_, frames) = read_frames(
             &[
@@ -1250,6 +1242,17 @@ mod tests {
         assert_eq!(frames[0].payload, b"aaaa");
     }
 
+    #[test]
+    fn capped_log_drain_makes_progress_on_an_oversized_frame() {
+        use crate::state::scrollback_log::{encode_frame, FrameKind};
+        let first = encode_frame(1, FrameKind::Output, &vec![b'x'; 65_536]);
+        let second = encode_frame(2, FrameKind::Output, b"after");
+        let mut pending = [first.clone(), second.clone()].concat();
+        assert!(super::drain_log_prefix(&mut pending, 0).is_empty());
+        assert_eq!(super::drain_log_prefix(&mut pending, 32 * 1024), first);
+        assert_eq!(super::drain_log_prefix(&mut pending, 32 * 1024), second);
+        assert!(pending.is_empty());
+    }
     #[test]
     fn shell_command_exports_panel_workspace_and_leaf_identity() {
         let panel = uuid::Uuid::new_v4();
