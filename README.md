@@ -226,11 +226,22 @@ The repository is in active consolidation. The main priorities are:
 
 Runtime and regression coverage lives under `tests/runtime` plus module-local tests.
 
-Typical verification command:
+Run the same checks used by CI with the pinned Rust toolchain:
 
 ```bash
-cargo test --quiet
+cargo fmt --all -- --check
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --all-targets --locked
+node --test extension/tests/*.test.cjs
 ```
+
+On macOS/Linux, repeat Clippy and tests with `--features daemon`. CI covers
+Windows x86_64, Linux x86_64, macOS Intel and Apple Silicon. The live PTY test
+starts twenty real shells and checks output, resizing and exit handling.
+
+See [support and recovery](docs/SUPPORT.md) for persistence boundaries,
+diagnostics and Windows toolchain selection, and [portable packages](docs/PORTABLE.md)
+for installation and manual updates.
 
 Optional Ghostty VT backend spike:
 
