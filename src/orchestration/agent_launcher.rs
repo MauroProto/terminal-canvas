@@ -71,7 +71,10 @@ pub fn prepare(
     if brief.trim().is_empty()
         || !matches!(
             provider,
-            AgentProvider::ClaudeCode | AgentProvider::GeminiCli | AgentProvider::OpenCode
+            AgentProvider::ClaudeCode
+                | AgentProvider::CodexCli
+                | AgentProvider::GeminiCli
+                | AgentProvider::OpenCode
         )
     {
         return Ok(None);
@@ -262,7 +265,10 @@ pub fn run_from_cli(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<
         .filter(|_| {
             matches!(
                 request.provider,
-                AgentProvider::ClaudeCode | AgentProvider::GeminiCli | AgentProvider::OpenCode
+                AgentProvider::ClaudeCode
+                    | AgentProvider::CodexCli
+                    | AgentProvider::GeminiCli
+                    | AgentProvider::OpenCode
             )
         })
         .ok_or_else(|| anyhow::anyhow!("Proveedor de lanzamiento no admitido"))?;
@@ -286,14 +292,16 @@ fn execute_request(request: LaunchRequest, mut command: Command) -> anyhow::Resu
 fn append_prompt_args(command: &mut Command, provider: AgentProvider, brief: &str) {
     match provider {
         AgentProvider::GeminiCli => {
-            command.arg("-i");
+            command.arg(format!("--prompt-interactive={brief}"));
         }
         AgentProvider::OpenCode => {
-            command.arg("--prompt");
+            command.arg(format!("--prompt={brief}"));
         }
-        _ => {}
+        _ => {
+            // A prompt beginning with `--` must remain positional text.
+            command.arg("--").arg(brief);
+        }
     }
-    command.arg(brief);
 }
 
 fn native_provider_command(executable: &Path) -> anyhow::Result<Command> {
@@ -465,19 +473,27 @@ fn main() {
         let fixture = Fixture::new();
         let executable = fixture.executable();
         let capture = fixture.0.join("captured.bin");
-        let brief = "quotes '\" & echo NOT_A_COMMAND | < > ^ %PATH% !name! $(echo x) `x`\nsegunda línea 中文";
-        for (provider, prefix) in [
-            (AgentProvider::ClaudeCode, None),
-            (AgentProvider::GeminiCli, Some("-i")),
-            (AgentProvider::OpenCode, Some("--prompt")),
+        let brief = "--version quotes '\" & echo NOT_A_COMMAND | < > ^ %PATH% !name! $(echo x) `x`\nsegunda línea 中文";
+        for (provider, expected) in [
+            (
+                AgentProvider::ClaudeCode,
+                vec!["--".to_owned(), brief.to_owned()],
+            ),
+            (
+                AgentProvider::CodexCli,
+                vec!["--".to_owned(), brief.to_owned()],
+            ),
+            (
+                AgentProvider::GeminiCli,
+                vec![format!("--prompt-interactive={brief}")],
+            ),
+            (AgentProvider::OpenCode, vec![format!("--prompt={brief}")]),
         ] {
             let token = write_request(&fixture.0, provider, brief).unwrap();
             let request = consume_request(&fixture.0, token).unwrap();
             let mut command = native_provider_command(&executable).unwrap();
             command.env("TC_LAUNCH_CAPTURE", &capture);
             assert_eq!(execute_request(request, command).unwrap(), 0);
-            let mut expected = prefix.into_iter().map(str::to_owned).collect::<Vec<_>>();
-            expected.push(brief.to_owned());
             assert_eq!(captured(&capture), expected);
         }
     }
@@ -590,7 +606,11 @@ fn main() {
         );
         assert_eq!(
             captured(&capture),
-            [script.to_string_lossy().into_owned(), brief.to_owned()]
+            [
+                script.to_string_lossy().into_owned(),
+                "--".to_owned(),
+                brief.to_owned()
+            ]
         );
     }
 
