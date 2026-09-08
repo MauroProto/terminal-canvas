@@ -895,8 +895,16 @@ impl Orchestrator {
     /// Drena los worktrees terminados: entrega los planes listos para spawnear
     /// y limpia sesión/tarea de los que fallaron.
     pub fn poll_ready_launches(&mut self) -> Vec<LaunchOutcome> {
+        let results = self.worktree_creator.poll();
+        self.accept_worktree_results(results)
+    }
+
+    fn accept_worktree_results(
+        &mut self,
+        results: Vec<super::git::WorktreeCreateResult>,
+    ) -> Vec<LaunchOutcome> {
         let mut outcomes = Vec::new();
-        for result in self.worktree_creator.poll() {
+        for result in results {
             let Some(plan) = self.pending_launches.remove(&result.session_id) else {
                 continue;
             };
@@ -2509,6 +2517,52 @@ mod tests {
         assert!(!should_inspect_git_for_session(
             session, &detached, now, None
         ));
+    }
+
+    #[test]
+    fn cancelling_a_launch_discards_an_already_ready_result_without_deleting_files() {
+        let mut orchestrator = Orchestrator::new();
+        let directory =
+            std::env::temp_dir().join(format!("tc-cancel-ready-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("work.txt"), "preserve this work").unwrap();
+        let request = AgentLaunchRequest {
+            workspace_id: uuid::Uuid::new_v4(),
+            task_id: None,
+            base_cwd: None,
+            provider: AgentProvider::ClaudeCode,
+            task_title: "Canceled".into(),
+            brief: String::new(),
+            worktree_mode: WorktreeMode::SharedRepo,
+        };
+        let LaunchPreparation::Ready(mut plan) = orchestrator
+            .prepare_launch_with_repo(request, None)
+            .unwrap()
+        else {
+            panic!("shared launch");
+        };
+        plan.worktree_path = Some(directory.clone());
+        let session_id = plan.session_id;
+        let task_id = plan.task_id.unwrap();
+        orchestrator.pending_launches.insert(session_id, *plan);
+        let ready = super::super::git::WorktreeCreateResult {
+            session_id,
+            error: None,
+        };
+        orchestrator.cancel_launch(session_id);
+
+        assert!(orchestrator.accept_worktree_results(vec![ready]).is_empty());
+        assert!(!orchestrator.has_pending_launches());
+        assert!(orchestrator.sessions().is_empty());
+        assert_eq!(
+            orchestrator.task_snapshot(task_id).unwrap().state,
+            TaskState::Draft
+        );
+        assert_eq!(
+            std::fs::read_to_string(directory.join("work.txt")).unwrap(),
+            "preserve this work"
+        );
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
