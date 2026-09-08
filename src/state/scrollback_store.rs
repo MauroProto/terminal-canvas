@@ -14,6 +14,10 @@ use uuid::Uuid;
 /// las últimas líneas, que son las que el usuario quiere ver).
 pub const MAX_PERSISTED_BYTES: usize = 256 * 1024;
 const CHECKPOINT_MAGIC: &[u8] = b"TC-SCROLLBACK\x00\x02";
+const SNAPSHOT_MAGIC: &[u8] = b"TC-SCROLLBACK\x00\x03";
+/// Semantic snapshots include full rows and terminal state. Bound their size
+/// before writing, never by cutting an ANSI stream through its state prefix.
+pub const MAX_SNAPSHOT_CHECKPOINT_BYTES: usize = 4 * 1024 * 1024;
 
 pub fn scrollback_dir() -> Option<PathBuf> {
     if let Ok(path) = std::env::var("MI_TERMINAL_SCROLLBACK_DIR") {
@@ -144,6 +148,36 @@ pub fn save_leaf_scrollback_versioned(
     Ok(())
 }
 
+/// Save an exact ANSI snapshot. Callers may reduce old history in their
+/// disposable grid, but a snapshot which still exceeds the budget is rejected
+/// without replacing the previous checkpoint or rotating its incremental log.
+pub fn save_leaf_snapshot_versioned(
+    dir: &Path,
+    panel_id: Uuid,
+    leaf_id: Option<Uuid>,
+    generation: u32,
+    snapshot: &str,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        snapshot.starts_with("\x1bc"),
+        "snapshot must start with terminal reset"
+    );
+    anyhow::ensure!(
+        snapshot.len() <= MAX_SNAPSHOT_CHECKPOINT_BYTES,
+        "semantic snapshot exceeds size limit"
+    );
+    std::fs::create_dir_all(dir)?;
+    let mut bytes = Vec::with_capacity(SNAPSHOT_MAGIC.len() + 4 + snapshot.len());
+    bytes.extend_from_slice(SNAPSHOT_MAGIC);
+    bytes.extend_from_slice(&generation.to_le_bytes());
+    bytes.extend_from_slice(snapshot.as_bytes());
+    crate::state::durable_write::write_atomic(
+        &dir.join(scrollback_leaf_file_name(panel_id, leaf_id)),
+        &bytes,
+    )?;
+    Ok(())
+}
+
 /// Lee tanto checkpoints versionados como los `.txt` históricos.
 pub fn load_leaf_scrollback_checkpoint(
     dir: &Path,
@@ -151,7 +185,9 @@ pub fn load_leaf_scrollback_checkpoint(
     leaf_id: Option<Uuid>,
 ) -> Option<(Option<u32>, String)> {
     let bytes = std::fs::read(dir.join(scrollback_leaf_file_name(panel_id, leaf_id))).ok()?;
-    if bytes.starts_with(CHECKPOINT_MAGIC) && bytes.len() >= CHECKPOINT_MAGIC.len() + 4 {
+    if (bytes.starts_with(CHECKPOINT_MAGIC) || bytes.starts_with(SNAPSHOT_MAGIC))
+        && bytes.len() >= CHECKPOINT_MAGIC.len() + 4
+    {
         let offset = CHECKPOINT_MAGIC.len();
         let generation = u32::from_le_bytes(bytes[offset..offset + 4].try_into().ok()?);
         let text = String::from_utf8_lossy(&bytes[offset + 4..]).into_owned();
@@ -218,14 +254,7 @@ pub fn save_scrollback(dir: &Path, panel_id: Uuid, text: &str) -> anyhow::Result
 }
 
 pub fn load_scrollback(dir: &Path, panel_id: Uuid) -> Option<String> {
-    let path = dir.join(scrollback_file_name(panel_id));
-    let bytes = std::fs::read(path).ok()?;
-    let text = String::from_utf8_lossy(&bytes).into_owned();
-    if text.trim().is_empty() {
-        None
-    } else {
-        Some(text)
-    }
+    load_leaf_scrollback(dir, panel_id, None)
 }
 
 /// Borra artefactos de paneles que esta instancia conoce y que ya no existen.
@@ -332,6 +361,12 @@ fn panel_stem_of(name: &str) -> &str {
 /// Cuerpo de replay: los saltos de línea pasan a CRLF porque el parser ANSI
 /// necesita el retorno de carro explícito para volver a la columna 0.
 pub fn replay_body(text: &str) -> Vec<u8> {
+    // Live snapshots start with RIS and already contain deliberate CR/LF,
+    // cursor positions, modes and saved cursor state. Normalizing them as a
+    // text document would change the saved primary cursor before future bytes.
+    if text.starts_with("\x1bc") {
+        return text.as_bytes().to_vec();
+    }
     let mut out = Vec::with_capacity(text.len() + 8);
     for line in text.lines() {
         out.extend_from_slice(line.as_bytes());
@@ -365,6 +400,35 @@ mod tests {
 
     fn temp_dir(tag: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("scrollback-{tag}-{}", Uuid::new_v4()))
+    }
+
+    #[test]
+    fn semantic_checkpoint_preserves_cursor_bytes_and_exceeds_text_budget_safely() {
+        let dir = temp_dir("raw-snapshot");
+        let panel = Uuid::new_v4();
+        let snapshot = format!(
+            "\x1bc{}\r\n\x1b[1;2H\x1b[?1049h",
+            "x".repeat(MAX_PERSISTED_BYTES + 20)
+        );
+        super::save_leaf_snapshot_versioned(&dir, panel, None, 7, &snapshot).unwrap();
+        let (generation, loaded) =
+            super::load_leaf_scrollback_checkpoint(&dir, panel, None).unwrap();
+        assert_eq!(generation, Some(7));
+        assert_eq!(loaded, snapshot);
+        assert_eq!(
+            super::load_leaf_session(&dir, panel, None).0,
+            snapshot.as_bytes()
+        );
+        assert_eq!(super::load_scrollback(&dir, panel).unwrap(), snapshot);
+        let oversized = format!("\x1bc{}", "x".repeat(super::MAX_SNAPSHOT_CHECKPOINT_BYTES));
+        assert!(super::save_leaf_snapshot_versioned(&dir, panel, None, 8, &oversized).is_err());
+        assert_eq!(
+            super::load_leaf_scrollback_checkpoint(&dir, panel, None)
+                .unwrap()
+                .0,
+            Some(7)
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
