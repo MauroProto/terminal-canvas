@@ -147,7 +147,7 @@ pub fn spawn_remote(
         reader,
         &snapshot,
         seq,
-        false,
+        true,
         alive,
         cols.max(1),
         rows.max(1),

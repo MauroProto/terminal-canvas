@@ -171,6 +171,36 @@ pub fn load_leaf_scrollback(dir: &Path, panel_id: Uuid, leaf_id: Option<Uuid>) -
     }
 }
 
+/// Load one coherent checkpoint/log generation before starting a new shell.
+pub fn load_leaf_session(
+    dir: &Path,
+    panel_id: Uuid,
+    leaf_id: Option<Uuid>,
+) -> (Vec<u8>, Vec<crate::state::scrollback_log::Frame>) {
+    let checkpoint = load_leaf_scrollback_checkpoint(dir, panel_id, leaf_id);
+    let generation = checkpoint
+        .as_ref()
+        .and_then(|(generation, _)| *generation)
+        .or_else(|| {
+            std::fs::read_to_string(dir.join(scrollback_leaf_gen_file_name(panel_id, leaf_id)))
+                .ok()?
+                .trim()
+                .parse()
+                .ok()
+        })
+        .unwrap_or(0);
+    let frames = std::fs::read(dir.join(scrollback_leaf_log_file_name(panel_id, leaf_id)))
+        .ok()
+        .and_then(|bytes| crate::state::scrollback_log::read_frames(&bytes))
+        .filter(|(log_generation, _)| *log_generation == generation)
+        .map(|(_, frames)| frames)
+        .unwrap_or_default();
+    let body = checkpoint
+        .map(|(_, text)| replay_body(&text))
+        .unwrap_or_default();
+    (body, frames)
+}
+
 pub fn save_scrollback(dir: &Path, panel_id: Uuid, text: &str) -> anyhow::Result<()> {
     if text.trim().is_empty() {
         // Nada que guardar: si había un archivo viejo, lo sacamos para no
@@ -343,6 +373,27 @@ mod tests {
         assert!(!name.contains('/'), "got {name}");
         assert!(!name.contains('\\'), "got {name}");
         assert!(name.ends_with(".txt"));
+    }
+
+    #[test]
+    fn cold_session_ignores_a_log_from_an_older_checkpoint_generation() {
+        use crate::state::scrollback_log::{append_frames, encode_frame, reset_log, FrameKind};
+        let dir = temp_dir("cold-generation");
+        let panel = Uuid::new_v4();
+        super::save_leaf_scrollback_versioned(&dir, panel, None, 2, "saved\n").unwrap();
+        let log = dir.join(super::scrollback_leaf_log_file_name(panel, None));
+        reset_log(&log, 1).unwrap();
+        append_frames(&log, &encode_frame(1, FrameKind::Output, b"duplicate")).unwrap();
+        let (checkpoint, frames) = super::load_leaf_session(&dir, panel, None);
+        assert_eq!(checkpoint, b"saved\r\n");
+        assert!(frames.is_empty());
+        reset_log(&log, 2).unwrap();
+        append_frames(&log, &encode_frame(1, FrameKind::Output, b"tail")).unwrap();
+        assert_eq!(
+            super::load_leaf_session(&dir, panel, None).1[0].payload,
+            b"tail"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

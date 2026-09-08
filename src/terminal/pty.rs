@@ -173,6 +173,21 @@ impl PtyHandle {
         scheduler: SharedRuntimeScheduler,
         hooks: HookIdentity,
     ) -> anyhow::Result<Self> {
+        Self::spawn_with_history(cwd, cols, rows, session_id, scheduler, hooks, &[], &[])
+    }
+
+    /// Replay durable history before the reader can publish any live output.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_with_history(
+        cwd: Option<&Path>,
+        cols: u16,
+        rows: u16,
+        session_id: Uuid,
+        scheduler: SharedRuntimeScheduler,
+        hooks: HookIdentity,
+        checkpoint: &[u8],
+        frames: &[crate::state::scrollback_log::Frame],
+    ) -> anyhow::Result<Self> {
         let pty_system = native_pty_system();
         let pair = pty_system.openpty(PtySize {
             rows,
@@ -215,6 +230,17 @@ impl PtyHandle {
             &TermSize::new(cols as usize, rows as usize),
             EventProxy::new(event_tx),
         )));
+        if !checkpoint.is_empty() || !frames.is_empty() {
+            restore_cold_history(
+                &mut term.lock().expect("new terminal lock"),
+                checkpoint,
+                frames,
+                cols,
+                rows,
+            );
+            // Replayed queries belong to the old process, never the new child.
+            while event_rx.try_recv().is_ok() {}
+        }
         #[cfg(feature = "ghostty-vt")]
         let requested_backend = runtime_backend_from_env();
         #[cfg(feature = "ghostty-vt")]
@@ -997,6 +1023,40 @@ impl PtyHandle {
     }
 }
 
+fn restore_cold_history(
+    term: &mut Term<EventProxy>,
+    checkpoint: &[u8],
+    frames: &[crate::state::scrollback_log::Frame],
+    cols: u16,
+    rows: u16,
+) {
+    use crate::state::scrollback_log::FrameKind;
+    let mut parser = Processor::<StdSyncHandler>::new();
+    parser.advance(term, checkpoint);
+    for frame in frames {
+        match frame.kind {
+            FrameKind::Output => parser.advance(term, &frame.payload),
+            FrameKind::Resize => {
+                if let Some((cols, rows)) =
+                    crate::state::scrollback_log::parse_resize(&frame.payload)
+                {
+                    term.resize(TermSize::new(cols.max(1) as usize, rows.max(1) as usize));
+                }
+            }
+            FrameKind::Clear => parser.advance(term, b"\x1b[2J\x1b[3J\x1b[H"),
+        }
+    }
+    // The old process is gone: retain its primary history and start the new
+    // shell with ordinary input modes and the current physical dimensions.
+    let mut parser = Processor::<StdSyncHandler>::new();
+    parser.advance(term, b"\x1b[?1049l\x1b[0m\x1b[?6l\x1b[r\x1b[?1l\x1b[?7h\x1b[?25h\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1005l\x1b[?1006l\x1b[?2004l\x1b[4l\x1b[20l\x1b>\x1b[=0u");
+    term.resize(TermSize::new(cols.max(1) as usize, rows.max(1) as usize));
+    // Resetting the scroll region homes the cursor; place the new session
+    // after all visible old content so its prompt cannot overwrite history.
+    parser.advance(term, format!("\x1b[{};1H\r\n", rows.max(1)).as_bytes());
+    parser.advance(term, &crate::state::scrollback_store::replay_marker());
+}
+
 fn shell_command(cwd: Option<&Path>, hooks: HookIdentity) -> CommandBuilder {
     let configured_shell = crate::config::runtime_config()
         .shell
@@ -1205,6 +1265,45 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::shell_command;
+
+    #[test]
+    fn cold_history_restores_checkpoint_tail_and_current_dimensions() {
+        use super::*;
+        use crate::state::scrollback_log::{Frame, FrameKind};
+        let (tx, _rx) = mpsc::channel();
+        let mut term = Term::new(
+            TermConfig::default(),
+            &TermSize::new(20, 4),
+            EventProxy::new(tx),
+        );
+        let frames = vec![
+            Frame {
+                seq: 1,
+                kind: FrameKind::Resize,
+                payload: crate::state::scrollback_log::resize_payload(12, 3).to_vec(),
+            },
+            Frame {
+                seq: 2,
+                kind: FrameKind::Output,
+                payload: b"tail\r\n\x1b[?1049hTUI".to_vec(),
+            },
+        ];
+        restore_cold_history(&mut term, b"old\r\n", &frames, 20, 4);
+        assert_eq!(term.columns(), 20);
+        assert_eq!(term.screen_lines(), 4);
+        assert!(!term.mode().contains(TermMode::ALT_SCREEN));
+        let text: String = term.grid().display_iter().map(|cell| cell.c).collect();
+        let history: String = (-(term.grid().history_size() as i32)..term.screen_lines() as i32)
+            .flat_map(|line| {
+                term.grid()[alacritty_terminal::index::Line(line)]
+                    .into_iter()
+                    .map(|cell| cell.c)
+            })
+            .collect();
+        assert!(history.contains("old"), "{history:?} {text:?}");
+        assert!(history.contains("tail"), "{history:?}");
+        assert!(!history.contains("TUI"), "{history:?}");
+    }
 
     #[test]
     fn incremental_sequence_fails_closed_at_u64_max() {

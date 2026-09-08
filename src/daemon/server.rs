@@ -276,7 +276,18 @@ impl DaemonState {
             None => self.spawn(spec.clone()),
         };
         let cwd = spec.cwd.as_deref().map(std::path::Path::new);
-        match PtyHandle::spawn(
+        let (checkpoint, frames) = spec
+            .panel_id
+            .and_then(|panel_id| {
+                let dir = crate::state::scrollback_store::scrollback_dir()?;
+                Some(crate::state::scrollback_store::load_leaf_session(
+                    &dir,
+                    panel_id,
+                    spec.leaf_id,
+                ))
+            })
+            .unwrap_or_default();
+        match PtyHandle::spawn_with_history(
             cwd,
             spec.cols.max(1),
             spec.rows.max(1),
@@ -287,6 +298,8 @@ impl DaemonState {
                 workspace_id: spec.workspace_id,
                 leaf_id: spec.leaf_id,
             },
+            &checkpoint,
+            &frames,
         ) {
             Ok(handle) => {
                 if let Some(command) = spec.startup_command.as_deref().map(str::trim) {
