@@ -25,6 +25,11 @@ use super::redaction::prepare_content;
 const SCHEMA_VERSION: i64 = 2;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(2);
 const BUSY_RETRY_ATTEMPTS: usize = 6;
+pub(crate) const MAX_SEARCH_RESULTS: usize = 100;
+pub(crate) const MAX_SEARCH_RESPONSE_BYTES: usize = 512 * 1024;
+const MAX_SEARCH_QUERY_CHARS: usize = 512;
+const MAX_FTS_TERMS: usize = 32;
+const MAX_CONTEXT_CANDIDATES_PER_SCOPE: usize = 32;
 
 #[derive(Debug, Clone)]
 pub struct MemoryStore {
@@ -391,7 +396,12 @@ impl MemoryStore {
             let project = upsert_project(tx, &location)?;
             let task = upsert_task(tx, &project.canonical_id, &location, orchestrator_task_id)?;
             let scopes = scopes_for(&project, &task, location.cwd.as_path(), workspace_id);
-            let memories = list_by_scopes(tx, &scopes, MemoryStatus::Active)?;
+            let memories = list_by_scopes_with_limit(
+                tx,
+                &scopes,
+                MemoryStatus::Active,
+                Some(MAX_CONTEXT_CANDIDATES_PER_SCOPE),
+            )?;
             let handoff = load_latest_handoff(tx, &task)?;
             Ok((project, task, memories, handoff))
         })
@@ -1255,6 +1265,15 @@ fn list_by_scopes(
     scopes: &[VisibleScope],
     status: MemoryStatus,
 ) -> Result<Vec<MemoryRecord>> {
+    list_by_scopes_with_limit(tx, scopes, status, None)
+}
+
+fn list_by_scopes_with_limit(
+    tx: &Transaction<'_>,
+    scopes: &[VisibleScope],
+    status: MemoryStatus,
+    per_scope_limit: Option<usize>,
+) -> Result<Vec<MemoryRecord>> {
     let mut out = Vec::new();
     for scope in scopes {
         let mut stmt = tx.prepare(
@@ -1263,10 +1282,16 @@ fn list_by_scopes(
              FROM memories
              WHERE scope_kind = ?1 AND scope_id = ?2 AND status = ?3
                AND (valid_until IS NULL OR valid_until > ?4)
-             ORDER BY updated_at DESC",
+             ORDER BY updated_at DESC, rowid DESC LIMIT ?5",
         )?;
         let rows = stmt.query_map(
-            params![scope.kind.as_str(), scope.id, status.as_str(), now_secs()],
+            params![
+                scope.kind.as_str(),
+                scope.id,
+                status.as_str(),
+                now_secs(),
+                per_scope_limit.map(|limit| limit as i64).unwrap_or(-1)
+            ],
             row_to_memory,
         )?;
         for row in rows {
@@ -1283,55 +1308,102 @@ fn search_visible(
 ) -> Result<Vec<MemoryRecord>> {
     let mut out = Vec::new();
     let trimmed = query.trim();
-    if trimmed.is_empty() {
-        return list_by_scopes(tx, scopes, MemoryStatus::Active);
+    if trimmed.chars().count() > MAX_SEARCH_QUERY_CHARS {
+        anyhow::bail!("la consulta supera el límite de {MAX_SEARCH_QUERY_CHARS} caracteres");
     }
-    for scope in scopes {
+    let mut response_bytes = 4; // Array brackets and newlines.
+    let mut scopes: Vec<_> = scopes.iter().collect();
+    scopes.sort_by_key(|scope| match scope.kind {
+        ScopeKind::Task => 0,
+        ScopeKind::Project => 1,
+        ScopeKind::Workspace => 2,
+        ScopeKind::User => 3,
+    });
+    for scope in &scopes {
         let mut stmt = tx.prepare(
             "SELECT id, scope_kind, scope_id, kind, stable_key, status, trust_class, content,
                     current_revision, valid_until, created_at, updated_at
              FROM memories
              WHERE scope_kind = ?1 AND scope_id = ?2 AND status = 'active'
                AND (valid_until IS NULL OR valid_until > ?4)
-               AND (stable_key = ?3 OR instr(lower(content), lower(?3)) > 0
-                    OR instr(lower(stable_key), lower(?3)) > 0)",
+               AND (?3 = '' OR stable_key = ?3 OR instr(lower(content), lower(?3)) > 0
+                    OR instr(lower(stable_key), lower(?3)) > 0)
+             ORDER BY CASE WHEN stable_key = ?3 THEN 0 ELSE 1 END,
+                      updated_at DESC, rowid DESC LIMIT ?5",
         )?;
         let rows = stmt.query_map(
-            params![scope.kind.as_str(), scope.id, trimmed, now_secs()],
+            params![
+                scope.kind.as_str(),
+                scope.id,
+                trimmed,
+                now_secs(),
+                MAX_SEARCH_RESULTS as i64
+            ],
             row_to_memory,
         )?;
         for row in rows {
-            out.push(row?);
+            append_search_result(&mut out, &mut response_bytes, row?)?;
+            if out.len() == MAX_SEARCH_RESULTS {
+                return Ok(out);
+            }
         }
     }
     if let Ok(fts_query) = fts_query(trimmed) {
-        let mut stmt = tx.prepare(
+        for scope in &scopes {
+            let mut stmt = tx.prepare(
             "SELECT m.id, m.scope_kind, m.scope_id, m.kind, m.stable_key, m.status, m.trust_class,
                     m.content, m.current_revision, m.valid_until, m.created_at, m.updated_at
              FROM memories m
              JOIN memories_fts f ON f.memory_id = m.id
              WHERE memories_fts MATCH ?1 AND m.status = 'active'
-               AND (m.valid_until IS NULL OR m.valid_until > ?2)",
+               AND (m.valid_until IS NULL OR m.valid_until > ?2)
+               AND m.scope_kind = ?3 AND m.scope_id = ?4
+             ORDER BY bm25(memories_fts), m.updated_at DESC, m.rowid DESC LIMIT ?5",
         )?;
-        let rows = stmt.query_map(params![fts_query, now_secs()], row_to_memory)?;
-        for row in rows {
-            let memory = row?;
-            if scopes
-                .iter()
-                .any(|scope| scope.kind == memory.scope_kind && scope.id == memory.scope_id)
-                && !out.iter().any(|existing| existing.id == memory.id)
-            {
-                out.push(memory);
+            let rows = stmt.query_map(
+                params![
+                    fts_query,
+                    now_secs(),
+                    scope.kind.as_str(),
+                    scope.id,
+                    MAX_SEARCH_RESULTS as i64
+                ],
+                row_to_memory,
+            )?;
+            for row in rows {
+                append_search_result(&mut out, &mut response_bytes, row?)?;
+                if out.len() == MAX_SEARCH_RESULTS {
+                    return Ok(out);
+                }
             }
         }
     }
     Ok(out)
 }
 
+fn append_search_result(
+    out: &mut Vec<MemoryRecord>,
+    response_bytes: &mut usize,
+    memory: MemoryRecord,
+) -> Result<()> {
+    if out.iter().any(|existing| existing.id == memory.id) {
+        return Ok(());
+    }
+    let json = serde_json::to_string_pretty(&memory)?;
+    // Pretty-printed records gain two spaces per line inside their array.
+    let cost = json.len() + json.lines().count() * 2 + 2;
+    if *response_bytes + cost <= MAX_SEARCH_RESPONSE_BYTES {
+        *response_bytes += cost;
+        out.push(memory);
+    }
+    Ok(())
+}
+
 fn fts_query(raw: &str) -> Result<String> {
     let terms: Vec<String> = raw
         .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' || ch == '/'))
         .filter(|term| !term.is_empty())
+        .take(MAX_FTS_TERMS)
         .map(|term| format!("\"{}\"", term.replace('"', "")))
         .collect();
     if terms.is_empty() {

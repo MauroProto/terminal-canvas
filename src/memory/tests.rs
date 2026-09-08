@@ -16,6 +16,64 @@ fn store_in(root: &std::path::Path) -> MemoryStore {
 }
 
 #[test]
+fn search_and_context_bound_large_visible_histories() {
+    let root = temp_dir();
+    let repo = root.join("repo");
+    init_git_repo(&repo);
+    let store = store_in(&root);
+    let seed = store
+        .remember(RememberRequest::human(repo.clone(), "seed", "small"))
+        .unwrap();
+    let scope = seed.memory().scope_id.clone();
+    let mut conn = rusqlite::Connection::open(store.path()).unwrap();
+    let tx = conn.transaction().unwrap();
+    for index in 0..120 {
+        tx.execute(
+            "INSERT INTO memories(id, scope_kind, scope_id, kind, stable_key, status,
+             trust_class, content, current_revision, created_at, updated_at)
+             VALUES (?1, 'project', ?2, 'fact', ?1, 'active', 'human_explicit', 'small', 1, 1, ?3)",
+            rusqlite::params![format!("bulk/{index:03}"), scope, 100 + index],
+        )
+        .unwrap();
+    }
+    tx.commit().unwrap();
+    let small = store.search(&repo, "").unwrap();
+    assert_eq!(small.len(), super::store::MAX_SEARCH_RESULTS);
+    let (_, _, candidates, _) = store.load_visible_active(&repo, None, None).unwrap();
+    assert_eq!(candidates.len(), 32);
+    assert!(store.search(&repo, &"x".repeat(513)).is_err());
+    conn.execute("UPDATE memories SET content = ?1", ["\n界".repeat(10_000)])
+        .unwrap();
+    let large = store.search(&repo, "").unwrap();
+    assert!(!large.is_empty());
+    assert!(large.len() < small.len());
+    assert!(
+        serde_json::to_string_pretty(&large).unwrap().len()
+            <= super::store::MAX_SEARCH_RESPONSE_BYTES
+    );
+}
+
+#[test]
+fn full_text_recall_stays_inside_visible_scopes() {
+    let root = temp_dir();
+    let own = root.join("own");
+    let foreign = root.join("foreign");
+    init_git_repo(&own);
+    init_git_repo(&foreign);
+    let store = store_in(&root);
+    store
+        .remember(RememberRequest::human(own.clone(), "own", "alpha beta"))
+        .unwrap();
+    store
+        .remember(RememberRequest::human(foreign, "foreign", "alpha beta"))
+        .unwrap();
+    // Neither content contains this literal phrase, so only FTS OR recall matches.
+    let results = store.search(&own, "beta alpha").unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].stable_key, "own");
+}
+
+#[test]
 fn context_budget_bounds_serialized_metadata_unicode_and_handoffs() {
     let root = temp_dir();
     let repo = root.join("repo");

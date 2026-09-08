@@ -163,7 +163,7 @@ fn tool_list() -> Value {
         },
         {
             "name": "memory_search",
-            "description": "Busca memoria activa visible para un cwd",
+            "description": "Busca memoria activa visible para un cwd (hasta 100 resultados y 512 KiB; refine query para consultas amplias)",
             "inputSchema": {
                 "type": "object",
                 "properties": {
