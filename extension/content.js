@@ -80,6 +80,7 @@ function meaningfulStyles(element) {
 
 // Clone a bounded subtree, omitting form contents and executable/private attributes.
 function captureHtml(element) {
+  const inert = document.implementation.createHTMLDocument("");
   let remaining = 24000;
   let nodes = 0;
   function copy(node, depth) {
@@ -87,10 +88,10 @@ function captureHtml(element) {
     if (node.nodeType === 3) {
       const text = node.textContent.slice(0, Math.min(remaining, 2048));
       remaining -= text.length;
-      return document.createTextNode(text);
+      return inert.createTextNode(text);
     }
     if (node.nodeType !== 1 || /^(SCRIPT|STYLE|IFRAME|OBJECT|EMBED|NOSCRIPT)$/.test(node.tagName)) return null;
-    const clone = document.createElement(node.tagName.toLowerCase());
+    const clone = inert.createElement(node.tagName.toLowerCase());
     for (const attribute of Array.from(node.attributes).slice(0, 32)) {
       if (/^on|value|srcdoc|token|secret|password|credential|nonce/i.test(attribute.name)) continue;
       const value = attribute.value.slice(0, Math.min(remaining, 512));
