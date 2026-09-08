@@ -409,14 +409,9 @@ pub fn estimate_tokens(text: &str) -> usize {
 }
 
 pub fn contents_equivalent(left: &str, right: &str) -> bool {
-    normalize_content(left) == normalize_content(right)
-}
-
-pub fn normalize_content(text: &str) -> String {
-    text.split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_lowercase()
+    // These values have already passed content preparation. Case, spaces,
+    // and line boundaries may be meaningful code or configuration.
+    left == right
 }
 
 pub fn normalize_key(key: &str) -> String {

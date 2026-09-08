@@ -16,6 +16,37 @@ fn store_in(root: &std::path::Path) -> MemoryStore {
 }
 
 #[test]
+fn case_only_memory_update_preserves_the_requested_value() {
+    let root = temp_dir();
+    let repo = root.join("repo");
+    init_git_repo(&repo);
+    let store = store_in(&root);
+    let original = store
+        .remember(RememberRequest::human(
+            repo.clone(),
+            "deployment/path",
+            "usar /srv/Project",
+        ))
+        .unwrap();
+    let mut correction =
+        RememberRequest::human(repo.clone(), "deployment/path", "usar /srv/project");
+    correction.expected_revision = Some(original.memory().current_revision);
+    let result = store.remember(correction).unwrap();
+    let active = store
+        .list_visible(&repo, MemoryStatus::Active)
+        .unwrap()
+        .into_iter()
+        .find(|memory| memory.stable_key == "deployment/path")
+        .unwrap();
+    assert_eq!(active.content, "usar /srv/project");
+    assert!(matches!(result, WriteResult::Committed(_)));
+    assert_eq!(
+        active.current_revision,
+        original.memory().current_revision + 1
+    );
+}
+
+#[test]
 fn mcp_proposal_conflict_does_not_disclose_another_pending_memory() {
     let root = temp_dir();
     let repo = root.join("repo");
