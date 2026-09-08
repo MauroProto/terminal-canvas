@@ -378,7 +378,7 @@ impl TerminalApp {
                 .collect();
             TopBottomPanel::bottom("window-taskbar")
                 .resizable(false)
-                .exact_height(34.0)
+                .exact_height(44.0)
                 .frame(
                     egui::Frame::NONE
                         .fill(palette::INK)
@@ -386,88 +386,106 @@ impl TerminalApp {
                 )
                 .show_separator_line(false)
                 .show(ctx, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.style_mut().spacing.item_spacing.x = 6.0;
-                        for (panel_id, title, minimized, focused, provider, unread) in
-                            &taskbar_panels
-                        {
-                            let truncated = truncate_taskbar_title(title);
-                            let font = egui::FontId::proportional(11.5);
-                            let text_w = ui.fonts(|f| {
-                                f.layout_no_wrap(truncated.clone(), font.clone(), palette::TEXT)
-                                    .size()
-                                    .x
+                    egui::ScrollArea::horizontal()
+                        .id_salt("taskbar-overflow")
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.style_mut().spacing.item_spacing.x = 6.0;
+                                for (panel_id, title, minimized, focused, provider, unread) in
+                                    &taskbar_panels
+                                {
+                                    let truncated = truncate_taskbar_title(title);
+                                    let font = egui::FontId::proportional(11.5);
+                                    let text_w = ui.fonts(|f| {
+                                        f.layout_no_wrap(
+                                            truncated.clone(),
+                                            font.clone(),
+                                            palette::TEXT,
+                                        )
+                                        .size()
+                                        .x
+                                    });
+                                    let dot_size = 7.0;
+                                    let dot_pad = 8.0;
+                                    let pad_x = 10.0;
+                                    // El punto naranja de unread (P1.8) suma ancho a la
+                                    // derecha del título cuando está activo.
+                                    let unread_w = if *unread { dot_size + 6.0 } else { 0.0 };
+                                    let item_w =
+                                        text_w + dot_size + dot_pad + pad_x * 2.0 + unread_w;
+                                    let (rect, response) = ui.allocate_exact_size(
+                                        egui::vec2(item_w, 26.0),
+                                        egui::Sense::click(),
+                                    );
+                                    response.widget_info(|| {
+                                        egui::WidgetInfo::selected(
+                                            egui::WidgetType::SelectableLabel,
+                                            ui.is_enabled(),
+                                            *focused,
+                                            title,
+                                        )
+                                    });
+                                    let response = response.on_hover_text(title);
+                                    let dot_x = rect.left() + pad_x + dot_size * 0.5;
+                                    let text_x = rect.left() + pad_x + dot_size + dot_pad;
+                                    if response.hovered() && !*focused {
+                                        ui.painter().rect_filled(rect, 4.0, palette::RAISED);
+                                    }
+                                    let accent = taskbar_provider_accent(*provider);
+                                    let dot_color = if *minimized {
+                                        accent.linear_multiply(0.55)
+                                    } else {
+                                        accent
+                                    };
+                                    ui.painter().circle_filled(
+                                        egui::pos2(dot_x, rect.center().y),
+                                        dot_size * 0.5,
+                                        dot_color,
+                                    );
+                                    let text_color = if *focused {
+                                        palette::TEXT_STRONG
+                                    } else if *minimized {
+                                        palette::DIM
+                                    } else if response.hovered() {
+                                        palette::TEXT_STRONG
+                                    } else {
+                                        palette::TEXT
+                                    };
+                                    ui.painter().text(
+                                        egui::pos2(text_x, rect.center().y),
+                                        egui::Align2::LEFT_CENTER,
+                                        &truncated,
+                                        font,
+                                        text_color,
+                                    );
+                                    if *unread {
+                                        // Punto naranja de atención pendiente (P1.8).
+                                        ui.painter().circle_filled(
+                                            egui::pos2(
+                                                text_x + text_w + 6.0 + dot_size * 0.5,
+                                                rect.center().y,
+                                            ),
+                                            dot_size * 0.5,
+                                            egui::Color32::from_rgb(255, 140, 40),
+                                        );
+                                    }
+                                    if *focused {
+                                        let underline_y = rect.bottom() - 3.0;
+                                        ui.painter().line_segment(
+                                            [
+                                                egui::pos2(text_x, underline_y),
+                                                egui::pos2(text_x + text_w, underline_y),
+                                            ],
+                                            Stroke::new(1.0, palette::TEXT_STRONG),
+                                        );
+                                    }
+                                    taskbar_button_rects.insert(*panel_id, rect);
+                                    if response.clicked() {
+                                        requested_panel = Some(*panel_id);
+                                    }
+                                }
                             });
-                            let dot_size = 7.0;
-                            let dot_pad = 8.0;
-                            let pad_x = 10.0;
-                            // El punto naranja de unread (P1.8) suma ancho a la
-                            // derecha del título cuando está activo.
-                            let unread_w = if *unread { dot_size + 6.0 } else { 0.0 };
-                            let item_w = text_w + dot_size + dot_pad + pad_x * 2.0 + unread_w;
-                            let (rect, response) = ui.allocate_exact_size(
-                                egui::vec2(item_w, 26.0),
-                                egui::Sense::click(),
-                            );
-                            let dot_x = rect.left() + pad_x + dot_size * 0.5;
-                            let text_x = rect.left() + pad_x + dot_size + dot_pad;
-                            if response.hovered() && !*focused {
-                                ui.painter().rect_filled(rect, 4.0, palette::RAISED);
-                            }
-                            let accent = taskbar_provider_accent(*provider);
-                            let dot_color = if *minimized {
-                                accent.linear_multiply(0.55)
-                            } else {
-                                accent
-                            };
-                            ui.painter().circle_filled(
-                                egui::pos2(dot_x, rect.center().y),
-                                dot_size * 0.5,
-                                dot_color,
-                            );
-                            let text_color = if *focused {
-                                palette::TEXT_STRONG
-                            } else if *minimized {
-                                palette::DIM
-                            } else if response.hovered() {
-                                palette::TEXT_STRONG
-                            } else {
-                                palette::TEXT
-                            };
-                            ui.painter().text(
-                                egui::pos2(text_x, rect.center().y),
-                                egui::Align2::LEFT_CENTER,
-                                &truncated,
-                                font,
-                                text_color,
-                            );
-                            if *unread {
-                                // Punto naranja de atención pendiente (P1.8).
-                                ui.painter().circle_filled(
-                                    egui::pos2(
-                                        text_x + text_w + 6.0 + dot_size * 0.5,
-                                        rect.center().y,
-                                    ),
-                                    dot_size * 0.5,
-                                    egui::Color32::from_rgb(255, 140, 40),
-                                );
-                            }
-                            if *focused {
-                                let underline_y = rect.bottom() - 3.0;
-                                ui.painter().line_segment(
-                                    [
-                                        egui::pos2(text_x, underline_y),
-                                        egui::pos2(text_x + text_w, underline_y),
-                                    ],
-                                    Stroke::new(1.0, palette::TEXT_STRONG),
-                                );
-                            }
-                            taskbar_button_rects.insert(*panel_id, rect);
-                            if response.clicked() {
-                                requested_panel = Some(*panel_id);
-                            }
-                        }
-                    });
+                        });
                 });
             self.taskbar_button_rects = taskbar_button_rects;
             self.layout_menu_open = false;
