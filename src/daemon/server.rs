@@ -397,7 +397,11 @@ impl DaemonState {
             let is_priority = self.priority_session == Some(id);
             let (frames, alive, alternate, replacement) = match handle.lock() {
                 Ok(pty) => {
-                    let budget = if is_priority && interactive_budget > 0 {
+                    // Sample EOF before draining. If it arrives during this
+                    // drain, defer Exit to the next pump, which drains all of
+                    // the final backlog before ending the subscriber stream.
+                    let alive = pty.alive.load(std::sync::atomic::Ordering::Acquire);
+                    let budget = if alive && is_priority && interactive_budget > 0 {
                         interactive_budget
                     } else {
                         usize::MAX
@@ -412,12 +416,7 @@ impl DaemonState {
                     if is_priority {
                         interactive_budget = interactive_budget.saturating_sub(frames.len());
                     }
-                    (
-                        frames,
-                        pty.alive.load(std::sync::atomic::Ordering::Relaxed),
-                        alternate,
-                        replacement,
-                    )
+                    (frames, alive, alternate, replacement)
                 }
                 Err(_) => (Vec::new(), false, session.was_alternate, None),
             };
@@ -1385,6 +1384,56 @@ mod tests {
         let mut state = DaemonState::new();
         let id = spawn_one(&mut state);
         assert_eq!(state.session_ids(), vec![id]);
+    }
+
+    #[test]
+    fn priority_session_delivers_its_entire_final_burst_before_exit() {
+        use std::sync::{Arc, Mutex};
+        let mut state = DaemonState::new();
+        let scheduler = Arc::new(Mutex::new(crate::runtime::RuntimeScheduler::new()));
+        let id = state.spawn_with_pty(WireSpec::default(), &scheduler, None);
+        let handle = state.session(id).unwrap().handle.clone().expect("real PTY");
+        let marker = format!("TC_FINAL_{}", Uuid::new_v4().simple());
+        let command = format!(
+            "sh -c 'i=0; while [ $i -lt 3000 ]; do printf \"{marker}\\n\"; i=$((i+1)); done'; exit\r"
+        );
+        handle.lock().unwrap().write_all(command.as_bytes());
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while handle
+            .lock()
+            .unwrap()
+            .alive
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            assert!(Instant::now() < deadline, "fixture process did not exit");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            handle.lock().unwrap().pending_log_snapshot().len() > super::INTERACTIVE_BYTE_BUDGET
+        );
+        state.priority_session = Some(id);
+        let events = state.pump_output();
+        let exit = events
+            .iter()
+            .position(|event| matches!(event, Response::Exit { id: exited } if *exited == id))
+            .expect("exit event");
+        let mut output = Vec::new();
+        for event in &events[..exit] {
+            if let Response::Output {
+                id: source, data, ..
+            } = event
+            {
+                if *source == id {
+                    output.extend_from_slice(data);
+                }
+            }
+        }
+        let text = String::from_utf8_lossy(&output);
+        assert!(
+            text.lines().filter(|line| line.trim() == marker).count() >= 3000,
+            "Exit arrived before the complete final output"
+        );
+        assert!(handle.lock().unwrap().pending_log_snapshot().is_empty());
     }
 
     #[test]
