@@ -39,6 +39,8 @@ pub struct FileDiff {
     pub deletions: usize,
     pub lines: Vec<DiffLine>,
     pub unavailable_reason: Option<String>,
+    /// Identity of the reviewed base and file diff, computed by the loader.
+    pub review_identity: String,
 }
 
 /// Resultado completo de revisar un repo.
@@ -276,8 +278,8 @@ pub fn load_repo_diff(repo_root: &Path) -> Option<RepoDiff> {
         .filter(|branch| !branch.is_empty())
         .unwrap_or_else(|| "detached".to_owned());
 
-    let has_head = git_string(&root, &["rev-parse", "--verify", "HEAD"]).is_some();
-    let mut files = if has_head {
+    let head = git_string(&root, &["rev-parse", "--verify", "HEAD"]);
+    let mut files = if head.is_some() {
         let text = git_string(&root, &["diff", "--no-ext-diff", "--no-textconv", "HEAD"])?;
         parse_unified_diff(&text)
     } else {
@@ -291,12 +293,36 @@ pub fn load_repo_diff(repo_root: &Path) -> Option<RepoDiff> {
     let untracked = list_untracked(&root)?;
     let has_untracked = !untracked.is_empty();
     files.extend(untracked.iter().map(|path| new_file_diff(&root, path)));
+    for file in &mut files {
+        file.review_identity = review_identity(file, head.as_deref());
+    }
     Some(RepoDiff {
         repo_root: root,
         branch,
         files,
         has_untracked,
     })
+}
+
+fn review_identity(file: &FileDiff, base: Option<&str>) -> String {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    for value in [
+        base.unwrap_or("unborn"),
+        &file.path,
+        file.old_path.as_deref().unwrap_or(""),
+    ] {
+        digest.update((value.len() as u64).to_le_bytes());
+        digest.update(value.as_bytes());
+    }
+    for line in &file.lines {
+        digest.update([line.kind as u8]);
+        digest.update((line.old_ln.unwrap_or(0) as u64).to_le_bytes());
+        digest.update((line.new_ln.unwrap_or(0) as u64).to_le_bytes());
+        digest.update((line.text.len() as u64).to_le_bytes());
+        digest.update(line.text.as_bytes());
+    }
+    format!("{:x}", digest.finalize())
 }
 
 fn new_file_diff(root: &Path, rel: &Path) -> FileDiff {

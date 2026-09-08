@@ -26,6 +26,8 @@ pub struct DiffNote {
     pub line: u32,
     #[serde(default)]
     pub old_side: bool,
+    #[serde(default)]
+    pub review_identity: Option<String>,
     pub body: String,
     pub created_at: DateTime<Utc>,
     /// `Some` = ya se mandó al agente. Editar el cuerpo la devuelve a `None`.
@@ -50,6 +52,7 @@ impl DiffNotes {
             start_line,
             line,
             old_side: false,
+            review_identity: None,
             body: body.trim().to_owned(),
             created_at: Utc::now(),
             sent_at: None,

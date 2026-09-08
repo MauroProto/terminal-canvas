@@ -647,7 +647,13 @@ impl TerminalApp {
                                     }
                                 }
                                 ReviewRow::Note(note) => {
-                                    draw_note_row(ui, row_rect, note, &mut actions);
+                                    draw_note_row(
+                                        ui,
+                                        row_rect,
+                                        note,
+                                        note_is_stale(note, Some(&file)),
+                                        &mut actions,
+                                    );
                                 }
                                 ReviewRow::Editor => {
                                     self.draw_note_editor(ui, row_rect, &mut actions);
@@ -975,12 +981,21 @@ impl TerminalApp {
             match editing.note_id {
                 Some(id) => state.notes.edit(id, &editing.body),
                 None => {
-                    state.notes.add_on_side(
+                    let id = state.notes.add_on_side(
                         &editing.file_path,
                         editing.line,
                         &editing.body,
                         editing.old_side,
                     );
+                    let identity = state
+                        .files
+                        .iter()
+                        .find(|file| file.path == editing.file_path)
+                        .map(|file| file.review_identity.clone())
+                        .filter(|id| !id.is_empty());
+                    if let Some(note) = state.notes.notes.iter_mut().find(|note| note.id == id) {
+                        note.review_identity = identity;
+                    }
                 }
             }
             state.editing_note = None;
@@ -1117,7 +1132,12 @@ impl TerminalApp {
                     .notes
                     .pending()
                     .iter()
-                    .map(|note| crate::orchestration::format_note(note))
+                    .map(|note| {
+                        let formatted = crate::orchestration::format_note(note);
+                        if note_is_stale(note, state.files.iter().find(|file| file.path == note.file_path)) {
+                            format!("Context: this note refers to an earlier diff; verify its line anchor against current code.\n{formatted}")
+                        } else { formatted }
+                    })
                     .collect::<Vec<_>>(),
                 state.repo_root.clone(),
             )
@@ -1344,6 +1364,14 @@ fn diff_line_anchor(line: &DiffLine) -> Option<u32> {
     line.new_ln.or(line.old_ln).map(|ln| ln as u32)
 }
 
+fn note_is_stale(note: &crate::orchestration::DiffNote, file: Option<&FileDiff>) -> bool {
+    file.is_none_or(|file| {
+        note.review_identity
+            .as_deref()
+            .is_some_and(|identity| identity != file.review_identity)
+    })
+}
+
 /// Plan de filas + offsets acumulados + altura total, para la virtualización
 /// con alturas variables. Las notas van debajo de su línea; las que apuntan a
 /// líneas fuera del diff visible van al final (mejor que perderlas).
@@ -1368,10 +1396,11 @@ fn build_review_rows<'a>(
         let Some(anchor) = diff_line_anchor(line) else {
             continue;
         };
-        for note in file_notes
-            .iter()
-            .filter(|note| note.line == anchor && note.old_side == line.new_ln.is_none())
-        {
+        for note in file_notes.iter().filter(|note| {
+            note.line == anchor
+                && note.old_side == line.new_ln.is_none()
+                && !note_is_stale(note, Some(file))
+        }) {
             rows.push(ReviewRow::Note(note));
             anchored_notes.insert(note.id);
         }
@@ -1404,6 +1433,7 @@ fn draw_note_row(
     ui: &mut egui::Ui,
     rect: egui::Rect,
     note: &crate::orchestration::DiffNote,
+    stale: bool,
     actions: &mut Vec<NoteAction>,
 ) {
     let response = ui.allocate_rect(rect, Sense::hover());
@@ -1413,7 +1443,7 @@ fn draw_note_row(
         rect.y_range(),
         Stroke::new(2.0, NOTE_ACCENT),
     );
-    let label = match note.start_line {
+    let mut label = match note.start_line {
         Some(start) if start != note.line => format!("L{start}-{} · {}", note.line, note.body),
         _ => format!(
             "{}L{} · {}",
@@ -1422,6 +1452,9 @@ fn draw_note_row(
             note.body
         ),
     };
+    if stale {
+        label = format!("Revisión anterior · {label}");
+    }
     let sent_suffix = if note.sent_at.is_some() { "  ✓" } else { "" };
     let font = FontId::monospace(MONO_SIZE * 0.95);
     let max_w = rect.width() - GUTTER_W * 2.0 - 120.0;
@@ -1524,6 +1557,51 @@ mod tests {
                 ReviewRow::Editor => "editor",
             })
             .collect()
+    }
+
+    #[test]
+    fn old_and_new_notes_with_the_same_line_number_each_render_once() {
+        let mut file = sample_file();
+        file.lines.insert(
+            0,
+            DiffLine {
+                kind: DiffLineKind::Removed,
+                old_ln: Some(1),
+                new_ln: None,
+                text: "old".into(),
+            },
+        );
+        let mut notes = crate::orchestration::DiffNotes::default();
+        let old = notes.add_on_side("src/a.rs", 1, "old side", true);
+        let new = notes.add_on_side("src/a.rs", 1, "new side", false);
+        let (rows, _, _) = build_review_rows(&file, &notes.notes, None);
+        let anchors: Vec<_> = rows
+            .iter()
+            .filter_map(|row| {
+                if let ReviewRow::Note(note) = row {
+                    Some(note.id)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(anchors, [old, new]);
+        assert_eq!(
+            note_kinds(&rows),
+            ["diff", "note", "diff", "note", "diff", "diff"]
+        );
+    }
+
+    #[test]
+    fn a_note_from_a_different_diff_is_preserved_without_attaching_to_reused_line_numbers() {
+        let mut file = sample_file();
+        file.review_identity = "current".into();
+        let mut notes = crate::orchestration::DiffNotes::default();
+        notes.add("src/a.rs", None, 1, "previous code");
+        notes.notes[0].review_identity = Some("previous".into());
+        let (rows, _, _) = build_review_rows(&file, &notes.notes, None);
+        assert_eq!(note_kinds(&rows), ["diff", "diff", "diff", "note"]);
+        assert!(super::note_is_stale(&notes.notes[0], Some(&file)));
     }
 
     #[test]
