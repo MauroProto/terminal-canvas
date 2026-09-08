@@ -100,8 +100,17 @@ pub struct RemoteReader {
 
 impl RemoteReader {
     pub fn new(stream: UnixStream, session_id: Uuid, attached_seq: u64) -> Self {
+        Self::from_buffered(BufReader::new(stream), session_id, attached_seq)
+    }
+
+    /// Preserve bytes read ahead while receiving the attach response.
+    pub fn from_buffered(
+        lines: BufReader<UnixStream>,
+        session_id: Uuid,
+        attached_seq: u64,
+    ) -> Self {
         Self {
-            lines: BufReader::new(stream),
+            lines,
             session_id,
             attached_seq,
             exited: false,
@@ -331,5 +340,37 @@ mod tests {
 
         let mut reader = RemoteReader::new(ours, id, 0);
         assert_eq!(reader.next_output(), Some(b"ok".to_vec()));
+    }
+
+    #[test]
+    fn handoff_keeps_output_buffered_after_the_attach_response() {
+        let (ours, mut theirs) = socket_pair();
+        let id = Uuid::new_v4();
+        let messages = [
+            encode_line(&Response::Attached {
+                id,
+                snapshot: Vec::new(),
+                seq: 1,
+            }),
+            encode_line(&Response::Output {
+                id,
+                seq: 2,
+                data: b"after".to_vec(),
+            }),
+        ]
+        .concat();
+        theirs.write_all(messages.as_bytes()).unwrap();
+        drop(theirs);
+        let mut buffered = BufReader::new(ours);
+        let first = crate::daemon::protocol::read_protocol_line(&mut buffered)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            decode_line::<Response>(&first),
+            Some(Response::Attached { .. })
+        ));
+        let mut reader = RemoteReader::from_buffered(buffered, id, 1);
+        assert_eq!(reader.next_output(), Some(b"after".to_vec()));
+        assert_eq!(reader.next_output(), None);
     }
 }

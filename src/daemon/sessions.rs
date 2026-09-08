@@ -92,7 +92,7 @@ pub fn spawn_remote(
         let handle = PtyHandle::attach_remote(
             session_id,
             control,
-            stream,
+            reader,
             &snapshot,
             seq,
             true,
@@ -134,7 +134,7 @@ pub fn spawn_remote(
     let handle = PtyHandle::attach_remote(
         session_id,
         control,
-        stream,
+        reader,
         &snapshot,
         seq,
         false,
@@ -170,7 +170,7 @@ pub fn attach_existing(
     PtyHandle::attach_remote(
         session_id,
         control,
-        stream,
+        reader,
         &snapshot,
         seq,
         true,

@@ -400,7 +400,7 @@ impl PtyHandle {
     pub fn attach_remote(
         session_id: Uuid,
         control: std::os::unix::net::UnixStream,
-        events: std::os::unix::net::UnixStream,
+        events: std::io::BufReader<std::os::unix::net::UnixStream>,
         snapshot: &[u8],
         attached_seq: u64,
         hot_reattached: bool,
@@ -467,7 +467,7 @@ impl PtyHandle {
             let loop_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let mut processor = Processor::<StdSyncHandler>::new();
                 let mut agent_stream = AgentStatusStream::new();
-                let mut reader = RemoteReader::new(events, session_id, attached_seq);
+                let mut reader = RemoteReader::from_buffered(events, session_id, attached_seq);
                 loop {
                     wait_for_history_restore(&restoring_for_reader);
                     yield_for_reader_priority(&scheduler_for_reader, session_id);
