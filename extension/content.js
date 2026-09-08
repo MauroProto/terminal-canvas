@@ -1,4 +1,4 @@
-// Content script: alt+click captura el elemento y lo manda al service worker.
+// Injected after an explicit extension action; selection is cancelled by Escape.
 //
 // Solo se recolectan las props computadas que difieren del default del
 // navegador (~40 útiles): mandar las 340 de getComputedStyle haría un prompt
@@ -54,9 +54,9 @@ const USEFUL_PROPS = [
 function readableSelector(element) {
   const describe = (node) => {
     if (!node || node.nodeType !== 1) return "";
-    if (node.id) return `${node.tagName.toLowerCase()}#${node.id}`;
+    if (node.id) return `${node.tagName.toLowerCase()}#${CSS.escape(node.id)}`;
     const classes = (node.className && typeof node.className === "string")
-      ? "." + node.className.trim().split(/\s+/).slice(0, 3).join(".")
+      ? "." + node.className.trim().split(/\s+/).filter(Boolean).slice(0, 3).map(name => CSS.escape(name)).join(".")
       : "";
     return node.tagName.toLowerCase() + classes;
   };
@@ -65,21 +65,50 @@ function readableSelector(element) {
   return parent ? `${parent} > ${self}` : self;
 }
 
-/// Props computadas que difieren del default de un elemento del mismo tag.
+// Selected computed properties; no probe in the page, which would inherit its CSS.
 function meaningfulStyles(element) {
   const computed = window.getComputedStyle(element);
-  const probe = document.createElement(element.tagName);
-  document.body.appendChild(probe);
-  const defaults = window.getComputedStyle(probe);
   const out = [];
   for (const prop of USEFUL_PROPS) {
     const value = computed.getPropertyValue(prop);
-    if (value && value !== defaults.getPropertyValue(prop)) {
-      out.push(`${prop}: ${value};`);
+    if (value) {
+      out.push(`${prop}: ${value.slice(0, 512)};`);
     }
   }
-  probe.remove();
   return out.join(" ");
+}
+
+// Clone a bounded subtree, omitting form contents and executable/private attributes.
+function captureHtml(element) {
+  let remaining = 24000;
+  let nodes = 0;
+  function copy(node, depth) {
+    if (++nodes > 512 || remaining <= 0 || depth > 32) return null;
+    if (node.nodeType === 3) {
+      const text = node.textContent.slice(0, Math.min(remaining, 2048));
+      remaining -= text.length;
+      return document.createTextNode(text);
+    }
+    if (node.nodeType !== 1 || /^(SCRIPT|STYLE|IFRAME|OBJECT|EMBED|NOSCRIPT)$/.test(node.tagName)) return null;
+    const clone = document.createElement(node.tagName.toLowerCase());
+    for (const attribute of Array.from(node.attributes).slice(0, 32)) {
+      if (/^on|value|srcdoc|token|secret|password|credential|nonce/i.test(attribute.name)) continue;
+      const value = attribute.value.slice(0, Math.min(remaining, 512));
+      remaining -= attribute.name.length + value.length + 4;
+      if (remaining < 0) break;
+      clone.setAttribute(attribute.name, value);
+    }
+    if (!/^(INPUT|TEXTAREA|SELECT)$/.test(node.tagName) && !node.isContentEditable) {
+      for (const child of node.childNodes) {
+        if (nodes >= 512 || remaining <= 0) break;
+        const result = copy(child, depth + 1);
+        if (result) clone.appendChild(result);
+      }
+    }
+    remaining -= node.tagName.length * 2 + 5;
+    return clone;
+  }
+  return (copy(element, 0)?.outerHTML || "").slice(0, 32768);
 }
 
 document.addEventListener(
@@ -99,7 +128,7 @@ document.addEventListener(
     const result = await chrome.runtime.sendMessage({
       kind: "tc-design-capture",
       selector: readableSelector(element),
-      html: element.outerHTML,
+      html: captureHtml(element),
       css: meaningfulStyles(element),
       rect: {
         x: rect.x + window.scrollX,
