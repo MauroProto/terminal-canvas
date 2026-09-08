@@ -34,6 +34,12 @@ struct RunClaim {
 /// Así dos binarios abiertos (por ejemplo release + bundle) no alternan
 /// snapshots distintos y hacen que un proyecto parezca desaparecer.
 static RUN_CLAIM: OnceLock<RunClaim> = OnceLock::new();
+static CLAIM_ERROR: OnceLock<String> = OnceLock::new();
+
+/// Startup can continue in memory, but the UI must surface unavailable saving.
+pub fn persistence_claim_error() -> Option<&'static str> {
+    CLAIM_ERROR.get().map(String::as_str)
+}
 
 /// Keeps ownership stable for the entire durable write, not just its preflight.
 pub struct RunWriteGuard {
@@ -118,7 +124,15 @@ pub fn begin_run() -> Option<DirtyRun> {
     let pid = std::process::id();
     let timestamp = chrono::Utc::now().to_rfc3339();
     let token = uuid::Uuid::new_v4().to_string();
-    let dirty = claim_run_in(&dir, pid, &token, &timestamp);
+    let dirty = match try_claim_run_in(&dir, pid, &token, &timestamp) {
+        Ok(dirty) => dirty,
+        Err(error) => {
+            let message = format!("No se pudo obtener la persistencia: {error}");
+            log::error!("{message}");
+            let _ = CLAIM_ERROR.set(message);
+            None
+        }
+    };
     let _ = RUN_CLAIM.set(RunClaim {
         marker_path: marker_path_in(&dir),
         token,
@@ -171,14 +185,18 @@ pub fn begin_run_in(dir: &Path, pid: u32, timestamp: &str) -> Option<DirtyRun> {
     previous.map(|marker| DirtyRun { marker })
 }
 
+#[cfg(test)]
 fn claim_run_in(dir: &Path, pid: u32, token: &str, timestamp: &str) -> Option<DirtyRun> {
-    let _guard = match lock_run_dir(dir) {
-        Ok(guard) => guard,
-        Err(error) => {
-            log::error!("failed to claim persistence ownership: {error}");
-            return None;
-        }
-    };
+    try_claim_run_in(dir, pid, token, timestamp).expect("claim ownership")
+}
+
+fn try_claim_run_in(
+    dir: &Path,
+    pid: u32,
+    token: &str,
+    timestamp: &str,
+) -> std::io::Result<Option<DirtyRun>> {
+    let _guard = lock_run_dir(dir)?;
     let marker = marker_path_in(dir);
     let previous = std::fs::read_to_string(&marker)
         .ok()
@@ -211,8 +229,8 @@ fn claim_run_in(dir: &Path, pid: u32, token: &str, timestamp: &str) -> Option<Di
         None
     };
 
-    let _ = std::fs::write(&marker, format!("{pid} {token} {timestamp}\n"));
-    dirty
+    std::fs::write(&marker, format!("{pid} {token} {timestamp}\n"))?;
+    Ok(dirty)
 }
 
 fn marker_pid(marker: &str) -> Option<u32> {
