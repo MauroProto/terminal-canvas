@@ -52,6 +52,12 @@ impl WorkspacePanel {
         }
     }
 
+    pub fn focused_memory_task_id(&self) -> Option<Uuid> {
+        match self {
+            Self::Terminal(panel) => panel.focused_memory_task_id(),
+        }
+    }
+
     pub fn live_leaf_cwds(&self) -> Vec<std::path::PathBuf> {
         match self {
             Self::Terminal(panel) => panel

@@ -27,6 +27,7 @@ pub(super) struct MemoryUiState {
     pub(super) confirm_forget: Option<String>,
     cwd: Option<PathBuf>,
     workspace_id: Option<Uuid>,
+    task_id: Option<Uuid>,
     worker: MemoryWorker,
     busy: bool,
 }
@@ -35,6 +36,7 @@ enum MemoryJob {
     Load {
         cwd: Option<PathBuf>,
         workspace_id: Option<Uuid>,
+        task_id: Option<Uuid>,
     },
     Remember {
         cwd: PathBuf,
@@ -44,10 +46,12 @@ enum MemoryJob {
     Export {
         cwd: PathBuf,
         path: PathBuf,
+        task_id: Option<Uuid>,
     },
     Handoff {
         cwd: PathBuf,
         summary: String,
+        task_id: Option<Uuid>,
     },
     Forget(String),
     Approve(String),
@@ -100,7 +104,11 @@ impl MemoryWorker {
 
 fn run_memory_job(job: MemoryJob) -> MemoryCompletion {
     match job {
-        MemoryJob::Load { cwd, workspace_id } => {
+        MemoryJob::Load {
+            cwd,
+            workspace_id,
+            task_id,
+        } => {
             let Some(cwd) = cwd else {
                 return MemoryCompletion::Loaded {
                     project_label: "sin proyecto".to_owned(),
@@ -121,10 +129,11 @@ fn run_memory_job(job: MemoryJob) -> MemoryCompletion {
                     project.canonical_id
                 );
                 let active =
-                    store.list_visible_for_workspace(&cwd, MemoryStatus::Active, workspace_id)?;
-                let pending = store.list_visible_for_workspace(
+                    store.list_visible_scoped(&cwd, MemoryStatus::Active, task_id, workspace_id)?;
+                let pending = store.list_visible_scoped(
                     &cwd,
                     MemoryStatus::Candidate,
+                    task_id,
                     workspace_id,
                 )?;
                 Ok((label, active, pending))
@@ -156,9 +165,9 @@ fn run_memory_job(job: MemoryJob) -> MemoryCompletion {
                 Err(err) => memory_error(err),
             }
         }
-        MemoryJob::Export { cwd, path } => {
+        MemoryJob::Export { cwd, path, task_id } => {
             let result = MemoryStore::open_default()
-                .and_then(|store| store.export_markdown(&cwd))
+                .and_then(|store| store.export_markdown_scoped(&cwd, task_id))
                 .and_then(|text| {
                     std::fs::write(&path, text)
                         .map_err(anyhow::Error::from)
@@ -172,14 +181,18 @@ fn run_memory_job(job: MemoryJob) -> MemoryCompletion {
                 Err(err) => memory_error(err),
             }
         }
-        MemoryJob::Handoff { cwd, summary } => {
+        MemoryJob::Handoff {
+            cwd,
+            summary,
+            task_id,
+        } => {
             let result = MemoryStore::open_default().and_then(|store| {
                 store.create_handoff(crate::memory::HandoffRequest {
                     cwd,
                     summary,
                     provider: None,
                     session_id: None,
-                    orchestrator_task_id: None,
+                    orchestrator_task_id: task_id,
                     ttl_secs: Some(72 * 3600),
                 })
             });
@@ -217,11 +230,12 @@ fn memory_error(error: anyhow::Error) -> MemoryCompletion {
 }
 
 impl MemoryUiState {
-    fn new(cwd: Option<PathBuf>, workspace_id: Option<Uuid>) -> Self {
+    fn new(cwd: Option<PathBuf>, workspace_id: Option<Uuid>, task_id: Option<Uuid>) -> Self {
         let worker = MemoryWorker::new();
         let busy = worker.submit(MemoryJob::Load {
             cwd: cwd.clone(),
             workspace_id,
+            task_id,
         });
         Self {
             key: String::new(),
@@ -234,6 +248,7 @@ impl MemoryUiState {
             confirm_forget: None,
             cwd,
             workspace_id,
+            task_id,
             worker,
             busy,
         }
@@ -250,6 +265,7 @@ impl MemoryUiState {
         if self.worker.submit(MemoryJob::Load {
             cwd: self.cwd.clone(),
             workspace_id: self.workspace_id,
+            task_id: self.task_id,
         }) {
             self.busy = true;
         }
@@ -287,7 +303,13 @@ impl TerminalApp {
     pub(super) fn open_memory_hub(&mut self) {
         let cwd = self.ws().cwd.clone();
         let workspace_id = self.ws().id;
-        self.memory_ui = Some(MemoryUiState::new(cwd, Some(workspace_id)));
+        self.memory_ui = Some(MemoryUiState::new(
+            cwd,
+            Some(workspace_id),
+            self.ws()
+                .focused_panel()
+                .and_then(|panel| panel.focused_memory_task_id()),
+        ));
     }
 
     pub(super) fn open_remember_selection(&mut self) {
@@ -296,7 +318,13 @@ impl TerminalApp {
             .focused_panel()
             .and_then(|panel| panel.selected_text())
             .unwrap_or_default();
-        let mut state = MemoryUiState::new(self.ws().cwd.clone(), Some(self.ws().id));
+        let mut state = MemoryUiState::new(
+            self.ws().cwd.clone(),
+            Some(self.ws().id),
+            self.ws()
+                .focused_panel()
+                .and_then(|panel| panel.focused_memory_task_id()),
+        );
         if !selected.trim().is_empty() {
             state.content = selected.trim().to_owned();
             if state.key.is_empty() {
@@ -309,7 +337,13 @@ impl TerminalApp {
     }
 
     pub(super) fn open_create_handoff(&mut self) {
-        let mut state = MemoryUiState::new(self.ws().cwd.clone(), Some(self.ws().id));
+        let mut state = MemoryUiState::new(
+            self.ws().cwd.clone(),
+            Some(self.ws().id),
+            self.ws()
+                .focused_panel()
+                .and_then(|panel| panel.focused_memory_task_id()),
+        );
         if state.handoff.is_empty() {
             state.handoff = "Continuar acá. Hecho: …  Siguiente: …  Bloqueos: …".to_owned();
         }
@@ -403,6 +437,7 @@ impl TerminalApp {
                             state.submit(MemoryJob::Export {
                                 cwd,
                                 path: downloads_dir().join("terminalcanvas-memory.md"),
+                                task_id: state.task_id,
                             });
                         }
                     }
@@ -428,6 +463,7 @@ impl TerminalApp {
                         state.submit(MemoryJob::Handoff {
                             cwd,
                             summary: state.handoff.trim().to_owned(),
+                            task_id: state.task_id,
                         });
                     }
                 }

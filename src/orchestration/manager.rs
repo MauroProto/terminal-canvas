@@ -754,14 +754,22 @@ impl Orchestrator {
         } else {
             request.task_title.trim().to_owned()
         };
-        let task_id = request.task_id.or_else(|| {
-            Some(self.create_task(
+        let task_id = request.task_id.unwrap_or_else(Uuid::new_v4);
+        if let Some(task) = self.state.tasks.iter().find(|task| task.id == task_id) {
+            anyhow::ensure!(
+                task.workspace_id == request.workspace_id,
+                "La tarea pertenece a otro workspace"
+            );
+        } else {
+            self.create_task_with_id(
+                task_id,
                 request.workspace_id,
                 &task_title,
                 &request.brief,
                 Some(request.provider),
-            ))
-        });
+            );
+        }
+        let task_id = Some(task_id);
 
         let session_id = Uuid::new_v4();
         let short_id = short_uuid(session_id);
@@ -793,8 +801,7 @@ impl Orchestrator {
                 }) {
                     Ok(()) => pending_worktree = Some(session_id),
                     Err(job) => {
-                        // Sin worker (fallo patológico de spawn): creación
-                        // síncrona antes que dejar el lanzamiento colgado.
+                        // Keep the error visible; never run Git on the UI thread.
                         anyhow::bail!(
                             "No se pudo iniciar el worker de worktrees para {}",
                             job.worktree_path.display()
@@ -1371,8 +1378,20 @@ impl Orchestrator {
         brief: &str,
         provider_hint: Option<AgentProvider>,
     ) -> Uuid {
-        let now = Utc::now();
         let task_id = Uuid::new_v4();
+        self.create_task_with_id(task_id, workspace_id, title, brief, provider_hint);
+        task_id
+    }
+
+    fn create_task_with_id(
+        &mut self,
+        task_id: Uuid,
+        workspace_id: Uuid,
+        title: &str,
+        brief: &str,
+        provider_hint: Option<AgentProvider>,
+    ) {
+        let now = Utc::now();
         self.state.tasks.push(TaskCard {
             id: task_id,
             workspace_id,
@@ -1385,7 +1404,6 @@ impl Orchestrator {
             created_at: now,
             updated_at: now,
         });
-        task_id
     }
 
     fn refresh_inbox(&mut self) {
@@ -2491,6 +2509,37 @@ mod tests {
         assert!(!should_inspect_git_for_session(
             session, &detached, now, None
         ));
+    }
+
+    #[test]
+    fn a_reserved_memory_task_id_is_used_by_the_persisted_task_and_launch() {
+        let mut orchestrator = Orchestrator::new();
+        let workspace_id = uuid::Uuid::new_v4();
+        let task_id = uuid::Uuid::new_v4();
+        let request = AgentLaunchRequest {
+            workspace_id,
+            task_id: Some(task_id),
+            base_cwd: None,
+            provider: AgentProvider::ClaudeCode,
+            task_title: "Stable memory".to_owned(),
+            brief: "Context loaded for this UUID".to_owned(),
+            worktree_mode: WorktreeMode::SharedRepo,
+        };
+        let LaunchPreparation::Ready(plan) = orchestrator
+            .prepare_launch_with_repo(request.clone(), None)
+            .unwrap()
+        else {
+            panic!("shared launch");
+        };
+        assert_eq!(plan.task_id, Some(task_id));
+        let task = orchestrator.task_snapshot(task_id).unwrap();
+        assert_eq!(task.session_ids, vec![plan.session_id]);
+        let mut other_workspace = request;
+        other_workspace.workspace_id = uuid::Uuid::new_v4();
+        assert!(orchestrator
+            .prepare_launch_with_repo(other_workspace, None)
+            .is_err());
+        assert_eq!(orchestrator.tasks().len(), 1);
     }
 
     #[test]

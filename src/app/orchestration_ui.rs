@@ -79,7 +79,10 @@ impl LaunchMemoryWorker {
         }
     }
 
-    fn submit(&mut self, job: MemoryLaunchJob) -> bool {
+    fn submit(&mut self, mut job: MemoryLaunchJob) -> bool {
+        // Reserve once, before loading Task memory. The same identity is used
+        // by the persisted TaskCard and the target PTY after it is created.
+        job.request.task_id.get_or_insert_with(Uuid::new_v4);
         if self.jobs.send(job).is_err() {
             return false;
         }
@@ -658,6 +661,7 @@ impl TerminalApp {
                     cwd: plan.cwd.clone(),
                     startup_command: plan.startup_command.clone(),
                     startup_input: plan.startup_input.clone(),
+                    memory_task_id: plan.task_id,
                 },
             )
         };

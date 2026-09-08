@@ -513,6 +513,11 @@ impl TerminalApp {
                 "La sesión anterior terminó de golpe; se restauró el último estado guardado",
             );
         }
+        if side_effects {
+            if let Some(error) = crate::state::run_marker::persistence_claim_error() {
+                app.toast_error(error);
+            }
+        }
         if let Some(invite_code) = pending_join_invite {
             app.join_session_open = true;
             app.join_session_draft.invite_code = invite_code;
