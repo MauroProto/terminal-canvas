@@ -263,6 +263,7 @@ mod tests {
     fn the_wire_spec_carries_what_the_daemon_needs() {
         let panel = Uuid::new_v4();
         let workspace = Uuid::new_v4();
+        let memory_task = Uuid::new_v4();
         let spec = SessionSpec {
             title: "Claude".to_owned(),
             cwd: Some(std::path::PathBuf::from("/tmp/repo")),
@@ -271,6 +272,7 @@ mod tests {
             panel_id: Some(panel),
             workspace_id: Some(workspace),
             leaf_id: Some(Uuid::new_v4()),
+            memory_task_id: Some(memory_task),
         };
         let wire = wire_spec_from(&spec, 120, 40);
         assert_eq!(wire.title, "Claude");
@@ -278,6 +280,7 @@ mod tests {
         assert_eq!(wire.startup_command.as_deref(), Some("claude"));
         assert_eq!(wire.panel_id, Some(panel));
         assert_eq!(wire.workspace_id, Some(workspace));
+        assert_eq!(wire.memory_task_id, Some(memory_task));
         assert_eq!((wire.cols, wire.rows), (120, 40));
     }
 
