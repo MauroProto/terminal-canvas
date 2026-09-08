@@ -87,6 +87,10 @@ impl DaemonConn {
 
     pub fn connect_raw_as(dir: &Path, token: &str, client_id: Uuid) -> Option<UnixStream> {
         let stream = UnixStream::connect(socket_path(dir)).ok()?;
+        stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .ok()?;
         let mut writer = stream.try_clone().ok()?;
         let mut reader = BufReader::new(stream.try_clone().ok()?);
         writer
@@ -114,6 +118,9 @@ impl DaemonConn {
 
     pub fn try_connect_as(dir: &Path, token: &str, client_id: Uuid) -> Option<Self> {
         let stream = UnixStream::connect(socket_path(dir)).ok()?;
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .ok()?;
         stream
             .set_read_timeout(Some(Duration::from_secs(10)))
             .ok()?;

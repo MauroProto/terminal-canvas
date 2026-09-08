@@ -449,6 +449,10 @@ impl PtyHandle {
         rows: u16,
         scheduler: SharedRuntimeScheduler,
     ) -> anyhow::Result<Self> {
+        events
+            .get_ref()
+            .set_read_timeout(None)
+            .context("switch attached socket to event streaming")?;
         use crate::terminal::remote_session::{RemoteReader, RemoteWriter};
 
         let link = RemoteLink::new(session_id, control);

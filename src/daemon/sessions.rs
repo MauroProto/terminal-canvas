@@ -80,6 +80,15 @@ pub fn spawn_remote(
     // ese caso hay que reusarla en vez de crear otra encima (P3.15, T4).
     let mut existing = None;
     if let Some(id) = desired_id {
+        let _ = request(
+            &mut writer,
+            &mut reader,
+            &Request::Resize {
+                id,
+                cols: cols.max(1),
+                rows: rows.max(1),
+            },
+        );
         if let Ok(Response::Attached {
             snapshot,
             seq,
@@ -170,6 +179,15 @@ pub fn attach_existing(
         .ok_or_else(|| anyhow::anyhow!("no se pudo conectar al daemon"))?;
     let mut writer = stream.try_clone()?;
     let mut reader = BufReader::new(stream.try_clone()?);
+    request(
+        &mut writer,
+        &mut reader,
+        &Request::Resize {
+            id: session_id,
+            cols: cols.max(1),
+            rows: rows.max(1),
+        },
+    )?;
     let (snapshot, seq, alive) = match request(
         &mut writer,
         &mut reader,
