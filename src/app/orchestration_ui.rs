@@ -32,6 +32,7 @@ struct MemoryLaunchJob {
 
 struct MemoryLaunchCompletion {
     request: AgentLaunchRequest,
+    repo_root: Option<std::path::PathBuf>,
     source: LaunchSource,
 }
 
@@ -56,8 +57,11 @@ impl LaunchMemoryWorker {
                         job.request.task_id,
                         Some(job.request.workspace_id),
                     );
+                    let repo_root =
+                        crate::orchestration::Orchestrator::resolve_launch_repo(&job.request);
                     if completion_tx
                         .send(MemoryLaunchCompletion {
+                            repo_root,
                             request: job.request,
                             source: job.source,
                         })
@@ -562,6 +566,12 @@ impl TerminalApp {
 
     fn poll_memory_launches(&mut self, ctx: &egui::Context) {
         for completion in self.launch_memory_worker.poll() {
+            if self
+                .workspace_index_by_id(completion.request.workspace_id)
+                .is_none()
+            {
+                continue;
+            }
             if let LaunchSource::Manual(request_id) = &completion.source {
                 let current = self
                     .launch_agent
@@ -575,7 +585,9 @@ impl TerminalApp {
                 }
             }
 
-            let preparation = self.orchestrator.prepare_launch(completion.request);
+            let preparation = self
+                .orchestrator
+                .prepare_launch_with_repo(completion.request, completion.repo_root);
             match (completion.source, preparation) {
                 (LaunchSource::Manual(_), Ok(LaunchPreparation::Ready(plan))) => {
                     if self.spawn_agent_panel(ctx, &plan) {

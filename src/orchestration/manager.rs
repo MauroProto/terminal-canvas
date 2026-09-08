@@ -5,9 +5,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::git::{
-    create_git_worktree, git_repo_root, GitInspector, WorktreeCreateJob, WorktreeCreator,
-};
+use super::git::{git_repo_root, GitInspector, WorktreeCreateJob, WorktreeCreator};
 use super::matching::{
     event_matches_filters, inbox_matches_query, session_matches_query, task_matches_filters,
     task_matches_query,
@@ -733,9 +731,23 @@ impl Orchestrator {
             .retain(|session_id, _| !removed_sessions.contains(session_id));
     }
 
+    pub fn resolve_launch_repo(request: &AgentLaunchRequest) -> Option<PathBuf> {
+        request.base_cwd.as_deref().and_then(git_repo_root)
+    }
+
     pub fn prepare_launch(
         &mut self,
         request: AgentLaunchRequest,
+    ) -> anyhow::Result<LaunchPreparation> {
+        let repo = Self::resolve_launch_repo(&request);
+        self.prepare_launch_with_repo(request, repo)
+    }
+
+    /// UI callers supply the root resolved by their background preparation.
+    pub fn prepare_launch_with_repo(
+        &mut self,
+        request: AgentLaunchRequest,
+        resolved_repo_root: Option<PathBuf>,
     ) -> anyhow::Result<LaunchPreparation> {
         let task_title = if request.task_title.trim().is_empty() {
             request.provider.label().to_owned()
@@ -755,15 +767,12 @@ impl Orchestrator {
         let short_id = short_uuid(session_id);
         let slug = slugify(&task_title);
         let base_cwd = request.base_cwd.clone();
-        let repo_root = base_cwd
-            .as_deref()
-            .and_then(git_repo_root)
-            .or_else(|| base_cwd.clone());
+        let repo_root = resolved_repo_root.clone().or_else(|| base_cwd.clone());
         let worktree_requested = matches!(request.worktree_mode, WorktreeMode::Auto);
 
         let mut pending_worktree = None;
         let (cwd, worktree_path, branch, shared_repo_mode) = if worktree_requested {
-            if let Some(root) = repo_root.as_deref().and_then(git_repo_root) {
+            if let Some(root) = resolved_repo_root {
                 let branch = format!(
                     "workspace/{}/{}-{}",
                     request.provider.slug(),
@@ -786,7 +795,10 @@ impl Orchestrator {
                     Err(job) => {
                         // Sin worker (fallo patológico de spawn): creación
                         // síncrona antes que dejar el lanzamiento colgado.
-                        create_git_worktree(&job.repo_root, &job.worktree_path, &job.branch)?;
+                        anyhow::bail!(
+                            "No se pudo iniciar el worker de worktrees para {}",
+                            job.worktree_path.display()
+                        );
                     }
                 }
                 (
