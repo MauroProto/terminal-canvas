@@ -108,7 +108,8 @@ struct ManagedSession {
 
 struct PendingStartupInput {
     input: String,
-    baseline_render_revision: u64,
+    /// None means readiness was already observed; capacity retries need no output.
+    baseline_render_revision: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -162,9 +163,36 @@ impl ManagedSession {
 
 impl PendingStartupInput {
     fn is_ready(&self, current_render_revision: u64) -> bool {
-        current_render_revision > self.baseline_render_revision
+        self.baseline_render_revision
+            .is_none_or(|baseline| current_render_revision > baseline)
+    }
+
+    fn try_send(
+        &mut self,
+        current_render_revision: u64,
+        send: impl FnOnce(&str) -> std::io::Result<()>,
+    ) -> std::io::Result<bool> {
+        if !self.is_ready(current_render_revision) {
+            return Ok(false);
+        }
+        self.baseline_render_revision = None;
+        match send(&self.input) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 }
+
+/// Count the sanitized bytes and maximum paste framing before allocating a copy.
+fn prompt_fits_input_budget(input: &str) -> bool {
+    let limit = crate::terminal::pty::MAX_INPUT_BYTES;
+    input.len() <= limit
+        && input.len() + input.bytes().filter(|byte| *byte == 0x1b).count() * 4 + 13 <= limit
+}
+
+const OVERSIZED_PROMPT_ERROR: &str =
+    "No se envió el prompt: el texto preparado supera el límite de 2 MiB. Dividilo en partes más pequeñas.";
 
 impl RuntimeScheduler {
     pub fn new() -> Self {
@@ -478,6 +506,19 @@ impl PtyManager {
     }
 
     fn configure_startup_input(session: &mut ManagedSession, handle: &SharedPtyHandle) {
+        if session
+            .spec
+            .startup_input
+            .as_deref()
+            .is_some_and(|input| !prompt_fits_input_budget(input.trim()))
+        {
+            session.spec.startup_input = None;
+            session.pending_startup_input = None;
+            if let Ok(handle) = handle.lock() {
+                handle.record_input_error(OVERSIZED_PROMPT_ERROR.to_owned());
+            }
+            return;
+        }
         let spec = &session.spec;
         if let Some(input) = spec
             .startup_input
@@ -500,16 +541,19 @@ impl PtyManager {
             {
                 session.pending_startup_input = Some(PendingStartupInput {
                     input,
-                    baseline_render_revision,
+                    baseline_render_revision: Some(baseline_render_revision),
                 });
             } else if let Ok(handle) = handle.lock() {
                 if let Err(error) = write_startup_input(&handle, &input) {
                     if error.kind() == std::io::ErrorKind::WouldBlock {
                         session.pending_startup_input = Some(PendingStartupInput {
                             input,
-                            baseline_render_revision: baseline_render_revision.saturating_sub(1),
+                            baseline_render_revision: None,
                         });
                     } else {
+                        handle.record_input_error(format!(
+                            "No se pudo enviar el prompt inicial: {error}"
+                        ));
                         log::warn!("No se pudo enviar el prompt inicial: {error}");
                     }
                 }
@@ -578,7 +622,7 @@ impl PtyManager {
     }
 
     pub fn drain_ui_updates(&mut self) -> UiUpdateBatch {
-        self.flush_pending_startup_inputs();
+        self.flush_pending_inputs();
         self.scheduler
             .lock()
             .ok()
@@ -620,31 +664,44 @@ impl PtyManager {
         let Some(handle) = session.handle.as_ref() else {
             return;
         };
+        if !prompt_fits_input_budget(text.trim()) {
+            if let Ok(handle) = handle.lock() {
+                handle.record_input_error(OVERSIZED_PROMPT_ERROR.to_owned());
+            }
+            return;
+        }
         let baseline = handle
             .lock()
             .ok()
             .map(|handle| handle.render_revision())
             .unwrap_or(0);
         session.pending_prompt = Some(PendingStartupInput {
-            input: text.to_owned(),
-            baseline_render_revision: baseline,
+            input: text.trim().to_owned(),
+            baseline_render_revision: Some(baseline),
         });
     }
 
-    fn flush_pending_startup_inputs(&mut self) {
+    /// Progress input without consuming scheduler events for hidden workspaces.
+    pub fn flush_pending_inputs(&mut self) {
         for session in self.sessions.values_mut() {
             Self::flush_one_pending(session, true);
             Self::flush_one_pending(session, false);
         }
     }
 
+    pub fn has_pending_inputs(&self) -> bool {
+        self.sessions.values().any(|session| {
+            session.pending_startup_input.is_some() || session.pending_prompt.is_some()
+        })
+    }
+
     /// Flushea `pending_startup_input` (is_startup=true) o `pending_prompt`
     /// (false) si el handle está listo. Conserva el prompt si la cola está llena.
     fn flush_one_pending(session: &mut ManagedSession, is_startup: bool) {
         let pending_ref = if is_startup {
-            session.pending_startup_input.as_ref()
+            session.pending_startup_input.as_mut()
         } else {
-            session.pending_prompt.as_ref()
+            session.pending_prompt.as_mut()
         };
         let Some(pending) = pending_ref else {
             return;
@@ -657,23 +714,27 @@ impl PtyManager {
         let Ok(handle) = handle.lock() else {
             return;
         };
-        if !pending.is_ready(handle.render_revision()) {
-            return;
-        }
-        let result = if is_startup {
-            write_startup_input(&handle, &pending.input)
+        let result = if !handle.alive() {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "El terminal terminó antes de recibir el prompt.",
+            ))
         } else {
-            write_prompt_input(&handle, &pending.input)
+            pending.try_send(handle.render_revision(), |input| {
+                if is_startup {
+                    write_startup_input(&handle, input)
+                } else {
+                    write_prompt_input(&handle, input)
+                }
+            })
         };
-        if result
-            .as_ref()
-            .is_err_and(|error| error.kind() == std::io::ErrorKind::WouldBlock)
-        {
+        if matches!(result, Ok(false)) {
             // Enqueue is atomic: no bytes were accepted, so retrying cannot
             // duplicate a partial prompt. UI updates retry after the queue drains.
             return;
         }
         if let Err(error) = result {
+            handle.record_input_error(format!("No se pudo enviar el prompt pendiente: {error}"));
             log::warn!("No se pudo enviar el prompt pendiente: {error}");
         }
         if is_startup {
@@ -714,11 +775,55 @@ mod tests {
     fn pending_startup_input_waits_for_render_revision_to_advance() {
         let pending = PendingStartupInput {
             input: "prompt".to_owned(),
-            baseline_render_revision: 4,
+            baseline_render_revision: Some(4),
         };
 
         assert!(!pending.is_ready(4));
         assert!(pending.is_ready(5));
+    }
+
+    #[test]
+    fn pending_input_retries_capacity_without_another_render() {
+        let mut pending = PendingStartupInput {
+            input: "prompt".to_owned(),
+            baseline_render_revision: None,
+        };
+        assert!(!pending
+            .try_send(0, |_| Err(std::io::ErrorKind::WouldBlock.into()))
+            .unwrap());
+        let mut accepted = String::new();
+        assert!(pending
+            .try_send(0, |input| {
+                accepted.push_str(input);
+                Ok(())
+            })
+            .unwrap());
+        assert_eq!(accepted, "prompt");
+    }
+
+    #[test]
+    fn pending_input_waits_before_attempting_and_returns_permanent_errors() {
+        let mut pending = PendingStartupInput {
+            input: "prompt".to_owned(),
+            baseline_render_revision: Some(4),
+        };
+        assert!(!pending.try_send(4, |_| panic!("not ready")).unwrap());
+        assert_eq!(
+            pending
+                .try_send(5, |_| Err(std::io::ErrorKind::InvalidInput.into()))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn deferred_prompt_budget_includes_escape_expansion_and_paste_framing() {
+        let limit = crate::terminal::pty::MAX_INPUT_BYTES;
+        assert!(super::prompt_fits_input_budget(&"x".repeat(limit - 13)));
+        assert!(!super::prompt_fits_input_budget(&"x".repeat(limit - 12)));
+        assert!(!super::prompt_fits_input_budget(&"\x1b".repeat(limit / 4)));
+        assert!(!super::prompt_fits_input_budget(&"x".repeat(limit + 1)));
     }
 
     #[test]

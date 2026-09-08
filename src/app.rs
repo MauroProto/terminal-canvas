@@ -1167,6 +1167,9 @@ impl TerminalApp {
     /// Fase 2: drena la salida de los PTYs, alimenta la política de repintado
     /// y registra los contadores de sesiones del frame.
     fn pump_runtime_updates(&mut self, perf_snapshot: &mut FramePerfSnapshot) {
+        for workspace in &self.workspaces {
+            workspace.flush_pending_inputs();
+        }
         #[cfg(all(unix, feature = "daemon"))]
         let focused_session = self
             .ws()
@@ -2048,6 +2051,11 @@ impl TerminalApp {
             ctx.request_repaint_after(delay.max(Duration::from_millis(1)));
         } else if let Some(delay) = self.cursor_blink_repaint_delay(ctx) {
             ctx.request_repaint_after(delay);
+        }
+        // A writer draining its queue need not produce terminal output. Retry
+        // deferred input even when the app is unfocused or its workspace hidden.
+        if self.workspaces.iter().any(Workspace::has_pending_inputs) {
+            ctx.request_repaint_after(Duration::from_millis(50));
         }
         perf_snapshot.frame_time = frame_started_at.elapsed();
         self.last_perf_snapshot = perf_snapshot;

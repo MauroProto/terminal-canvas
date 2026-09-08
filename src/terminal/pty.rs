@@ -18,7 +18,7 @@ use uuid::Uuid;
 
 #[path = "input_writer.rs"]
 mod input_writer;
-pub(crate) use input_writer::InputWriter;
+pub(crate) use input_writer::{InputWriter, MAX_INPUT_BYTES};
 
 #[derive(Clone)]
 enum TerminalWriter {
@@ -49,10 +49,10 @@ impl TerminalWriter {
             Self::Remote(link) => link.disconnect(),
         }
     }
-    #[cfg(all(unix, feature = "daemon"))]
     fn record_error(&self, message: String) {
         match self {
             Self::Local(writer) => writer.record_error(message),
+            #[cfg(all(unix, feature = "daemon"))]
             Self::Remote(link) => link.record_input_error(message),
         }
     }
@@ -743,6 +743,10 @@ impl PtyHandle {
 
     pub fn try_write_all(&self, bytes: &[u8]) -> std::io::Result<()> {
         self.writer.enqueue(bytes)
+    }
+
+    pub fn record_input_error(&self, message: String) {
+        self.writer.record_error(message);
     }
 
     pub fn input_error(&self) -> Option<String> {

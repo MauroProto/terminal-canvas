@@ -519,6 +519,19 @@ impl Workspace {
             .unwrap_or_default()
     }
 
+    pub fn flush_pending_inputs(&self) {
+        if let Ok(mut manager) = self.pty_manager.lock() {
+            manager.flush_pending_inputs();
+        }
+    }
+
+    pub fn has_pending_inputs(&self) -> bool {
+        self.pty_manager
+            .lock()
+            .map(|manager| manager.has_pending_inputs())
+            .unwrap_or(false)
+    }
+
     pub fn matches_cwd(&self, path: &Path) -> bool {
         self.cwd
             .as_deref()

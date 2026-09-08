@@ -3,7 +3,7 @@ use std::collections::VecDeque;
 use std::io::{self, Write};
 use std::sync::{Arc, Condvar, Mutex};
 
-const MAX_INPUT_BYTES: usize = 2 * 1024 * 1024;
+pub(crate) const MAX_INPUT_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Default)]
 struct State {
@@ -101,7 +101,6 @@ impl InputWriter {
         self.shared.0.lock().ok()?.error.clone()
     }
 
-    #[cfg(any(test, all(unix, feature = "daemon")))]
     pub fn record_error(&self, message: String) {
         if let Ok(mut state) = self.shared.0.lock() {
             state.error = Some(message);
