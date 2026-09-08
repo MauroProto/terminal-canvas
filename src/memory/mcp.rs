@@ -25,12 +25,14 @@ const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &[
 #[derive(Debug, Clone)]
 struct McpScope {
     location: super::model::ResolvedLocation,
+    task_id: Option<uuid::Uuid>,
 }
 
 impl McpScope {
     fn from_root(root: &Path) -> Self {
         Self {
             location: resolve_location(root),
+            task_id: None,
         }
     }
 
@@ -62,7 +64,8 @@ pub fn serve_stdio() -> Result<()> {
         .map(PathBuf::from)
         .map(Ok)
         .unwrap_or_else(std::env::current_dir)?;
-    let scope = McpScope::from_root(&root);
+    let mut scope = McpScope::from_root(&root);
+    scope.task_id = super::identity::task_id_from_env()?;
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
     let mut reader = stdin.lock();
@@ -237,11 +240,13 @@ fn call_tool(store: &MemoryStore, params: &Value, scope: Option<&McpScope>) -> R
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow::anyhow!("falta name"))?;
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
+    // Task identity belongs to this process, never to tool-call arguments.
+    let task_id = scope.and_then(|scope| scope.task_id);
     let text = match name {
         "memory_context" => {
             let cwd = arg_path(&args, "cwd", scope)?;
             let query = args.get("query").and_then(Value::as_str);
-            let pack = build_context_pack(store, &cwd, query, None)?;
+            let pack = build_context_pack(store, &cwd, query, task_id)?;
             let mut rendered = format_context_pack(&pack);
             if rendered.is_empty() {
                 rendered = serde_json::to_string_pretty(&pack)?;
@@ -254,7 +259,7 @@ fn call_tool(store: &MemoryStore, params: &Value, scope: Option<&McpScope>) -> R
                 .get("query")
                 .and_then(Value::as_str)
                 .ok_or_else(|| anyhow::anyhow!("falta query"))?;
-            serde_json::to_string_pretty(&store.search(&cwd, query)?)?
+            serde_json::to_string_pretty(&store.search_scoped(&cwd, query, task_id)?)?
         }
         "memory_get" => {
             let cwd = arg_path(&args, "cwd", scope)?;
@@ -262,7 +267,7 @@ fn call_tool(store: &MemoryStore, params: &Value, scope: Option<&McpScope>) -> R
                 .get("id")
                 .and_then(Value::as_str)
                 .ok_or_else(|| anyhow::anyhow!("falta id"))?;
-            serde_json::to_string_pretty(&store.get_visible(&cwd, id)?)?
+            serde_json::to_string_pretty(&store.get_visible_scoped(&cwd, id, task_id)?)?
         }
         "memory_propose" => {
             let cwd = arg_path(&args, "cwd", scope)?;
@@ -284,7 +289,7 @@ fn call_tool(store: &MemoryStore, params: &Value, scope: Option<&McpScope>) -> R
                     .to_owned(),
                 actor: Actor::agent("mcp"),
                 expected_revision: None,
-                orchestrator_task_id: None,
+                orchestrator_task_id: task_id,
                 workspace_id: None,
             })?;
             serde_json::to_string_pretty(&proposal_response(&result))?
@@ -301,13 +306,13 @@ fn call_tool(store: &MemoryStore, params: &Value, scope: Option<&McpScope>) -> R
                 summary,
                 provider: Some("mcp".to_owned()),
                 session_id: None,
-                orchestrator_task_id: None,
+                orchestrator_task_id: task_id,
                 ttl_secs: Some(72 * 3600),
             })?)?
         }
         "handoff_get" => {
             let cwd = arg_path(&args, "cwd", scope)?;
-            serde_json::to_string_pretty(&store.latest_handoff(&cwd, None)?)?
+            serde_json::to_string_pretty(&store.latest_handoff(&cwd, task_id)?)?
         }
         other => anyhow::bail!("herramienta desconocida: {other}"),
     };
@@ -441,6 +446,82 @@ mod tests {
     use super::{dispatch, write_message, McpScope};
     use crate::memory::test_support::{init_git_repo, temp_dir};
     use crate::memory::MemoryStore;
+
+    #[test]
+    fn process_task_scope_is_used_by_every_tool_and_cannot_be_overridden() {
+        use crate::memory::{RememberRequest, ScopeKind};
+        let root = temp_dir();
+        let repo = root.join("repo");
+        init_git_repo(&repo);
+        let store = MemoryStore::open(root.join("memory.db")).unwrap();
+        let own_task = uuid::Uuid::new_v4();
+        let other_task = uuid::Uuid::new_v4();
+        let mut scope = McpScope::from_root(&repo);
+        scope.task_id = Some(own_task);
+        let mut other_id = String::new();
+        for (task, value) in [(own_task, "own-marker"), (other_task, "foreign-marker")] {
+            let mut request = RememberRequest::human(repo.clone(), "task-value", value);
+            request.scope = ScopeKind::Task;
+            request.orchestrator_task_id = Some(task);
+            let write = store.remember(request).unwrap();
+            if task == other_task {
+                other_id = write.memory().id.clone();
+            }
+        }
+        let call = |name: &str, mut args: serde_json::Value| {
+            args["cwd"] = serde_json::json!(repo);
+            args["task_id"] = serde_json::json!(other_task);
+            super::call_tool(
+                &store,
+                &serde_json::json!({"name":name,"arguments":args}),
+                Some(&scope),
+            )
+            .unwrap()["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        for name in ["memory_context", "memory_search"] {
+            let text = call(name, serde_json::json!({"query":""}));
+            assert!(text.contains("own-marker"));
+            assert!(!text.contains("foreign-marker"));
+        }
+        assert_eq!(
+            call("memory_get", serde_json::json!({"id":other_id})),
+            "null"
+        );
+        call(
+            "handoff_create",
+            serde_json::json!({"summary":"own-handoff"}),
+        );
+        assert!(call("handoff_get", serde_json::json!({})).contains("own-handoff"));
+        assert!(store
+            .latest_handoff(&repo, Some(other_task))
+            .unwrap()
+            .is_none());
+        let proposal: serde_json::Value = serde_json::from_str(&call(
+            "memory_propose",
+            serde_json::json!({"scope":"task","key":"new","content":"proposed"}),
+        ))
+        .unwrap();
+        store
+            .approve(
+                proposal["memory_id"].as_str().unwrap(),
+                &crate::memory::Actor::human(),
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .search_scoped(&repo, "proposed", Some(own_task))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(store
+            .search_scoped(&repo, "proposed", Some(other_task))
+            .unwrap()
+            .is_empty());
+    }
 
     #[test]
     fn stdio_output_is_one_compact_json_line() {

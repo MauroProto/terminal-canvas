@@ -9,6 +9,24 @@ use std::process::Command;
 
 use super::model::{IdentityKind, ResolvedLocation};
 
+/// Process-owned task identity shared by the terminal, CLI and MCP bridge.
+/// An invalid configured identity must never silently fall back to the cwd.
+pub(crate) fn task_id_from_env() -> anyhow::Result<Option<uuid::Uuid>> {
+    parse_task_id(std::env::var_os("TC_MEMORY_TASK_ID").as_deref())
+}
+
+fn parse_task_id(value: Option<&std::ffi::OsStr>) -> anyhow::Result<Option<uuid::Uuid>> {
+    value
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value
+                .to_str()
+                .and_then(|value| uuid::Uuid::parse_str(value).ok())
+                .ok_or_else(|| anyhow::anyhow!("TC_MEMORY_TASK_ID debe ser un UUID válido"))
+        })
+        .transpose()
+}
+
 /// Resuelve la identidad durable de un directorio de trabajo.
 ///
 /// No acepta un `project_id` aportado por un agente: el daemon calcula el
@@ -136,6 +154,18 @@ fn git_stdout(path: &Path, args: &[&str]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn process_task_identity_rejects_invalid_values() {
+        use std::ffi::OsStr;
+        assert_eq!(super::parse_task_id(None).unwrap(), None);
+        assert_eq!(super::parse_task_id(Some(OsStr::new(""))).unwrap(), None);
+        assert!(super::parse_task_id(Some(OsStr::new("invalid"))).is_err());
+        let id = uuid::Uuid::new_v4();
+        assert_eq!(
+            super::parse_task_id(Some(OsStr::new(&id.to_string()))).unwrap(),
+            Some(id)
+        );
+    }
     use super::{fingerprint_remote, resolve_location, IdentityKind};
     use crate::memory::test_support::{
         clone_repo, init_git_repo, make_worktree, temp_dir, write_file,

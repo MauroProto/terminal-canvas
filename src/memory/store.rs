@@ -244,9 +244,18 @@ impl MemoryStore {
     /// Recupera una memoria activa sólo si pertenece a un scope visible desde
     /// el cwd. Es la variante segura para clientes MCP y otros agentes.
     pub fn get_visible(&self, cwd: &Path, memory_id: &str) -> Result<Option<MemoryRecord>> {
+        self.get_visible_scoped(cwd, memory_id, None)
+    }
+
+    pub fn get_visible_scoped(
+        &self,
+        cwd: &Path,
+        memory_id: &str,
+        orchestrator_task_id: Option<Uuid>,
+    ) -> Result<Option<MemoryRecord>> {
         let location = resolve_location(cwd);
         self.with_immediate_tx(|tx| {
-            let scopes = visible_scopes(tx, &location, None, None)?;
+            let scopes = visible_scopes(tx, &location, orchestrator_task_id, None)?;
             let memory = load_memory(tx, memory_id)?;
             let visible = memory.filter(|memory| {
                 memory.status.is_retrievable()
@@ -269,17 +278,36 @@ impl MemoryStore {
         status: MemoryStatus,
         workspace_id: Option<Uuid>,
     ) -> Result<Vec<MemoryRecord>> {
+        self.list_visible_scoped(cwd, status, None, workspace_id)
+    }
+
+    pub fn list_visible_scoped(
+        &self,
+        cwd: &Path,
+        status: MemoryStatus,
+        orchestrator_task_id: Option<Uuid>,
+        workspace_id: Option<Uuid>,
+    ) -> Result<Vec<MemoryRecord>> {
         let location = resolve_location(cwd);
         self.with_immediate_tx(|tx| {
-            let scopes = visible_scopes(tx, &location, None, workspace_id)?;
+            let scopes = visible_scopes(tx, &location, orchestrator_task_id, workspace_id)?;
             list_by_scopes(tx, &scopes, status)
         })
     }
 
     pub fn search(&self, cwd: &Path, query: &str) -> Result<Vec<MemoryRecord>> {
+        self.search_scoped(cwd, query, None)
+    }
+
+    pub fn search_scoped(
+        &self,
+        cwd: &Path,
+        query: &str,
+        orchestrator_task_id: Option<Uuid>,
+    ) -> Result<Vec<MemoryRecord>> {
         let location = resolve_location(cwd);
         self.with_immediate_tx(|tx| {
-            let scopes = visible_scopes(tx, &location, None, None)?;
+            let scopes = visible_scopes(tx, &location, orchestrator_task_id, None)?;
             search_visible(tx, &scopes, query)
         })
     }
@@ -354,9 +382,19 @@ impl MemoryStore {
     }
 
     pub fn export_markdown(&self, cwd: &Path) -> Result<String> {
+        self.export_markdown_scoped(cwd, None)
+    }
+
+    pub fn export_markdown_scoped(
+        &self,
+        cwd: &Path,
+        orchestrator_task_id: Option<Uuid>,
+    ) -> Result<String> {
         let project = self.resolve_project(cwd)?;
-        let active = self.list_visible(cwd, MemoryStatus::Active)?;
-        let pending = self.list_visible(cwd, MemoryStatus::Candidate)?;
+        let active =
+            self.list_visible_scoped(cwd, MemoryStatus::Active, orchestrator_task_id, None)?;
+        let pending =
+            self.list_visible_scoped(cwd, MemoryStatus::Candidate, orchestrator_task_id, None)?;
         let mut out = String::new();
         out.push_str("# TerminalCanvas shared memory\n\n");
         out.push_str(&format!(

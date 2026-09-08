@@ -92,13 +92,22 @@ pub fn run(args: &[String]) -> Result<String> {
                 .query
                 .clone()
                 .ok_or_else(|| anyhow!("search requiere una consulta"))?;
-            Ok(serde_json::to_string_pretty(&store.search(&cwd, &query)?)? + "\n")
+            Ok(
+                serde_json::to_string_pretty(&store.search_scoped(
+                    &cwd,
+                    &query,
+                    parsed.task_id,
+                )?)? + "\n",
+            )
         }
         "pending" => {
             let cwd = required_cwd(&parsed)?;
-            Ok(serde_json::to_string_pretty(
-                &store.list_visible(&cwd, crate::memory::MemoryStatus::Candidate)?,
-            )? + "\n")
+            Ok(serde_json::to_string_pretty(&store.list_visible_scoped(
+                &cwd,
+                crate::memory::MemoryStatus::Candidate,
+                parsed.task_id,
+                None,
+            )?)? + "\n")
         }
         "handoff" => {
             let cwd = required_cwd(&parsed)?;
@@ -123,7 +132,7 @@ pub fn run(args: &[String]) -> Result<String> {
         }
         "export" => {
             let cwd = required_cwd(&parsed)?;
-            store.export_markdown(&cwd)
+            store.export_markdown_scoped(&cwd, parsed.task_id)
         }
         "link" => {
             let a = parsed
@@ -252,7 +261,10 @@ fn parse_args(args: &[String]) -> Result<Parsed> {
         scope,
         kind,
         expected_revision,
-        task_id,
+        task_id: match task_id {
+            Some(id) => Some(id),
+            None => super::identity::task_id_from_env()?,
+        },
         request_id,
         provider,
         text_output,
@@ -291,7 +303,8 @@ fn required_cwd(parsed: &Parsed) -> Result<PathBuf> {
 fn usage() -> String {
     "tc-memory [--db PATH] <command> [options]\n\
      commands: health remember propose approve reject forget context search pending handoff export link\n\
-     context prints JSON by default; add --text for an injectable context block\n"
+     context prints JSON by default; add --text for an injectable context block\n\
+     --task UUID overrides TC_MEMORY_TASK_ID for task-scoped context, search and writes\n"
         .to_owned()
 }
 
