@@ -66,6 +66,7 @@ pub fn parse_unified_diff(text: &str) -> Vec<FileDiff> {
     let mut current: Option<FileDiff> = None;
     let mut old_ln: usize = 0;
     let mut new_ln: usize = 0;
+    let mut in_hunk = false;
 
     for raw in text.lines() {
         if let Some(rest) = raw.strip_prefix("diff --git ") {
@@ -79,6 +80,7 @@ pub fn parse_unified_diff(text: &str) -> Vec<FileDiff> {
             current = Some(file);
             old_ln = 0;
             new_ln = 0;
+            in_hunk = false;
             continue;
         }
 
@@ -98,14 +100,14 @@ pub fn parse_unified_diff(text: &str) -> Vec<FileDiff> {
             file.is_binary = true;
             continue;
         }
-        if let Some(rest) = raw.strip_prefix("--- ") {
+        if let Some(rest) = raw.strip_prefix("--- ").filter(|_| !in_hunk) {
             let path = strip_ab_prefix(rest);
             if path != "/dev/null" {
                 file.old_path = Some(path);
             }
             continue;
         }
-        if let Some(rest) = raw.strip_prefix("+++ ") {
+        if let Some(rest) = raw.strip_prefix("+++ ").filter(|_| !in_hunk) {
             let path = strip_ab_prefix(rest);
             if path != "/dev/null" {
                 file.path = path;
@@ -113,6 +115,7 @@ pub fn parse_unified_diff(text: &str) -> Vec<FileDiff> {
             continue;
         }
         if let Some(rest) = raw.strip_prefix("@@ ") {
+            in_hunk = true;
             if let Some((old_start, new_start)) = parse_hunk_header(rest) {
                 old_ln = old_start;
                 new_ln = new_start;
@@ -175,12 +178,50 @@ fn parse_diff_git_path(rest: &str) -> String {
 }
 
 fn strip_ab_prefix(path: &str) -> String {
-    let path = path.trim();
+    let decoded = decode_git_path(path.trim_end_matches('\t'));
+    let path = decoded.as_str();
     if let Some(stripped) = path.strip_prefix("a/").or_else(|| path.strip_prefix("b/")) {
         stripped.to_owned()
     } else {
         path.to_owned()
     }
+}
+
+/// Git quotes unusual paths with C escapes, including octal UTF-8 bytes.
+fn decode_git_path(path: &str) -> String {
+    let Some(quoted) = path.strip_prefix('"').and_then(|p| p.strip_suffix('"')) else {
+        return path.to_owned();
+    };
+    let mut bytes = Vec::new();
+    let mut input = quoted.bytes().peekable();
+    while let Some(byte) = input.next() {
+        if byte != b'\\' {
+            bytes.push(byte);
+            continue;
+        }
+        let Some(escaped) = input.next() else { break };
+        let value = match escaped {
+            b'n' => b'\n',
+            b'r' => b'\r',
+            b't' => b'\t',
+            b'a' => 7,
+            b'b' => 8,
+            b'f' => 12,
+            b'v' => 11,
+            b'0'..=b'7' => {
+                let mut value = (escaped - b'0') as u16;
+                for _ in 0..2 {
+                    if input.peek().is_some_and(|b| (b'0'..=b'7').contains(b)) {
+                        value = value * 8 + (input.next().unwrap_or(b'0') - b'0') as u16;
+                    }
+                }
+                value as u8
+            }
+            other => other,
+        };
+        bytes.push(value);
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 /// `@@ -old_start,old_count +new_start,new_count @@ ...` → (old_start, new_start).
@@ -491,6 +532,25 @@ index 1111111..2222222 100644
 +    println!(\"new\");
  }
 ";
+
+    #[test]
+    fn hunk_content_that_looks_like_file_headers_keeps_paths_and_counts() {
+        let files = parse_unified_diff("diff --git a/test.txt b/test.txt\n--- a/test.txt\n+++ b/test.txt\n@@ -1,2 +1,2 @@\n--- old content\n+++ new content\n stable\n");
+        assert_eq!(files[0].path, "test.txt");
+        assert_eq!(files[0].old_path.as_deref(), Some("test.txt"));
+        assert_eq!((files[0].additions, files[0].deletions), (1, 1));
+        assert_eq!(files[0].lines.last().unwrap().new_ln, Some(2));
+    }
+
+    #[test]
+    fn quoted_git_paths_decode_utf8_and_control_characters() {
+        assert_eq!(
+            super::strip_ab_prefix(r#""b/espa\303\261ol.txt""#),
+            "español.txt"
+        );
+        assert_eq!(super::strip_ab_prefix(r#""b/a\tb.txt""#), "a\tb.txt");
+        assert_eq!(super::strip_ab_prefix("b/ leading.txt"), " leading.txt");
+    }
 
     #[test]
     fn parses_single_file_with_mixed_lines() {
