@@ -413,6 +413,8 @@ impl TerminalApp {
                 quick_open_rx: None,
                 screenshot_rx: None,
                 file_viewer: None,
+                screenshot_target: None,
+                file_viewer_keyboard_active: false,
                 file_viewer_rx: None,
                 settings_open: false,
                 settings_draft: None,
