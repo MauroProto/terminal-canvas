@@ -86,7 +86,9 @@ impl PersistenceWorker {
                             Completion::State { snapshot, result }
                         }
                         Job::Incremental(batch) => {
-                            let (rollover_panels, acknowledgements) = if crate::state::run_marker::current_process_may_write() {
+                            let (rollover_panels, acknowledgements) = if let Ok(Some(_guard)) =
+                                crate::state::run_marker::acquire_write_guard()
+                            {
                                 persist_incremental_batch(batch, &mut next_sequences)
                             } else {
                                 (Vec::new(), Vec::new())
@@ -97,7 +99,9 @@ impl PersistenceWorker {
                             }
                         }
                         Job::Full(entries) => Completion::Full {
-                            acknowledgements: if crate::state::run_marker::current_process_may_write() {
+                            acknowledgements: if let Ok(Some(_guard)) =
+                                crate::state::run_marker::acquire_write_guard()
+                            {
                                 persist_full_entries(entries)
                             } else {
                                 Vec::new()
