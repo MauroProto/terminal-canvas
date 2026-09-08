@@ -30,7 +30,10 @@ pub fn install_hint(provider: AgentProvider) -> Option<&'static str> {
 /// ¿Está el binario en el PATH? Resuelve sin ejecutar nada (un `--version`
 /// puede colgarse o pedir login).
 pub fn resolve_in_path(command: &str, path_var: &str) -> Option<PathBuf> {
-    if command.contains('/') {
+    if command.contains('/')
+        || command.contains('\\')
+        || std::path::Path::new(command).is_absolute()
+    {
         // Ya es un path: solo se verifica que exista y sea ejecutable.
         let path = PathBuf::from(command);
         return is_executable(&path).then_some(path);
@@ -39,6 +42,26 @@ pub fn resolve_in_path(command: &str, path_var: &str) -> Option<PathBuf> {
         let candidate = dir.join(command);
         if is_executable(&candidate) {
             return Some(candidate);
+        }
+        #[cfg(windows)]
+        if let Some(path) = resolve_windows_extensions(
+            &candidate,
+            &std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_owned()),
+        ) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+#[cfg(windows)]
+fn resolve_windows_extensions(candidate: &std::path::Path, extensions: &str) -> Option<PathBuf> {
+    for extension in extensions.split(';').filter(|ext| ext.starts_with('.')) {
+        let mut name = candidate.as_os_str().to_os_string();
+        name.push(extension);
+        let path = PathBuf::from(name);
+        if is_executable(&path) {
+            return Some(path);
         }
     }
     None
@@ -141,6 +164,22 @@ pub fn detect_installed(path_var: &str) -> InstalledAgents {
 #[cfg(test)]
 mod tests {
     use super::{detect_installed, install_hint, resolve_in_path, InstalledAgents};
+
+    #[cfg(windows)]
+    #[test]
+    fn resolves_exe_and_cmd_using_windows_extensions() {
+        let dir = std::env::temp_dir().join(format!("agent-pathext-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, extension) in [("claude", "exe"), ("codex", "cmd")] {
+            let binary = dir.join(format!("{name}.{extension}"));
+            std::fs::write(&binary, b"fixture").unwrap();
+            assert_eq!(
+                super::resolve_windows_extensions(&dir.join(name), ".EXE;.CMD"),
+                Some(binary)
+            );
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     use crate::orchestration::AgentProvider;
 
     /// Crea un PATH falso con un "binario" ejecutable adentro.
