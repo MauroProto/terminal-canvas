@@ -97,7 +97,22 @@ fn twenty_live_terminals_deliver_output_resize_and_exit() {
     let deadline = Instant::now() + Duration::from_secs(15);
     while sessions.iter().any(|(id, _)| manager.is_alive(*id)) {
         manager.drain_ui_updates();
-        assert!(Instant::now() < deadline, "PTY exit was not observed");
+        if Instant::now() >= deadline {
+            let remaining: Vec<_> = sessions
+                .iter()
+                .filter(|(id, _)| manager.is_alive(*id))
+                .map(|(id, _)| {
+                    let handle = manager.handle(*id).unwrap();
+                    let handle = handle.lock().unwrap();
+                    (
+                        *id,
+                        handle.input_error(),
+                        handle.with_term(scrollback_to_text),
+                    )
+                })
+                .collect();
+            panic!("PTY exit was not observed; remaining sessions: {remaining:?}");
+        }
         std::thread::sleep(Duration::from_millis(20));
     }
     for (id, _) in sessions {
