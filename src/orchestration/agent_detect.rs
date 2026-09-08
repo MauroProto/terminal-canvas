@@ -40,15 +40,15 @@ pub fn resolve_in_path(command: &str, path_var: &str) -> Option<PathBuf> {
     }
     for dir in std::env::split_paths(path_var) {
         let candidate = dir.join(command);
-        if is_executable(&candidate) {
-            return Some(candidate);
-        }
         #[cfg(windows)]
         if let Some(path) = resolve_windows_extensions(
             &candidate,
             &std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_owned()),
         ) {
             return Some(path);
+        }
+        if is_executable(&candidate) {
+            return Some(candidate);
         }
     }
     None
@@ -164,6 +164,24 @@ pub fn detect_installed(path_var: &str) -> InstalledAgents {
 #[cfg(test)]
 mod tests {
     use super::{detect_installed, install_hint, resolve_in_path, InstalledAgents};
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_prefers_the_cmd_shim_over_an_adjacent_unix_launcher() {
+        let dir = std::env::temp_dir().join(format!("agent-shim-order-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("claude"), "#!/bin/sh\n").unwrap();
+        std::fs::write(dir.join("claude.cmd"), "@echo off\n").unwrap();
+        let resolved = resolve_in_path(
+            "claude",
+            &std::env::join_paths([&dir]).unwrap().to_string_lossy(),
+        )
+        .unwrap();
+        assert!(resolved
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("cmd")));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[cfg(windows)]
     #[test]
