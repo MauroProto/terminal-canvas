@@ -1,6 +1,4 @@
 use std::io::Read;
-#[cfg(all(unix, feature = "daemon"))]
-use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
@@ -21,6 +19,44 @@ use uuid::Uuid;
 #[path = "input_writer.rs"]
 mod input_writer;
 pub(crate) use input_writer::InputWriter;
+
+#[derive(Clone)]
+enum TerminalWriter {
+    Local(InputWriter),
+    #[cfg(all(unix, feature = "daemon"))]
+    Remote(RemoteLink),
+}
+
+impl TerminalWriter {
+    fn enqueue(&self, bytes: &[u8]) -> std::io::Result<()> {
+        match self {
+            Self::Local(writer) => writer.enqueue(bytes),
+            #[cfg(all(unix, feature = "daemon"))]
+            Self::Remote(link) => link.write_input(bytes),
+        }
+    }
+    fn error(&self) -> Option<String> {
+        match self {
+            Self::Local(writer) => writer.error(),
+            #[cfg(all(unix, feature = "daemon"))]
+            Self::Remote(link) => link.input_error(),
+        }
+    }
+    fn close(&self) {
+        match self {
+            Self::Local(writer) => writer.close(),
+            #[cfg(all(unix, feature = "daemon"))]
+            Self::Remote(link) => link.disconnect(),
+        }
+    }
+    #[cfg(all(unix, feature = "daemon"))]
+    fn record_error(&self, message: String) {
+        match self {
+            Self::Local(writer) => writer.record_error(message),
+            Self::Remote(link) => link.record_input_error(message),
+        }
+    }
+}
 
 fn next_log_sequence(counter: &AtomicU64) -> Option<u64> {
     counter
@@ -129,7 +165,7 @@ pub struct PtyHandle {
     title: Arc<ArcSwap<String>>,
     pub alive: Arc<AtomicBool>,
     pub bell_fired: Arc<AtomicBool>,
-    writer: InputWriter,
+    writer: TerminalWriter,
     last_output_at: Arc<AtomicI64>,
     window_size: Arc<Mutex<WindowSize>>,
     render_revision: Arc<AtomicU64>,
@@ -276,7 +312,8 @@ impl PtyHandle {
         let title_for_reader = Arc::clone(&title);
         let alive_for_reader = Arc::clone(&alive);
         let bell_for_reader = Arc::clone(&bell_fired);
-        let writer_for_reader = InputWriter::new(writer).context("start PTY input writer")?;
+        let writer_for_reader =
+            TerminalWriter::Local(InputWriter::new(writer).context("start PTY input writer")?);
         let writer_for_thread = writer_for_reader.clone();
         let output_for_reader = Arc::clone(&last_output_at);
         let term_for_reader = Arc::clone(&term);
@@ -453,7 +490,7 @@ impl PtyHandle {
             .get_ref()
             .set_read_timeout(None)
             .context("switch attached socket to event streaming")?;
-        use crate::terminal::remote_session::{RemoteReader, RemoteWriter};
+        use crate::terminal::remote_session::RemoteReader;
 
         let link = RemoteLink::new(session_id, control);
         let title = Arc::new(ArcSwap::from_pointee("Terminal".to_owned()));
@@ -502,8 +539,7 @@ impl PtyHandle {
             }
         }
 
-        let writer: Box<dyn Write + Send> = Box::new(RemoteWriter::new(link.clone()));
-        let writer_for_reader = InputWriter::new(writer).context("start remote input writer")?;
+        let writer_for_reader = TerminalWriter::Remote(link.clone());
         let writer_for_thread = writer_for_reader.clone();
         let title_for_reader = Arc::clone(&title);
         let alive_for_reader = Arc::clone(&alive);
@@ -1222,7 +1258,7 @@ impl HookIdentity {
 
 fn drain_terminal_events(
     event_rx: &mpsc::Receiver<Event>,
-    writer: &InputWriter,
+    writer: &TerminalWriter,
     title: &Arc<ArcSwap<String>>,
     alive: &Arc<AtomicBool>,
     bell_fired: &Arc<AtomicBool>,

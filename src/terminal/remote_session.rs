@@ -65,6 +65,33 @@ impl RemoteLink {
         control.enqueue(encode_line(request).as_bytes())
     }
 
+    pub fn write_input(&self, bytes: &[u8]) -> std::io::Result<()> {
+        // One acceptance boundary for an entire paste. Returning WouldBlock
+        // after earlier chunks were sent would make retries duplicate input.
+        let control = self
+            .control
+            .as_ref()
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        if bytes.len() > 2 * 1024 * 1024 {
+            // Reject before allocating an encoded copy of an oversized paste.
+            return control.enqueue(bytes);
+        }
+        let mut framed = String::new();
+        for chunk in bytes.chunks(MAX_WIRE_INPUT_BYTES) {
+            framed.push_str(&encode_line(&Request::Write {
+                id: self.session_id,
+                data: chunk.to_vec(),
+            }));
+        }
+        control.enqueue(framed.as_bytes())
+    }
+
+    pub fn record_input_error(&self, message: String) {
+        if let Ok(writer) = &self.control {
+            writer.record_error(message);
+        }
+    }
+
     pub fn resize(&self, cols: u16, rows: u16) {
         let _ = self.send(&Request::Resize {
             id: self.session_id,
@@ -126,12 +153,7 @@ impl RemoteWriter {
 
 impl Write for RemoteWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        for chunk in buf.chunks(MAX_WIRE_INPUT_BYTES) {
-            self.link.send(&Request::Write {
-                id: self.link.session_id(),
-                data: chunk.to_vec(),
-            })?;
-        }
+        self.link.write_input(buf)?;
         Ok(buf.len())
     }
 
@@ -282,7 +304,6 @@ mod tests {
         let id = Uuid::new_v4();
         let link = RemoteLink::new(id, ours);
         link.resize(120, 40);
-        link.kill();
 
         let mut reader = BufReader::new(theirs);
         let mut line = String::new();
@@ -298,11 +319,39 @@ mod tests {
             ),
             "got {line}"
         );
+        link.kill();
         line.clear();
         reader.read_line(&mut line).unwrap();
         assert!(
             matches!(decode_line::<Request>(&line), Some(Request::Kill { .. })),
             "got {line}"
+        );
+    }
+
+    #[test]
+    fn rejected_remote_paste_keeps_the_channel_usable_without_partial_chunks() {
+        let (ours, theirs) = socket_pair();
+        theirs
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        let id = Uuid::new_v4();
+        let link = RemoteLink::new(id, ours);
+        assert_eq!(
+            link.write_input(&vec![b'x'; 2 * 1024 * 1024])
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        link.write_input(b"accepted").unwrap();
+        let mut reader = BufReader::new(theirs);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        assert_eq!(
+            decode_line::<Request>(&line),
+            Some(Request::Write {
+                id,
+                data: b"accepted".to_vec()
+            })
         );
     }
 
