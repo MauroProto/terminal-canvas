@@ -467,7 +467,7 @@ impl PtyManager {
                 .map(str::trim)
                 .filter(|command| !command.is_empty())
             {
-                handle.write_all(format!("{command}\n").as_bytes());
+                handle.try_write_all(format!("{command}\n").as_bytes())?;
             }
         }
         let shared_handle = Arc::new(Mutex::new(handle));
@@ -503,7 +503,16 @@ impl PtyManager {
                     baseline_render_revision,
                 });
             } else if let Ok(handle) = handle.lock() {
-                write_startup_input(&handle, &input);
+                if let Err(error) = write_startup_input(&handle, &input) {
+                    if error.kind() == std::io::ErrorKind::WouldBlock {
+                        session.pending_startup_input = Some(PendingStartupInput {
+                            input,
+                            baseline_render_revision: baseline_render_revision.saturating_sub(1),
+                        });
+                    } else {
+                        log::warn!("No se pudo enviar el prompt inicial: {error}");
+                    }
+                }
             }
         }
     }
@@ -630,7 +639,7 @@ impl PtyManager {
     }
 
     /// Flushea `pending_startup_input` (is_startup=true) o `pending_prompt`
-    /// (false) si el handle está listo. Devuelve el input escrito, si hubo.
+    /// (false) si el handle está listo. Conserva el prompt si la cola está llena.
     fn flush_one_pending(session: &mut ManagedSession, is_startup: bool) {
         let pending_ref = if is_startup {
             session.pending_startup_input.as_ref()
@@ -651,18 +660,26 @@ impl PtyManager {
         if !pending.is_ready(handle.render_revision()) {
             return;
         }
-        let taken = if is_startup {
-            session.pending_startup_input.take()
+        let result = if is_startup {
+            write_startup_input(&handle, &pending.input)
         } else {
-            session.pending_prompt.take()
+            write_prompt_input(&handle, &pending.input)
         };
-        let Some(pending) = taken else {
+        if result
+            .as_ref()
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::WouldBlock)
+        {
+            // Enqueue is atomic: no bytes were accepted, so retrying cannot
+            // duplicate a partial prompt. UI updates retry after the queue drains.
             return;
-        };
+        }
+        if let Err(error) = result {
+            log::warn!("No se pudo enviar el prompt pendiente: {error}");
+        }
         if is_startup {
-            write_startup_input(&handle, &pending.input);
+            session.pending_startup_input = None;
         } else {
-            write_prompt_input(&handle, &pending.input);
+            session.pending_prompt = None;
         }
     }
 }
@@ -671,19 +688,19 @@ impl PtyManager {
 /// de escape para que el brief no pueda emitir secuencias de control, y si
 /// el TUI ya activó bracketed paste lo envía como paste atómico para que un
 /// brief multi-línea no se ejecute línea por línea.
-fn write_startup_input(handle: &PtyHandle, input: &str) {
+fn write_startup_input(handle: &PtyHandle, input: &str) -> std::io::Result<()> {
     let sanitized = sanitize_agent_prompt(input);
     let mode = handle.input_mode();
     let mut bytes = paste_bytes(&sanitized, &mode);
     bytes.push(b'\n');
-    handle.write_all(&bytes);
+    handle.try_write_all(&bytes)
 }
 
 /// Prompt interactivo (feedback): igual que el startup pero submit con `\r`
 /// (la tecla Enter real), consistente con `agent_prompt_bytes`.
-fn write_prompt_input(handle: &PtyHandle, input: &str) {
+fn write_prompt_input(handle: &PtyHandle, input: &str) -> std::io::Result<()> {
     let bytes = agent_prompt_bytes(input, &handle.input_mode());
-    handle.write_all(&bytes);
+    handle.try_write_all(&bytes)
 }
 
 #[cfg(test)]
