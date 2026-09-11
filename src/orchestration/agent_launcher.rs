@@ -554,13 +554,20 @@ fn main() {
         let token = Uuid::new_v4();
         for shell in ["cmd.exe", "powershell.exe"] {
             let mut command = Command::new(shell);
-            if shell == "cmd.exe" {
-                command.args(["/d", "/c"]);
+            // Producción escribe esta línea tal cual en el PTY del shell
+            // interactivo. `Command::arg` aplicaría el escapado MSVCRT (`\"`),
+            // que cmd.exe no entiende: expondría el `&` de la ruta y `start`
+            // terminaría ejecutando un directorio (acceso denegado).
+            let flags = if shell == "cmd.exe" {
+                "/d /c"
             } else {
-                command.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"]);
-            }
+                "-NoLogo -NoProfile -NonInteractive -Command"
+            };
             command
-                .arg(helper_command(&executable, token, shell))
+                .raw_arg(format!(
+                    "{flags} {}",
+                    helper_command(&executable, token, shell)
+                ))
                 .env("TC_LAUNCH_CAPTURE", &capture)
                 .creation_flags(0x08000000);
             let output = command.output().unwrap();
@@ -584,7 +591,9 @@ fn main() {
         let binary = fixture.executable();
         let node = fixture.0.join("node.exe");
         std::fs::copy(binary, &node).unwrap();
-        let script = fixture.0.join("node_modules/agent/cli.js");
+        // El shim real usa `\` y el lanzador une el entry point sin reescribir
+        // separadores; la expectativa debe componerse de la misma forma.
+        let script = fixture.0.join("node_modules").join("agent").join("cli.js");
         std::fs::create_dir_all(script.parent().unwrap()).unwrap();
         std::fs::write(&script, "fixture only").unwrap();
         let shim = fixture.0.join("claude.cmd");
