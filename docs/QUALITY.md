@@ -65,24 +65,73 @@ Ver [instalación portable](PORTABLE.md) y [release](RELEASE.md).
 
 ## Verificación
 
-La matriz usa Rust 1.98.0 y compila Windows x86_64, Linux x86_64 y macOS
-x86_64/aarch64. Incluye formato, Clippy con advertencias como errores, tests de
-todos los targets, tests del daemon en Unix, pruebas de la extensión y auditoría
-de dependencias. Las suites de runtime importan la librería real, evitando copias
-del código bajo prueba. Hay una prueba con veinte PTY reales, además de pruebas
-de interacción egui y regresiones de almacenamiento y reconexión.
+La revisión de código cerró el 16 de septiembre de 2026 sobre
+`b8e0c33c2cddd8af0cd4668e66ac11b6e4b47d78`. La corrida del
+[PR #13, `35142399418`](https://github.com/MauroProto/terminal-canvas/actions/runs/35142399418)
+terminó con sus siete jobs aprobados. La
+[corrida del push, `35142392994`](https://github.com/MauroProto/terminal-canvas/actions/runs/35142392994)
+también completó correctamente los seis jobs ejecutados; el benchmark sólo se
+ejecuta en pull requests. Este registro agrega documentación a ese código
+validado. Las verificaciones posteriores del HEAD y de la integración se pueden
+consultar en el [PR #13](https://github.com/MauroProto/terminal-canvas/pull/13).
 
-En Windows pasaron `cargo fmt`, Clippy con advertencias como errores y
-`cargo test --all-targets --locked --quiet --no-fail-fast`, además de las nueve
-pruebas de la extensión. La corrida remota
-[`34648292200`](https://github.com/MauroProto/terminal-canvas/actions/runs/34648292200)
-sobre `c766dff` dejó verdes la auditoría, Windows y las suites base de ambos
-macOS. Antes de integrar a `master` quedan por resolver tres regresiones Unix:
-el orden entre la última ráfaga y `Exit` en Ubuntu, la detección de entrada a la
-pantalla alternativa en ambos macOS y reintentos ante `WouldBlock` en la prueba
-paralela de PTY de macOS Intel. El ajuste de detección de pantalla alternativa
-quedó preparado en el commit inmediatamente posterior, pendiente de validación
-en la matriz.
+| Validación | Resultado en la matriz del PR |
+| --- | --- |
+| Ubuntu 24.04 x86_64 | Formato, Clippy y todos los targets aprobados, tanto base como con `daemon`. |
+| Windows 2025 x86_64 | Clippy y todos los targets aprobados. El daemon Unix no se ejecuta en Windows. |
+| macOS 15 aarch64 | Clippy y todos los targets aprobados, tanto base como con `daemon`. |
+| macOS 15 Intel x86_64 | Clippy y todos los targets aprobados, tanto base como con `daemon`. |
+| Extensión | Las nueve pruebas JavaScript aprobadas en un job independiente. |
+| Auditoría | Aprobada después de actualizar `rustls` a 0.23.45 y regenerar `Cargo.lock` con Cargo. Persisten las advertencias de mantenimiento indicadas abajo. |
+| Benchmark | Aprobado el umbral existente de degradación máxima del 15% frente a `origin/master`. |
+
+La matriz utiliza Rust 1.98.0. Ejecuta `cargo fmt --all -- --check`,
+`cargo clippy --all-targets --locked -- -D warnings` y
+`cargo test --all-targets --locked --quiet --no-fail-fast`. En Unix también
+comprueba y ejecuta todos los targets con `--features daemon`, incluyendo Clippy
+con advertencias como errores. Clippy y tests se ejecutan secuencialmente en cada
+runner. La extensión usa `node --test extension/tests/*.test.cjs`.
+
+Las suites de runtime importan la librería real. La prueba con veinte PTY
+conserva sus comprobaciones de salida, tamaño y finalización; la inspección del
+grid redimensionado ahora usa su lock, sin interpretar contención de `try_lock`
+como un fallo de resize.
+
+El daemon toma la finalización del hilo lector como frontera antes del drenaje
+final, en lugar de usar la señal de vida del proceso. Una regresión adicional
+verifica que una señal de salida anticipada no descarte bytes posteriores.
+La prueba original sigue exigiendo las 3000 líneas completas antes de `Exit` y
+que no queden frames pendientes. Se separó la primera línea de los controles
+que puede emitir Bash; no se redujo la aserción. Pasó diez ejecuciones dirigidas
+consecutivas en Linux en la
+[corrida `35137098426`](https://github.com/MauroProto/terminal-canvas/actions/runs/35137098426).
+
+La restauración de TUI conserva la comprobación de entrada real a alternate
+screen. Se corrigió `WireSpec::default()` para que use 80x24, igual que la
+deserialización de campos omitidos, en vez de terminar abriendo un PTY de 1x1.
+
+La prueba paralela mantiene ocho PTY, 512 KiB por sesión y el plazo original de
+30 segundos. Conserva respuestas parciales y reintenta errores transitorios
+contra una fecha límite monotónica fija. EOF, mensajes inválidos y errores
+permanentes siguen provocando un fallo. En macOS se espera con `poll`, sin
+cambiar opciones del socket después del cierre del peer. Las regresiones cubren
+UTF-8 partido, datos precargados, EOF vacío o parcial y vencimiento del plazo.
+
+El payload se verifica sin contar metadatos OSC; quitar un byte sigue siendo
+ detectable por la regresión. Los dos marcadores de finalización los genera
+Python después del payload y no aparecen completos en el comando enviado,
+eliminando la dependencia del eco del shell. Se espera a todos los workers
+antes de cerrar el daemon, incluso si alguno falla. La carga pasó cinco
+repeticiones dirigidas en
+[Linux, `35137938512`](https://github.com/MauroProto/terminal-canvas/actions/runs/35137938512),
+y cinco con la condición final de marcadores en
+[macOS Intel, `35142238258`](https://github.com/MauroProto/terminal-canvas/actions/runs/35142238258).
+Estas corridas dirigidas corresponden a los ajustes progresivos; la matriz
+completa citada al principio valida su combinación final.
+
+Las verificaciones de esta continuación se ejecutaron en GitHub Actions, no en
+la PC local. No se modificaron sus worktrees. No quedan scripts ni workflows
+transitorios de reparación en el árbol final.
 
 ## Límites de esta entrega
 
@@ -95,6 +144,13 @@ en la matriz.
   monitores, escalas, drivers y sistemas de accesibilidad reales.
 - Los tests de la extensión usan el runtime JavaScript con mocks; no certifican
   todas las páginas ni todas las versiones del navegador.
+- La auditoría conserva cinco advertencias por dependencias sin mantenimiento,
+  `bincode`, `paste`, `rustls-pemfile`, `ttf-parser` y `yaml-rust`. No se agregaron
+  excepciones para ocultarlas. Cargo también informa incompatibilidad futura
+  de `block` 0.1.6 en macOS.
+- La prueba de sesiones reales de Claude sigue requiriendo datos de un entorno
+  local y no forma parte de la ejecución automática. El fixture de subprocess
+  marcado como ignorado se invoca explícitamente desde sus tests de regresión.
 - No se ha publicado una release firmada, un instalador ni un tap Homebrew en
   esta revisión. El cask requiere los checksums de los DMG finales.
 - La actualización se instala manualmente. Online e invitaciones conservan su
