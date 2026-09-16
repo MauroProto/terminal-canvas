@@ -1,0 +1,117 @@
+name: Verify PTY payload validation
+
+on:
+  push:
+    branches: ["codex/premium-quality"]
+    paths: [".github/workflows/quality-payload.yml"]
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_BUILD_JOBS: 4
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.98.0"
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Keep payload validation independent of OSC metadata
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('tests/daemon_process.rs')
+          s = p.read_text()
+          old = "output.split(|byte| *byte != b'x').any(|run| run.len() >= OUTPUT_BYTES)"
+          new = "daemon_response::longest_printed_run(&output, 'x') >= OUTPUT_BYTES"
+          assert s.count(old) == 1
+          s = s.replace(old, new)
+          old = '                                && output.len() >= OUTPUT_BYTES\n'
+          new = old + "                                && daemon_response::longest_printed_run(&output, 'x') >= OUTPUT_BYTES\n"
+          assert s.count(old) == 1
+          p.write_text(s.replace(old, new))
+          p = Path('tests/support/daemon_response.rs')
+          s = p.read_text()
+          anchor = '#[cfg(test)]\nmod tests {'
+          assert s.count(anchor) == 1
+          helper = '''/// Measure real printed payload, excluding OSC title/cwd/status frames that
+          /// the daemon may insert between PTY chunks. Metadata cannot supply bytes.
+          pub fn longest_printed_run(bytes: &[u8], needle: char) -> usize {
+              struct Runs {
+                  needle: char,
+                  current: usize,
+                  longest: usize,
+              }
+              impl alacritty_terminal::vte::Perform for Runs {
+                  fn print(&mut self, character: char) {
+                      if character == self.needle {
+                          self.current += 1;
+                          self.longest = self.longest.max(self.current);
+                      } else {
+                          self.current = 0;
+                      }
+                  }
+                  fn execute(&mut self, byte: u8) {
+                      if matches!(byte, b'\\r' | b'\\n') {
+                          self.current = 0;
+                      }
+                  }
+              }
+              let mut runs = Runs { needle, current: 0, longest: 0 };
+              let mut parser = alacritty_terminal::vte::Parser::new();
+              parser.advance(&mut runs, bytes);
+              runs.longest
+          }
+
+          '''
+          s = s.replace(anchor, helper + anchor)
+          test_anchor = '    #[test]\n    fn retains_partial_utf8_and_the_next_buffered_response() {'
+          assert s.count(test_anchor) == 1
+          test = r'''    #[test]
+              fn osc_metadata_neither_breaks_nor_supplies_payload_bytes() {
+                  const BYTES: usize = 512 * 1024;
+                  let mut output = vec![b'x'; BYTES / 2];
+                  output.extend_from_slice(b"\x1b]2;xxxx\x07\x1b]7;file:///xxxx\x1b\\");
+                  output.extend(std::iter::repeat_n(b'x', BYTES / 2));
+                  assert_eq!(longest_printed_run(&output, 'x'), BYTES);
+                  output.pop();
+                  assert_eq!(longest_printed_run(&output, 'x'), BYTES - 1);
+                  assert_eq!(longest_printed_run(b"xxx\r\nxxx", 'x'), 3);
+                  assert_eq!(longest_printed_run(b"xxxYxxx", 'x'), 3);
+              }
+
+          '''
+          p.write_text(s.replace(test_anchor, test + test_anchor))
+          PY
+          cargo fmt --all
+          cargo fmt --all -- --check
+          git diff --check
+          python3 - <<'PY'
+          import subprocess
+          changed = subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()
+          assert set(changed) == {'tests/daemon_process.rs', 'tests/support/daemon_response.rs'}, changed
+          PY
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add tests/daemon_process.rs tests/support/daemon_response.rs
+          git commit -m 'test(daemon): validate burst bytes independently of OSC metadata'
+          test "$(git ls-remote origin refs/heads/codex/premium-quality | cut -f1)" = "${{ github.sha }}"
+          git push origin HEAD:refs/heads/codex/premium-quality
+      - name: Clippy daemon
+        run: cargo clippy --all-targets --locked --features daemon -- -D warnings
+      - name: Reader and payload regression tests
+        run: cargo test --locked --features daemon --test daemon_process daemon_response::tests -- --nocapture
+      - name: Repeat all eight complete 512 KiB bursts
+        run: |
+          for attempt in $(seq 1 5); do
+            echo "Parallel PTY regression attempt ${attempt}/5"
+            cargo test --locked --features daemon --test daemon_process several_real_ptys_finish_parallel_output_bursts -- --nocapture
+          done
