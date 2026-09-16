@@ -65,11 +65,57 @@ pub fn read_before(reader: &mut BufReader<UnixStream>, deadline: Instant) -> io:
     }
 }
 
+/// Measure real printed payload, excluding OSC title/cwd/status frames that
+/// the daemon may insert between PTY chunks. Metadata cannot supply bytes.
+pub fn longest_printed_run(bytes: &[u8], needle: char) -> usize {
+    struct Runs {
+        needle: char,
+        current: usize,
+        longest: usize,
+    }
+    impl alacritty_terminal::vte::Perform for Runs {
+        fn print(&mut self, character: char) {
+            if character == self.needle {
+                self.current += 1;
+                self.longest = self.longest.max(self.current);
+            } else {
+                self.current = 0;
+            }
+        }
+        fn execute(&mut self, byte: u8) {
+            if matches!(byte, b'\r' | b'\n') {
+                self.current = 0;
+            }
+        }
+    }
+    let mut runs = Runs {
+        needle,
+        current: 0,
+        longest: 0,
+    };
+    let mut parser = alacritty_terminal::vte::Parser::new();
+    parser.advance(&mut runs, bytes);
+    runs.longest
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use mi_terminal::daemon::protocol::encode_line;
     use std::io::Write;
+
+    #[test]
+    fn osc_metadata_neither_breaks_nor_supplies_payload_bytes() {
+        const BYTES: usize = 512 * 1024;
+        let mut output = vec![b'x'; BYTES / 2];
+        output.extend_from_slice(b"\x1b]2;xxxx\x07\x1b]7;file:///xxxx\x1b\\");
+        output.extend(std::iter::repeat_n(b'x', BYTES / 2));
+        assert_eq!(longest_printed_run(&output, 'x'), BYTES);
+        output.pop();
+        assert_eq!(longest_printed_run(&output, 'x'), BYTES - 1);
+        assert_eq!(longest_printed_run(b"xxx\r\nxxx", 'x'), 3);
+        assert_eq!(longest_printed_run(b"xxxYxxx", 'x'), 3);
+    }
 
     #[test]
     fn retains_partial_utf8_and_the_next_buffered_response() {

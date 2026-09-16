@@ -704,6 +704,7 @@ fn several_real_ptys_finish_parallel_output_bursts() {
                                 .count()
                                 >= 2
                                 && output.len() >= OUTPUT_BYTES
+                                && daemon_response::longest_printed_run(&output, 'x') >= OUTPUT_BYTES
                             {
                                 break;
                             }
@@ -721,7 +722,7 @@ fn several_real_ptys_finish_parallel_output_bursts() {
                     output.len()
                 );
                 assert!(
-                    output.split(|byte| *byte != b'x').any(|run| run.len() >= OUTPUT_BYTES),
+                    daemon_response::longest_printed_run(&output, 'x') >= OUTPUT_BYTES,
                     "la sesión {index} perdió bytes del payload"
                 );
                 assert!(
