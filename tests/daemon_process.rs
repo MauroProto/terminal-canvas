@@ -681,9 +681,13 @@ fn several_real_ptys_finish_parallel_output_bursts() {
                 assert!(matches!(next(&mut reader, handshake_deadline), Response::Attached { .. }));
 
                 let marker = format!("load_done_{index}_{}", Uuid::new_v4().simple());
+                // Neither marker is present in the command echo. Both must be
+                // emitted by Python after the entire payload has been written.
+                let (prefix, suffix) = marker.split_at(marker.len() / 2);
                 let command = format!(
-                    "python3 -c \"import sys;sys.stdout.write('x'*{OUTPUT_BYTES});print('{marker}')\"\n"
+                    "python3 -c \"import sys;m='{prefix}'+'{suffix}';sys.stdout.write('x'*{OUTPUT_BYTES});print(m);print(m)\"\n"
                 );
+                assert!(!command.contains(&marker), "marker must not come from echo");
                 send(
                     &Request::Write {
                         id,
@@ -695,7 +699,16 @@ fn several_real_ptys_finish_parallel_output_bursts() {
                 let deadline = Instant::now() + Duration::from_secs(30);
                 let mut output = Vec::new();
                 while Instant::now() < deadline {
-                    match next(&mut reader, deadline) {
+                    match daemon_response::read_before(&mut reader, deadline).unwrap_or_else(|error| {
+                        panic!(
+                            "session {index}: {error}; bytes={}, markers={}, payload={}, head={:?}, tail={:?}",
+                            output.len(),
+                            output.windows(marker.len()).filter(|window| *window == marker.as_bytes()).count(),
+                            daemon_response::longest_printed_run(&output, 'x'),
+                            String::from_utf8_lossy(&output[..output.len().min(128)]),
+                            String::from_utf8_lossy(&output[output.len().saturating_sub(128)..]),
+                        )
+                    }) {
                         Response::Output { id: got, data, .. } if got == id => {
                             output.extend_from_slice(&data);
                             if output
@@ -734,9 +747,12 @@ fn several_real_ptys_finish_parallel_output_bursts() {
         })
         .collect::<Vec<_>>();
 
-    for worker in workers {
-        worker.join().expect("worker de carga");
-    }
+    // Join every worker before dropping the daemon, even if one failed.
+    let results: Vec<_> = workers
+        .into_iter()
+        .map(std::thread::JoinHandle::join)
+        .collect();
+    assert!(results.iter().all(Result::is_ok), "worker de carga");
 }
 
 #[test]
