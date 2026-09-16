@@ -67,7 +67,7 @@ pub fn pid_path(dir: &Path) -> PathBuf {
 /// Spec de sesión que viaja por el socket (espejo de `runtime::SessionSpec`,
 /// desacoplado a propósito: el protocolo no puede romperse porque el struct
 /// interno gane un campo).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WireSpec {
     #[serde(default)]
     pub memory_task_id: Option<Uuid>,
@@ -87,6 +87,24 @@ pub struct WireSpec {
     pub cols: u16,
     #[serde(default = "default_rows")]
     pub rows: u16,
+}
+
+// Rust construction and deserialization must use the same terminal geometry.
+// Deriving Default silently creates a 0x0 PTY, later clamped to 1x1.
+impl Default for WireSpec {
+    fn default() -> Self {
+        Self {
+            memory_task_id: None,
+            title: String::new(),
+            cwd: None,
+            startup_command: None,
+            panel_id: None,
+            workspace_id: None,
+            leaf_id: None,
+            cols: default_cols(),
+            rows: default_rows(),
+        }
+    }
 }
 
 fn default_cols() -> u16 {
@@ -411,6 +429,13 @@ mod tests {
     };
     use std::io::{Cursor, ErrorKind};
     use uuid::Uuid;
+
+    #[test]
+    fn default_spec_matches_missing_wire_fields() {
+        let decoded: WireSpec = serde_json::from_str("{}").unwrap();
+        assert_eq!(WireSpec::default(), decoded);
+        assert_eq!((decoded.cols, decoded.rows), (80, 24));
+    }
 
     fn temp_dir(tag: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("daemon-{tag}-{}", Uuid::new_v4()))
