@@ -2182,3 +2182,7 @@ mod tests {
         assert!(!state.resize(Uuid::new_v4(), 80, 24));
     }
 }
+
+#[cfg(test)]
+#[path = "attach_transition_tests.rs"]
+mod attach_transition_tests;
