@@ -14,6 +14,9 @@ use std::time::{Duration, Instant};
 use mi_terminal::daemon::client::DaemonConn;
 use mi_terminal::daemon::protocol::{self, WireSpec};
 
+#[path = "support/daemon_response.rs"]
+mod daemon_response;
+
 struct DaemonProcess {
     child: Child,
     dir: PathBuf,
@@ -621,8 +624,8 @@ fn remote_spawn_delivers_startup_input_after_the_agent_renders() {
 
 #[test]
 fn several_real_ptys_finish_parallel_output_bursts() {
-    use mi_terminal::daemon::protocol::{decode_line, encode_line, Request, Response};
-    use std::io::{BufRead, BufReader, Write};
+    use mi_terminal::daemon::protocol::{encode_line, Request, Response};
+    use std::io::{BufReader, Write};
     use std::os::unix::net::UnixStream;
     use uuid::Uuid;
 
@@ -648,14 +651,11 @@ fn several_real_ptys_finish_parallel_output_bursts() {
                         .expect("escribe");
                     writer.flush().expect("flush");
                 };
-                let next = |reader: &mut BufReader<UnixStream>| loop {
-                    let mut line = String::new();
-                    let read = reader.read_line(&mut line).expect("respuesta");
-                    assert!(read > 0, "el daemon cerró el stream");
-                    if let Some(response) = decode_line::<Response>(&line) {
-                        break response;
-                    }
+                let next = |reader: &mut BufReader<UnixStream>, deadline: Instant| {
+                    daemon_response::read_before(reader, deadline)
+                        .unwrap_or_else(|error| panic!("respuesta de la sesión {index}: {error}"))
                 };
+                let handshake_deadline = Instant::now() + Duration::from_secs(30);
 
                 send(
                     &Request::Hello {
@@ -665,7 +665,7 @@ fn several_real_ptys_finish_parallel_output_bursts() {
                     },
                     &mut writer,
                 );
-                assert!(matches!(next(&mut reader), Response::Welcome { .. }));
+                assert!(matches!(next(&mut reader, handshake_deadline), Response::Welcome { .. }));
                 send(
                     &Request::Spawn {
                         id: None,
@@ -673,12 +673,12 @@ fn several_real_ptys_finish_parallel_output_bursts() {
                     },
                     &mut writer,
                 );
-                let id = match next(&mut reader) {
+                let id = match next(&mut reader, handshake_deadline) {
                     Response::Spawned { id } => id,
                     other => panic!("spawn inesperado: {other:?}"),
                 };
                 send(&Request::Attach { id }, &mut writer);
-                assert!(matches!(next(&mut reader), Response::Attached { .. }));
+                assert!(matches!(next(&mut reader, handshake_deadline), Response::Attached { .. }));
 
                 let marker = format!("load_done_{index}_{}", Uuid::new_v4().simple());
                 let command = format!(
@@ -695,7 +695,7 @@ fn several_real_ptys_finish_parallel_output_bursts() {
                 let deadline = Instant::now() + Duration::from_secs(30);
                 let mut output = Vec::new();
                 while Instant::now() < deadline {
-                    match next(&mut reader) {
+                    match next(&mut reader, deadline) {
                         Response::Output { id: got, data, .. } if got == id => {
                             output.extend_from_slice(&data);
                             if output
@@ -719,6 +719,10 @@ fn several_real_ptys_finish_parallel_output_bursts() {
                         >= 2,
                     "la sesión {index} no terminó su burst ({} bytes)",
                     output.len()
+                );
+                assert!(
+                    output.split(|byte| *byte != b'x').any(|run| run.len() >= OUTPUT_BYTES),
+                    "la sesión {index} perdió bytes del payload"
                 );
                 assert!(
                     output.len() >= OUTPUT_BYTES,
