@@ -46,11 +46,7 @@ jobs:
         run: cargo clippy --all-targets --locked -- -D warnings
 
       - name: Run test suite
-        run: cargo test --all-targets --locked --quiet
-
-      - name: Verify browser extension
-        if: runner.os == 'Linux'
-        run: node --test extension/tests/*.test.cjs
+        run: cargo test --all-targets --locked --quiet --no-fail-fast
 
       # El daemon usa Unix sockets. Ubuntu y macOS validan el artefacto que se
       # distribuye; Windows conserva la cobertura del fallback in-process.
@@ -64,7 +60,16 @@ jobs:
 
       - name: Run daemon feature test suite (Unix)
         if: runner.os != 'Windows'
-        run: cargo test --all-targets --locked --features daemon --quiet
+        run: cargo test --all-targets --locked --features daemon --quiet --no-fail-fast
+
+  extension:
+    # Una regresión de Rust no debe ocultar la señal de la extensión.
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Verify browser extension
+        run: node --test extension/tests/*.test.cjs
 
   bench:
     # Presupuesto de performance (Ship-it 7.3): compara las rutas calientes
