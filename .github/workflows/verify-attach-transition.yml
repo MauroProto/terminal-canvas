@@ -1,0 +1,281 @@
+name: Verify attach transition
+
+on:
+  push:
+    branches: [codex/premium-quality]
+    paths: [.github/workflows/verify-attach-transition.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  reproduce-and-fix:
+    if: github.repository == 'MauroProto/terminal-canvas' && github.ref == 'refs/heads/codex/premium-quality'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    permissions:
+      contents: write
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.98.0'
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Add deterministic two-client regressions
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('src/daemon/server.rs')
+          text = p.read_text()
+          assert 'mod attach_transition_tests;' not in text
+          p.write_text(text + '\n#[cfg(test)]\n#[path = "attach_transition_tests.rs"]\nmod attach_transition_tests;\n')
+          Path('src/daemon/attach_transition_tests.rs').write_text(r'''//! Force attach/pump/checkpoint ordering without relying on the 50 ms pump timer.
+          use std::sync::mpsc::{self, Receiver};
+          use std::sync::{Arc, Mutex};
+          use std::time::{Duration, Instant};
+          
+          use alacritty_terminal::term::test::TermSize;
+          use alacritty_terminal::term::{Config, Term, TermMode};
+          use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
+          use uuid::Uuid;
+          
+          use super::{decode_frames, handle_request, DaemonState};
+          use crate::daemon::protocol::{Request, Response, WireSpec};
+          use crate::runtime::RuntimeScheduler;
+          use crate::state::scrollback_log::FrameKind;
+          use crate::terminal::export::scrollback_to_text;
+          use crate::terminal::pty::EventProxy;
+          
+          struct View {
+              term: Term<EventProxy>,
+              parser: Processor<StdSyncHandler>,
+              seq: u64,
+          }
+          
+          impl View {
+              fn attached(response: Response) -> Self {
+                  let Response::Attached { snapshot, seq, .. } = response else {
+                      panic!("expected an attached snapshot");
+                  };
+                  let (tx, _rx) = mpsc::channel();
+                  let mut view = Self {
+                      term: Term::new(Config::default(), &TermSize::new(80, 24), EventProxy::new(tx)),
+                      parser: Processor::<StdSyncHandler>::new(),
+                      seq,
+                  };
+                  view.parser.advance(&mut view.term, &snapshot);
+                  view
+              }
+          
+              fn receive(&mut self, events: &Receiver<Response>, id: Uuid) {
+                  for event in events.try_iter() {
+                      if let Response::Output { id: source, seq, data } = event {
+                          assert_eq!(source, id);
+                          assert!(seq > self.seq, "duplicated or reordered output sequence");
+                          self.seq = seq;
+                          self.parser.advance(&mut self.term, &data);
+                      }
+                  }
+              }
+          
+              fn assert_primary(&self, primary: &str, returned: &str, label: &str) {
+                  let text = scrollback_to_text(&self.term);
+                  assert!(!self.term.mode().contains(TermMode::ALT_SCREEN), "{label}: still alternate");
+                  assert_eq!(
+                      text.lines().filter(|line| line.trim() == primary).count(),
+                      1,
+                      "{label} lost primary history or duplicated it: {text:?}"
+                  );
+                  assert_eq!(
+                      text.lines().filter(|line| line.trim() == returned).count(),
+                      1,
+                      "{label} lost or duplicated the final TUI output: {text:?}"
+                  );
+              }
+          }
+          
+          // Adjacent shell strings are concatenated at execution time. Complete
+          // markers never occur in command echo, only in actual program output.
+          fn shell_marker(marker: &str) -> String {
+              let (a, b) = marker.split_at(marker.len() / 2);
+              format!("'{a}''{b}'")
+          }
+          
+          fn wait_for_screen(state: &DaemonState, id: Uuid, alternate: bool, marker: &str) {
+              let deadline = Instant::now() + Duration::from_secs(20);
+              let handle = state.session(id).unwrap().handle.as_ref().expect("real PTY");
+              loop {
+                  let reached = handle.lock().unwrap().with_term(|term| {
+                      term.mode().contains(TermMode::ALT_SCREEN) == alternate
+                          && scrollback_to_text(term).contains(marker)
+                  }).unwrap_or(false);
+                  if reached {
+                      return;
+                  }
+                  assert!(Instant::now() < deadline, "fixture did not reach screen {marker}");
+                  std::thread::sleep(Duration::from_millis(10));
+              }
+          }
+          
+          fn check_transition(pump_first: bool, checkpoint_first: bool) {
+              let mut state = DaemonState::new();
+              let scheduler = Arc::new(Mutex::new(RuntimeScheduler::new()));
+              let suffix = Uuid::new_v4().simple().to_string();
+              let primary = format!("TC_PRIMARY_{suffix}");
+              let tui = format!("TC_TUI_{suffix}");
+              let returned = format!("TC_RETURNED_{suffix}");
+              let command = format!(
+                  "stty -echo; printf '\\033[2J\\033[3J\\033[H%s\\r\\n\\033[?1049h%s' {} {}; read tc_continue; printf '\\033[?1049l\\r\\n%s\\r\\n' {}; read tc_keep",
+                  shell_marker(&primary), shell_marker(&tui), shell_marker(&returned)
+              );
+              for marker in [&primary, &tui, &returned] {
+                  assert!(!command.contains(marker));
+              }
+              let id = state.spawn_with_pty(WireSpec {
+                  panel_id: Some(Uuid::new_v4()),
+                  startup_command: Some(command),
+                  ..WireSpec::default()
+              }, &scheduler, None);
+              wait_for_screen(&state, id, true, &tui);
+              let mut first = View::attached(handle_request(&mut state, Request::Attach { id }, None));
+              assert!(first.term.mode().contains(TermMode::ALT_SCREEN));
+              assert!(!scrollback_to_text(&first.term).contains(&primary));
+              let (tx, first_events) = mpsc::sync_channel(64);
+              state.subscribe(Uuid::new_v4(), id, tx, None);
+          
+              assert!(state.write_to(id, b"\n"));
+              wait_for_screen(&state, id, false, &returned);
+              // The real reader has finished the transition. Deliberately do
+              // not pump yet: the second attach must repair existing clients.
+              if checkpoint_first {
+                  let targets = state.take_dirty_scrollback_targets();
+                  assert_eq!(targets.len(), 1);
+                  assert!(targets[0].text.contains(&primary));
+                  assert!(targets[0].text.contains(&returned));
+                  assert!(state.session(id).unwrap().handle.as_ref().unwrap()
+                      .lock().unwrap().pending_log_snapshot().is_empty());
+              }
+              if pump_first {
+                  let events = state.pump_output();
+                  state.broadcast(&events);
+              }
+              let mut second = View::attached(handle_request(&mut state, Request::Attach { id }, None));
+              let (tx, second_events) = mpsc::sync_channel(64);
+              state.subscribe(Uuid::new_v4(), id, tx, None);
+              first.receive(&first_events, id);
+              first.assert_primary(&primary, &returned, "existing client");
+              second.assert_primary(&primary, &returned, "new client");
+          
+              // Further pumps must not lose or duplicate history in either view.
+              for _ in 0..3 {
+                  let events = state.pump_output();
+                  state.broadcast(&events);
+                  first.receive(&first_events, id);
+                  second.receive(&second_events, id);
+              }
+              first.assert_primary(&primary, &returned, "existing client after pump");
+              second.assert_primary(&primary, &returned, "new client after pump");
+          
+              // Repair snapshots are for rendering, not extra durable PTY bytes.
+              let durable: Vec<u8> = decode_frames(&state.session(id).unwrap().persist_pending)
+                  .into_iter().filter(|frame| frame.kind == FrameKind::Output)
+                  .flat_map(|frame| frame.payload).collect();
+              for marker in [&primary, &returned] {
+                  assert_eq!(durable.windows(marker.len())
+                      .filter(|window| *window == marker.as_bytes()).count(), 1,
+                      "repair snapshot duplicated or lost durable output");
+              }
+          }
+          
+          #[test]
+          fn second_attach_before_pump_restores_existing_primary_history() {
+              check_transition(false, false);
+          }
+          
+          #[test]
+          fn second_attach_after_checkpoint_restores_existing_primary_history() {
+              check_transition(false, true);
+          }
+          
+          #[test]
+          fn pump_before_second_attach_restores_primary_history_once() {
+              check_transition(true, false);
+          }
+          ''')
+          PY
+          cargo fmt --all
+          git config user.name 'Mauro Proto'
+          git config user.email '56734993+MauroProto@users.noreply.github.com'
+          git add src/daemon/server.rs src/daemon/attach_transition_tests.rs
+          git commit -m 'test(daemon): cover two-client attach across TUI exit'
+      - name: Require reproduction on the unchanged implementation
+        shell: bash
+        run: |
+          set +e
+          cargo test --locked --features daemon --lib daemon::server::attach_transition_tests -- --nocapture > /tmp/attach-red.log 2>&1
+          status=$?
+          set -e
+          cat /tmp/attach-red.log
+          test "$status" -eq 101
+          grep -F 'existing client lost primary history or duplicated it' /tmp/attach-red.log
+          grep -F 'test result: FAILED. 1 passed; 2 failed;' /tmp/attach-red.log
+      - name: Preserve the transition when attach drains before the pump
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('src/daemon/server.rs')
+          text = p.read_text()
+          old = '''        self.was_alternate = alternate;
+                  let event = self.ingest_pty_frames(&frames);
+                  (snapshot.into_bytes(), event)'''
+          new = '''        // Attach can be the first observer of a TUI exit, before the
+                  // output pump. Existing clients that attached in alternate screen
+                  // have no primary grid, so raw exit bytes cannot restore history.
+                  let restore_primary = self.was_alternate && !alternate;
+                  self.was_alternate = alternate;
+                  let event = self.ingest_pty_frames(&frames);
+                  let snapshot = snapshot.into_bytes();
+                  let event = if restore_primary {
+                      // Preserve the raw frames for durability; the semantic snapshot
+                      // only replaces their live event. A checkpoint may have drained
+                      // every frame already, in which case the repair needs a new seq.
+                      let seq = event
+                          .map(|(seq, _)| seq)
+                          .unwrap_or_else(|| self.push_output_event(&snapshot));
+                      Some((seq, snapshot.clone()))
+                  } else {
+                      event
+                  };
+                  (snapshot, event)'''
+          assert text.count(old) == 1, 'unexpected attach implementation'
+          p.write_text(text.replace(old, new))
+          PY
+          cargo fmt --all
+          cargo fmt --all -- --check
+          cargo clippy --all-targets --locked --features daemon -- -D warnings
+          for attempt in $(seq 1 10); do
+            echo "ATTACH REGRESSION PASS $attempt/10"
+            cargo test --locked --features daemon --lib daemon::server::attach_transition_tests -- --nocapture
+          done
+          cargo test --locked --features daemon --lib daemon::server::tests::priority_session_delivers_its_entire_final_burst_before_exit -- --nocapture
+          cargo test --locked --features daemon --test daemon_process -- --nocapture
+          git add src/daemon/server.rs
+          git commit -m 'fix(daemon): restore existing clients when attach observes TUI exit'
+          git diff --exit-code
+      - name: Publish validated microcommits without replacing concurrent work
+        shell: bash
+        run: |
+          expected="$GITHUB_SHA"
+          actual="$(git ls-remote origin refs/heads/codex/premium-quality | cut -f1)"
+          test "$actual" = "$expected"
+          git push origin HEAD:refs/heads/codex/premium-quality
+          git log -3 --oneline
