@@ -397,10 +397,10 @@ impl DaemonState {
             let is_priority = self.priority_session == Some(id);
             let (frames, alive, alternate, replacement) = match handle.lock() {
                 Ok(pty) => {
-                    // Sample EOF before draining. If it arrives during this
-                    // drain, defer Exit to the next pump, which drains all of
-                    // the final backlog before ending the subscriber stream.
-                    let alive = pty.alive.load(std::sync::atomic::Ordering::Acquire);
+                    // Process liveness (including terminal exit events) is not
+                    // an EOF boundary. Sample reader completion before draining:
+                    // a completion during this drain is handled by the next pump.
+                    let alive = !pty.output_finished();
                     let budget = if alive && is_priority && interactive_budget > 0 {
                         interactive_budget
                     } else {
@@ -1412,13 +1412,8 @@ mod tests {
         );
         handle.lock().unwrap().write_all(command.as_bytes());
         let deadline = Instant::now() + Duration::from_secs(20);
-        while handle
-            .lock()
-            .unwrap()
-            .alive
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
-            assert!(Instant::now() < deadline, "fixture process did not exit");
+        while !handle.lock().unwrap().output_finished() {
+            assert!(Instant::now() < deadline, "fixture reader did not finish");
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(
@@ -1447,6 +1442,57 @@ mod tests {
             "Exit arrived before the complete final output"
         );
         assert!(handle.lock().unwrap().pending_log_snapshot().is_empty());
+    }
+
+    #[test]
+    fn early_exit_signal_does_not_discard_later_pty_output() {
+        use std::sync::{Arc, Mutex};
+        let mut state = DaemonState::new();
+        let scheduler = Arc::new(Mutex::new(crate::runtime::RuntimeScheduler::new()));
+        let id = state.spawn_with_pty(WireSpec::default(), &scheduler, None);
+        let handle = state.session(id).unwrap().handle.clone().expect("real PTY");
+        state.priority_session = Some(id);
+        // Model a process-exit notification while the reader is still active.
+        handle
+            .lock()
+            .unwrap()
+            .alive
+            .store(false, std::sync::atomic::Ordering::Release);
+        assert!(!handle.lock().unwrap().output_finished());
+        assert!(!state
+            .pump_output()
+            .iter()
+            .any(|event| matches!(event, Response::Exit { .. })));
+        let marker = format!("TC_LATE_{}", Uuid::new_v4().simple());
+        handle
+            .lock()
+            .unwrap()
+            .write_all(format!("printf '\\n{marker}\\n'; exit\r").as_bytes());
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut output = Vec::new();
+        let mut exited = false;
+        while !exited {
+            for event in state.pump_output() {
+                match event {
+                    Response::Output { id: got, data, .. } if got == id => {
+                        assert!(!exited, "output delivered after Exit");
+                        output.extend_from_slice(&data);
+                    }
+                    Response::Exit { id: got } if got == id => exited = true,
+                    _ => {}
+                }
+            }
+            assert!(Instant::now() < deadline, "PTY reader did not finish");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(String::from_utf8_lossy(&output)
+            .lines()
+            .any(|line| line.trim() == marker));
+        assert!(handle.lock().unwrap().pending_log_snapshot().is_empty());
+        assert!(!state
+            .pump_output()
+            .iter()
+            .any(|event| matches!(event, Response::Output { .. } | Response::Exit { .. })));
     }
 
     #[test]

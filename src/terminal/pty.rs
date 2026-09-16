@@ -413,7 +413,11 @@ impl PtyHandle {
                                 session_id,
                             );
                         }
-                        Err(_) => break,
+                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(error) => {
+                            log::error!("PTY reader for session {session_id} failed: {error}");
+                            break;
+                        }
                     }
                 }
             }));
@@ -1197,6 +1201,13 @@ impl PtyHandle {
 
     pub fn take_bell(&self) -> bool {
         self.bell_fired.swap(false, Ordering::Relaxed)
+    }
+
+    /// The process can exit before its PTY reader finishes publishing bytes.
+    /// This non-blocking boundary must be sampled before draining the final log.
+    /// Windows UI liveness still uses its independent ConPTY process watcher.
+    pub fn output_finished(&self) -> bool {
+        self._reader_thread.is_finished()
     }
 
     pub fn alive(&self) -> bool {
