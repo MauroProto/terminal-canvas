@@ -171,10 +171,17 @@ fn attaching_inside_a_tui_recovers_primary_history_when_it_exits() {
     let deadline = Instant::now() + Duration::from_secs(10);
     let (snapshot, attached_seq) = loop {
         let attached = conn.attach(id).expect("attach");
+        // El eco del comando en la pantalla primaria también contiene el
+        // texto literal "TC_TUI_SCREEN". Sólo la secuencia real de alternate
+        // screen, que el eco no puede producir, prueba que la TUI empezó.
         if attached
             .0
-            .windows(b"TC_TUI_SCREEN".len())
-            .any(|bytes| bytes == b"TC_TUI_SCREEN")
+            .windows(b"\x1b[?1049h".len())
+            .any(|bytes| bytes == b"\x1b[?1049h")
+            && attached
+                .0
+                .windows(b"TC_TUI_SCREEN".len())
+                .any(|bytes| bytes == b"TC_TUI_SCREEN")
         {
             break attached;
         }
