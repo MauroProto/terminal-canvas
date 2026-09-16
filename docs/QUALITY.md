@@ -1,4 +1,4 @@
-# Revisión de calidad — septiembre de 2026
+# Revisión de calidad de septiembre de 2026
 
 Base revisada: `88f67656700bac4cef83b094864d18d22d91e503`.
 Los cambios se desarrollan en `codex/premium-quality` mediante commits pequeños
@@ -65,15 +65,19 @@ Ver [instalación portable](PORTABLE.md) y [release](RELEASE.md).
 
 ## Verificación
 
-La revisión de código cerró el 16 de septiembre de 2026 sobre
+La primera revisión de código cerró el 16 de septiembre de 2026 sobre
 `b8e0c33c2cddd8af0cd4668e66ac11b6e4b47d78`. La corrida del
 [PR #13, `35142399418`](https://github.com/MauroProto/terminal-canvas/actions/runs/35142399418)
 terminó con sus siete jobs aprobados. La
 [corrida del push, `35142392994`](https://github.com/MauroProto/terminal-canvas/actions/runs/35142392994)
 también completó correctamente los seis jobs ejecutados; el benchmark sólo se
-ejecuta en pull requests. Este registro agrega documentación a ese código
-validado. Las verificaciones posteriores del HEAD y de la integración se pueden
-consultar en el [PR #13](https://github.com/MauroProto/terminal-canvas/pull/13).
+ejecuta en pull requests. El registro documental de ese código,
+`b6d4ac5b5ded96f47ed25bc8ab27fbbf1c7d966a`, pasó la
+[CI del PR, `35145789968`](https://github.com/MauroProto/terminal-canvas/actions/runs/35145789968)
+y, después de integrar por fast-forward, la
+[CI de master, `35150436283`](https://github.com/MauroProto/terminal-canvas/actions/runs/35150436283).
+El [PR #13](https://github.com/MauroProto/terminal-canvas/pull/13) conserva el
+registro de esa integración. La revisión adicional se detalla más abajo.
 
 | Validación | Resultado en la matriz del PR |
 | --- | --- |
@@ -118,7 +122,7 @@ cambiar opciones del socket después del cierre del peer. Las regresiones cubren
 UTF-8 partido, datos precargados, EOF vacío o parcial y vencimiento del plazo.
 
 El payload se verifica sin contar metadatos OSC; quitar un byte sigue siendo
- detectable por la regresión. Los dos marcadores de finalización los genera
+detectable por la regresión. Los dos marcadores de finalización los genera
 Python después del payload y no aparecen completos en el comando enviado,
 eliminando la dependencia del eco del shell. Se espera a todos los workers
 antes de cerrar el daemon, incluso si alguno falla. La carga pasó cinco
@@ -132,6 +136,41 @@ completa citada al principio valida su combinación final.
 Las verificaciones de esta continuación se ejecutaron en GitHub Actions, no en
 la PC local. No se modificaron sus worktrees. No quedan scripts ni workflows
 transitorios de reparación en el árbol final.
+
+### Revisión adicional de attach durante la salida de una TUI
+
+La revisión posterior confirmó una carrera que no cubría la prueba de un solo
+cliente. Si un segundo attach observaba la salida de alternate screen antes
+que el pump, actualizaba `was_alternate` sin restaurar la pantalla primaria de
+los clientes existentes. El mismo fallo aparecía cuando un checkpoint ya había
+drenado los frames pendientes.
+
+La [corrida `35155362695`](https://github.com/MauroProto/terminal-canvas/actions/runs/35155362695)
+lo reprodujo con la implementación anterior y el commit de pruebas
+`d5ff81e4f1f9ec4fdf1b3502eae59753ed49e9d8`. Fallaron los dos escenarios de
+attach tardío por ausencia del marcador de historial primario, mientras pasó
+el control con pump previo. Después de aplicar
+`ec50f796b7f8eb51b6b7649853fea2ea8b704254`, las mismas tres regresiones pasaron
+diez veces consecutivas: 30 ejecuciones aprobadas, sin omisiones ni cambios en
+las aserciones. También pasaron formato, Clippy de todos los targets con daemon
+y advertencias como errores, la prueba de las 3000 líneas antes de `Exit` y las
+24 pruebas de `daemon_process`.
+
+Las regresiones usan un PTY real y dos parsers/vistas independientes conectados
+a las suscripciones del daemon. Fuerzan el orden de attach, pump y checkpoint
+sin depender del temporizador de producción. Exigen historial y salida final
+exactamente una vez en cada vista, secuencias crecientes y ausencia de
+repetición de los bytes originales en el log durable.
+
+El arreglo entrega el snapshot primario a los clientes existentes en la misma
+frontera del attach. Reutiliza la secuencia del evento original o asigna una
+nueva si los frames ya fueron drenados; el snapshot de reparación no se agrega
+como salida nueva al log durable. No cambia el protocolo ni la colaboración.
+
+La reproducción dirigida no sustituye la matriz completa. El
+[PR #14](https://github.com/MauroProto/terminal-canvas/pull/14) registra las
+corridas del HEAD final y de la integración, con sus resultados comprobados.
+La integración sólo se realiza después de aprobar la matriz del candidato.
 
 ## Límites de esta entrega
 
