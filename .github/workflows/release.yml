@@ -106,7 +106,7 @@ jobs:
           codesign --verify --deep --strict --verbose=2 dist/TerminalCanvas.app
 
       - name: Upload verified macOS artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-macos-${{ matrix.arch }}
           if-no-files-found: error
@@ -199,7 +199,7 @@ jobs:
           target/${{ matrix.target }}/release/tc-memory --help
 
       - name: Upload verified portable artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-${{ matrix.platform }}-x86_64
           if-no-files-found: error
