@@ -1,5 +1,6 @@
 //! Test-only NDJSON reader. Retry transient socket errors without losing a prefix.
 use std::io::{self, BufRead, BufReader};
+use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
@@ -15,9 +16,35 @@ pub fn read_before(reader: &mut BufReader<UnixStream>, deadline: Instant) -> io:
                 "response deadline expired",
             ));
         }
-        reader
-            .get_ref()
-            .set_read_timeout(Some(remaining.min(Duration::from_millis(100))))?;
+        if reader.buffer().is_empty() {
+            // Darwin rejects setsockopt after peer closure, even when output
+            // is still readable. Wait for data or EOF without changing options.
+            // This reader is the socket's only consumer; clones only write.
+            let mut descriptor = libc::pollfd {
+                fd: reader.get_ref().as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let timeout = remaining.min(Duration::from_millis(100)).as_millis() as libc::c_int;
+            // SAFETY: descriptor is a live pollfd for the duration of the call;
+            // its fd is owned by reader, and the array contains exactly one fd.
+            let ready = unsafe { libc::poll(&mut descriptor, 1, timeout) };
+            if ready < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error);
+            }
+            if ready == 0 {
+                continue;
+            }
+            if descriptor.revents & libc::POLLNVAL != 0 {
+                return Err(io::Error::from_raw_os_error(libc::EBADF));
+            }
+            // POLLHUP may accompany the final bytes. Read them before EOF;
+            // POLLERR is also read so the original permanent error is reported.
+        }
         // read_until can keep reading indefinitely if bytes arrive without a
         // newline. Check the absolute deadline between individual buffers.
         let available = match reader.fill_buf() {
@@ -127,7 +154,7 @@ mod tests {
         let split = encoded.iter().position(|byte| *byte == 0xf0).unwrap() + 1;
         let writer = std::thread::spawn(move || {
             server.write_all(&encoded[..split]).unwrap();
-            // Exceed the per-read timeout, but not the absolute deadline.
+            // Exceed the per-poll wait, but not the absolute deadline.
             std::thread::sleep(Duration::from_millis(250));
             server.write_all(&encoded[split..]).unwrap();
             server
