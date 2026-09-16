@@ -648,14 +648,34 @@ fn several_real_ptys_finish_parallel_output_bursts() {
                         .expect("escribe");
                     writer.flush().expect("flush");
                 };
-                let next = |reader: &mut BufReader<UnixStream>| loop {
-                    let mut line = String::new();
-                    let read = reader.read_line(&mut line).expect("respuesta");
-                    assert!(read > 0, "el daemon cerró el stream");
-                    if let Some(response) = decode_line::<Response>(&line) {
-                        break response;
+                let next = |reader: &mut BufReader<UnixStream>, deadline: Instant| {
+                    let mut line = Vec::new();
+                    loop {
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        assert!(!remaining.is_zero(), "la sesión {index} agotó el deadline");
+                        reader
+                            .get_ref()
+                            .set_read_timeout(Some(remaining.min(Duration::from_millis(250))))
+                            .expect("timeout de respuesta");
+                        match reader.read_until(b'\n', &mut line) {
+                            Ok(0) => panic!("el daemon cerró el stream de la sesión {index}"),
+                            Ok(_) => {
+                                assert_eq!(line.last(), Some(&b'\n'), "respuesta incompleta");
+                                let text = std::str::from_utf8(&line).expect("respuesta UTF-8");
+                                break decode_line::<Response>(text).expect("respuesta válida");
+                            }
+                            Err(error)
+                                if matches!(
+                                    error.kind(),
+                                    std::io::ErrorKind::WouldBlock
+                                        | std::io::ErrorKind::TimedOut
+                                        | std::io::ErrorKind::Interrupted
+                                ) => {}
+                            Err(error) => panic!("respuesta de la sesión {index}: {error}"),
+                        }
                     }
                 };
+                let handshake_deadline = Instant::now() + Duration::from_secs(30);
 
                 send(
                     &Request::Hello {
@@ -665,7 +685,7 @@ fn several_real_ptys_finish_parallel_output_bursts() {
                     },
                     &mut writer,
                 );
-                assert!(matches!(next(&mut reader), Response::Welcome { .. }));
+                assert!(matches!(next(&mut reader, handshake_deadline), Response::Welcome { .. }));
                 send(
                     &Request::Spawn {
                         id: None,
@@ -673,12 +693,12 @@ fn several_real_ptys_finish_parallel_output_bursts() {
                     },
                     &mut writer,
                 );
-                let id = match next(&mut reader) {
+                let id = match next(&mut reader, handshake_deadline) {
                     Response::Spawned { id } => id,
                     other => panic!("spawn inesperado: {other:?}"),
                 };
                 send(&Request::Attach { id }, &mut writer);
-                assert!(matches!(next(&mut reader), Response::Attached { .. }));
+                assert!(matches!(next(&mut reader, handshake_deadline), Response::Attached { .. }));
 
                 let marker = format!("load_done_{index}_{}", Uuid::new_v4().simple());
                 let command = format!(
@@ -695,7 +715,7 @@ fn several_real_ptys_finish_parallel_output_bursts() {
                 let deadline = Instant::now() + Duration::from_secs(30);
                 let mut output = Vec::new();
                 while Instant::now() < deadline {
-                    match next(&mut reader) {
+                    match next(&mut reader, deadline) {
                         Response::Output { id: got, data, .. } if got == id => {
                             output.extend_from_slice(&data);
                             if output
