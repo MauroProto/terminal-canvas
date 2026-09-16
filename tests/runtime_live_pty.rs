@@ -58,10 +58,12 @@ fn twenty_live_terminals_deliver_output_resize_and_exit() {
         let handle = manager.handle(*id).unwrap();
         let mut handle = handle.lock().unwrap();
         handle.resize(100, 30);
-        assert_eq!(
-            handle.with_term(|term| (term.columns(), term.screen_lines())),
-            Some((100, 30))
-        );
+        // with_term uses try_lock for the UI. Reader contention immediately
+        // after resize is not a failed resize; inspect the grid under its lock.
+        {
+            let term = handle.term.lock().expect("terminal grid");
+            assert_eq!((term.columns(), term.screen_lines()), (100, 30));
+        }
         #[cfg(unix)]
         handle.write_all(b"stty size\r");
     }
