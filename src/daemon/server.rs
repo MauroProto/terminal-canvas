@@ -1406,9 +1406,11 @@ mod tests {
         let scheduler = Arc::new(Mutex::new(crate::runtime::RuntimeScheduler::new()));
         let id = state.spawn_with_pty(WireSpec::default(), &scheduler, None);
         let handle = state.session(id).unwrap().handle.clone().expect("real PTY");
+        // Shell startup may prepend bracketed-paste control bytes to the first
+        // output line. Delimit the burst so all 3000 markers remain whole lines.
         let marker = format!("TC_FINAL_{}", Uuid::new_v4().simple());
         let command = format!(
-            "sh -c 'i=0; while [ $i -lt 3000 ]; do printf \"{marker}\\n\"; i=$((i+1)); done'; exit\r"
+            "sh -c 'printf \"\\n\"; i=0; while [ $i -lt 3000 ]; do printf \"{marker}\\n\"; i=$((i+1)); done'; exit\r"
         );
         handle.lock().unwrap().write_all(command.as_bytes());
         let deadline = Instant::now() + Duration::from_secs(20);
