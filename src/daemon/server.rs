@@ -165,9 +165,25 @@ impl DaemonSession {
             // Fallback de tests/sesiones sin PTY.
             return (self.snapshot.clone(), None);
         };
+        // Attach can be the first observer of a TUI exit, before the
+        // output pump. Existing clients that attached in alternate screen
+        // have no primary grid, so raw exit bytes cannot restore history.
+        let restore_primary = self.was_alternate && !alternate;
         self.was_alternate = alternate;
         let event = self.ingest_pty_frames(&frames);
-        (snapshot.into_bytes(), event)
+        let snapshot = snapshot.into_bytes();
+        let event = if restore_primary {
+            // Preserve the raw frames for durability; the semantic snapshot
+            // only replaces their live event. A checkpoint may have drained
+            // every frame already, in which case the repair needs a new seq.
+            let seq = event
+                .map(|(seq, _)| seq)
+                .unwrap_or_else(|| self.push_output_event(&snapshot));
+            Some((seq, snapshot.clone()))
+        } else {
+            event
+        };
+        (snapshot, event)
     }
 }
 
