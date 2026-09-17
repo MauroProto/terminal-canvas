@@ -1,0 +1,38 @@
+name: Apply security remediation
+on:
+  push:
+    branches: [codex/security-remediation-20260916]
+    paths: [.github/workflows/security-remediation.yml]
+permissions:
+  contents: write
+jobs:
+  apply:
+    if: github.repository == 'MauroProto/terminal-canvas' && github.ref == 'refs/heads/codex/security-remediation-20260916'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Check audited source and apply bounded edits
+        run: |
+          python3 scripts/security-remediate-once.py
+          # Workflow changes are performed through the connected GitHub tool,
+          # not by granting this runner workflow-administration authority.
+          git restore --source=HEAD -- .github/workflows/ci.yml .github/workflows/release.yml .github/workflows/security-remediation.yml
+      - name: Format source with the project toolchain
+        run: |
+          rustup toolchain install 1.98.0 --profile minimal --component rustfmt
+          cargo +1.98.0 fmt --all
+          git diff --check
+      - name: Publish source edits to maintenance branch only
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git -c core.hooksPath=/dev/null add src .gitignore SECURITY.md extension/README.md scripts/security-remediate-once.py
+          git -c core.hooksPath=/dev/null -c commit.gpgsign=false -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'fix: enforce collaboration authorization and protect local data'
+          auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          echo "::add-mask::$auth"
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth" push origin HEAD:refs/heads/codex/security-remediation-20260916
