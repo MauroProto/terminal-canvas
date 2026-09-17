@@ -3,7 +3,9 @@
 Base revisada: `88f67656700bac4cef83b094864d18d22d91e503`.
 Los cambios se desarrollan en `codex/premium-quality` mediante commits pequeños
 que permiten revisar y revertir cada corrección. Online, invitaciones y el
-protocolo de colaboración quedan fuera de esta revisión por decisión del proyecto.
+protocolo de colaboración quedan fuera de esta revisión de calidad por decisión
+del proyecto. La remediación de seguridad posterior del PR #15 tiene alcance
+separado y sí revisa esas fronteras; se documenta al final de Verificación.
 
 ## Cambios que protegen el trabajo del usuario
 
@@ -172,6 +174,57 @@ La reproducción dirigida no sustituye la matriz completa. El
 corridas del HEAD final y de la integración, con sus resultados comprobados.
 La integración sólo se realiza después de aprobar la matriz del candidato.
 
+## Remediación de seguridad posterior al pase de calidad
+
+La revisión de seguridad del commit `9d7bf141426d384cf5083e41c7b97a5ddc46dcbd`
+identificó seis recorridos que este pase corrige. A diferencia del mantenimiento
+original, los cambios puntuales en colaboración fueron autorizados expresamente.
+
+- La aprobación de un invitado es independiente de su conexión. Reconectar no
+  aprueba una solicitud pendiente y la denegación no se revierte por reconexión.
+- Los pedidos de control comprueban el panel vivo y controlable, la admisión del
+  invitado y las cuotas antes de insertar estado. Los controles obsoletos se podan.
+- Las capturas del navegador abren un borrador revisable ligado al workspace.
+  No escriben ni envían Enter al terminal enfocado. El lanzamiento requiere una
+  acción explícita y un proveedor con entrega nativa del prompt.
+- HTTP y WebSocket comparten un almacén TLS exclusivo para el certificado del
+  invite. HTTP no sigue redirecciones de solicitudes con credenciales.
+- La configuración y sus backups usan permisos privados en Unix. Los temporales
+  nuevos se crean exclusivamente, con nombres aleatorios y permisos 0600.
+- El broker valida la política Argon2id antes de calcularla, limita concurrencia
+  y sesiones, trabaja fuera del bloqueo del registro y revalida la admisión.
+
+Las regresiones permanentes están en `src/collab/*_security_tests.rs` y los tests
+`security_` de `auth`, `config`, `durable_write` y `orchestration_ui`. La CI los
+muestra por separado además de ejecutar las suites completas. Se conservan las
+aserciones de certificados, permisos, rechazo de acceso y entrega de salida PTY.
+El fixture TLS establece explícitamente el modo bloqueante del socket aceptado,
+consume el request completo y cierra TLS de forma acotada en todas las plataformas.
+
+El último cambio de código, `389e6eafd545b447e849674890be9880cab67c05`,
+aprobó los siete jobs del PR en la corrida
+[`35176413746`](https://github.com/MauroProto/terminal-canvas/actions/runs/35176413746),
+completada el 17 de septiembre de 2026. Pasaron Ubuntu, Windows, macOS ARM,
+macOS Intel, extensión, auditoría y benchmark. En los tres sistemas Unix
+pasaron también Clippy y la suite completa con `--features daemon`.
+El paso explícito de seguridad aprobó 20 pruebas en Unix y 17 en Windows,
+sin fallos ni pruebas de seguridad ignoradas; las tres adicionales comprueban
+permisos y archivos específicos de Unix. Pasaron las nueve pruebas JavaScript.
+Este registro identifica el código validado; los checks del
+[PR #15](https://github.com/MauroProto/terminal-canvas/pull/15) y la CI de `master`
+registran por separado el commit documental final y su integración.
+
+La CI declara permisos de lectura, no persiste credenciales del checkout y usa
+compilación acotada y comandos secuenciales. `.gitignore` evita incorporar por
+accidente archivos `.env` y material de firma habitual; no reemplaza un escaneo
+histórico de secretos.
+
+Los controles administrativos de protección de `master`, los ACL reales de las
+instalaciones Windows, el historial Git completo, los despliegues y una revisión
+independiente permanecen fuera de lo acreditado por estas pruebas. No se publican
+releases ni instaladores. [SECURITY.md](../SECURITY.md) documenta las fronteras y
+los requisitos operativos. Una CI verde no certifica ausencia de otras fallas.
+
 ## Límites de esta entrega
 
 - Windows restaura el contexto guardado, pero sus procesos ConPTY no sobreviven
@@ -192,5 +245,6 @@ La integración sólo se realiza después de aprobar la matriz del candidato.
   marcado como ignorado se invoca explícitamente desde sus tests de regresión.
 - No se ha publicado una release firmada, un instalador ni un tap Homebrew en
   esta revisión. El cask requiere los checksums de los DMG finales.
-- La actualización se instala manualmente. Online e invitaciones conservan su
-  implementación anterior y no reciben una nueva garantía de calidad por estos cambios.
+- La actualización se instala manualmente. El pase de calidad original no
+  modificó Online; la remediación posterior se limita a las fronteras de
+  seguridad y regresiones detalladas arriba, no a una certificación integral.

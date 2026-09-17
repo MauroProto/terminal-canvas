@@ -5,3 +5,11 @@ dist/
 .cursor/hooks/state/
 /.terminalcanvas-archive/
 /.terminalcanvas-trash/
+
+# Local credentials and signing material. Keep documented placeholders trackable.
+.env
+.env.*
+!.env.example
+!.env.sample
+*.p12
+*.pfx
