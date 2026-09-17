@@ -1,6 +1,6 @@
 use super::*;
 use std::io::{Read, Write};
-use std::net::TcpListener;
+use std::net::{Shutdown, TcpListener};
 use std::thread;
 use std::time::Instant;
 
@@ -45,10 +45,63 @@ fn fixture_server(
             .unwrap();
         let connection = rustls::ServerConnection::new(Arc::new(config)).unwrap();
         let mut tls = rustls::StreamOwned::new(connection, stream);
-        let mut buffer = [0u8; 4096];
-        if tls.read(&mut buffer).is_ok() {
-            let _ = tls.write_all(status.as_bytes());
-            let _ = tls.flush();
+        let mut byte = [0u8; 1];
+        // Rejection of the other certificate is expected before HTTP starts.
+        if tls.read_exact(&mut byte).is_err() {
+            return;
+        }
+        let mut headers = vec![byte[0]];
+        while !headers.ends_with(b"\r\n\r\n") {
+            assert!(headers.len() < 8192, "fixture request headers too large");
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "fixture request deadline exceeded");
+            tls.sock.set_read_timeout(Some(remaining)).unwrap();
+            tls.read_exact(&mut byte).expect("complete HTTP headers");
+            headers.push(byte[0]);
+        }
+        let headers = std::str::from_utf8(&headers).unwrap();
+        let mut content_length = None;
+        for line in headers.lines().skip(1) {
+            let Some((name, value)) = line.split_once(':') else {
+                continue;
+            };
+            assert!(
+                !name.eq_ignore_ascii_case("transfer-encoding"),
+                "fixture expects a bounded Content-Length body"
+            );
+            if name.eq_ignore_ascii_case("content-length") {
+                assert!(content_length.is_none(), "duplicate fixture Content-Length");
+                content_length = Some(value.trim().parse::<usize>().unwrap());
+            }
+        }
+        let content_length = content_length.unwrap_or(0);
+        assert!(content_length <= 4096, "fixture request body too large");
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(!remaining.is_zero(), "fixture request deadline exceeded");
+        tls.sock.set_read_timeout(Some(remaining)).unwrap();
+        let mut body = vec![0u8; content_length];
+        tls.read_exact(&mut body).expect("complete HTTP body");
+
+        // Closing with unread request bytes can reset the socket on macOS.
+        // Consume the body first, then flush both the response and TLS alert.
+        tls.write_all(status.as_bytes()).expect("fixture response");
+        tls.conn.send_close_notify();
+        tls.flush().expect("fixture TLS close_notify");
+        tls.sock.shutdown(Shutdown::Write).unwrap();
+        // Allow the peer to consume the response and close. Cleanup is bounded
+        // and never changes the client-side certificate/status assertions.
+        let mut ignored = [0u8; 1024];
+        let mut drained = 0usize;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() || drained >= 8192 {
+                break;
+            }
+            tls.sock.set_read_timeout(Some(remaining)).unwrap();
+            match tls.sock.read(&mut ignored) {
+                Ok(0) | Err(_) => break,
+                Ok(count) => drained += count,
+            }
         }
     });
     (format!("https://{address}"), handle)
@@ -65,18 +118,17 @@ fn security_http_accepts_only_the_invite_certificate() {
     let client = http_client(Some(&pinned.cert_pem)).unwrap();
     let (url, server) = fixture_server(
         &other,
-        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
     );
     assert!(client.get(url).send().is_err());
     server.join().unwrap();
     let (url, server) = fixture_server(
         &pinned,
-        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
     );
-    assert_eq!(
-        client.get(url).send().unwrap().status(),
-        reqwest::StatusCode::OK
-    );
+    let response = client.get(url).send().unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(response.text().unwrap(), "ok");
     server.join().unwrap();
 }
 
@@ -91,6 +143,7 @@ fn security_broker_http_never_follows_credential_redirects() {
         .send()
         .unwrap();
     assert_eq!(response.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
+    assert!(response.bytes().unwrap().is_empty());
     server.join().unwrap();
 }
 
