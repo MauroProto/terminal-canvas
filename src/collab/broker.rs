@@ -101,11 +101,52 @@ struct GuestRecord {
     #[allow(dead_code)]
     device_id: String,
     joined_at: chrono::DateTime<chrono::Utc>,
+    // Authorization survives transport changes. A reconnect never grants access.
+    approved: bool,
     connection_state: GuestConnectionState,
     tx: Option<mpsc::Sender<Message>>,
     connection_id: Option<Uuid>,
     last_seen: Instant,
     disconnected_at: Option<Instant>,
+}
+
+impl GuestRecord {
+    fn may_relay(&self) -> bool {
+        self.approved
+            && matches!(
+                self.connection_state,
+                GuestConnectionState::Approved | GuestConnectionState::Connected
+            )
+    }
+
+    fn connect(&mut self, tx: mpsc::Sender<Message>, id: Uuid, now: Instant) -> bool {
+        if matches!(self.connection_state, GuestConnectionState::Denied) {
+            return false;
+        }
+        self.tx = Some(tx);
+        self.connection_id = Some(id);
+        self.last_seen = now;
+        self.disconnected_at = None;
+        self.connection_state = if self.approved {
+            GuestConnectionState::Connected
+        } else {
+            GuestConnectionState::Pending
+        };
+        true
+    }
+
+    fn disconnect(&mut self, now: Instant) {
+        self.tx = None;
+        self.connection_id = None;
+        self.disconnected_at = Some(now);
+        if !matches!(self.connection_state, GuestConnectionState::Denied) {
+            self.connection_state = if self.approved {
+                GuestConnectionState::Disconnected
+            } else {
+                GuestConnectionState::Pending
+            };
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -282,6 +323,7 @@ async fn join_share_session(
             display_name: body.display_name.clone(),
             device_id: body.device_id.clone(),
             joined_at: Utc::now(),
+            approved: auto_approved,
             connection_state: if auto_approved {
                 GuestConnectionState::Approved
             } else {
@@ -353,6 +395,10 @@ async fn approve_join(
         .guests
         .get_mut(&body.guest_id)
         .ok_or((StatusCode::NOT_FOUND, "Guest not found".to_owned()))?;
+    if matches!(guest.connection_state, GuestConnectionState::Denied) {
+        return Err((StatusCode::GONE, "Join request was revoked".to_owned()));
+    }
+    guest.approved = true;
     guest.connection_state = GuestConnectionState::Approved;
     guest.disconnected_at = None;
     guest.last_seen = Instant::now();
@@ -389,6 +435,7 @@ async fn deny_join(
         .guests
         .get_mut(&body.guest_id)
         .ok_or((StatusCode::NOT_FOUND, "Guest not found".to_owned()))?;
+    guest.approved = false;
     guest.connection_state = GuestConnectionState::Denied;
     guest.disconnected_at = Some(Instant::now());
     if let Some(tx) = &guest.tx {
@@ -460,7 +507,10 @@ async fn stream_session(
                 let (guest_id, _) = session
                     .guests
                     .iter()
-                    .find(|(_, guest)| constant_time_str_eq(&guest.token, &query.token))
+                    .find(|(_, guest)| {
+                        !matches!(guest.connection_state, GuestConnectionState::Denied)
+                            && constant_time_str_eq(&guest.token, &query.token)
+                    })
                     .ok_or((StatusCode::UNAUTHORIZED, "Invalid token".to_owned()))?;
                 StreamAuth::Guest(*guest_id)
             }
@@ -501,15 +551,9 @@ async fn handle_socket(
                 let Some(guest) = session.guests.get_mut(&guest_id) else {
                     return;
                 };
-                guest.tx = Some(tx.clone());
-                guest.connection_id = Some(connection_id);
-                guest.last_seen = Instant::now();
-                guest.disconnected_at = None;
-                if matches!(
-                    guest.connection_state,
-                    GuestConnectionState::Approved | GuestConnectionState::Disconnected
-                ) {
-                    guest.connection_state = GuestConnectionState::Connected;
+                // Approval may have been revoked between upgrade and registration.
+                if !guest.connect(tx.clone(), connection_id, Instant::now()) {
+                    return;
                 }
             }
         }
@@ -535,10 +579,7 @@ async fn handle_socket(
         if let Some(session) = guard.sessions.get(&session_id) {
             if let StreamAuth::Guest(guest_id) = auth {
                 if let Some(guest) = session.guests.get(&guest_id) {
-                    if matches!(
-                        guest.connection_state,
-                        GuestConnectionState::Approved | GuestConnectionState::Connected
-                    ) {
+                    if guest.may_relay() {
                         send_json(
                             &tx,
                             &BrokerControlMessage::JoinApproved {
@@ -655,10 +696,7 @@ async fn relay_payload(
     match auth {
         StreamAuth::Host => {
             for guest in session.guests.values() {
-                if matches!(
-                    guest.connection_state,
-                    GuestConnectionState::Approved | GuestConnectionState::Connected
-                ) {
+                if guest.may_relay() {
                     if let Some(tx) = &guest.tx {
                         let _ = tx.try_send(payload.clone());
                     }
@@ -669,10 +707,7 @@ async fn relay_payload(
             let Some(guest) = session.guests.get(&guest_id) else {
                 return;
             };
-            if !matches!(
-                guest.connection_state,
-                GuestConnectionState::Approved | GuestConnectionState::Connected
-            ) {
+            if !guest.may_relay() {
                 return;
             }
             if let Some(host_tx) = &session.host_tx {
@@ -733,12 +768,7 @@ async fn handle_disconnect(
                     if guest.connection_id != Some(connection_id) {
                         return;
                     }
-                    guest.tx = None;
-                    guest.connection_id = None;
-                    guest.disconnected_at = Some(Instant::now());
-                    if !matches!(guest.connection_state, GuestConnectionState::Denied) {
-                        guest.connection_state = GuestConnectionState::Disconnected;
-                    }
+                    guest.disconnect(Instant::now());
                 }
                 broadcast_presence(session);
             }
@@ -845,12 +875,7 @@ async fn cleanup_expired_sessions(state: &BrokerState, now: Instant) {
                 if guest.tx.is_some()
                     && now.saturating_duration_since(guest.last_seen) > HEARTBEAT_TIMEOUT
                 {
-                    guest.tx = None;
-                    guest.connection_id = None;
-                    guest.disconnected_at = Some(now);
-                    if !matches!(guest.connection_state, GuestConnectionState::Denied) {
-                        guest.connection_state = GuestConnectionState::Disconnected;
-                    }
+                    guest.disconnect(now);
                     guest_presence_changed = true;
                 }
             }
@@ -1323,6 +1348,7 @@ mod tests {
                         display_name: "Guest".to_owned(),
                         device_id: "device-1".to_owned(),
                         joined_at: Utc::now(),
+                        approved: true,
                         connection_state: GuestConnectionState::Connected,
                         tx: Some(guest_tx),
                         connection_id: Some(Uuid::new_v4()),
@@ -1405,3 +1431,7 @@ mod tests {
         assert!(session.host_disconnected_at.is_none());
     }
 }
+
+#[cfg(test)]
+#[path = "broker_security_tests.rs"]
+mod security_tests;
