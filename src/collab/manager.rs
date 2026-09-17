@@ -37,6 +37,8 @@ const MAX_SHARED_PANELS: usize = 256;
 const MAX_SHARED_GUESTS: usize = 128;
 const MAX_SHARED_CONTROLS: usize = 512;
 const MAX_CONTROL_QUEUE: usize = 128;
+const MAX_PENDING_CONTROL_REQUESTS: usize = 128;
+const MAX_PENDING_CONTROLS_PER_GUEST: usize = 16;
 const MAX_SHARED_TEXT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_INPUT_EVENTS: usize = 1_024;
 const MAX_INPUT_TEXT_BYTES: usize = 256 * 1024;
@@ -111,6 +113,19 @@ struct HostSessionContext {
     rekey_recovery_until: Option<Instant>,
     last_rekey_recovery_at: Option<Instant>,
     next_message_seq: u64,
+}
+
+impl HostSessionContext {
+    fn allows_control_target(&self, terminal_id: Uuid, guest_id: GuestId) -> bool {
+        self.guests.get(&guest_id).is_some_and(|guest| {
+            matches!(guest.connection_state,
+                GuestConnectionState::Approved | GuestConnectionState::Connected)
+        }) && self.last_snapshot.as_ref().is_some_and(|snapshot| {
+            snapshot.panels.iter().any(|panel| {
+                panel.panel_id == terminal_id && panel.alive && panel.share_scope.allows_control()
+            })
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -548,6 +563,14 @@ impl CollabManager {
         let Some(host) = &mut self.host else {
             return;
         };
+        // Reconcile against the live host snapshot before publishing derived
+        // state. Closed/private panels cannot retain requests or control grants.
+        let controllable: HashSet<_> = snapshot.panels.iter()
+            .filter(|panel| panel.alive && panel.share_scope.allows_control())
+            .map(|panel| panel.panel_id)
+            .collect();
+        host.terminal_controls.retain(|id, _| controllable.contains(id));
+        host.pending_control_requests.retain(|request| controllable.contains(&request.terminal_id));
         snapshot.guests = host.guests.values().cloned().collect();
         snapshot.terminal_controls = host.terminal_controls.values().cloned().collect();
         for panel in &mut snapshot.panels {
@@ -706,6 +729,13 @@ impl CollabManager {
         let Some(host) = &mut self.host else {
             return;
         };
+        if !host.allows_control_target(terminal_id, guest_id)
+            || !host.pending_control_requests.iter().any(|request| {
+                request.terminal_id == terminal_id && request.guest_id == guest_id
+            })
+        {
+            return;
+        }
         let controller_name = host
             .guests
             .get(&guest_id)
@@ -775,6 +805,22 @@ impl CollabManager {
         let Some(host) = &mut self.host else {
             return;
         };
+        // Bound attacker-controlled state at admission, not when a legitimate
+        // snapshot later tries to serialize it. UUIDs are not capabilities.
+        if !host.allows_control_target(request.terminal_id, request.guest_id)
+            || host.guests.get(&request.guest_id)
+                .is_none_or(|guest| guest.display_name != request.display_name)
+            || host.pending_control_requests.len() >= MAX_PENDING_CONTROL_REQUESTS
+            || host.pending_control_requests.iter()
+                .filter(|pending| pending.guest_id == request.guest_id).count()
+                >= MAX_PENDING_CONTROLS_PER_GUEST
+            || (!host.terminal_controls.contains_key(&request.terminal_id)
+                && host.terminal_controls.len() >= MAX_SHARED_CONTROLS)
+            || host.terminal_controls.get(&request.terminal_id)
+                .is_some_and(|control| control.queue.len() >= MAX_CONTROL_QUEUE)
+        {
+            return;
+        }
         if host.pending_control_requests.iter().any(|existing| {
             existing.terminal_id == request.terminal_id && existing.guest_id == request.guest_id
         }) {
@@ -897,6 +943,12 @@ impl CollabManager {
         if let Some(host) = &mut self.host {
             host.pending_control_requests
                 .retain(|request| request.guest_id != guest_id);
+            for control in host.terminal_controls.values_mut() {
+                control.queue.retain(|queued| *queued != guest_id);
+            }
+            host.terminal_controls.retain(|_, control| {
+                control.controller.is_some() || !control.queue.is_empty()
+            });
         }
     }
 
@@ -2177,3 +2229,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "manager_security_tests.rs"]
+mod security_tests;
