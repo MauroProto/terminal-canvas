@@ -407,6 +407,15 @@ impl TerminalApp {
                 dialog_frame().show(ui, |ui| {
                     ui.set_min_width(420.0);
                     dialog_title(ui, "Launch agent");
+                    if draft.requires_native_prompt {
+                        ui.label("Captura web sin ejecutar. Revisá el contenido y el destino antes de pulsar Launch.");
+                        if let Some(workspace) = self.workspaces.iter().find(|ws| ws.id == draft.workspace_id) {
+                            ui.label(format!("Workspace: {}", workspace.name));
+                            if let Some(cwd) = &workspace.cwd {
+                                ui.label(cwd.display().to_string());
+                            }
+                        }
+                    }
                     dialog_field_label(ui, "Provider");
                     egui::ComboBox::from_id_salt("launch-agent-provider")
                         .selected_text(draft.provider.label())

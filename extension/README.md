@@ -2,7 +2,7 @@
 
 Activá la selección desde el icono de la extensión y elegí un elemento de la
 página. Su HTML, CSS computado, rectángulo e imagen recortada se envían a
-TerminalCanvas para el agente enfocado.
+TerminalCanvas como borrador para revisión. La captura nunca se escribe en la terminal enfocada ni se ejecuta automáticamente.
 
 ## Instalación (descomprimida)
 
@@ -31,7 +31,7 @@ TerminalCanvas para el agente enfocado.
 - La confirmación aparece cuando la app local acepta la captura. Los errores
   de token, conexión y cambio de pestaña se muestran en la página. Si falta
   la imagen, la confirmación lo indica explícitamente.
-- El prompt le llega al **agente enfocado** con este formato exacto:
+- En TerminalCanvas se abre **Launch agent** con el contenido y el workspace destino. Revisalo y confirmá **Launch** para iniciar un agente nuevo mediante argumentos nativos. Cancelar no envía nada. Para capturas se admiten Claude Code, Codex, Gemini y OpenCode. El contenido incluye este formato:
 
   ```
   Element: div.card > button

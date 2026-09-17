@@ -144,7 +144,7 @@ document.addEventListener(
     });
 
     if (!result?.ok) throw new Error(result?.error || "No se recibió confirmación de la app.");
-    feedback(result.warning || "Elemento enviado a TerminalCanvas.", true);
+    feedback(result.warning || "Captura enviada. Revisá y confirmá el borrador en TerminalCanvas.", true);
     } catch (error) {
       feedback(error.message || "No se pudo enviar el elemento.", true);
     } finally { sending = false; }

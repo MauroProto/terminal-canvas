@@ -336,6 +336,7 @@ fn native_provider_command(executable: &Path) -> anyhow::Result<Command> {
             command.arg(script);
             return Ok(command);
         }
+        anyhow::bail!("El wrapper cmd/bat del agente no es un shim npm reconocido; no se enviará el prompt a un intérprete de comandos");
     }
     Ok(Command::new(executable))
 }
