@@ -116,7 +116,7 @@ async fn security_heartbeat_disconnect_preserves_pending_authorization() {
 #[tokio::test]
 async fn security_approved_reconnect_works_but_revocation_is_terminal() {
     let (state, session_id, guest_id, host_token) = fixture().await;
-    approve_join(
+    let Json(approved) = approve_join(
         State(state.clone()),
         Path(session_id.0),
         Json(JoinDecisionRequest {
@@ -126,6 +126,7 @@ async fn security_approved_reconnect_works_but_revocation_is_terminal() {
     )
     .await
     .unwrap();
+    assert!(approved.ok);
     let (id, _rx) = reconnect(&state, session_id, guest_id).await;
     handle_disconnect(&state, session_id, StreamAuth::Guest(guest_id), id).await;
     let (_, mut rx) = reconnect(&state, session_id, guest_id).await;
@@ -140,7 +141,7 @@ async fn security_approved_reconnect_works_but_revocation_is_terminal() {
         rx.try_recv().unwrap(),
         Message::Binary(b"allowed-fixture".to_vec())
     );
-    deny_join(
+    let Json(denied) = deny_join(
         State(state.clone()),
         Path(session_id.0),
         Json(JoinDecisionRequest {
@@ -150,6 +151,7 @@ async fn security_approved_reconnect_works_but_revocation_is_terminal() {
     )
     .await
     .unwrap();
+    assert!(denied.ok);
     let (tx, _rx) = mpsc::channel(8);
     {
         let mut guard = state.inner.lock().await;
@@ -259,7 +261,7 @@ async fn security_join_rechecks_invite_rotation_after_verification() {
     let preparation = prepare_join_verification(&state, session_id, &body)
         .await
         .unwrap();
-    rotate_invite(
+    let Json(rotated) = rotate_invite(
         State(state.clone()),
         Path(session_id.0),
         Json(RotateInviteRequest {
@@ -270,6 +272,7 @@ async fn security_join_rechecks_invite_rotation_after_verification() {
     )
     .await
     .unwrap();
+    assert!(rotated.ok);
     let result = finish_join(&state, session_id, body, preparation.passphrase_hash, true).await;
     assert_eq!(result.err().unwrap().0, StatusCode::UNAUTHORIZED);
     assert_eq!(
@@ -284,7 +287,7 @@ async fn security_session_creation_has_a_global_capacity_bound() {
         require_loopback_session_creation: false,
     });
     for _ in 0..MAX_SHARE_SESSIONS {
-        create_share_session(
+        let Json(created) = create_share_session(
             None,
             State(state.clone()),
             Json(CreateShareSessionRequest {
@@ -296,6 +299,8 @@ async fn security_session_creation_has_a_global_capacity_bound() {
         )
         .await
         .unwrap();
+        assert_ne!(created.session_id.0, Uuid::nil());
+        assert!(!created.host_token.is_empty());
     }
     let result = create_share_session(
         None,
