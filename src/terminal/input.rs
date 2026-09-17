@@ -158,7 +158,17 @@ pub fn mouse_motion_sgr_sequence(
 /// agente (idea de orca): un prompt no debe poder emitir secuencias de
 /// control al terminal.
 pub fn sanitize_agent_prompt(text: &str) -> String {
-    text.replace('\x1b', "<ESC>")
+    text.chars()
+        .map(|ch| {
+            if ch == '\x1b' {
+                "<ESC>".to_owned()
+            } else if ch.is_control() && !matches!(ch, '\n' | '\t') {
+                " ".to_owned()
+            } else {
+                ch.to_string()
+            }
+        })
+        .collect()
 }
 
 /// Compone los bytes para inyectar un prompt/feedback en un agente:
@@ -761,5 +771,14 @@ mod tests {
                 ..Modifiers::NONE
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod prompt_security_tests {
+    #[test]
+    fn prompt_sanitization_drops_terminal_controls_but_keeps_text() {
+        let text = super::sanitize_agent_prompt("hola\x03\r\x00\x1b\n\tfin");
+        assert_eq!(text, "hola   <ESC>\n\tfin");
     }
 }

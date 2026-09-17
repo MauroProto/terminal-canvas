@@ -39,11 +39,14 @@ pub fn http_client(tls_cert_pem: Option<&str>) -> anyhow::Result<Client> {
     ensure_crypto_provider();
     let mut builder = Client::builder()
         .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
-        .https_only(true);
+        .https_only(true)
+        .redirect(reqwest::redirect::Policy::none());
     if let Some(cert_pem) = tls_cert_pem {
         let cert = Certificate::from_pem(cert_pem.as_bytes())
             .context("failed to parse pinned TLS certificate")?;
-        builder = builder.add_root_certificate(cert);
+        builder = builder
+            .tls_built_in_root_certs(false)
+            .add_root_certificate(cert);
     }
     builder.build().context("failed to build HTTP client")
 }
@@ -59,6 +62,7 @@ pub fn websocket_connector(tls_cert_pem: Option<&str>) -> anyhow::Result<Option<
         .collect::<Result<Vec<_>, _>>()
         .context("failed to parse pinned websocket certificate")?;
 
+    anyhow::ensure!(certs.len() == 1, "Expected one pinned certificate");
     let mut roots = RootCertStore::empty();
     for cert in certs {
         roots
@@ -71,4 +75,45 @@ pub fn websocket_connector(tls_cert_pem: Option<&str>) -> anyhow::Result<Option<
         .with_no_client_auth();
 
     Ok(Some(Connector::Rustls(Arc::new(config))))
+}
+
+#[cfg(test)]
+mod security_tls_tests {
+    use super::*;
+    use crate::collab::server::EmbeddedCollabServer;
+    #[test]
+    fn pinned_http_accepts_its_host_and_rejects_a_different_certificate() {
+        let material = generate_tls_material(vec!["127.0.0.1".to_owned()]).unwrap();
+        let other = generate_tls_material(vec!["127.0.0.1".to_owned()]).unwrap();
+        let mut server = EmbeddedCollabServer::start(
+            "127.0.0.1:0".parse().unwrap(),
+            material.cert_pem.clone(),
+            material.key_pem,
+        )
+        .unwrap();
+        let response = http_client(Some(&material.cert_pem))
+            .unwrap()
+            .get(server.local_api_url())
+            .send();
+        assert!(
+            response.is_ok(),
+            "the pinned host must be reachable: {response:?}"
+        );
+        assert!(http_client(Some(&other.cert_pem))
+            .unwrap()
+            .get(server.local_api_url())
+            .send()
+            .is_err());
+        assert!(http_client(None)
+            .unwrap()
+            .get(server.local_api_url())
+            .send()
+            .is_err());
+        server.stop().unwrap();
+    }
+    #[test]
+    fn malformed_pins_fail_closed_for_http_and_websocket() {
+        assert!(http_client(Some("invalid certificate")).is_err());
+        assert!(websocket_connector(Some("invalid certificate")).is_err());
+    }
 }

@@ -68,3 +68,12 @@ y recorte de imágenes. La activación sigue el contrato oficial de
 [activeTab](https://developer.chrome.com/docs/extensions/develop/concepts/activeTab)
 y la captura usa el `windowId` requerido por
 [captureVisibleTab](https://developer.chrome.com/docs/extensions/reference/api/tabs#method-captureVisibleTab).
+
+
+## Revisión antes de usar una captura
+
+Las capturas se muestran en una ventana de revisión dentro de TerminalCanvas.
+El botón **Copiar texto** copia el contenido para pegarlo en el agente elegido.
+No se envía texto automáticamente a un terminal y no se pulsa Enter. Cerrar o
+cambiar de agente no puede redirigir una captura pendiente a un shell.
+Las capturas contienen datos de páginas externas; revisalos antes de usarlos.

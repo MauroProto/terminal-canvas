@@ -21,7 +21,7 @@ use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, Semaphore};
 use uuid::Uuid;
 
 use super::auth::{constant_time_str_eq, verify_passphrase};
@@ -64,6 +64,7 @@ pub struct BrokerConfig {
 pub struct BrokerState {
     config: BrokerConfig,
     inner: Arc<Mutex<Sessions>>,
+    password_work: Arc<Semaphore>,
 }
 
 impl BrokerState {
@@ -71,6 +72,7 @@ impl BrokerState {
         Self {
             config,
             inner: Arc::new(Mutex::new(Sessions::default())),
+            password_work: Arc::new(Semaphore::new(2)),
         }
     }
 }
@@ -95,7 +97,15 @@ struct SessionRecord {
     guests: HashMap<GuestId, GuestRecord>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GuestAuthorization {
+    Pending,
+    Approved,
+    Denied,
+}
+
 struct GuestRecord {
+    authorization: GuestAuthorization,
     token: String,
     display_name: String,
     #[allow(dead_code)]
@@ -165,6 +175,28 @@ async fn create_share_session(
             ));
         }
     }
+    if body.invite_secret.is_empty()
+        || body.invite_secret.len() > MAX_INVITE_SECRET_LEN
+        || body.trusted_devices.len() > 128
+        || body.trusted_devices.iter().any(|device| {
+            device.device_id.is_empty()
+                || device.device_id.len() > MAX_DEVICE_ID_LEN
+                || device.last_display_name.len() > MAX_DISPLAY_NAME_LEN
+        })
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Invalid session configuration".to_owned(),
+        ));
+    }
+    if let Some(hash) = &body.passphrase_hash {
+        super::auth::validate_passphrase_hash(hash).map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                "Unsupported passphrase hash policy".to_owned(),
+            )
+        })?;
+    }
     let session_id = ShareSessionId(Uuid::new_v4());
     let host_token = random_token();
     let session = SessionRecord {
@@ -185,12 +217,14 @@ async fn create_share_session(
             .collect(),
         guests: HashMap::new(),
     };
-    state
-        .inner
-        .lock()
-        .await
-        .sessions
-        .insert(session_id, session);
+    let mut guard = state.inner.lock().await;
+    if guard.sessions.len() >= 64 {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            "Session capacity reached".to_owned(),
+        ));
+    }
+    guard.sessions.insert(session_id, session);
     Ok(Json(CreateShareSessionResponse {
         session_id,
         host_token,
@@ -205,66 +239,69 @@ async fn join_share_session(
     let body = sanitize_join_request(body)
         .map_err(|reason| (StatusCode::BAD_REQUEST, reason.to_owned()))?;
     let session_id = ShareSessionId(session_id);
+    let passphrase_hash = {
+        let guard = state.inner.lock().await;
+        let session = guard
+            .sessions
+            .get(&session_id)
+            .ok_or((StatusCode::NOT_FOUND, "Session not found".to_owned()))?;
+        check_join_access(session, &body, Instant::now())?;
+        session.passphrase_hash.clone()
+    };
+    // The permit remains held by the work even if its HTTP request is cancelled.
+    // No sessions mutex is held while computing or waiting for password work.
+    let verified = if let Some(hash) = passphrase_hash.clone() {
+        if let Some(passphrase) = body.passphrase.clone() {
+            let permit = state
+                .password_work
+                .clone()
+                .try_acquire_owned()
+                .map_err(|_| {
+                    (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        "Password verification busy".to_owned(),
+                    )
+                })?;
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                verify_passphrase(&hash, &passphrase).unwrap_or(false)
+            })
+            .await
+            .map_err(|_| {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Password verification unavailable".to_owned(),
+                )
+            })?
+        } else {
+            false
+        }
+    } else {
+        true
+    };
     let mut guard = state.inner.lock().await;
     let session = guard
         .sessions
         .get_mut(&session_id)
         .ok_or((StatusCode::NOT_FOUND, "Session not found".to_owned()))?;
     let now = Instant::now();
-    if let Some(locked_until) = session.join_locked_until {
-        if locked_until > now {
-            let wait_secs = locked_until.saturating_duration_since(now).as_secs().max(1);
-            return Err((
-                StatusCode::TOO_MANY_REQUESTS,
-                format!("Too many failed attempts. Wait {wait_secs}s and try again."),
-            ));
-        }
-        session.join_locked_until = None;
+    // Re-check rotation, expiry, lockout and capacity after the unlocked calculation.
+    check_join_access(session, &body, now)?;
+    if session.passphrase_hash != passphrase_hash {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "Session credentials changed".to_owned(),
+        ));
     }
-    if session
-        .invite_expires_at
-        .map(|expires_at| expires_at <= Utc::now())
-        .unwrap_or(false)
-    {
-        return Err((StatusCode::GONE, "Invite expired".to_owned()));
-    }
-    if !constant_time_str_eq(&session.invite_secret, &body.invite_secret) {
-        return Err((StatusCode::UNAUTHORIZED, "Invalid invite secret".to_owned()));
-    }
-    if let Some(passphrase_hash) = &session.passphrase_hash {
-        let Some(passphrase) = body.passphrase.as_deref() else {
-            register_failed_join_attempt(session, now);
-            return Err((
-                StatusCode::UNAUTHORIZED,
-                "Session passphrase required".to_owned(),
-            ));
-        };
-        match verify_passphrase(passphrase_hash, passphrase) {
-            Ok(true) => {}
-            Ok(false) => {
-                register_failed_join_attempt(session, now);
-                return Err((
-                    StatusCode::UNAUTHORIZED,
-                    "Invalid session passphrase".to_owned(),
-                ));
-            }
-            Err(_) => {
-                return Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Failed to verify session passphrase".to_owned(),
-                ));
-            }
-        }
+    if !verified {
+        register_failed_join_attempt(session, now);
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "Invalid or missing session passphrase".to_owned(),
+        ));
     }
     session.failed_join_attempts = 0;
     session.join_locked_until = None;
-
-    if active_guest_count(session) >= 3 {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "Participant limit reached".to_owned(),
-        ));
-    }
 
     let guest_id = GuestId(Uuid::new_v4());
     let guest_token = random_token();
@@ -278,6 +315,11 @@ async fn join_share_session(
     session.guests.insert(
         guest_id,
         GuestRecord {
+            authorization: if auto_approved {
+                GuestAuthorization::Approved
+            } else {
+                GuestAuthorization::Pending
+            },
             token: guest_token.clone(),
             display_name: body.display_name.clone(),
             device_id: body.device_id.clone(),
@@ -353,7 +395,12 @@ async fn approve_join(
         .guests
         .get_mut(&body.guest_id)
         .ok_or((StatusCode::NOT_FOUND, "Guest not found".to_owned()))?;
-    guest.connection_state = GuestConnectionState::Approved;
+    guest.authorization = GuestAuthorization::Approved;
+    guest.connection_state = if guest.tx.is_some() {
+        GuestConnectionState::Connected
+    } else {
+        GuestConnectionState::Approved
+    };
     guest.disconnected_at = None;
     guest.last_seen = Instant::now();
     if let Some(tx) = &guest.tx {
@@ -389,6 +436,7 @@ async fn deny_join(
         .guests
         .get_mut(&body.guest_id)
         .ok_or((StatusCode::NOT_FOUND, "Guest not found".to_owned()))?;
+    guest.authorization = GuestAuthorization::Denied;
     guest.connection_state = GuestConnectionState::Denied;
     guest.disconnected_at = Some(Instant::now());
     if let Some(tx) = &guest.tx {
@@ -460,7 +508,10 @@ async fn stream_session(
                 let (guest_id, _) = session
                     .guests
                     .iter()
-                    .find(|(_, guest)| constant_time_str_eq(&guest.token, &query.token))
+                    .find(|(_, guest)| {
+                        guest.authorization != GuestAuthorization::Denied
+                            && constant_time_str_eq(&guest.token, &query.token)
+                    })
                     .ok_or((StatusCode::UNAUTHORIZED, "Invalid token".to_owned()))?;
                 StreamAuth::Guest(*guest_id)
             }
@@ -490,7 +541,9 @@ async fn handle_socket(
         match auth {
             StreamAuth::Host => {
                 let was_reconnected = session.host_disconnected_at.take().is_some();
-                session.host_tx = Some(tx.clone());
+                if let Some(previous) = session.host_tx.replace(tx.clone()) {
+                    let _ = previous.try_send(Message::Close(None));
+                }
                 session.host_connection_id = Some(connection_id);
                 session.host_last_seen = Instant::now();
                 if was_reconnected {
@@ -501,16 +554,17 @@ async fn handle_socket(
                 let Some(guest) = session.guests.get_mut(&guest_id) else {
                     return;
                 };
-                guest.tx = Some(tx.clone());
+                // Denial may race with stream authentication; re-check at upgrade.
+                if guest.authorization == GuestAuthorization::Denied {
+                    return;
+                }
+                if let Some(previous) = guest.tx.replace(tx.clone()) {
+                    let _ = previous.try_send(Message::Close(None));
+                }
                 guest.connection_id = Some(connection_id);
                 guest.last_seen = Instant::now();
                 guest.disconnected_at = None;
-                if matches!(
-                    guest.connection_state,
-                    GuestConnectionState::Approved | GuestConnectionState::Disconnected
-                ) {
-                    guest.connection_state = GuestConnectionState::Connected;
-                }
+                guest.mark_connected();
             }
         }
         broadcast_presence(session);
@@ -535,10 +589,7 @@ async fn handle_socket(
         if let Some(session) = guard.sessions.get(&session_id) {
             if let StreamAuth::Guest(guest_id) = auth {
                 if let Some(guest) = session.guests.get(&guest_id) {
-                    if matches!(
-                        guest.connection_state,
-                        GuestConnectionState::Approved | GuestConnectionState::Connected
-                    ) {
+                    if guest.can_relay() {
                         send_json(
                             &tx,
                             &BrokerControlMessage::JoinApproved {
@@ -583,7 +634,14 @@ async fn handle_socket(
                     );
                     break;
                 }
-                relay_payload(&state, session_id, auth, Message::Binary(payload)).await;
+                relay_payload(
+                    &state,
+                    session_id,
+                    auth,
+                    connection_id,
+                    Message::Binary(payload),
+                )
+                .await;
             }
             Message::Text(_) => {
                 // Text frames are reserved for broker-generated control
@@ -646,6 +704,7 @@ async fn relay_payload(
     state: &BrokerState,
     session_id: ShareSessionId,
     auth: StreamAuth,
+    connection_id: Uuid,
     payload: Message,
 ) {
     let guard = state.inner.lock().await;
@@ -654,11 +713,11 @@ async fn relay_payload(
     };
     match auth {
         StreamAuth::Host => {
+            if session.host_connection_id != Some(connection_id) {
+                return;
+            }
             for guest in session.guests.values() {
-                if matches!(
-                    guest.connection_state,
-                    GuestConnectionState::Approved | GuestConnectionState::Connected
-                ) {
+                if guest.can_relay() {
                     if let Some(tx) = &guest.tx {
                         let _ = tx.try_send(payload.clone());
                     }
@@ -669,10 +728,7 @@ async fn relay_payload(
             let Some(guest) = session.guests.get(&guest_id) else {
                 return;
             };
-            if !matches!(
-                guest.connection_state,
-                GuestConnectionState::Approved | GuestConnectionState::Connected
-            ) {
+            if !guest.can_relay() || guest.connection_id != Some(connection_id) {
                 return;
             }
             if let Some(host_tx) = &session.host_tx {
@@ -736,9 +792,7 @@ async fn handle_disconnect(
                     guest.tx = None;
                     guest.connection_id = None;
                     guest.disconnected_at = Some(Instant::now());
-                    if !matches!(guest.connection_state, GuestConnectionState::Denied) {
-                        guest.connection_state = GuestConnectionState::Disconnected;
-                    }
+                    guest.mark_disconnected();
                 }
                 broadcast_presence(session);
             }
@@ -848,9 +902,7 @@ async fn cleanup_expired_sessions(state: &BrokerState, now: Instant) {
                     guest.tx = None;
                     guest.connection_id = None;
                     guest.disconnected_at = Some(now);
-                    if !matches!(guest.connection_state, GuestConnectionState::Denied) {
-                        guest.connection_state = GuestConnectionState::Disconnected;
-                    }
+                    guest.mark_disconnected();
                     guest_presence_changed = true;
                 }
             }
@@ -1319,6 +1371,7 @@ mod tests {
                 guests: HashMap::from([(
                     guest_id,
                     GuestRecord {
+                        authorization: GuestAuthorization::Approved,
                         token: "guest-token".to_owned(),
                         display_name: "Guest".to_owned(),
                         device_id: "device-1".to_owned(),
@@ -1403,5 +1456,307 @@ mod tests {
         assert_eq!(session.host_connection_id, Some(current_connection_id));
         assert!(session.host_tx.is_some());
         assert!(session.host_disconnected_at.is_none());
+    }
+}
+
+impl GuestRecord {
+    fn mark_connected(&mut self) {
+        self.connection_state = match self.authorization {
+            GuestAuthorization::Pending => GuestConnectionState::Pending,
+            GuestAuthorization::Approved => GuestConnectionState::Connected,
+            GuestAuthorization::Denied => GuestConnectionState::Denied,
+        };
+    }
+    fn mark_disconnected(&mut self) {
+        self.connection_state = match self.authorization {
+            GuestAuthorization::Pending => GuestConnectionState::Pending,
+            GuestAuthorization::Approved => GuestConnectionState::Disconnected,
+            GuestAuthorization::Denied => GuestConnectionState::Denied,
+        };
+    }
+    fn can_relay(&self) -> bool {
+        self.authorization == GuestAuthorization::Approved
+            && matches!(
+                self.connection_state,
+                GuestConnectionState::Approved | GuestConnectionState::Connected
+            )
+    }
+}
+
+fn check_join_access(
+    session: &SessionRecord,
+    body: &JoinShareSessionRequest,
+    now: Instant,
+) -> Result<(), (StatusCode, String)> {
+    if session.join_locked_until.is_some_and(|until| until > now) {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            "Too many failed attempts".to_owned(),
+        ));
+    }
+    if session
+        .invite_expires_at
+        .is_some_and(|expires| expires <= Utc::now())
+    {
+        return Err((StatusCode::GONE, "Invite expired".to_owned()));
+    }
+    if !constant_time_str_eq(&session.invite_secret, &body.invite_secret) {
+        return Err((StatusCode::UNAUTHORIZED, "Invalid invite secret".to_owned()));
+    }
+    if active_guest_count(session) >= 3 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Participant limit reached".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod security_regressions {
+    use super::*;
+    async fn session(hash: Option<String>) -> (BrokerState, CreateShareSessionResponse) {
+        let state = BrokerState::new(BrokerConfig {
+            require_loopback_session_creation: false,
+        });
+        let created = create_share_session(
+            None,
+            State(state.clone()),
+            Json(CreateShareSessionRequest {
+                invite_secret: "dummy-invite".to_owned(),
+                invite_expires_at: None,
+                passphrase_hash: hash,
+                trusted_devices: Vec::new(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        (state, created)
+    }
+    fn join_request(passphrase: Option<&str>) -> JoinShareSessionRequest {
+        JoinShareSessionRequest {
+            display_name: "Dummy".to_owned(),
+            invite_secret: "dummy-invite".to_owned(),
+            device_id: "dummy-device".to_owned(),
+            passphrase: passphrase.map(str::to_owned),
+        }
+    }
+    async fn attach_dummy(
+        state: &BrokerState,
+        id: ShareSessionId,
+        guest_id: GuestId,
+    ) -> (Uuid, mpsc::Receiver<Message>) {
+        let connection_id = Uuid::new_v4();
+        let (tx, rx) = mpsc::channel(8);
+        let mut guard = state.inner.lock().await;
+        let guest = guard
+            .sessions
+            .get_mut(&id)
+            .unwrap()
+            .guests
+            .get_mut(&guest_id)
+            .unwrap();
+        guest.tx = Some(tx);
+        guest.connection_id = Some(connection_id);
+        guest.disconnected_at = None;
+        guest.mark_connected();
+        (connection_id, rx)
+    }
+    #[tokio::test]
+    async fn pending_reconnection_does_not_authorize_either_relay_direction() {
+        let (state, created) = session(None).await;
+        let join = join_share_session(
+            State(state.clone()),
+            Path(created.session_id.0),
+            Json(join_request(None)),
+        )
+        .await
+        .unwrap()
+        .0;
+        let (old, _old_rx) = attach_dummy(&state, created.session_id, join.guest_id).await;
+        handle_disconnect(
+            &state,
+            created.session_id,
+            StreamAuth::Guest(join.guest_id),
+            old,
+        )
+        .await;
+        let (current, mut guest_rx) = attach_dummy(&state, created.session_id, join.guest_id).await;
+        let (host_tx, mut host_rx) = mpsc::channel(8);
+        let host_id = Uuid::new_v4();
+        {
+            let mut guard = state.inner.lock().await;
+            let session = guard.sessions.get_mut(&created.session_id).unwrap();
+            session.host_tx = Some(host_tx);
+            session.host_connection_id = Some(host_id);
+            assert!(!session.guests.get(&join.guest_id).unwrap().can_relay());
+        }
+        relay_payload(
+            &state,
+            created.session_id,
+            StreamAuth::Host,
+            host_id,
+            Message::Binary(b"dummy".to_vec()),
+        )
+        .await;
+        relay_payload(
+            &state,
+            created.session_id,
+            StreamAuth::Guest(join.guest_id),
+            current,
+            Message::Binary(b"dummy".to_vec()),
+        )
+        .await;
+        assert!(guest_rx.try_recv().is_err());
+        assert!(host_rx.try_recv().is_err());
+    }
+    #[tokio::test]
+    async fn approval_survives_reconnect_but_denial_does_not_become_approval() {
+        let (state, created) = session(None).await;
+        let join = join_share_session(
+            State(state.clone()),
+            Path(created.session_id.0),
+            Json(join_request(None)),
+        )
+        .await
+        .unwrap()
+        .0;
+        approve_join(
+            State(state.clone()),
+            Path(created.session_id.0),
+            Json(JoinDecisionRequest {
+                host_token: created.host_token.clone(),
+                guest_id: join.guest_id,
+            }),
+        )
+        .await
+        .unwrap();
+        let (connection, _rx) = attach_dummy(&state, created.session_id, join.guest_id).await;
+        handle_disconnect(
+            &state,
+            created.session_id,
+            StreamAuth::Guest(join.guest_id),
+            connection,
+        )
+        .await;
+        let (_connection, _rx) = attach_dummy(&state, created.session_id, join.guest_id).await;
+        {
+            let guard = state.inner.lock().await;
+            assert!(guard.sessions[&created.session_id].guests[&join.guest_id].can_relay());
+        }
+        deny_join(
+            State(state.clone()),
+            Path(created.session_id.0),
+            Json(JoinDecisionRequest {
+                host_token: created.host_token,
+                guest_id: join.guest_id,
+            }),
+        )
+        .await
+        .unwrap();
+        let mut guard = state.inner.lock().await;
+        let guest = guard
+            .sessions
+            .get_mut(&created.session_id)
+            .unwrap()
+            .guests
+            .get_mut(&join.guest_id)
+            .unwrap();
+        guest.mark_disconnected();
+        guest.mark_connected();
+        assert!(!guest.can_relay());
+        assert_eq!(guest.connection_state, GuestConnectionState::Denied);
+    }
+    #[tokio::test]
+    async fn heartbeat_timeout_preserves_pending_authorization() {
+        let (state, created) = session(None).await;
+        let join = join_share_session(
+            State(state.clone()),
+            Path(created.session_id.0),
+            Json(join_request(None)),
+        )
+        .await
+        .unwrap()
+        .0;
+        let (_connection, _rx) = attach_dummy(&state, created.session_id, join.guest_id).await;
+        {
+            let mut guard = state.inner.lock().await;
+            guard
+                .sessions
+                .get_mut(&created.session_id)
+                .unwrap()
+                .host_disconnected_at = None;
+        }
+        cleanup_expired_sessions(
+            &state,
+            Instant::now() + HEARTBEAT_TIMEOUT + Duration::from_secs(1),
+        )
+        .await;
+        let (_connection, _rx) = attach_dummy(&state, created.session_id, join.guest_id).await;
+        let guard = state.inner.lock().await;
+        let guest = &guard.sessions[&created.session_id].guests[&join.guest_id];
+        assert_eq!(guest.connection_state, GuestConnectionState::Pending);
+        assert!(!guest.can_relay());
+    }
+    #[tokio::test]
+    async fn invalid_hash_parameters_are_rejected_before_session_creation() {
+        let state = BrokerState::new(BrokerConfig {
+            require_loopback_session_creation: false,
+        });
+        let hash = super::super::auth::hash_passphrase("dummy-password")
+            .unwrap()
+            .replace("m=19456", "m=19457");
+        let result = create_share_session(
+            None,
+            State(state.clone()),
+            Json(CreateShareSessionRequest {
+                invite_secret: "dummy".to_owned(),
+                invite_expires_at: None,
+                passphrase_hash: Some(hash),
+                trusted_devices: Vec::new(),
+            }),
+        )
+        .await;
+        assert_eq!(result.err().unwrap().0, StatusCode::BAD_REQUEST);
+        assert!(state.inner.lock().await.sessions.is_empty());
+    }
+    #[tokio::test]
+    async fn password_work_is_bounded_without_locking_unrelated_sessions() {
+        let hash = super::super::auth::hash_passphrase("dummy-password").unwrap();
+        let (state, created) = session(Some(hash)).await;
+        let permits = state
+            .password_work
+            .clone()
+            .try_acquire_many_owned(2)
+            .unwrap();
+        let result = join_share_session(
+            State(state.clone()),
+            Path(created.session_id.0),
+            Json(join_request(Some("dummy-password"))),
+        )
+        .await;
+        assert_eq!(result.err().unwrap().0, StatusCode::TOO_MANY_REQUESTS);
+        assert!(state.inner.try_lock().is_ok());
+        let other = create_share_session(
+            None,
+            State(state.clone()),
+            Json(CreateShareSessionRequest {
+                invite_secret: "other-dummy".to_owned(),
+                invite_expires_at: None,
+                passphrase_hash: None,
+                trusted_devices: Vec::new(),
+            }),
+        )
+        .await;
+        assert!(other.is_ok());
+        drop(permits);
+        assert!(join_share_session(
+            State(state),
+            Path(created.session_id.0),
+            Json(join_request(Some("dummy-password")))
+        )
+        .await
+        .is_ok());
     }
 }

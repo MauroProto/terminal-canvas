@@ -54,17 +54,27 @@ fn write_atomic_changed(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let tmp = tmp_path(path);
-    {
-        let mut file = std::fs::File::create(&tmp)?;
+    let tmp = sibling_with_suffix(path, &format!(".{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&tmp)?;
         file.write_all(bytes)?;
-        // fsync del archivo ANTES del rename: sin esto, un crash puede dejar
-        // el rename aterrizado sobre un archivo todavía vacío en disco.
         file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, path)?;
+        sync_directory(path);
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
-    std::fs::rename(&tmp, path)?;
-    sync_directory(path);
-    Ok(())
+    result
 }
 
 fn content_matches(path: &Path, bytes: &[u8]) -> bool {
@@ -146,7 +156,7 @@ fn rotate_backup_ring(path: &Path, now: SystemTime, min_spacing: Duration) {
             let _ = std::fs::rename(&from, &to);
         }
     }
-    if let Err(err) = std::fs::copy(path, &newest) {
+    if let Err(err) = std::fs::read(path).and_then(|bytes| write_atomic_changed(&newest, &bytes)) {
         log::warn!(
             "No se pudo refrescar el backup de {}: {err}",
             path.display()
@@ -304,5 +314,125 @@ mod tests {
         let path = dir.join("layout.json");
         let loaded: Option<Vec<u8>> = load_first_valid(&path, |_| None);
         assert!(loaded.is_none());
+    }
+}
+
+/// Migrate existing Unix configuration and backups even for content-equal saves.
+/// Windows inherits the per-user profile ACL; mode bits are not an ACL substitute.
+pub fn protect_private_files(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+        // SAFETY: geteuid has no pointer arguments and only returns process identity.
+        let uid = unsafe { libc::geteuid() };
+        let parent = path
+            .parent()
+            .ok_or_else(|| std::io::Error::other("Private file has no parent"))?;
+        let parent_metadata = match std::fs::symlink_metadata(parent) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => return Err(err),
+        };
+        if !parent_metadata.is_dir()
+            || parent_metadata.file_type().is_symlink()
+            || parent_metadata.uid() != uid
+        {
+            return Err(std::io::Error::other(
+                "Private directory must be owned by the current user and not be a symlink",
+            ));
+        }
+        let directory = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+            .open(parent)?;
+        let metadata = directory.metadata()?;
+        if !metadata.is_dir() || metadata.uid() != uid {
+            return Err(std::io::Error::other("Invalid private directory owner"));
+        }
+        directory.set_permissions(std::fs::Permissions::from_mode(0o700))?;
+        let mut paths = candidate_paths(path);
+        paths.push(tmp_path(path));
+        for candidate in paths {
+            let file = match std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(&candidate)
+            {
+                Ok(file) => file,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(err),
+            };
+            let metadata = file.metadata()?;
+            if !metadata.is_file() || metadata.nlink() != 1 || metadata.uid() != uid {
+                return Err(std::io::Error::other(
+                    "Private config must be an owner-only regular file",
+                ));
+            }
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+#[cfg(all(test, unix))]
+mod private_file_tests {
+    use super::*;
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    #[test]
+    fn config_migration_noop_replacement_and_backups_remain_private() {
+        let root = std::env::temp_dir().join(format!("tc-private-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("config.toml");
+        let config = crate::config::AppConfig {
+            linear_token: Some("dummy-private-value".to_owned()),
+            ..Default::default()
+        };
+        crate::config::save_to_path(&config, &path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::write(backup_path(&path, 0), "old dummy").unwrap();
+        std::fs::set_permissions(
+            backup_path(&path, 0),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        crate::config::save_to_path(&config, &path).unwrap();
+        for candidate in [&path, &backup_path(&path, 0)] {
+            assert_eq!(
+                std::fs::metadata(candidate).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        assert_eq!(
+            std::fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let mut changed = config.clone();
+        changed.font_size += 1.0;
+        crate::config::save_to_path(&changed, &path).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            crate::config::load_from_path(&path).linear_token,
+            config.linear_token
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn private_config_rejects_symlinks_and_hardlinks() {
+        let root = std::env::temp_dir().join(format!("tc-links-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let target = root.join("other.txt");
+        let path = root.join("config.toml");
+        std::fs::write(&target, "untouched").unwrap();
+        symlink(&target, &path).unwrap();
+        assert!(protect_private_files(&path).is_err());
+        std::fs::remove_file(&path).unwrap();
+        std::fs::hard_link(&target, &path).unwrap();
+        assert!(protect_private_files(&path).is_err());
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "untouched");
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

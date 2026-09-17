@@ -548,6 +548,17 @@ impl CollabManager {
         let Some(host) = &mut self.host else {
             return;
         };
+        // Prune before output validation so stale controls cannot poison snapshots.
+        let controllable: HashSet<_> = snapshot
+            .panels
+            .iter()
+            .filter(|panel| panel.share_scope.allows_control())
+            .map(|panel| panel.panel_id)
+            .collect();
+        host.pending_control_requests
+            .retain(|request| controllable.contains(&request.terminal_id));
+        host.terminal_controls
+            .retain(|id, _| controllable.contains(id));
         snapshot.guests = host.guests.values().cloned().collect();
         snapshot.terminal_controls = host.terminal_controls.values().cloned().collect();
         for panel in &mut snapshot.panels {
@@ -706,6 +717,9 @@ impl CollabManager {
         let Some(host) = &mut self.host else {
             return;
         };
+        if !control_target_allowed(host, terminal_id, guest_id) {
+            return;
+        }
         let controller_name = host
             .guests
             .get(&guest_id)
@@ -775,6 +789,24 @@ impl CollabManager {
         let Some(host) = &mut self.host else {
             return;
         };
+        if !control_target_allowed(host, request.terminal_id, request.guest_id)
+            || host
+                .guests
+                .get(&request.guest_id)
+                .is_none_or(|guest| guest.display_name != request.display_name)
+            || host.pending_control_requests.len() >= MAX_SHARED_CONTROLS
+            || (!host.terminal_controls.contains_key(&request.terminal_id)
+                && host.terminal_controls.len() >= MAX_SHARED_CONTROLS)
+            || host
+                .terminal_controls
+                .get(&request.terminal_id)
+                .is_some_and(|control| {
+                    control.controller == Some(request.guest_id)
+                        || control.queue.len() >= MAX_CONTROL_QUEUE
+                })
+        {
+            return;
+        }
         if host.pending_control_requests.iter().any(|existing| {
             existing.terminal_id == request.terminal_id && existing.guest_id == request.guest_id
         }) {
@@ -897,6 +929,11 @@ impl CollabManager {
         if let Some(host) = &mut self.host {
             host.pending_control_requests
                 .retain(|request| request.guest_id != guest_id);
+            for control in host.terminal_controls.values_mut() {
+                control.queue.retain(|queued| *queued != guest_id);
+            }
+            host.terminal_controls
+                .retain(|_, control| control.controller.is_some() || !control.queue.is_empty());
         }
     }
 
@@ -2175,5 +2212,170 @@ mod tests {
             host.previous_session_secret.as_deref(),
             Some(old_secret.as_str())
         );
+    }
+}
+
+fn control_target_allowed(host: &HostSessionContext, terminal_id: Uuid, guest_id: GuestId) -> bool {
+    host.guests.get(&guest_id).is_some_and(|guest| {
+        matches!(
+            guest.connection_state,
+            GuestConnectionState::Approved | GuestConnectionState::Connected
+        )
+    }) && host.last_snapshot.as_ref().is_some_and(|snapshot| {
+        snapshot.workspace_id == host.workspace_id
+            && snapshot
+                .panels
+                .iter()
+                .any(|panel| panel.panel_id == terminal_id && panel.share_scope.allows_control())
+    })
+}
+#[cfg(test)]
+mod security_control_tests {
+    use super::*;
+    use crate::collab::models::{PanelShareScope, SharedPanelSnapshot};
+    fn fixture() -> (CollabManager, Uuid, GuestId) {
+        let mut manager = CollabManager::new();
+        let terminal_id = Uuid::new_v4();
+        let guest_id = GuestId(Uuid::new_v4());
+        let workspace_id = Uuid::new_v4();
+        let snapshot = SharedWorkspaceSnapshot {
+            workspace_id,
+            workspace_name: "Dummy".to_owned(),
+            generated_at: Utc::now(),
+            guests: Vec::new(),
+            terminal_controls: Vec::new(),
+            panels: vec![SharedPanelSnapshot {
+                panel_id: terminal_id,
+                title: "Dummy".to_owned(),
+                position: [0.0, 0.0],
+                size: [800.0, 600.0],
+                color: [0, 0, 0],
+                z_index: 0,
+                focused: false,
+                minimized: false,
+                alive: true,
+                preview_label: String::new(),
+                share_scope: PanelShareScope::Controllable,
+                visible_text: String::new(),
+                history_text: String::new(),
+                controller: None,
+                controller_name: None,
+                queue_len: 0,
+            }],
+        };
+        manager.mode = CollabMode::Host;
+        manager.session_state = CollabSessionState::Live;
+        manager.host = Some(HostSessionContext {
+            session_id: ShareSessionId(Uuid::new_v4()),
+            workspace_id,
+            host_token: "dummy".to_owned(),
+            session_secret: random_secret(),
+            previous_session_secret: None,
+            invite_secret: "dummy".to_owned(),
+            invite_expires_at: None,
+            requires_passphrase: false,
+            tls_cert_pem: String::new(),
+            invite_code: String::new(),
+            guests: HashMap::from([(
+                guest_id,
+                GuestPresence {
+                    id: guest_id,
+                    display_name: "Dummy".to_owned(),
+                    joined_at: Utc::now(),
+                    connection_state: GuestConnectionState::Connected,
+                },
+            )]),
+            pending_joins: Vec::new(),
+            pending_control_requests: Vec::new(),
+            terminal_controls: HashMap::new(),
+            last_snapshot: Some(snapshot),
+            last_snapshot_sent_at: None,
+            rekey_recovery_until: None,
+            last_rekey_recovery_at: None,
+            next_message_seq: 1,
+        });
+        (manager, terminal_id, guest_id)
+    }
+    fn request(terminal_id: Uuid, guest_id: GuestId) -> ControlRequest {
+        ControlRequest {
+            terminal_id,
+            guest_id,
+            display_name: "Dummy".to_owned(),
+            requested_at: Utc::now(),
+        }
+    }
+    #[test]
+    fn nonexistent_targets_do_not_accumulate_or_poison_snapshots() {
+        let (mut manager, terminal_id, guest_id) = fixture();
+        for _ in 0..MAX_SHARED_CONTROLS + 1 {
+            manager.note_control_request(request(Uuid::new_v4(), guest_id));
+        }
+        assert!(manager.pending_control_requests().is_empty());
+        assert!(manager.host.as_ref().unwrap().terminal_controls.is_empty());
+        manager.note_control_request(request(terminal_id, guest_id));
+        manager.note_control_request(request(terminal_id, guest_id));
+        assert_eq!(manager.pending_control_requests().len(), 1);
+        assert_eq!(manager.host.as_ref().unwrap().terminal_controls.len(), 1);
+        let snapshot = manager
+            .host
+            .as_ref()
+            .unwrap()
+            .last_snapshot
+            .clone()
+            .unwrap();
+        manager.publish_snapshot(snapshot);
+        assert!(manager.last_error().is_none());
+    }
+    #[test]
+    fn private_read_only_and_unknown_guests_cannot_request_or_gain_control() {
+        let (mut manager, terminal_id, guest_id) = fixture();
+        for scope in [
+            PanelShareScope::Private,
+            PanelShareScope::VisibleOnly,
+            PanelShareScope::VisibleAndHistory,
+        ] {
+            manager
+                .host
+                .as_mut()
+                .unwrap()
+                .last_snapshot
+                .as_mut()
+                .unwrap()
+                .panels[0]
+                .share_scope = scope;
+            manager.note_control_request(request(terminal_id, guest_id));
+            manager.grant_control(terminal_id, guest_id);
+            assert!(manager.pending_control_requests().is_empty());
+            assert_eq!(manager.controller_for(terminal_id), None);
+        }
+        manager
+            .host
+            .as_mut()
+            .unwrap()
+            .last_snapshot
+            .as_mut()
+            .unwrap()
+            .panels[0]
+            .share_scope = PanelShareScope::Controllable;
+        manager.note_control_request(request(terminal_id, GuestId(Uuid::new_v4())));
+        assert!(manager.pending_control_requests().is_empty());
+    }
+    #[test]
+    fn changing_scope_prunes_control_state_before_publication() {
+        let (mut manager, terminal_id, guest_id) = fixture();
+        manager.note_control_request(request(terminal_id, guest_id));
+        manager.grant_control(terminal_id, guest_id);
+        assert_eq!(manager.controller_for(terminal_id), Some(guest_id));
+        let mut snapshot = manager
+            .host
+            .as_ref()
+            .unwrap()
+            .last_snapshot
+            .clone()
+            .unwrap();
+        snapshot.panels[0].share_scope = PanelShareScope::Private;
+        manager.publish_snapshot(snapshot);
+        assert_eq!(manager.controller_for(terminal_id), None);
+        assert!(manager.pending_control_requests().is_empty());
     }
 }

@@ -429,43 +429,39 @@ impl TerminalApp {
         }
     }
 
-    /// Drena las capturas de Design Mode (P3.18, T3) y las manda al agente
-    /// enfocado con el formato determinístico.
-    pub(super) fn poll_design_captures(&mut self) {
-        let Some(server) = self.hook_server.as_ref() else {
-            return;
-        };
-        let captures = server.poll_design();
-        if captures.is_empty() {
-            return;
-        }
-        let Some(panel_id) = self
-            .ws()
-            .panels
-            .iter()
-            .find(|panel| panel.focused() && panel.is_alive())
-            .map(|panel| panel.id())
-        else {
-            self.toast_error("Elemento capturado, pero no hay agente enfocado");
-            return;
-        };
-        let mut delivered = 0usize;
-        for capture in captures {
-            let prompt = crate::orchestration::format_design_capture(&capture);
-            for workspace in &mut self.workspaces {
-                if workspace.send_prompt_to_panel(panel_id, &prompt) {
-                    delivered += 1;
-                    break;
+    /// Review captures without sending bytes or Enter to any terminal.
+    pub(super) fn poll_design_captures(&mut self, ctx: &egui::Context) {
+        let id = egui::Id::new("terminalcanvas.pending-design-captures");
+        let mut pending = ctx.data_mut(|data| {
+            data.get_temp::<Vec<crate::orchestration::DesignCapture>>(id)
+                .unwrap_or_default()
+        });
+        if let Some(server) = self.hook_server.as_ref() {
+            for capture in server.poll_design() {
+                if pending.len() < 16 {
+                    pending.push(capture);
+                } else {
+                    discard_design_screenshot(&capture);
                 }
             }
         }
-        if delivered > 0 {
-            self.toast_success(if delivered == 1 {
-                "Elemento capturado".to_owned()
-            } else {
-                format!("{delivered} elementos capturados")
-            });
+        if let Some(capture) = pending.first() {
+            match review_design_capture(ctx, capture) {
+                CaptureReviewAction::Keep => {}
+                CaptureReviewAction::Copy => {
+                    ctx.copy_text(crate::terminal::input::sanitize_agent_prompt(
+                        &crate::orchestration::format_design_capture(capture),
+                    ));
+                    pending.remove(0);
+                    self.toast_success("Texto copiado. Revisalo y pegalo en el agente elegido.");
+                }
+                CaptureReviewAction::Discard => {
+                    discard_design_screenshot(capture);
+                    pending.remove(0);
+                }
+            }
         }
+        ctx.data_mut(|data| data.insert_temp(id, pending));
     }
 
     pub(super) fn maybe_refresh_orchestration(&mut self) {
@@ -861,5 +857,76 @@ mod attention_tests {
         let live: HashSet<Uuid> = [a, b].into_iter().collect();
         super::retain_seen_sessions(&mut seen, &live);
         assert_eq!(seen.len(), 2, "live sessions must never be dropped");
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum CaptureReviewAction {
+    Keep,
+    Copy,
+    Discard,
+}
+fn review_design_capture(
+    ctx: &egui::Context,
+    capture: &crate::orchestration::DesignCapture,
+) -> CaptureReviewAction {
+    let mut action = CaptureReviewAction::Keep;
+    egui::Window::new("Revisar captura web")
+        .id(egui::Id::new("terminalcanvas.design-review"))
+        .collapsible(false)
+        .default_width(560.0)
+        .show(ctx, |ui| {
+            ui.label(
+                "Contenido externo no confiable. No se enviará ni ejecutará en ningún terminal.",
+            );
+            let mut preview = crate::terminal::input::sanitize_agent_prompt(
+                &crate::orchestration::format_design_capture(capture),
+            );
+            egui::ScrollArea::vertical()
+                .max_height(360.0)
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::TextEdit::multiline(&mut preview)
+                            .desired_width(f32::INFINITY)
+                            .interactive(false)
+                            .code_editor(),
+                    );
+                });
+            ui.horizontal(|ui| {
+                if ui.button("Copiar texto").clicked() {
+                    action = CaptureReviewAction::Copy;
+                }
+                if ui.button("Descartar").clicked() {
+                    action = CaptureReviewAction::Discard;
+                }
+            });
+        });
+    action
+}
+fn discard_design_screenshot(capture: &crate::orchestration::DesignCapture) {
+    if let Some(path) = &capture.screenshot_path {
+        let _ = std::fs::remove_file(path);
+    }
+}
+#[cfg(test)]
+mod capture_security_tests {
+    use super::*;
+    #[test]
+    fn review_never_copies_or_submits_without_an_explicit_button_action() {
+        let ctx = egui::Context::default();
+        let capture = crate::orchestration::DesignCapture {
+            selector: "button".to_owned(),
+            html: "dummy untrusted text".to_owned(),
+            css: String::new(),
+            rect: String::new(),
+            screenshot_path: None,
+        };
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            assert_eq!(
+                review_design_capture(ctx, &capture),
+                CaptureReviewAction::Keep
+            );
+        });
+        assert!(output.platform_output.commands.is_empty());
     }
 }

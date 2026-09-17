@@ -114,6 +114,10 @@ pub fn load() -> AppConfig {
 /// Carga durable: si el principal no parsea (crash a mitad de escritura), se
 /// prueba el ring de backups slot por slot antes de caer a defaults.
 pub fn load_from_path(path: &std::path::Path) -> AppConfig {
+    if let Err(err) = crate::state::durable_write::protect_private_files(path) {
+        log::warn!("No se puede proteger la configuración privada: {err}");
+        return AppConfig::default();
+    }
     let mut config = AppConfig::default();
     let parsed = crate::state::durable_write::load_first_valid(path, |bytes| {
         let raw = std::str::from_utf8(bytes).ok()?;
@@ -199,6 +203,7 @@ pub fn save_to_path(config: &AppConfig, path: &std::path::Path) -> anyhow::Resul
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    crate::state::durable_write::protect_private_files(path)?;
     let file = ConfigFile {
         terminal: TerminalSection {
             font_size: Some(config.font_size),

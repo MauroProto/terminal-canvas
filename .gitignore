@@ -5,3 +5,15 @@ dist/
 .cursor/hooks/state/
 /.terminalcanvas-archive/
 /.terminalcanvas-trash/
+
+
+# Local secrets and generated diagnostic data
+.env
+.env.*
+!.env.example
+!.env.sample
+*.p12
+*.pfx
+*.key
+credentials.json
+terminalcanvas-diagnostics-*.zip

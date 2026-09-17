@@ -1149,7 +1149,7 @@ impl TerminalApp {
         self.poll_quick_open();
         self.poll_hook_events();
         self.poll_gh_client();
-        self.poll_design_captures();
+        self.poll_design_captures(ctx);
         if let Some(installed) = self.agent_detector.poll() {
             self.installed_agents = installed;
         }
