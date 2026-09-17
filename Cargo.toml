@@ -58,8 +58,8 @@ name = "runtime_perf_scenarios"
 path = "tests/runtime/perf_scenarios.rs"
 
 [dependencies]
-eframe = { version = "0.32.3", features = ["wgpu"] }
-egui = "0.32.3"
+eframe = { version = "0.36.2", features = ["wgpu"] }
+egui = "0.36.2"
 alacritty_terminal = "0.25.1"
 libghostty-vt = { version = "0.1.1", optional = true }
 portable-pty = "0.9"
@@ -102,7 +102,7 @@ zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 tower = { version = "0.5", features = ["util"] }
 tokio-tungstenite = "0.24"
 criterion = { version = "0.8.2", features = ["html_reports"] }
-egui_kittest = "0.32.3"
+egui_kittest = "0.36.2"
 
 [profile.dev]
 opt-level = 1
