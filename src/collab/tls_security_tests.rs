@@ -102,7 +102,13 @@ fn fixture_server(
             if remaining.is_zero() || drained >= 8192 {
                 break;
             }
-            tls.sock.set_read_timeout(Some(remaining)).unwrap();
+            // The peer may already have closed after consuming the response.
+            // macOS can reject this cleanup-only socket option with EINVAL.
+            // Stop draining rather than failing an already completed exchange;
+            // request reads, response writes and client assertions stay strict.
+            if tls.sock.set_read_timeout(Some(remaining)).is_err() {
+                break;
+            }
             match tls.sock.read(&mut ignored) {
                 Ok(0) | Err(_) => break,
                 Ok(count) => drained += count,
