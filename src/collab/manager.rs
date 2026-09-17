@@ -118,8 +118,10 @@ struct HostSessionContext {
 impl HostSessionContext {
     fn allows_control_target(&self, terminal_id: Uuid, guest_id: GuestId) -> bool {
         self.guests.get(&guest_id).is_some_and(|guest| {
-            matches!(guest.connection_state,
-                GuestConnectionState::Approved | GuestConnectionState::Connected)
+            matches!(
+                guest.connection_state,
+                GuestConnectionState::Approved | GuestConnectionState::Connected
+            )
         }) && self.last_snapshot.as_ref().is_some_and(|snapshot| {
             snapshot.panels.iter().any(|panel| {
                 panel.panel_id == terminal_id && panel.alive && panel.share_scope.allows_control()
@@ -565,12 +567,16 @@ impl CollabManager {
         };
         // Reconcile against the live host snapshot before publishing derived
         // state. Closed/private panels cannot retain requests or control grants.
-        let controllable: HashSet<_> = snapshot.panels.iter()
+        let controllable: HashSet<_> = snapshot
+            .panels
+            .iter()
             .filter(|panel| panel.alive && panel.share_scope.allows_control())
             .map(|panel| panel.panel_id)
             .collect();
-        host.terminal_controls.retain(|id, _| controllable.contains(id));
-        host.pending_control_requests.retain(|request| controllable.contains(&request.terminal_id));
+        host.terminal_controls
+            .retain(|id, _| controllable.contains(id));
+        host.pending_control_requests
+            .retain(|request| controllable.contains(&request.terminal_id));
         snapshot.guests = host.guests.values().cloned().collect();
         snapshot.terminal_controls = host.terminal_controls.values().cloned().collect();
         for panel in &mut snapshot.panels {
@@ -730,9 +736,10 @@ impl CollabManager {
             return;
         };
         if !host.allows_control_target(terminal_id, guest_id)
-            || !host.pending_control_requests.iter().any(|request| {
-                request.terminal_id == terminal_id && request.guest_id == guest_id
-            })
+            || !host
+                .pending_control_requests
+                .iter()
+                .any(|request| request.terminal_id == terminal_id && request.guest_id == guest_id)
         {
             return;
         }
@@ -808,15 +815,22 @@ impl CollabManager {
         // Bound attacker-controlled state at admission, not when a legitimate
         // snapshot later tries to serialize it. UUIDs are not capabilities.
         if !host.allows_control_target(request.terminal_id, request.guest_id)
-            || host.guests.get(&request.guest_id)
+            || host
+                .guests
+                .get(&request.guest_id)
                 .is_none_or(|guest| guest.display_name != request.display_name)
             || host.pending_control_requests.len() >= MAX_PENDING_CONTROL_REQUESTS
-            || host.pending_control_requests.iter()
-                .filter(|pending| pending.guest_id == request.guest_id).count()
+            || host
+                .pending_control_requests
+                .iter()
+                .filter(|pending| pending.guest_id == request.guest_id)
+                .count()
                 >= MAX_PENDING_CONTROLS_PER_GUEST
             || (!host.terminal_controls.contains_key(&request.terminal_id)
                 && host.terminal_controls.len() >= MAX_SHARED_CONTROLS)
-            || host.terminal_controls.get(&request.terminal_id)
+            || host
+                .terminal_controls
+                .get(&request.terminal_id)
                 .is_some_and(|control| control.queue.len() >= MAX_CONTROL_QUEUE)
         {
             return;
@@ -946,9 +960,8 @@ impl CollabManager {
             for control in host.terminal_controls.values_mut() {
                 control.queue.retain(|queued| *queued != guest_id);
             }
-            host.terminal_controls.retain(|_, control| {
-                control.controller.is_some() || !control.queue.is_empty()
-            });
+            host.terminal_controls
+                .retain(|_, control| control.controller.is_some() || !control.queue.is_empty());
         }
     }
 

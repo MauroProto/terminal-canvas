@@ -213,18 +213,27 @@ async fn create_share_session(
             ));
         }
     }
-    if body.invite_secret.is_empty() || body.invite_secret.len() > MAX_INVITE_SECRET_LEN
+    if body.invite_secret.is_empty()
+        || body.invite_secret.len() > MAX_INVITE_SECRET_LEN
         || body.trusted_devices.len() > MAX_TRUSTED_DEVICES
         || body.trusted_devices.iter().any(|device| {
-            device.device_id.is_empty() || device.device_id.len() > MAX_DEVICE_ID_LEN
+            device.device_id.is_empty()
+                || device.device_id.len() > MAX_DEVICE_ID_LEN
                 || device.last_display_name.len() > MAX_DISPLAY_NAME_LEN
         })
     {
-        return Err((StatusCode::BAD_REQUEST, "Invalid session parameters".to_owned()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Invalid session parameters".to_owned(),
+        ));
     }
     if let Some(hash) = &body.passphrase_hash {
-        validate_passphrase_hash(hash)
-            .map_err(|_| (StatusCode::BAD_REQUEST, "Unsupported passphrase hash policy".to_owned()))?;
+        validate_passphrase_hash(hash).map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                "Unsupported passphrase hash policy".to_owned(),
+            )
+        })?;
     }
     let session_id = ShareSessionId(Uuid::new_v4());
     let host_token = random_token();
@@ -248,7 +257,10 @@ async fn create_share_session(
     };
     let mut guard = state.inner.lock().await;
     if guard.sessions.len() >= MAX_SHARE_SESSIONS {
-        return Err((StatusCode::TOO_MANY_REQUESTS, "Session capacity reached".to_owned()));
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            "Session capacity reached".to_owned(),
+        ));
     }
     guard.sessions.insert(session_id, session);
     Ok(Json(CreateShareSessionResponse {
@@ -264,15 +276,24 @@ struct JoinPreparation {
     permit: Option<OwnedSemaphorePermit>,
 }
 
-fn validate_join_access(session: &SessionRecord, body: &JoinShareSessionRequest) -> Result<(), ApiError> {
-    if session.invite_expires_at.is_some_and(|expires_at| expires_at <= Utc::now()) {
+fn validate_join_access(
+    session: &SessionRecord,
+    body: &JoinShareSessionRequest,
+) -> Result<(), ApiError> {
+    if session
+        .invite_expires_at
+        .is_some_and(|expires_at| expires_at <= Utc::now())
+    {
         return Err((StatusCode::GONE, "Invite expired".to_owned()));
     }
     if !constant_time_str_eq(&session.invite_secret, &body.invite_secret) {
         return Err((StatusCode::UNAUTHORIZED, "Invalid invite secret".to_owned()));
     }
     if active_guest_count(session) >= 3 {
-        return Err((StatusCode::BAD_REQUEST, "Participant limit reached".to_owned()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Participant limit reached".to_owned(),
+        ));
     }
     Ok(())
 }
@@ -284,20 +305,36 @@ async fn prepare_join_verification(
     body: &JoinShareSessionRequest,
 ) -> Result<JoinPreparation, ApiError> {
     let mut guard = state.inner.lock().await;
-    let session = guard.sessions.get_mut(&session_id)
+    let session = guard
+        .sessions
+        .get_mut(&session_id)
         .ok_or((StatusCode::NOT_FOUND, "Session not found".to_owned()))?;
     let now = Instant::now();
     if session.join_locked_until.is_some_and(|until| until > now) {
-        return Err((StatusCode::TOO_MANY_REQUESTS, "Join temporarily throttled".to_owned()));
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            "Join temporarily throttled".to_owned(),
+        ));
     }
     validate_join_access(session, body)?;
     let permit = if session.passphrase_hash.is_some() {
         if body.passphrase.is_none() {
             register_failed_join_attempt(session, now);
-            return Err((StatusCode::UNAUTHORIZED, "Session passphrase required".to_owned()));
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                "Session passphrase required".to_owned(),
+            ));
         }
-        let permit = state.verification_slots.clone().try_acquire_owned()
-            .map_err(|_| (StatusCode::TOO_MANY_REQUESTS, "Password verification capacity reached".to_owned()))?;
+        let permit = state
+            .verification_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| {
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "Password verification capacity reached".to_owned(),
+                )
+            })?;
         // Reserve this attempt before releasing the registry. Cancellation
         // cannot strand an in-flight flag or create an unbounded waiting queue.
         session.join_locked_until = Some(now + Duration::from_secs(1));
@@ -305,7 +342,10 @@ async fn prepare_join_verification(
     } else {
         None
     };
-    Ok(JoinPreparation { passphrase_hash: session.passphrase_hash.clone(), permit })
+    Ok(JoinPreparation {
+        passphrase_hash: session.passphrase_hash.clone(),
+        permit,
+    })
 }
 
 async fn join_share_session(
@@ -318,20 +358,43 @@ async fn join_share_session(
     let session_id = ShareSessionId(session_id);
     let mut preparation = prepare_join_verification(&state, session_id, &body).await?;
     let verified = if let Some(hash) = preparation.passphrase_hash.clone() {
-        let passphrase = body.passphrase.clone().expect("passphrase checked during preparation");
-        let permit = preparation.permit.take().expect("password verification reserved");
+        let passphrase = body
+            .passphrase
+            .clone()
+            .expect("passphrase checked during preparation");
+        let permit = preparation
+            .permit
+            .take()
+            .expect("password verification reserved");
         tokio::task::spawn_blocking(move || {
             // The blocking job owns its permit even when the HTTP task is cancelled.
             let _permit = permit;
             verify_passphrase(&hash, &passphrase)
         })
         .await
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Verification worker failed".to_owned()))?
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Invalid verification policy".to_owned()))?
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Verification worker failed".to_owned(),
+            )
+        })?
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Invalid verification policy".to_owned(),
+            )
+        })?
     } else {
         true
     };
-    finish_join(&state, session_id, body, preparation.passphrase_hash, verified).await
+    finish_join(
+        &state,
+        session_id,
+        body,
+        preparation.passphrase_hash,
+        verified,
+    )
+    .await
 }
 
 async fn finish_join(
@@ -342,17 +405,25 @@ async fn finish_join(
     verified: bool,
 ) -> Result<Json<JoinShareSessionResponse>, ApiError> {
     let mut guard = state.inner.lock().await;
-    let session = guard.sessions.get_mut(&session_id)
+    let session = guard
+        .sessions
+        .get_mut(&session_id)
         .ok_or((StatusCode::NOT_FOUND, "Session not found".to_owned()))?;
     // The host may rotate/end the session while hashing. The old proof must
     // not authorize a different policy, and concurrent joins still obey quotas.
     validate_join_access(session, &body)?;
     if session.passphrase_hash != verified_hash {
-        return Err((StatusCode::CONFLICT, "Session policy changed; retry join".to_owned()));
+        return Err((
+            StatusCode::CONFLICT,
+            "Session policy changed; retry join".to_owned(),
+        ));
     }
     if !verified {
         register_failed_join_attempt(session, Instant::now());
-        return Err((StatusCode::UNAUTHORIZED, "Invalid session passphrase".to_owned()));
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "Invalid session passphrase".to_owned(),
+        ));
     }
     session.failed_join_attempts = 0;
     session.join_locked_until = None;

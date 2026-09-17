@@ -55,7 +55,9 @@ pub fn websocket_connector(tls_cert_pem: Option<&str>) -> anyhow::Result<Option<
         return Ok(None);
     };
 
-    Ok(Some(Connector::Rustls(Arc::new(pinned_tls_config(cert_pem)?))))
+    Ok(Some(Connector::Rustls(Arc::new(pinned_tls_config(
+        cert_pem,
+    )?))))
 }
 
 fn pinned_roots(cert_pem: &str) -> anyhow::Result<RootCertStore> {
@@ -63,9 +65,13 @@ fn pinned_roots(cert_pem: &str) -> anyhow::Result<RootCertStore> {
     let certs = rustls_pemfile::certs(&mut reader)
         .collect::<Result<Vec<_>, _>>()
         .context("failed to parse pinned certificate")?;
-    anyhow::ensure!(certs.len() == 1, "invite must contain exactly one pinned certificate");
+    anyhow::ensure!(
+        certs.len() == 1,
+        "invite must contain exactly one pinned certificate"
+    );
     let mut roots = RootCertStore::empty();
-    roots.add(certs.into_iter().next().expect("one pinned certificate"))
+    roots
+        .add(certs.into_iter().next().expect("one pinned certificate"))
         .context("failed to add pinned certificate")?;
     Ok(roots)
 }

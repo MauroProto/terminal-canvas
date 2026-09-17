@@ -84,19 +84,25 @@ fn write_atomic_changed(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// its inherited ACL remain the OS security boundary.
 pub fn protect_private_state(path: &Path) -> std::io::Result<()> {
     let parent = path.parent().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "private state needs a directory")
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "private state needs a directory",
+        )
     })?;
     std::fs::create_dir_all(parent)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-        let directory = std::fs::OpenOptions::new().read(true)
+        let directory = std::fs::OpenOptions::new()
+            .read(true)
             .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(parent)?;
         directory.set_permissions(std::fs::Permissions::from_mode(0o700))?;
         for candidate in candidate_paths(path) {
-            let file = match std::fs::OpenOptions::new().read(true)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(&candidate)
+            let file = match std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(&candidate)
             {
                 Ok(file) => file,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -104,8 +110,10 @@ pub fn protect_private_state(path: &Path) -> std::io::Result<()> {
             };
             let metadata = file.metadata()?;
             if !metadata.is_file() || metadata.nlink() != 1 {
-                return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput,
-                    "private state must be a regular file with a single link"));
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "private state must be a regular file with a single link",
+                ));
             }
             // Descriptor-based chmod never follows a replacement symlink.
             file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
@@ -116,8 +124,10 @@ pub fn protect_private_state(path: &Path) -> std::io::Result<()> {
         for candidate in candidate_paths(path) {
             match std::fs::symlink_metadata(&candidate) {
                 Ok(metadata) if !metadata.is_file() || metadata.file_type().is_symlink() => {
-                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput,
-                        "private state must be a regular file"));
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "private state must be a regular file",
+                    ));
                 }
                 Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error),
                 _ => {}
@@ -393,11 +403,20 @@ mod private_security_tests {
         }
         assert!(!write_private_durable(&path, b"dummy-current").unwrap());
         for file in [&path, &backup] {
-            assert_eq!(std::fs::metadata(file).unwrap().permissions().mode() & 0o777, 0o600);
+            assert_eq!(
+                std::fs::metadata(file).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
         }
-        assert_eq!(std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(
+            std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
         write_private_durable(&path, b"dummy-new").unwrap();
-        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -419,7 +438,10 @@ mod private_security_tests {
         write_private_durable(&path, b"private-fixture").unwrap();
         assert_eq!(std::fs::read(&outside).unwrap(), b"outside-fixture");
         assert_eq!(std::fs::read(&path).unwrap(), b"private-fixture");
-        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 }

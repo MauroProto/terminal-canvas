@@ -328,12 +328,18 @@ mod private_config_security_tests {
     fn security_linear_token_is_saved_with_private_backups() {
         let root = std::env::temp_dir().join(format!("tc-config-private-{}", uuid::Uuid::new_v4()));
         let path = root.join("config.toml");
-        let mut config = AppConfig { linear_token: Some("dummy-token-not-a-credential".to_owned()), ..Default::default() };
+        let mut config = AppConfig {
+            linear_token: Some("dummy-token-not-a-credential".to_owned()),
+            ..Default::default()
+        };
         save_to_path(&config, &path).unwrap();
         config.font_size += 1.0;
         save_to_path(&config, &path).unwrap();
         for file in [&path, &crate::state::durable_write::backup_path(&path, 0)] {
-            assert_eq!(std::fs::metadata(file).unwrap().permissions().mode() & 0o777, 0o600);
+            assert_eq!(
+                std::fs::metadata(file).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
         }
         std::fs::remove_dir_all(root).unwrap();
     }

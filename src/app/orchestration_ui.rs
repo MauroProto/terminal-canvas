@@ -500,9 +500,14 @@ impl TerminalApp {
         let Some(draft) = self.launch_agent.clone() else {
             return;
         };
-        if draft.requires_native_prompt && !matches!(draft.provider,
-            AgentProvider::ClaudeCode | AgentProvider::CodexCli
-                | AgentProvider::GeminiCli | AgentProvider::OpenCode)
+        if draft.requires_native_prompt
+            && !matches!(
+                draft.provider,
+                AgentProvider::ClaudeCode
+                    | AgentProvider::CodexCli
+                    | AgentProvider::GeminiCli
+                    | AgentProvider::OpenCode
+            )
         {
             if let Some(current) = self.launch_agent.as_mut() {
                 current.error = Some("Para capturas usá Claude Code, Codex, Gemini u OpenCode; los demás no tienen entrega nativa segura del prompt.".to_owned());
