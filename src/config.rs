@@ -106,6 +106,10 @@ pub fn load() -> AppConfig {
     let Some(path) = config_file_path() else {
         return AppConfig::default();
     };
+    if let Err(error) = crate::state::durable_write::protect_private_state(&path) {
+        log::warn!("config privacy check failed; configuration not loaded: {error}");
+        return AppConfig::default();
+    }
     load_from_path(&path)
 }
 
@@ -217,7 +221,7 @@ pub fn save_to_path(config: &AppConfig, path: &std::path::Path) -> anyhow::Resul
         },
     };
     let raw = toml::to_string_pretty(&file)?;
-    crate::state::durable_write::write_durable(path, raw.as_bytes())?;
+    crate::state::durable_write::write_private_durable(path, raw.as_bytes())?;
     Ok(())
 }
 
@@ -312,5 +316,25 @@ mod tests {
             std::env::temp_dir().join(format!("no-such-config-{}.toml", uuid::Uuid::new_v4()));
         let loaded = super::load_from_path(&missing);
         assert_eq!(loaded, AppConfig::default());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod private_config_security_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn security_linear_token_is_saved_with_private_backups() {
+        let root = std::env::temp_dir().join(format!("tc-config-private-{}", uuid::Uuid::new_v4()));
+        let path = root.join("config.toml");
+        let mut config = AppConfig { linear_token: Some("dummy-token-not-a-credential".to_owned()), ..Default::default() };
+        save_to_path(&config, &path).unwrap();
+        config.font_size += 1.0;
+        save_to_path(&config, &path).unwrap();
+        for file in [&path, &crate::state::durable_write::backup_path(&path, 0)] {
+            assert_eq!(std::fs::metadata(file).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
