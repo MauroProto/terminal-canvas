@@ -1,0 +1,32 @@
+name: Security remediation source snapshot
+
+on:
+  push:
+    branches: [codex/security-remediation]
+    paths: [.github/workflows/security-remediation.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot:
+    if: github.repository == 'MauroProto/terminal-canvas'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Archive tracked source only
+        shell: bash
+        run: |
+          git archive --format=zip -o "$RUNNER_TEMP/terminal-canvas-source.zip" HEAD
+          git rev-parse HEAD > "$RUNNER_TEMP/source-ref.txt"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: security-remediation-source
+          retention-days: 1
+          path: |
+            ${{ runner.temp }}/terminal-canvas-source.zip
+            ${{ runner.temp }}/source-ref.txt
