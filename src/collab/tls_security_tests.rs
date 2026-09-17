@@ -37,6 +37,9 @@ fn fixture_server(
                 Err(err) => panic!("fixture accept: {err}"),
             }
         };
+        // accept() does not have portable flag-inheritance semantics. The
+        // listener polls, but rustls StreamOwned below requires blocking I/O.
+        stream.set_nonblocking(false).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(3)))
             .unwrap();
@@ -47,7 +50,9 @@ fn fixture_server(
         let mut tls = rustls::StreamOwned::new(connection, stream);
         let mut byte = [0u8; 1];
         // Rejection of the other certificate is expected before HTTP starts.
-        if tls.read_exact(&mut byte).is_err() {
+        // Retain the error in failed-test output instead of hiding I/O errors.
+        if let Err(error) = tls.read_exact(&mut byte) {
+            eprintln!("TLS fixture stopped before HTTP: {error:?}");
             return;
         }
         let mut headers = vec![byte[0]];
