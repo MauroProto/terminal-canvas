@@ -106,3 +106,68 @@ async fn security_approved_reconnect_works_but_revocation_is_terminal() {
     }
     assert!(approve_join(State(state.clone()), Path(session_id.0), Json(JoinDecisionRequest { host_token, guest_id })).await.is_err());
 }
+
+#[tokio::test]
+async fn security_session_creation_rejects_unbounded_phc_policy() {
+    let state = BrokerState::new(BrokerConfig { require_loopback_session_creation: false });
+    let valid = super::super::auth::hash_passphrase("fixture-passphrase").unwrap();
+    let result = create_share_session(None, State(state.clone()), Json(CreateShareSessionRequest {
+        invite_secret: "fixture-invite".to_owned(), invite_expires_at: None,
+        passphrase_hash: Some(valid.replace("m=19456", "m=4294967295")), trusted_devices: Vec::new(),
+    })).await;
+    assert_eq!(result.err().unwrap().0, StatusCode::BAD_REQUEST);
+    assert!(state.inner.lock().await.sessions.is_empty());
+}
+
+#[tokio::test]
+async fn security_password_work_is_bounded_and_never_holds_the_session_registry() {
+    let (state, session_id, _, _) = fixture().await;
+    let hash = super::super::auth::hash_passphrase("fixture-passphrase").unwrap();
+    state.inner.lock().await.sessions.get_mut(&session_id).unwrap().passphrase_hash = Some(hash);
+    let body = JoinShareSessionRequest {
+        display_name: "Second fixture".to_owned(), invite_secret: "fixture-invite".to_owned(),
+        device_id: "second".to_owned(), passphrase: Some("fixture-passphrase".to_owned()),
+    };
+    let all_slots = state.verification_slots.clone()
+        .try_acquire_many_owned(MAX_PASSWORD_VERIFICATIONS as u32).unwrap();
+    assert_eq!(prepare_join_verification(&state, session_id, &body).await.err().unwrap().0, StatusCode::TOO_MANY_REQUESTS);
+    drop(all_slots);
+    let preparation = prepare_join_verification(&state, session_id, &body).await.unwrap();
+    assert!(state.inner.try_lock().is_ok(), "password work retained the global registry lock");
+    assert_eq!(state.verification_slots.available_permits(), MAX_PASSWORD_VERIFICATIONS - 1);
+    drop(preparation);
+    assert_eq!(state.verification_slots.available_permits(), MAX_PASSWORD_VERIFICATIONS);
+}
+
+#[tokio::test]
+async fn security_join_rechecks_invite_rotation_after_verification() {
+    let (state, session_id, _, host_token) = fixture().await;
+    let body = JoinShareSessionRequest {
+        display_name: "Second fixture".to_owned(), invite_secret: "fixture-invite".to_owned(),
+        device_id: "second".to_owned(), passphrase: None,
+    };
+    let preparation = prepare_join_verification(&state, session_id, &body).await.unwrap();
+    rotate_invite(State(state.clone()), Path(session_id.0), Json(RotateInviteRequest {
+        host_token, invite_secret: "rotated-fixture".to_owned(), invite_expires_at: None,
+    })).await.unwrap();
+    let result = finish_join(&state, session_id, body, preparation.passphrase_hash, true).await;
+    assert_eq!(result.err().unwrap().0, StatusCode::UNAUTHORIZED);
+    assert_eq!(state.inner.lock().await.sessions[&session_id].guests.len(), 1);
+}
+
+#[tokio::test]
+async fn security_session_creation_has_a_global_capacity_bound() {
+    let state = BrokerState::new(BrokerConfig { require_loopback_session_creation: false });
+    for _ in 0..MAX_SHARE_SESSIONS {
+        create_share_session(None, State(state.clone()), Json(CreateShareSessionRequest {
+            invite_secret: "fixture-invite".to_owned(), invite_expires_at: None,
+            passphrase_hash: None, trusted_devices: Vec::new(),
+        })).await.unwrap();
+    }
+    let result = create_share_session(None, State(state.clone()), Json(CreateShareSessionRequest {
+        invite_secret: "fixture-invite".to_owned(), invite_expires_at: None,
+        passphrase_hash: None, trusted_devices: Vec::new(),
+    })).await;
+    assert_eq!(result.err().unwrap().0, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(state.inner.lock().await.sessions.len(), MAX_SHARE_SESSIONS);
+}
