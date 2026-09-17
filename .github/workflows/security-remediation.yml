@@ -17,9 +17,13 @@ jobs:
       - name: Check audited source and apply bounded edits
         run: |
           python3 scripts/security-remediate-once.py
-          # Workflow changes are performed through the connected GitHub tool,
-          # not by granting this runner workflow-administration authority.
           git restore --source=HEAD -- .github/workflows/ci.yml .github/workflows/release.yml .github/workflows/security-remediation.yml
+          python3 - <<'PY'
+          from pathlib import Path
+          for name in ['.gitignore', 'extension/README.md']:
+              p = Path(name)
+              p.write_text(p.read_text().rstrip() + '\n')
+          PY
       - name: Format source with the project toolchain
         run: |
           rustup toolchain install 1.98.0 --profile minimal --component rustfmt
