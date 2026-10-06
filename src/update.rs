@@ -678,12 +678,8 @@ struct DownloadDirectory {
 }
 
 impl DownloadDirectory {
-    fn create() -> Result<Self, String> {
-        let root = crate::utils::app_paths::get()
-            .map_err(|error| format!("The update cache directory is unavailable: {error}"))?
-            .cache
-            .join("updates");
-        std::fs::create_dir_all(&root)
+    fn create(root: &Path) -> Result<Self, String> {
+        std::fs::create_dir_all(root)
             .map_err(|error| format!("Cannot create update cache: {error}"))?;
         let path = root.join(uuid::Uuid::new_v4().to_string());
         let builder = std::fs::DirBuilder::new();
@@ -721,103 +717,161 @@ fn download_release_asset(
     cancellation: &AtomicBool,
     ctx: &egui::Context,
 ) -> Result<(PathBuf, String), String> {
+    if !allowed_release_asset_url(url) {
+        return Err("The update URL is not an official HTTPS release asset".to_owned());
+    }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|error| format!("Cannot start update downloader: {error}"))?;
-    runtime.block_on(async {
-        let client = reqwest::Client::builder()
-            .https_only(true)
-            .user_agent("TerminalCanvas")
-            .connect_timeout(Duration::from_secs(REQUEST_TIMEOUT))
-            .read_timeout(Duration::from_secs(REQUEST_TIMEOUT))
-            .timeout(Duration::from_secs(10 * 60))
-            .redirect(release_redirect_policy())
-            .build().map_err(|error| format!("Cannot create update downloader: {error}"))?;
-        let name = url.rsplit('/').next().ok_or_else(|| "Invalid update filename".to_owned())?;
-        let checksum_url = format!("{url}.sha256");
-        let request = client.get(&checksum_url).send();
-        let mut response = tokio::select! {
-            response = request => response.map_err(|error| format!("Cannot download update checksum: {error}"))?,
-            _ = wait_for_download_cancellation(cancellation) => return Err("Download cancelled".to_owned()),
-        };
-        if response.status() != reqwest::StatusCode::OK || response.content_length().is_some_and(|len| len > MAX_CHECKSUM_BYTES as u64) {
-            return Err("The release checksum is missing or too large".to_owned());
-        }
-        let mut checksum_bytes = Vec::new();
-        loop {
-            let chunk = tokio::select! {
-                chunk = response.chunk() => chunk.map_err(|error| format!("Cannot read update checksum: {error}"))?,
-                _ = wait_for_download_cancellation(cancellation) => return Err("Download cancelled".to_owned()),
-            };
-            let Some(chunk) = chunk else { break };
-            if checksum_bytes.len().saturating_add(chunk.len()) > MAX_CHECKSUM_BYTES {
-                return Err("The release checksum is too large".to_owned());
-            }
-            checksum_bytes.extend_from_slice(&chunk);
-        }
-        let hash = std::str::from_utf8(&checksum_bytes).ok()
-            .and_then(|text| parse_checksum_manifest(text, name))
-            .ok_or_else(|| "The checksum does not name this exact release file".to_owned())?;
-        let mut response = tokio::select! {
-            response = client.get(url).send() => response.map_err(|error| format!("Cannot download update: {error}"))?,
-            _ = wait_for_download_cancellation(cancellation) => return Err("Download cancelled".to_owned()),
-        };
-        if response.status() != reqwest::StatusCode::OK {
-            return Err(format!("Release download returned HTTP {}", response.status().as_u16()));
-        }
-        let expected_length = response.content_length();
-        if expected_length.is_some_and(|len| len == 0 || len > MAX_DOWNLOAD_BYTES) {
-            return Err("The update file size is invalid or exceeds 512 MiB".to_owned());
-        }
-        if let Ok(mut current) = state.lock() { current.total_bytes = expected_length; }
-        let mut directory = DownloadDirectory::create()?;
-        let partial = directory.path.join(format!("{name}.part"));
-        let completed = directory.path.join(name);
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options.open(&partial).map_err(|error| format!("Cannot write update: {error}"))?;
-        let mut hasher = Sha256::new();
-        let mut length = 0_u64;
-        let mut last_repaint = Instant::now();
-        loop {
-            let chunk = tokio::select! {
-                chunk = response.chunk() => chunk.map_err(|error| format!("Update download interrupted: {error}"))?,
-                _ = wait_for_download_cancellation(cancellation) => return Err("Download cancelled".to_owned()),
-            };
-            let Some(chunk) = chunk else { break };
-            length = length.saturating_add(chunk.len() as u64);
-            if length > MAX_DOWNLOAD_BYTES { return Err("The update exceeds 512 MiB".to_owned()); }
-            file.write_all(&chunk).map_err(|error| format!("Cannot save update: {error}"))?;
-            hasher.update(&chunk);
-            if let Ok(mut current) = state.lock() { current.downloaded_bytes = length; }
-            if last_repaint.elapsed() >= Duration::from_millis(100) {
-                ctx.request_repaint();
-                last_repaint = Instant::now();
-            }
-        }
-        if cancellation.load(Ordering::Acquire) { return Err("Download cancelled".to_owned()); }
-        if length == 0 || expected_length.is_some_and(|expected| expected != length) {
-            return Err("The update file is incomplete".to_owned());
-        }
-        if format!("{:x}", hasher.finalize()) != hash {
-            return Err("Update checksum mismatch; the partial file was removed".to_owned());
-        }
-        file.sync_all().map_err(|error| format!("Cannot finish saving update: {error}"))?;
-        drop(file);
-        std::fs::rename(&partial, &completed).map_err(|error| format!("Cannot stage verified update: {error}"))?;
-        std::fs::write(directory.path.join(format!("{name}.sha256")), &checksum_bytes)
-            .map_err(|error| format!("Cannot save release checksum: {error}"))?;
-        // Retain only completed verified files; the guard cleans every error/cancel path.
-        directory.keep = true;
-        Ok((completed, hash))
-    })
+    let client = reqwest::Client::builder()
+        .https_only(true)
+        .user_agent("TerminalCanvas")
+        .connect_timeout(Duration::from_secs(REQUEST_TIMEOUT))
+        .read_timeout(Duration::from_secs(REQUEST_TIMEOUT))
+        .timeout(Duration::from_secs(10 * 60))
+        .redirect(release_redirect_policy())
+        .build()
+        .map_err(|error| format!("Cannot create update downloader: {error}"))?;
+    let root = crate::utils::app_paths::get()
+        .map_err(|error| format!("The update cache directory is unavailable: {error}"))?
+        .cache
+        .join("updates");
+    runtime.block_on(download_with_client(
+        url,
+        &client,
+        state,
+        cancellation,
+        ctx,
+        &root,
+    ))
 }
+
+// The public updater fixes the official URL policy, HTTP client, and profile
+// root above. Keeping the transport here lets tests exercise real TLS and file
+// writes using their own server, certificate, and disposable cache.
+async fn download_with_client(
+    url: &str,
+    client: &reqwest::Client,
+    state: &Mutex<UpdateState>,
+    cancellation: &AtomicBool,
+    ctx: &egui::Context,
+    cache_root: &Path,
+) -> Result<(PathBuf, String), String> {
+    let name = url
+        .rsplit('/')
+        .next()
+        .ok_or_else(|| "Invalid update filename".to_owned())?;
+    let checksum_url = format!("{url}.sha256");
+    let request = client.get(&checksum_url).send();
+    let mut response = tokio::select! {
+        response = request => response.map_err(|error| format!("Cannot download update checksum: {error}"))?,
+        _ = wait_for_download_cancellation(cancellation) => return Err("Download cancelled".to_owned()),
+    };
+    if response.status() != reqwest::StatusCode::OK
+        || response
+            .content_length()
+            .is_some_and(|len| len > MAX_CHECKSUM_BYTES as u64)
+    {
+        return Err("The release checksum is missing or too large".to_owned());
+    }
+    let mut checksum_bytes = Vec::new();
+    loop {
+        let chunk = tokio::select! {
+            chunk = response.chunk() => chunk.map_err(|error| format!("Cannot read update checksum: {error}"))?,
+            _ = wait_for_download_cancellation(cancellation) => return Err("Download cancelled".to_owned()),
+        };
+        let Some(chunk) = chunk else { break };
+        if checksum_bytes.len().saturating_add(chunk.len()) > MAX_CHECKSUM_BYTES {
+            return Err("The release checksum is too large".to_owned());
+        }
+        checksum_bytes.extend_from_slice(&chunk);
+    }
+    let hash = std::str::from_utf8(&checksum_bytes)
+        .ok()
+        .and_then(|text| parse_checksum_manifest(text, name))
+        .ok_or_else(|| "The checksum does not name this exact release file".to_owned())?;
+    let mut response = tokio::select! {
+        response = client.get(url).send() => response.map_err(|error| format!("Cannot download update: {error}"))?,
+        _ = wait_for_download_cancellation(cancellation) => return Err("Download cancelled".to_owned()),
+    };
+    if response.status() != reqwest::StatusCode::OK {
+        return Err(format!(
+            "Release download returned HTTP {}",
+            response.status().as_u16()
+        ));
+    }
+    let expected_length = response.content_length();
+    if expected_length.is_some_and(|len| len == 0 || len > MAX_DOWNLOAD_BYTES) {
+        return Err("The update file size is invalid or exceeds 512 MiB".to_owned());
+    }
+    if let Ok(mut current) = state.lock() {
+        current.total_bytes = expected_length;
+    }
+    let mut directory = DownloadDirectory::create(cache_root)?;
+    let partial = directory.path.join(format!("{name}.part"));
+    let completed = directory.path.join(name);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&partial)
+        .map_err(|error| format!("Cannot write update: {error}"))?;
+    let mut hasher = Sha256::new();
+    let mut length = 0_u64;
+    let mut last_repaint = Instant::now();
+    loop {
+        let chunk = tokio::select! {
+            chunk = response.chunk() => chunk.map_err(|error| format!("Update download interrupted: {error}"))?,
+            _ = wait_for_download_cancellation(cancellation) => return Err("Download cancelled".to_owned()),
+        };
+        let Some(chunk) = chunk else { break };
+        length = length.saturating_add(chunk.len() as u64);
+        if length > MAX_DOWNLOAD_BYTES {
+            return Err("The update exceeds 512 MiB".to_owned());
+        }
+        file.write_all(&chunk)
+            .map_err(|error| format!("Cannot save update: {error}"))?;
+        hasher.update(&chunk);
+        if let Ok(mut current) = state.lock() {
+            current.downloaded_bytes = length;
+        }
+        if last_repaint.elapsed() >= Duration::from_millis(100) {
+            ctx.request_repaint();
+            last_repaint = Instant::now();
+        }
+    }
+    if cancellation.load(Ordering::Acquire) {
+        return Err("Download cancelled".to_owned());
+    }
+    if length == 0 || expected_length.is_some_and(|expected| expected != length) {
+        return Err("The update file is incomplete".to_owned());
+    }
+    if format!("{:x}", hasher.finalize()) != hash {
+        return Err("Update checksum mismatch; the partial file was removed".to_owned());
+    }
+    file.sync_all()
+        .map_err(|error| format!("Cannot finish saving update: {error}"))?;
+    drop(file);
+    std::fs::rename(&partial, &completed)
+        .map_err(|error| format!("Cannot stage verified update: {error}"))?;
+    std::fs::write(
+        directory.path.join(format!("{name}.sha256")),
+        &checksum_bytes,
+    )
+    .map_err(|error| format!("Cannot save release checksum: {error}"))?;
+    // Retain only completed verified files; the guard cleans every error/cancel path.
+    directory.keep = true;
+    Ok((completed, hash))
+}
+
+#[cfg(test)]
+#[path = "update/download_tests.rs"]
+mod download_tests;
 
 pub fn verify_checksum(file_path: &Path, expected_hash: &str) -> bool {
     let Ok(mut file) = std::fs::File::open(file_path) else {
