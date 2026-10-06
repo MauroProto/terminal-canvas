@@ -1,7 +1,7 @@
 //! Serial preference I/O. Pending saves coalesce by destination; the worker
 //! drains accepted writes on shutdown so the last edit survives a quick exit.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread::{self, JoinHandle};
@@ -32,11 +32,11 @@ pub(super) enum Completion {
 
 pub(super) struct PreferencesWorker {
     jobs: Option<SyncSender<Job>>,
-    results: Receiver<Completion>,
+    results: Receiver<(Option<PathBuf>, Completion)>,
     thread: Option<JoinHandle<()>>,
     pending: VecDeque<Job>,
     busy: bool,
-    notes_write_error: Option<String>,
+    notes_write_errors: BTreeMap<PathBuf, String>,
     settings_write_error: Option<String>,
 }
 
@@ -72,6 +72,10 @@ impl PreferencesWorker {
             .name("preferences-writer".to_owned())
             .spawn(move || {
                 while let Ok(job) = rx.recv() {
+                    let notes_root = match &job {
+                        Job::SaveNotes(root, _) => Some(root.clone()),
+                        _ => None,
+                    };
                     let completion = process(job);
                     if let Completion::NotesSaved(Err(error))
                     | Completion::SettingsSaved(Err(error)) = &completion
@@ -79,7 +83,7 @@ impl PreferencesWorker {
                         log::error!("No se pudo persistir una preferencia: {error}");
                     }
                     // An absent UI must not abandon writes already accepted.
-                    let _ = result_tx.send(completion);
+                    let _ = result_tx.send((notes_root, completion));
                 }
             })
             .expect("preferences writer thread");
@@ -89,7 +93,7 @@ impl PreferencesWorker {
             thread: Some(worker),
             pending: VecDeque::new(),
             busy: false,
-            notes_write_error: None,
+            notes_write_errors: BTreeMap::new(),
             settings_write_error: None,
         }
     }
@@ -148,22 +152,31 @@ impl PreferencesWorker {
 
     pub(super) fn poll(&mut self) -> Vec<Completion> {
         let results = self.results.try_iter().collect::<Vec<_>>();
-        for result in &results {
-            self.note_write_result(result);
+        for (notes_root, completion) in &results {
+            self.note_write_result(notes_root.as_ref(), completion);
         }
         if !results.is_empty() {
             self.busy = false;
         }
         self.schedule();
         results
+            .into_iter()
+            .map(|(_, completion)| completion)
+            .collect()
     }
 
-    fn note_write_result(&mut self, completion: &Completion) {
-        match completion {
-            Completion::NotesSaved(result) => {
-                self.notes_write_error = result.as_ref().err().map(ToString::to_string)
-            }
-            Completion::SettingsSaved(result) => {
+    fn note_write_result(&mut self, notes_root: Option<&PathBuf>, completion: &Completion) {
+        match (notes_root, completion) {
+            (Some(root), Completion::NotesSaved(result)) => match result {
+                Ok(()) => {
+                    self.notes_write_errors.remove(root);
+                }
+                Err(error) => {
+                    self.notes_write_errors
+                        .insert(root.clone(), error.to_string());
+                }
+            },
+            (_, Completion::SettingsSaved(result)) => {
                 self.settings_write_error = result.as_ref().err().map(ToString::to_string)
             }
             _ => {}
@@ -176,18 +189,20 @@ impl PreferencesWorker {
         while self.busy() {
             self.schedule();
             if self.busy {
-                let result = self.results.recv().map_err(|error| {
+                let (notes_root, completion) = self.results.recv().map_err(|error| {
                     anyhow::anyhow!("Preference writer stopped before finishing: {error}")
                 })?;
-                self.note_write_result(&result);
+                self.note_write_result(notes_root.as_ref(), &completion);
                 self.busy = false;
             }
         }
-        if let Some(error) = self
-            .notes_write_error
-            .as_ref()
-            .or(self.settings_write_error.as_ref())
-        {
+        if let Some((root, error)) = self.notes_write_errors.iter().next() {
+            anyhow::bail!(
+                "An accepted notes save failed for {}: {error}",
+                root.display()
+            );
+        }
+        if let Some(error) = &self.settings_write_error {
             anyhow::bail!("An accepted preference save failed: {error}");
         }
         Ok(())
@@ -238,6 +253,36 @@ mod tests {
         });
         assert!(worker.drain().is_ok());
         assert!(!worker.busy());
+    }
+
+    #[test]
+    fn successful_notes_save_in_another_repository_does_not_clear_a_failed_destination() {
+        let repo_a = PathBuf::from("repo-a");
+        let repo_b = PathBuf::from("repo-b");
+        let failed_root = repo_a.clone();
+        let mut failed_once = false;
+        let mut worker = PreferencesWorker::with_processor(move |job| match job {
+            Job::SaveNotes(root, _) if root == failed_root && !failed_once => {
+                failed_once = true;
+                Completion::NotesSaved(Err(anyhow::anyhow!("repository A is read-only")))
+            }
+            Job::SaveNotes(_, _) => Completion::NotesSaved(Ok(())),
+            _ => panic!("fixture only accepts notes"),
+        });
+
+        worker.save_notes(repo_a.clone(), DiffNotes::default());
+        worker.save_notes(repo_b.clone(), DiffNotes::default());
+        let error = worker.drain().unwrap_err().to_string();
+        assert!(error.contains("repo-a"));
+        assert!(error.contains("repository A is read-only"));
+        assert!(worker.notes_write_errors.contains_key(&repo_a));
+        assert!(!worker.notes_write_errors.contains_key(&repo_b));
+
+        worker.save_notes(repo_b, DiffNotes::default());
+        assert!(worker.drain().is_err());
+        worker.save_notes(repo_a, DiffNotes::default());
+        assert!(worker.drain().is_ok());
+        assert!(worker.notes_write_errors.is_empty());
     }
 
     #[test]
