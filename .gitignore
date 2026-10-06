@@ -13,3 +13,5 @@ dist/
 !.env.sample
 *.p12
 *.pfx
+__pycache__/
+*.pyc
