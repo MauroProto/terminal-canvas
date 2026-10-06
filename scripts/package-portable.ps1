@@ -7,6 +7,8 @@ param(
 $ErrorActionPreference = 'Stop'
 $repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 . (Join-Path $PSScriptRoot 'rust-toolchain.ps1')
+. (Join-Path $PSScriptRoot 'package-sign-windows.ps1')
+if ($env:TC_WINDOWS_CERT_THUMBPRINT) { Assert-TerminalCanvasWindowsSigningConfiguration }
 $toolchain = Get-TerminalCanvasRustToolchain -RepoRoot $repoRoot
 $distRoot = [IO.Path]::GetFullPath((Join-Path $repoRoot 'dist'))
 $versionMatch = Select-String -LiteralPath (Join-Path $repoRoot 'Cargo.toml') -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1
@@ -38,7 +40,9 @@ try {
     foreach ($binary in @('mi-terminal.exe', 'tc-memory.exe', 'tc-memory-mcp.exe')) {
         $source = Join-Path $binaryRoot $binary
         if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "Falta helper: $binary" }
-        Copy-Item -LiteralPath $source -Destination (Join-Path $packageRoot $binary)
+        $packagedBinary = Join-Path $packageRoot $binary
+        Copy-Item -LiteralPath $source -Destination $packagedBinary
+        if ($env:TC_WINDOWS_CERT_THUMBPRINT) { Invoke-TerminalCanvasWindowsSigning -Path $packagedBinary }
     }
     Copy-Item -LiteralPath (Join-Path $repoRoot 'LICENSE') -Destination $packageRoot
     Copy-Item -LiteralPath (Join-Path $repoRoot 'docs/PORTABLE.md') -Destination (Join-Path $packageRoot 'PORTABLE.md')
