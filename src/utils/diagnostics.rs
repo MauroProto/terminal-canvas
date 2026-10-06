@@ -136,11 +136,12 @@ fn anonymize_strings(value: &mut serde_json::Value) {
     }
 }
 
-/// Nombre del archivo de diagnóstico, ordenable por fecha.
+/// Nombre ordenable por fecha y único incluso para exports simultáneos.
 pub fn diagnostics_file_name(now: chrono::DateTime<chrono::Local>) -> String {
     format!(
-        "terminalcanvas-diagnostics-{}.zip",
-        now.format("%Y%m%d-%H%M%S")
+        "terminalcanvas-diagnostics-{}-{}.zip",
+        now.format("%Y%m%d-%H%M%S"),
+        uuid::Uuid::new_v4()
     )
 }
 
@@ -222,20 +223,19 @@ fn read_bounded(path: &Path, tail: bool) -> std::io::Result<String> {
     }
 }
 
-/// Escribe el zip con las entradas dadas.
+/// Publica un zip completo mediante escritura atómica y privada en Unix.
 pub fn write_zip(path: &Path, entries: &[DiagnosticEntry]) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let file = std::fs::File::create(path)?;
-    let mut zip = zip::ZipWriter::new(file);
+    // Build and finish the archive before touching its destination. An error
+    // in compression or an entry must never truncate an earlier export.
+    let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
     let options: zip::write::FileOptions<'_, ()> =
         zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
     for entry in entries {
         zip.start_file(entry.name.as_str(), options)?;
         zip.write_all(entry.contents.as_bytes())?;
     }
-    zip.finish()?;
+    let bytes = zip.finish()?.into_inner();
+    crate::state::durable_write::write_atomic(path, &bytes)?;
     Ok(())
 }
 
@@ -259,6 +259,8 @@ pub fn export(version: &str) -> anyhow::Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Read;
+
     use super::{
         anonymize_layout, collect_entries, diagnostics_file_name, redact_config, stable_hash,
         write_zip,
@@ -383,10 +385,15 @@ mod tests {
             .with_ymd_and_hms(2026, 8, 6, 15, 4, 9)
             .single()
             .expect("hora válida");
-        assert_eq!(
-            diagnostics_file_name(when),
-            "terminalcanvas-diagnostics-20260806-150409.zip"
-        );
+        let name = diagnostics_file_name(when);
+        let prefix = "terminalcanvas-diagnostics-20260806-150409-";
+        let suffix = name
+            .strip_prefix(prefix)
+            .unwrap()
+            .strip_suffix(".zip")
+            .unwrap();
+        assert!(uuid::Uuid::parse_str(suffix).is_ok());
+        assert!(name < diagnostics_file_name(when + chrono::Duration::seconds(1)));
     }
 
     #[test]
@@ -474,6 +481,98 @@ mod tests {
         assert!(names.contains(&"version.txt".to_owned()));
         assert!(names.contains(&"runs.log".to_owned()));
 
-        let _ = std::fs::remove_dir_all(&dir);
+        let mut contents = String::new();
+        archive
+            .by_name("runs.log")
+            .unwrap()
+            .read_to_string(&mut contents)
+            .unwrap();
+        assert_eq!(contents, "run\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        drop(archive);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn exports_created_at_the_same_instant_keep_both_archives() {
+        let dir = std::env::temp_dir().join(format!("diag-same-time-{}", uuid::Uuid::new_v4()));
+        let now = chrono::Local::now();
+        let paths = [
+            dir.join(diagnostics_file_name(now)),
+            dir.join(diagnostics_file_name(now)),
+        ];
+        assert_ne!(paths[0], paths[1]);
+        for (index, path) in paths.iter().enumerate() {
+            let contents = format!("export {index}");
+            write_zip(
+                path,
+                &[super::DiagnosticEntry {
+                    name: "version.txt".to_owned(),
+                    contents: contents.clone(),
+                }],
+            )
+            .unwrap();
+            let mut archive = zip::ZipArchive::new(std::fs::File::open(path).unwrap()).unwrap();
+            let mut restored = String::new();
+            archive
+                .by_name("version.txt")
+                .unwrap()
+                .read_to_string(&mut restored)
+                .unwrap();
+            assert_eq!(restored, contents);
+        }
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_archive_construction_error_preserves_the_previous_export() {
+        let dir = std::env::temp_dir().join(format!("diag-preserve-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("previous.zip");
+        let entry = super::DiagnosticEntry {
+            name: "version.txt".to_owned(),
+            contents: "previous export".to_owned(),
+        };
+        write_zip(&path, std::slice::from_ref(&entry)).unwrap();
+        let previous = std::fs::read(&path).unwrap();
+
+        // ZipWriter rejects duplicate names after it already wrote one entry.
+        // The previous implementation had already truncated the destination.
+        assert!(write_zip(&path, &[entry.clone(), entry]).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), previous);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_publication_error_preserves_the_destination_and_cleans_temporary_files() {
+        let dir = std::env::temp_dir().join(format!("diag-publish-error-{}", uuid::Uuid::new_v4()));
+        let destination = dir.join("existing-directory.zip");
+        std::fs::create_dir_all(&destination).unwrap();
+        let previous = destination.join("existing.txt");
+        std::fs::write(&previous, "retain previous contents").unwrap();
+        let entries = [super::DiagnosticEntry {
+            name: "version.txt".to_owned(),
+            contents: "new export".to_owned(),
+        }];
+
+        // The completed temporary ZIP cannot replace a nonempty directory.
+        assert!(write_zip(&destination, &entries).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&previous).unwrap(),
+            "retain previous contents"
+        );
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        assert_eq!(std::fs::read_dir(&destination).unwrap().count(), 1);
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
