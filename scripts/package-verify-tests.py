@@ -51,7 +51,7 @@ class PackageValidationTests(unittest.TestCase):
         digest = hashlib.sha256(archive.read_bytes()).hexdigest()
         Path(str(archive) + ".sha256").write_text(f"{digest}  {name or archive.name}\n", encoding="utf-8")
 
-    def archive(self, platform="windows", mutate=None, mode=0o755):
+    def archive(self, platform="windows", mutate=None, mode=0o755, force_zip64=False):
         root = f"TerminalCanvas-{self.version}-{platform}-x86_64"
         binary = pe() if platform == "windows" else elf()
         files = [(root + "/" + name, binary) for name in verify.package_files(platform)[0]]
@@ -66,7 +66,11 @@ class PackageValidationTests(unittest.TestCase):
                 for name, content in files:
                     info = zipfile.ZipInfo(name)
                     info.external_attr = (stat.S_IFREG | mode) << 16
-                    target.writestr(info, content)
+                    if force_zip64:
+                        with target.open(info, "w", force_zip64=True) as member:
+                            member.write(content)
+                    else:
+                        target.writestr(info, content)
         else:
             with tarfile.open(archive, "w:gz") as target:
                 for name, content in files:
@@ -76,6 +80,28 @@ class PackageValidationTests(unittest.TestCase):
         self.checksum(archive)
         return archive
 
+    def zip64_footer(self, archive, sentinels=True):
+        raw = archive.read_bytes()
+        footer = struct.unpack("<4s4H2IH", raw[-22:])
+        record_offset = len(raw) - 22
+        record = struct.pack("<4sQ2H2I4Q", b"PK\x06\x06", 44, 45, 45, 0, 0,
+                             footer[3], footer[4], footer[5], footer[6])
+        locator = struct.pack("<4sIQI", b"PK\x06\x07", 0, record_offset, 1)
+        if sentinels:
+            end = struct.pack("<4s4H2IH", b"PK\x05\x06", 0, 0, 0xFFFF, 0xFFFF,
+                              0xFFFFFFFF, 0xFFFFFFFF, 0)
+        else:
+            end = raw[-22:]
+        archive.write_bytes(raw[:-22] + record + locator + end)
+        self.checksum(archive)
+        return record_offset
+
+    def reject_before_zipfile(self, archive, message):
+        with mock.patch.object(verify.zipfile, "ZipFile", side_effect=AssertionError("ZipFile parsed before the gate")):
+            with self.assertRaisesRegex(ValueError, message):
+                self.validate(archive)
+        self.assertFalse((self.root / "extracted").exists())
+
     def validate(self, archive, platform="windows"):
         target = "x86_64-pc-windows-msvc" if platform == "windows" else "x86_64-unknown-linux-gnu"
         return verify.verify_portable(archive, target, self.version, self.root / "extracted")
@@ -83,6 +109,125 @@ class PackageValidationTests(unittest.TestCase):
     def test_complete_windows_zip(self):
         directory = self.validate(self.archive())
         self.assertTrue((directory / "tc-memory-mcp.exe").is_file())
+
+    def test_complete_zip_with_comment(self):
+        archive = self.archive()
+        with zipfile.ZipFile(archive, "a") as target:
+            target.comment = b"portable package comment " + b"x" * 4096
+        self.checksum(archive)
+        self.assertEqual((self.validate(archive) / "mi-terminal.exe").read_bytes(), pe())
+
+    def test_complete_zip64_local_headers_and_footer(self):
+        archive = self.archive(force_zip64=True)
+        self.zip64_footer(archive)
+        with zipfile.ZipFile(archive) as target:
+            self.assertIsNone(target.testzip())
+            self.assertEqual(len(target.infolist()), 5)
+        self.assertEqual((self.validate(archive) / "mi-terminal.exe").read_bytes(), pe())
+
+    def test_complete_zip64_footer_without_normal_sentinels(self):
+        archive = self.archive()
+        self.zip64_footer(archive, sentinels=False)
+        self.assertEqual((self.validate(archive) / "tc-memory.exe").read_bytes(), pe())
+
+    def test_complete_zip_with_optional_package_directory(self):
+        archive = self.archive()
+        with zipfile.ZipFile(archive, "a") as target:
+            target.writestr(f"TerminalCanvas-{self.version}-windows-x86_64/", b"")
+        self.checksum(archive)
+        self.assertEqual((self.validate(archive) / "mi-terminal.exe").read_bytes(), pe())
+
+    def test_large_zip_manifest_rejected_before_constructing_zipfile(self):
+        archive = self.archive(mutate=lambda files, root: files.extend(
+            (root + f"/unexpected-{index}", b"x") for index in range(3000)
+        ))
+        self.reject_before_zipfile(archive, "Unexpected archive entries")
+
+    def test_forged_small_zip_entry_count_does_not_bypass_scan(self):
+        archive = self.archive(mutate=lambda files, root: files.extend(
+            (root + f"/unexpected-{index}", b"x") for index in range(3000)
+        ))
+        raw = bytearray(archive.read_bytes())
+        struct.pack_into("<2H", raw, len(raw) - 22 + 8, 5, 5)
+        archive.write_bytes(raw)
+        self.checksum(archive)
+        self.reject_before_zipfile(archive, "Unexpected archive entries")
+
+    def test_zip64_override_is_checked_without_normal_sentinels(self):
+        for field, offset, value, message in (
+                ("entries", 32, 3005, "Unexpected archive entries"),
+                ("metadata", 40, verify.MAX_ZIP_METADATA + 1, "Oversized ZIP central directory")):
+            with self.subTest(field=field):
+                archive = self.archive()
+                record_offset = self.zip64_footer(archive, sentinels=False)
+                raw = bytearray(archive.read_bytes())
+                struct.pack_into("<Q", raw, record_offset + offset, value)
+                archive.write_bytes(raw)
+                self.checksum(archive)
+                self.reject_before_zipfile(archive, message)
+
+    def test_invalid_zip_offsets_and_disks_rejected_before_parser(self):
+        for field, offset, fmt, value, message in (
+                ("offset", 16, "<I", 0xFFFFFFFE, "Invalid ZIP directory offset"),
+                ("disk", 4, "<H", 1, "Multi-disk ZIP"),
+                ("directory_disk", 6, "<H", 1, "Multi-disk ZIP"),
+                ("metadata", 12, "<I", verify.MAX_ZIP_METADATA + 1, "Oversized ZIP central directory"),
+                ("missing_zip64", 8, "<2H", (0xFFFF, 0xFFFF), "Missing ZIP64 locator")):
+            with self.subTest(field=field):
+                archive = self.archive()
+                raw = bytearray(archive.read_bytes())
+                values = value if isinstance(value, tuple) else (value,)
+                struct.pack_into(fmt, raw, len(raw) - 22 + offset, *values)
+                archive.write_bytes(raw)
+                self.checksum(archive)
+                self.reject_before_zipfile(archive, message)
+
+    def test_invalid_zip64_offsets_and_disks_rejected_before_parser(self):
+        for field, relative_offset, fmt, value, message in (
+                ("locator_offset", 56 + 8, "<Q", 0xFFFFFFFFFFFFFFFF, "Invalid ZIP64 metadata offset"),
+                ("locator_disks", 56 + 16, "<I", 2, "Multi-disk ZIP64"),
+                ("disk", 16, "<I", 1, "Multi-disk ZIP64"),
+                ("directory_offset", 48, "<Q", 0xFFFFFFFFFFFFFFFF, "Invalid ZIP64 directory offset"),
+                ("extensible_data", 4, "<Q", 45, "Unsupported ZIP64 extensible metadata")):
+            with self.subTest(field=field):
+                archive = self.archive()
+                record_offset = self.zip64_footer(archive)
+                raw = bytearray(archive.read_bytes())
+                struct.pack_into(fmt, raw, record_offset + relative_offset, value)
+                archive.write_bytes(raw)
+                self.checksum(archive)
+                self.reject_before_zipfile(archive, message)
+
+    def test_zip64_gap_cannot_change_which_record_the_parser_reads(self):
+        archive = self.archive()
+        record_offset = self.zip64_footer(archive)
+        raw = archive.read_bytes()
+        locator_offset = record_offset + 56
+        archive.write_bytes(raw[:locator_offset] + raw[record_offset:locator_offset] + raw[locator_offset:])
+        self.checksum(archive)
+        self.reject_before_zipfile(archive, "Invalid ZIP64 metadata offset")
+
+    def test_zip_footer_comment_and_trailing_data_must_match(self):
+        for field in ("comment", "trailing_data"):
+            with self.subTest(field=field):
+                archive = self.archive()
+                raw = bytearray(archive.read_bytes())
+                if field == "comment":
+                    struct.pack_into("<H", raw, len(raw) - 2, 10)
+                else:
+                    raw.extend(b"unexpected trailing bytes")
+                archive.write_bytes(raw)
+                self.checksum(archive)
+                self.reject_before_zipfile(archive, "Invalid ZIP footer comment")
+
+    def test_central_directory_lengths_cannot_escape_metadata_bounds(self):
+        archive = self.archive()
+        raw = bytearray(archive.read_bytes())
+        directory_offset = struct.unpack_from("<I", raw, len(raw) - 22 + 16)[0]
+        struct.pack_into("<H", raw, directory_offset + 28, 0xFFFF)
+        archive.write_bytes(raw)
+        self.checksum(archive)
+        self.reject_before_zipfile(archive, "Invalid ZIP central directory lengths")
 
     def test_complete_linux_tar_preserves_executable_mode(self):
         directory = self.validate(self.archive("linux"), "linux")

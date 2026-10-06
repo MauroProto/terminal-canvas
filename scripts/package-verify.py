@@ -2,6 +2,7 @@
 """Validate the files users download, using only Python's standard library."""
 
 import argparse
+from contextlib import contextmanager
 import hashlib
 from itertools import islice
 import json
@@ -20,6 +21,7 @@ import tomllib
 import zipfile
 
 REPO = Path(__file__).resolve().parent.parent
+MAX_ZIP_METADATA = 2 * 1024 * 1024
 TARGETS = {
     "x86_64-pc-windows-msvc": ("windows", "x86_64"),
     "aarch64-pc-windows-msvc": ("windows", "aarch64"),
@@ -71,15 +73,98 @@ def validate_member(name, root, seen):
     return path
 
 
+def preflight_zip(source, maximum_members):
+    """Bound ZIP metadata before ZipFile eagerly constructs its member list."""
+    source.seek(0, os.SEEK_END)
+    file_size = source.tell()
+
+    def read_at(offset, size):
+        require(0 <= offset <= file_size and 0 <= size <= file_size - offset,
+                "Invalid ZIP metadata offset")
+        source.seek(offset)
+        data = source.read(size)
+        require(len(data) == size, "Truncated ZIP metadata")
+        return data
+
+    require(file_size >= 22, "Invalid ZIP footer")
+    tail_size = min(file_size, 65535 + 22)
+    tail = read_at(file_size - tail_size, tail_size)
+    # Match ZipFile's last-footer selection, including its no-comment shortcut.
+    index = len(tail) - 22 if tail[-22:-18] == b"PK\x05\x06" and tail[-2:] == b"\0\0" else tail.rfind(b"PK\x05\x06")
+    require(index >= 0 and index + 22 <= len(tail), "Invalid ZIP footer")
+    footer_offset = file_size - tail_size + index
+    _, disk, directory_disk, disk_members, members, directory_size, directory_offset, comment_size = struct.unpack(
+        "<4s4H2IH", tail[index:index + 22])
+    require(footer_offset + 22 + comment_size == file_size, "Invalid ZIP footer comment")
+    require(disk == directory_disk == 0, "Multi-disk ZIP is unsupported")
+    directory_end = footer_offset
+
+    locator_offset = footer_offset - 20
+    locator = read_at(locator_offset, 20) if locator_offset >= 0 else b""
+    needs_zip64 = disk_members == 0xFFFF or members == 0xFFFF or directory_size == 0xFFFFFFFF or directory_offset == 0xFFFFFFFF
+    require(not needs_zip64 or locator[:4] == b"PK\x06\x07", "Missing ZIP64 locator")
+    if locator[:4] == b"PK\x06\x07":
+        _, locator_disk, zip64_offset, disks = struct.unpack("<4sIQI", locator)
+        require(locator_disk == 0 and disks == 1, "Multi-disk ZIP64 is unsupported")
+        # Python 3.11/3.12 consume this fixed record immediately before the
+        # locator. Reject layouts that another reader could interpret differently.
+        record_offset = locator_offset - 56
+        require(zip64_offset == record_offset, "Invalid ZIP64 metadata offset")
+        record = read_at(record_offset, 56)
+        require(record[:4] == b"PK\x06\x06", "Invalid ZIP64 footer")
+        _, record_size, _, _, disk64, directory_disk64, disk_members64, members64, directory_size64, directory_offset64 = struct.unpack(
+            "<4sQ2H2I4Q", record)
+        require(record_size == 44, "Unsupported ZIP64 extensible metadata")
+        require(record_offset + 12 + record_size == locator_offset, "Invalid ZIP64 metadata offset")
+        require(disk64 == directory_disk64 == 0, "Multi-disk ZIP64 is unsupported")
+        require(members64 <= maximum_members, "Unexpected archive entries")
+        require(directory_size64 <= MAX_ZIP_METADATA, "Oversized ZIP central directory")
+        for original, expanded, sentinel in (
+                (disk_members, disk_members64, 0xFFFF), (members, members64, 0xFFFF),
+                (directory_size, directory_size64, 0xFFFFFFFF), (directory_offset, directory_offset64, 0xFFFFFFFF)):
+            require(original == sentinel or original == expanded, "Inconsistent ZIP64 footer")
+        disk_members, members = disk_members64, members64
+        directory_size, directory_offset = directory_size64, directory_offset64
+        directory_end = record_offset
+        require(directory_offset + directory_size == zip64_offset, "Invalid ZIP64 directory offset")
+
+    require(disk_members == members, "Inconsistent ZIP entry count")
+    require(members <= maximum_members, "Unexpected archive entries")
+    require(directory_size <= MAX_ZIP_METADATA, "Oversized ZIP central directory")
+    directory_start = directory_end - directory_size
+    require(0 <= directory_offset == directory_start, "Invalid ZIP directory offset")
+    position, inspected = directory_start, 0
+    while position < directory_end:
+        require(inspected < maximum_members, "Unexpected archive entries")
+        require(position + 46 <= directory_end, "Truncated ZIP central directory")
+        header = read_at(position, 46)
+        require(header[:4] == b"PK\x01\x02", "Invalid ZIP central directory")
+        name_size, extra_size, member_comment_size, member_disk = struct.unpack_from("<4H", header, 28)
+        require(member_disk == 0, "Multi-disk ZIP member is unsupported")
+        position += 46 + name_size + extra_size + member_comment_size
+        require(position <= directory_end, "Invalid ZIP central directory lengths")
+        inspected += 1
+    require(inspected == members, "Inconsistent ZIP entry count")
+
+
+@contextmanager
+def open_bounded_zip(archive, maximum_members):
+    # Use the same descriptor for the preflight and parser, avoiding a reopen.
+    with archive.open("rb") as source:
+        preflight_zip(source, maximum_members)
+        with zipfile.ZipFile(source) as handle:
+            yield handle
+
+
 def extract_portable(archive, destination, root, platform):
     """Validate the complete manifest before writing any archive entries."""
     _, expected = package_files(platform)
     seen, actual, entries = set(), set(), []
     if platform == "windows":
-        handle = zipfile.ZipFile(archive)
+        handle = open_bounded_zip(archive, len(expected) + 1)
     else:
         handle = tarfile.open(archive, "r:gz")
-    with handle:
+    with handle as handle:
         # Inspect only enough TAR headers to detect an oversized manifest.
         # getmembers() would parse and retain the entire archive before the gate.
         members = handle.infolist() if platform == "windows" else list(islice(handle, len(expected) + 2))
