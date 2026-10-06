@@ -20,7 +20,7 @@ use crate::runtime::RenderTier;
 use crate::shortcuts::shortcut_command;
 use crate::sidebar::{Sidebar, SidebarResponse};
 use crate::state::persistence::{AutosaveController, AutosaveDecision, PeriodicFlushController};
-use crate::state::{save_state, AppState, Workspace};
+use crate::state::{AppState, Workspace};
 use crate::theme::colors as palette;
 use crate::theme::fonts::setup_fonts;
 use crate::update::{RepaintPolicy, UpdateChecker};
@@ -829,9 +829,6 @@ impl TerminalApp {
         self.viewport.pan = self.ws().viewport_pan;
         self.viewport.zoom = self.ws().viewport_zoom.max(0.125);
         let can_persist = self.ensure_persistence_ownership();
-        if can_persist {
-            self.persist_scrollbacks(false);
-        }
         self.reconcile_daemon_sessions();
         self.reconcile_orchestration();
         self.refresh_orchestration();
@@ -839,11 +836,20 @@ impl TerminalApp {
         // Un cierre explícito no debe reaparecer si la app termina antes del
         // próximo tick de autosave.
         if can_persist {
+            // An accepted autosave still contains the workspace we removed.
+            // Publish its replacement only after that older write finishes.
+            self.persistence_worker.wait_until_idle();
+            if !self.ensure_persistence_ownership() {
+                return;
+            }
             let snapshot = self.snapshot_state();
             match crate::state::persistence::try_save_state(&snapshot) {
                 Ok(()) => {
                     self.persisted_state = Some(snapshot);
                     self.autosave.mark_saved(Instant::now());
+                    // Pruning closed panels is safe only after their removal
+                    // is durable in the layout that restart will restore.
+                    self.persist_scrollbacks(false);
                 }
                 Err(err) => {
                     log::warn!("no se pudo persistir el cierre del workspace: {err}");
@@ -1060,22 +1066,36 @@ impl TerminalApp {
     }
 
     fn persist_before_update(&mut self) -> anyhow::Result<()> {
-        self.preferences_worker.drain()?;
+        self.persist_final_state()
+    }
+
+    /// Drain older accepted writes before publishing the final snapshot. A
+    /// failed preference save must not prevent rescuing layout and history,
+    /// but it still prevents treating the shutdown as clean.
+    fn persist_final_state(&mut self) -> anyhow::Result<()> {
         if !self.ensure_persistence_ownership() {
-            anyhow::bail!("Cannot install while this app does not own its saved profile");
+            anyhow::bail!("This app does not own its saved profile");
         }
+        let preferences_saved = self.preferences_worker.drain();
         self.persistence_worker.wait_until_idle();
-        crate::state::persistence::try_save_state(&self.snapshot_state())?;
-        let directory = crate::state::scrollback_store::scrollback_dir()
-            .ok_or_else(|| anyhow::anyhow!("Terminal history directory is unavailable"))?;
-        self.remember_scrollback_layout();
-        let entries = self.full_scrollback_entries(&directory, None);
-        let expected = entries.len();
-        let acknowledgements = persistence_worker::persist_full_entries(entries);
-        if acknowledgements.len() != expected {
-            anyhow::bail!("Some terminal history could not be saved; the app will stay open");
+        // Ownership may have changed while the worker was finishing its queue.
+        if !self.ensure_persistence_ownership() {
+            anyhow::bail!("Another app took ownership while saving was finishing");
         }
-        self.acknowledge_persisted_logs(acknowledgements);
+        let snapshot = self.snapshot_state();
+        let layout_saved = crate::state::persistence::try_save_state(&snapshot);
+        let history_saved = self.persist_scrollbacks_with_pruning(true, layout_saved.is_ok());
+        if layout_saved.is_ok() {
+            self.persisted_state = Some(snapshot);
+        }
+        layout_saved?;
+        if !history_saved {
+            anyhow::bail!("Some terminal history could not be saved");
+        }
+        preferences_saved?;
+        if !self.ensure_persistence_ownership() {
+            anyhow::bail!("Another app took ownership before saving completed");
+        }
         Ok(())
     }
 
@@ -1521,15 +1541,41 @@ impl TerminalApp {
     /// `full` reescribe el checkpoint completo (cierre limpio / panic /
     /// rollover); `false` appendea solo el log incremental (autosave de 2 s).
     fn persist_scrollbacks(&mut self, full: bool) -> bool {
+        self.persist_scrollbacks_with_pruning(full, true)
+    }
+
+    fn persist_scrollbacks_with_pruning(&mut self, full: bool, prune_closed_history: bool) -> bool {
+        if !self.ensure_persistence_ownership() {
+            return false;
+        }
         let Some(dir) = crate::state::scrollback_store::scrollback_dir() else {
             return false;
         };
         self.remember_scrollback_layout();
         if full {
             self.persistence_worker.wait_until_idle();
+            // Hold the same lease used by queued history writes through the
+            // checkpoint and pruning, so another app cannot take it midway.
+            let Ok(Some(_guard)) = crate::state::run_marker::acquire_write_guard() else {
+                return false;
+            };
+            if std::fs::create_dir_all(&dir).is_err() {
+                return false;
+            }
             let entries = self.full_scrollback_entries(&dir, None);
-            let _ = persistence_worker::persist_full_entries(entries);
-            self.prune_scrollback_files(&dir);
+            let expected = entries.len();
+            let acknowledgements = persistence_worker::persist_full_entries(entries);
+            let complete = acknowledgements.len() == expected;
+            self.acknowledge_persisted_logs(acknowledgements);
+            if !complete {
+                return false;
+            }
+            // A failed layout save still refers to panels closed in memory.
+            // Rescue live histories without destroying that older recovery
+            // state; pruning requires both the new layout and its checkpoints.
+            if prune_closed_history {
+                self.prune_scrollback_files(&dir);
+            }
             return true;
         }
         if self.persistence_worker.scrollback_in_flight() {
@@ -1556,11 +1602,19 @@ impl TerminalApp {
                 );
             }
         }
-        let known_panels = self
-            .scrollback_known_leaves
-            .iter()
-            .map(|(panel, leaves)| (*panel, leaves.iter().copied().collect()))
-            .collect();
+        let can_prune = !self.persistence_worker.state_in_flight()
+            && self.persisted_state.as_ref() == Some(&self.snapshot_state());
+        let known_panels = if can_prune {
+            self.scrollback_known_leaves
+                .iter()
+                .map(|(panel, leaves)| (*panel, leaves.iter().copied().collect()))
+                .collect()
+        } else {
+            // A pending or failed layout publication may still refer to
+            // panels closed in memory. Keep their history and remember the
+            // pruning scope until the current layout is acknowledged.
+            Vec::new()
+        };
         let submitted =
             self.persistence_worker
                 .submit_incremental(persistence_worker::IncrementalBatch {
@@ -1569,7 +1623,7 @@ impl TerminalApp {
                     live_panels,
                     known_panels,
                 });
-        if submitted {
+        if submitted && can_prune {
             // El batch ya conserva el alcance de poda que necesita. Retener
             // después sólo el layout vivo evita que una sesión larga acumule
             // un UUID por cada terminal y split cerrados.
@@ -2218,8 +2272,9 @@ impl eframe::App for TerminalApp {
                             || crate::state::run_marker::current_process_may_write())
                     {
                         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            save_state(&self.snapshot_state());
-                            self.persist_scrollbacks(true);
+                            if let Err(error) = self.persist_final_state() {
+                                log::error!("Final crash recovery save failed: {error}");
+                            }
                         }));
                     }
                     std::process::exit(1);
@@ -2231,18 +2286,21 @@ impl eframe::App for TerminalApp {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.collab.stop_session();
-        if self.persistence_writes_enabled
-            && (!self.run_marker_active || crate::state::run_marker::current_process_may_write())
-        {
-            save_state(&self.snapshot_state());
-            // El autosave puede tener hasta AUTOSAVE_INTERVAL de atraso: al salir
-            // guardamos el scrollback definitivo para no perder las últimas líneas.
-            self.persist_scrollbacks(true);
-        }
+        let saved_cleanly = if self.persistence_writes_enabled {
+            match self.persist_final_state() {
+                Ok(()) => true,
+                Err(error) => {
+                    log::error!("Shutdown saving failed; keeping recovery marker: {error}");
+                    false
+                }
+            }
+        } else {
+            false
+        };
         // El daemon se apaga solo si no le quedan sesiones (P3.15, T5).
         #[cfg(all(unix, feature = "daemon"))]
         self.daemon.shutdown_if_idle();
-        if self.run_marker_active {
+        if self.run_marker_active && saved_cleanly {
             crate::state::run_marker::end_run_clean();
         }
     }

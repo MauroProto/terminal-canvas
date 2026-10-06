@@ -71,6 +71,19 @@ pub(super) struct PersistenceWorker {
 
 impl PersistenceWorker {
     pub(super) fn new() -> Self {
+        Self::with_state_processor(crate::state::persistence::try_save_state)
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_state_processor_for_tests(
+        process: impl FnMut(&AppState) -> anyhow::Result<()> + Send + 'static,
+    ) -> Self {
+        Self::with_state_processor(process)
+    }
+
+    fn with_state_processor(
+        mut process_state: impl FnMut(&AppState) -> anyhow::Result<()> + Send + 'static,
+    ) -> Self {
         // Capacidad dos: uno de layout y uno de scrollback. Nunca se acumula
         // una cola de snapshots stale si el disco está lento.
         let (jobs_tx, jobs_rx) = mpsc::sync_channel::<Job>(2);
@@ -82,7 +95,7 @@ impl PersistenceWorker {
                 while let Ok(job) = jobs_rx.recv() {
                     let completion = match job {
                         Job::State(snapshot) => {
-                            let result = crate::state::persistence::try_save_state(&snapshot);
+                            let result = process_state(&snapshot);
                             Completion::State { snapshot, result }
                         }
                         Job::Incremental(batch) => {

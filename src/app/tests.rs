@@ -33,6 +33,347 @@ fn test_app_never_owns_the_users_run_marker() {
     assert!(!app.persistence_writes_enabled);
 }
 
+/// Run real closing writes in a fresh process: cached paths and the writer
+/// claim must never be changed in the test runner's own user profile.
+fn run_final_save_fixture(phase: &str) {
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    let profile = unique_temp_dir("tc-final-save-profile");
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
+        .args([
+            "--exact",
+            "app::tests::final_save_profile_fixture",
+            "--ignored",
+            "--nocapture",
+        ])
+        .current_dir(&profile)
+        .env("TERMINAL_CANVAS_HOME", &profile)
+        .env("TC_FINAL_SAVE_FIXTURE", phase)
+        .env_remove("MI_TERMINAL_SCROLLBACK_DIR")
+        .env_remove("MI_TERMINAL_DAEMON_DIR")
+        .env_remove("TC_MEMORY_DB")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
+    let mut child = command.spawn().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = fs::remove_dir_all(&profile);
+            panic!("Final save fixture timed out: {phase}");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let output = child.wait_with_output().unwrap();
+    let _ = fs::remove_dir_all(&profile);
+    assert!(
+        output.status.success(),
+        "{phase}: {}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn final_save_drains_stale_autosave_before_publishing_and_removing_marker() {
+    run_final_save_fixture("ordered-close");
+}
+
+#[test]
+fn final_save_confirmed_workspace_close_cannot_be_replaced_by_stale_autosave() {
+    run_final_save_fixture("workspace-close");
+}
+
+#[test]
+fn final_save_retains_recovery_marker_when_layout_write_fails() {
+    run_final_save_fixture("layout-failure");
+}
+
+#[test]
+fn final_save_preserves_history_referenced_by_old_layout_when_publication_fails() {
+    run_final_save_fixture("layout-failure-keeps-old-history");
+}
+
+#[test]
+fn final_save_incremental_pruning_waits_for_current_layout_acknowledgement() {
+    run_final_save_fixture("incremental-pruning-after-layout-ack");
+}
+
+#[test]
+fn final_save_retains_recovery_marker_when_history_write_fails() {
+    run_final_save_fixture("history-failure");
+}
+
+#[test]
+fn final_save_rescues_layout_and_history_after_accepted_settings_write_fails() {
+    run_final_save_fixture("settings-failure");
+}
+
+#[test]
+fn final_save_does_not_write_or_remove_successor_marker_after_losing_lease() {
+    run_final_save_fixture("lease-lost");
+}
+
+#[test]
+fn final_save_crash_recovery_preserves_the_dirty_marker() {
+    run_final_save_fixture("crash-recovery");
+}
+
+#[test]
+#[ignore = "only run in an isolated child process through run_final_save_fixture"]
+fn final_save_profile_fixture() {
+    use eframe::App;
+    use std::time::{Duration, Instant};
+
+    fn hold_stale_autosave(
+        app: &mut super::TerminalApp,
+        snapshot: crate::state::AppState,
+        observed_layout: std::path::PathBuf,
+    ) -> std::thread::JoinHandle<()> {
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        app.persistence_worker =
+            super::persistence_worker::PersistenceWorker::with_state_processor_for_tests(
+                move |snapshot| {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+                    crate::state::persistence::try_save_state(snapshot)
+                },
+            );
+        assert!(app.persistence_worker.submit_state(snapshot));
+        entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        std::thread::spawn(move || {
+            // A premature final save publishes the new file while the old
+            // autosave is still blocked, then the stale worker replaces it.
+            // A correct barrier keeps the file absent until we release it.
+            let deadline = Instant::now() + Duration::from_millis(500);
+            while !observed_layout.exists() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            release_tx.send(()).unwrap();
+        })
+    }
+
+    let phase = std::env::var("TC_FINAL_SAVE_FIXTURE").expect("isolated fixture phase");
+    let profile = std::path::PathBuf::from(
+        std::env::var_os("TERMINAL_CANVAS_HOME").expect("isolated fixture profile"),
+    );
+    assert!(profile.is_absolute());
+    let data = crate::utils::app_paths::data_dir().unwrap();
+    let layout = crate::state::persistence::state_file_path().unwrap();
+    let history = crate::state::scrollback_store::scrollback_dir().unwrap();
+    let marker = data.join("run.marker");
+    assert!(data.starts_with(&profile));
+    assert!(layout.starts_with(&profile));
+    assert!(history.starts_with(&profile));
+    crate::state::run_marker::begin_run();
+    assert!(crate::state::run_marker::current_process_may_write());
+    assert!(marker.exists());
+    let ctx = egui::Context::default();
+    let mut app = super::TerminalApp::new_for_tests(&ctx);
+    app.persistence_writes_enabled = true;
+    app.run_marker_active = true;
+    app.workspaces[0].name = "Final workspace".to_owned();
+
+    match phase.as_str() {
+        "ordered-close" => {
+            let mut stale = app.snapshot_state();
+            stale.workspaces[0].name = "Stale autosave workspace".to_owned();
+            let release = hold_stale_autosave(&mut app, stale, layout.clone());
+            app.on_exit(None);
+            release.join().unwrap();
+            let saved: crate::state::AppState =
+                serde_json::from_slice(&fs::read(&layout).unwrap()).unwrap();
+            assert_eq!(saved.workspaces[0].name, "Final workspace");
+            assert!(!marker.exists(), "a successful close removes its marker");
+        }
+        "workspace-close" => {
+            let removed = Workspace::new("Confirmed closed workspace", None);
+            let removed_id = removed.id;
+            app.workspaces.push(removed);
+            let stale = app.snapshot_state();
+            assert_eq!(stale.workspaces.len(), 2);
+            let release = hold_stale_autosave(&mut app, stale, layout.clone());
+            app.close_workspace_confirmed(removed_id);
+            release.join().unwrap();
+            app.persistence_worker.wait_until_idle();
+            let saved: crate::state::AppState =
+                serde_json::from_slice(&fs::read(&layout).unwrap()).unwrap();
+            assert_eq!(saved.workspaces.len(), 1);
+            assert!(saved
+                .workspaces
+                .iter()
+                .all(|workspace| workspace.id != removed_id.to_string()));
+            assert_eq!(saved.workspaces[0].name, "Final workspace");
+            assert!(
+                marker.exists(),
+                "closing a workspace does not end the app run"
+            );
+        }
+        "layout-failure" => {
+            fs::create_dir(&layout).unwrap();
+            app.on_exit(None);
+            assert!(layout.is_dir());
+            assert!(
+                history.is_dir(),
+                "history rescue still runs after layout failure"
+            );
+            assert!(marker.exists());
+        }
+        "layout-failure-keeps-old-history" => {
+            let panel_id = app.workspaces[0].panels[0].id();
+            let leaf_id = app.workspaces[0].panels[0].root_leaf_id();
+            let old_layout = app.snapshot_state();
+            let backup = crate::state::durable_write::backup_path(&layout, 0);
+            crate::state::persistence::save_state_to_path(&backup, &old_layout).unwrap();
+            let old_backup_bytes = fs::read(&backup).unwrap();
+            crate::state::scrollback_store::save_leaf_scrollback_versioned(
+                &history,
+                panel_id,
+                Some(leaf_id),
+                1,
+                "Old recoverable terminal output\n",
+            )
+            .unwrap();
+            app.remember_scrollback_layout();
+            app.workspaces[0].panels.clear();
+            // Nonempty directory guarantees the new file cannot be renamed
+            // onto the layout path on any supported operating system.
+            fs::create_dir(&layout).unwrap();
+            fs::write(
+                layout.join("publication-blocker"),
+                b"keep directory nonempty",
+            )
+            .unwrap();
+            app.on_exit(None);
+            assert_eq!(fs::read(&backup).unwrap(), old_backup_bytes);
+            let restored = crate::state::persistence::load_state().unwrap();
+            assert_eq!(restored.workspaces[0].panels[0].id, panel_id.to_string());
+            assert_eq!(
+                crate::state::scrollback_store::load_leaf_scrollback(
+                    &history,
+                    panel_id,
+                    Some(leaf_id)
+                )
+                .as_deref(),
+                Some("Old recoverable terminal output\n")
+            );
+            assert!(marker.exists());
+        }
+        "incremental-pruning-after-layout-ack" => {
+            let panel_id = app.workspaces[0].panels[0].id();
+            let leaf_id = app.workspaces[0].panels[0].root_leaf_id();
+            let old_layout = app.snapshot_state();
+            crate::state::persistence::try_save_state(&old_layout).unwrap();
+            app.persisted_state = Some(old_layout.clone());
+            crate::state::scrollback_store::save_leaf_scrollback_versioned(
+                &history,
+                panel_id,
+                Some(leaf_id),
+                1,
+                "History retained until removal is durable\n",
+            )
+            .unwrap();
+            app.remember_scrollback_layout();
+            app.workspaces[0].panels.clear();
+            // The last acknowledged layout still references this closed panel.
+            assert!(app.persist_scrollbacks(false));
+            app.persistence_worker.wait_until_idle();
+            assert!(app.scrollback_known_leaves.contains_key(&panel_id));
+            assert_eq!(
+                crate::state::scrollback_store::load_leaf_scrollback(
+                    &history,
+                    panel_id,
+                    Some(leaf_id)
+                )
+                .as_deref(),
+                Some("History retained until removal is durable\n")
+            );
+            let current_layout = app.snapshot_state();
+            crate::state::persistence::try_save_state(&current_layout).unwrap();
+            app.persisted_state = Some(current_layout.clone());
+            // Even a matching acknowledgement cannot authorize pruning while
+            // an older accepted state write can replace it in the worker.
+            let release = hold_stale_autosave(&mut app, old_layout, layout.clone());
+            assert!(app.persistence_worker.state_in_flight());
+            assert!(app.persist_scrollbacks(false));
+            release.join().unwrap();
+            app.persistence_worker.wait_until_idle();
+            assert!(app.scrollback_known_leaves.contains_key(&panel_id));
+            assert!(crate::state::scrollback_store::load_leaf_scrollback(
+                &history,
+                panel_id,
+                Some(leaf_id)
+            )
+            .is_some());
+            // After the final layout publication succeeds and the worker is
+            // idle, the retained scope is finally eligible for pruning.
+            crate::state::persistence::try_save_state(&current_layout).unwrap();
+            app.persisted_state = Some(current_layout);
+            assert!(app.persist_scrollbacks(false));
+            app.persistence_worker.wait_until_idle();
+            assert!(!app.scrollback_known_leaves.contains_key(&panel_id));
+            assert!(crate::state::scrollback_store::load_leaf_scrollback(
+                &history,
+                panel_id,
+                Some(leaf_id)
+            )
+            .is_none());
+            assert!(marker.exists());
+        }
+        "history-failure" => {
+            fs::write(&history, b"blocked history directory").unwrap();
+            app.on_exit(None);
+            let saved: crate::state::AppState =
+                serde_json::from_slice(&fs::read(&layout).unwrap()).unwrap();
+            assert_eq!(saved.workspaces[0].name, "Final workspace");
+            assert_eq!(fs::read(&history).unwrap(), b"blocked history directory");
+            assert!(marker.exists());
+        }
+        "settings-failure" => {
+            let config = crate::utils::app_paths::config_dir().unwrap();
+            assert!(config.starts_with(&profile));
+            fs::write(&config, b"blocked configuration directory").unwrap();
+            app.preferences_worker.save_settings(Default::default());
+            app.on_exit(None);
+            assert!(app.preferences_worker.drain().is_err());
+            let saved: crate::state::AppState =
+                serde_json::from_slice(&fs::read(&layout).unwrap()).unwrap();
+            assert_eq!(saved.workspaces[0].name, "Final workspace");
+            assert!(history.is_dir());
+            assert!(marker.exists());
+        }
+        "lease-lost" => {
+            crate::state::persistence::try_save_state(&app.snapshot_state()).unwrap();
+            let before = fs::read(&layout).unwrap();
+            app.workspaces[0].name = "Must not overwrite successor".to_owned();
+            let successor = b"12345 successor-claim timestamp\n";
+            fs::write(&marker, successor).unwrap();
+            app.on_exit(None);
+            assert_eq!(fs::read(&layout).unwrap(), before);
+            assert_eq!(fs::read(&marker).unwrap(), successor);
+            assert!(!history.exists());
+            assert!(!app.persistence_writes_enabled);
+        }
+        "crash-recovery" => {
+            app.persist_final_state().unwrap();
+            let saved: crate::state::AppState =
+                serde_json::from_slice(&fs::read(&layout).unwrap()).unwrap();
+            assert_eq!(saved.workspaces[0].name, "Final workspace");
+            assert!(marker.exists(), "crash recovery must remain a dirty run");
+        }
+        _ => panic!("unknown isolated fixture phase: {phase}"),
+    }
+}
+
 #[test]
 fn taskbar_reveals_a_focused_terminal_beyond_the_window_width() {
     use egui_kittest::{kittest::Queryable, Harness};
