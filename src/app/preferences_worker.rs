@@ -36,6 +36,8 @@ pub(super) struct PreferencesWorker {
     thread: Option<JoinHandle<()>>,
     pending: VecDeque<Job>,
     busy: bool,
+    notes_write_error: Option<String>,
+    settings_write_error: Option<String>,
 }
 
 impl Default for PreferencesWorker {
@@ -87,6 +89,8 @@ impl PreferencesWorker {
             thread: Some(worker),
             pending: VecDeque::new(),
             busy: false,
+            notes_write_error: None,
+            settings_write_error: None,
         }
     }
 }
@@ -144,11 +148,49 @@ impl PreferencesWorker {
 
     pub(super) fn poll(&mut self) -> Vec<Completion> {
         let results = self.results.try_iter().collect::<Vec<_>>();
+        for result in &results {
+            self.note_write_result(result);
+        }
         if !results.is_empty() {
             self.busy = false;
         }
         self.schedule();
         results
+    }
+
+    fn note_write_result(&mut self, completion: &Completion) {
+        match completion {
+            Completion::NotesSaved(result) => {
+                self.notes_write_error = result.as_ref().err().map(ToString::to_string)
+            }
+            Completion::SettingsSaved(result) => {
+                self.settings_write_error = result.as_ref().err().map(ToString::to_string)
+            }
+            _ => {}
+        }
+    }
+
+    /// Update installation must verify accepted preference writes before asking
+    /// the native window to close. Drop alone cannot report a failed write.
+    pub(super) fn drain(&mut self) -> anyhow::Result<()> {
+        while self.busy() {
+            self.schedule();
+            if self.busy {
+                let result = self.results.recv().map_err(|error| {
+                    anyhow::anyhow!("Preference writer stopped before finishing: {error}")
+                })?;
+                self.note_write_result(&result);
+                self.busy = false;
+            }
+        }
+        if let Some(error) = self
+            .notes_write_error
+            .as_ref()
+            .or(self.settings_write_error.as_ref())
+        {
+            anyhow::bail!("An accepted preference save failed: {error}");
+        }
+        Ok(())
     }
 }
 
@@ -171,6 +213,32 @@ impl Drop for PreferencesWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn update_drain_reports_a_failed_save_and_allows_a_successful_retry() {
+        let mut worker = PreferencesWorker::with_processor(|job| match job {
+            Job::SaveSettings(config) if config.font_size < 14.0 => {
+                Completion::SettingsSaved(Err(anyhow::anyhow!("disk is full")))
+            }
+            Job::SaveSettings(_) => Completion::SettingsSaved(Ok(())),
+            _ => panic!("fixture only accepts settings"),
+        });
+        worker.save_settings(crate::config::AppConfig {
+            font_size: 12.0,
+            ..Default::default()
+        });
+        assert!(worker
+            .drain()
+            .unwrap_err()
+            .to_string()
+            .contains("disk is full"));
+        worker.save_settings(crate::config::AppConfig {
+            font_size: 14.0,
+            ..Default::default()
+        });
+        assert!(worker.drain().is_ok());
+        assert!(!worker.busy());
+    }
 
     #[test]
     fn shutdown_drains_the_latest_notes_and_settings_to_real_temporary_files() {
