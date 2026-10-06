@@ -179,12 +179,43 @@ mod command_job {
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn CreateJobObjectW(attributes: *const c_void, name: *const u16) -> *mut c_void;
+        fn SetInformationJobObject(
+            job: *mut c_void,
+            information_class: i32,
+            information: *const c_void,
+            information_length: u32,
+        ) -> i32;
         fn AssignProcessToJobObject(job: *mut c_void, process: *mut c_void) -> i32;
         fn TerminateJobObject(job: *mut c_void, exit_code: u32) -> i32;
         fn CloseHandle(handle: *mut c_void) -> i32;
     }
 
     pub(super) struct Job(*mut c_void);
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct BasicLimitInformation {
+        per_process_user_time_limit: i64,
+        per_job_user_time_limit: i64,
+        limit_flags: u32,
+        minimum_working_set_size: usize,
+        maximum_working_set_size: usize,
+        active_process_limit: u32,
+        affinity: usize,
+        priority_class: u32,
+        scheduling_class: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct ExtendedLimitInformation {
+        basic_limit_information: BasicLimitInformation,
+        io_counters: [u64; 6],
+        process_memory_limit: usize,
+        job_memory_limit: usize,
+        peak_process_memory_used: usize,
+        peak_job_memory_used: usize,
+    }
 
     impl Job {
         pub(super) fn new(child: &Child) -> std::io::Result<Self> {
@@ -197,6 +228,28 @@ mod command_job {
                     return Err(std::io::Error::last_os_error());
                 }
                 let job = Self(handle);
+                // Let the OS terminate associated helpers even if the app is
+                // aborted or calls process::exit, which bypasses Rust Drop.
+                // This still does not close the spawn -> assignment window.
+                let limits = ExtendedLimitInformation {
+                    basic_limit_information: BasicLimitInformation {
+                        limit_flags: 0x0000_2000, // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                };
+                // JobObjectExtendedLimitInformation = 9. Both repr(C)
+                // structures follow the documented Win32 layout; unused
+                // limits are zero and the buffer lives through this call.
+                if SetInformationJobObject(
+                    handle,
+                    9,
+                    (&limits as *const ExtendedLimitInformation).cast(),
+                    std::mem::size_of::<ExtendedLimitInformation>() as u32,
+                ) == 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
                 if AssignProcessToJobObject(handle, child.as_raw_handle()) == 0 {
                     return Err(std::io::Error::last_os_error());
                 }
@@ -208,6 +261,18 @@ mod command_job {
             // SAFETY: this owned handle names only the private job containing
             // this verification command and its children.
             unsafe { TerminateJobObject(self.0, 1) };
+        }
+
+        #[cfg(test)]
+        pub(super) fn close_without_drop_for_test(self) -> std::io::Result<()> {
+            let job = std::mem::ManuallyDrop::new(self);
+            let handle = job.0;
+            // SAFETY: ManuallyDrop transfers the sole owned handle here.
+            // Deliberately skip TerminateJobObject to test the OS close policy.
+            if unsafe { CloseHandle(handle) } == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
         }
     }
 
@@ -454,7 +519,9 @@ fn validate_registered_install_directory(
     let executable = std::fs::canonicalize(running)?;
     let registered_executable = std::fs::canonicalize(directory.join("mi-terminal.exe"))?;
     if executable != registered_executable || executable.parent() != Some(directory.as_path()) {
-        anyhow::bail!("This copy does not run from its registered installation directory; update the portable copy manually");
+        anyhow::bail!(
+            "This copy does not run from its registered installation directory; update the portable copy manually"
+        );
     }
     Ok(directory)
 }
@@ -515,7 +582,9 @@ fn verify_windows_installer(path: &Path, version: &str) -> anyhow::Result<PathBu
     let installed_publisher = windows_publisher(&running, None)?;
     let downloaded_publisher = windows_publisher(path, Some(version))?;
     if installed_publisher != downloaded_publisher {
-        anyhow::bail!("The update signing certificate differs from the running application; install this publisher change manually");
+        anyhow::bail!(
+            "The update signing certificate differs from the running application; install this publisher change manually"
+        );
     }
     Ok(install_directory)
 }
@@ -705,8 +774,13 @@ fn swap_verified_bundle(
         let restored = std::fs::rename(&backup, target);
         let _ = std::fs::remove_dir_all(&staging_root);
         match restored {
-            Ok(()) => anyhow::bail!("Cannot install update; the previous app was restored: {error}"),
-            Err(restore_error) => anyhow::bail!("Cannot install update: {error}; the previous app is preserved at {} (restore failed: {restore_error})", backup.display()),
+            Ok(()) => {
+                anyhow::bail!("Cannot install update; the previous app was restored: {error}")
+            }
+            Err(restore_error) => anyhow::bail!(
+                "Cannot install update: {error}; the previous app is preserved at {} (restore failed: {restore_error})",
+                backup.display()
+            ),
         }
     }
     let _ = std::fs::remove_dir(&staging_root);
@@ -787,7 +861,7 @@ mod tests {
             return;
         };
         let marker = std::env::var_os("TC_UPDATE_COMMAND_MARKER").unwrap();
-        std::fs::write(marker, std::process::id().to_string()).unwrap();
+        std::fs::write(&marker, std::process::id().to_string()).unwrap();
         match mode.to_str().unwrap() {
             "success" => {
                 println!("bounded_stdout");
@@ -795,6 +869,8 @@ mod tests {
             }
             "failure" => std::process::exit(17),
             "deadline" => std::thread::sleep(Duration::from_secs(15)),
+            #[cfg(windows)]
+            "job-parent-exit" => windows_jobs::exit_parent(Path::new(&marker)),
             "output" => {
                 let line = "x".repeat(1024);
                 for _ in 0..1024 {
@@ -898,6 +974,161 @@ mod tests {
         assert!(error.to_string().contains("output limit"));
         assert!(started.elapsed() < Duration::from_secs(8));
         assert_fixture_process_stopped(&marker);
+    }
+
+    #[cfg(windows)]
+    mod windows_jobs {
+        use super::{fixture_command, TestDirectory};
+        use std::ffi::c_void;
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+        use std::os::windows::process::CommandExt;
+        use std::path::Path;
+        use std::process::{Child, ExitStatus, Stdio};
+        use std::time::{Duration, Instant};
+
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut c_void;
+            fn WaitForSingleObject(handle: *mut c_void, milliseconds: u32) -> u32;
+            fn TerminateProcess(handle: *mut c_void, exit_code: u32) -> i32;
+        }
+
+        struct FixtureChild(Child);
+
+        impl FixtureChild {
+            fn spawn(mode: &str, marker: &Path) -> Self {
+                Self(
+                    fixture_command(mode, marker)
+                        .creation_flags(0x0800_0000)
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .spawn()
+                        .unwrap(),
+                )
+            }
+
+            fn wait(&mut self) -> ExitStatus {
+                let started = Instant::now();
+                loop {
+                    if let Some(status) = self.0.try_wait().unwrap() {
+                        return status;
+                    }
+                    assert!(
+                        started.elapsed() < Duration::from_secs(5),
+                        "The fixture process did not stop"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+
+        impl Drop for FixtureChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        /// Keep an owned process handle before asking the parent to exit so
+        /// PID reuse cannot make the test observe or kill an unrelated process.
+        struct FixtureProcess(OwnedHandle);
+
+        impl FixtureProcess {
+            fn open(pid: u32) -> Self {
+                // SAFETY: the PID came from our UUID-directory handshake.
+                // Only query, synchronization, and cleanup termination access
+                // are requested, and OwnedHandle closes the handle once.
+                let handle = unsafe { OpenProcess(0x0010_1001, 0, pid) };
+                assert!(!handle.is_null(), "{}", std::io::Error::last_os_error());
+                // SAFETY: OpenProcess returned a valid owned handle that has
+                // not been wrapped or closed elsewhere.
+                Self(unsafe { OwnedHandle::from_raw_handle(handle) })
+            }
+
+            fn stopped(&self, milliseconds: u32) -> bool {
+                // SAFETY: this is the owned handle to our live/exited fixture.
+                match unsafe { WaitForSingleObject(self.0.as_raw_handle(), milliseconds) } {
+                    0 => true,
+                    258 => false, // WAIT_TIMEOUT
+                    other => panic!(
+                        "Cannot wait for fixture ({other}): {}",
+                        std::io::Error::last_os_error()
+                    ),
+                }
+            }
+        }
+
+        impl Drop for FixtureProcess {
+            fn drop(&mut self) {
+                // SAFETY: cleanup targets the held fixture handle, never a PID.
+                unsafe {
+                    TerminateProcess(self.0.as_raw_handle(), 1);
+                    WaitForSingleObject(self.0.as_raw_handle(), 1_000);
+                }
+            }
+        }
+
+        fn marker_pid(marker: &Path) -> u32 {
+            let started = Instant::now();
+            loop {
+                if let Ok(contents) = std::fs::read_to_string(marker) {
+                    if let Ok(pid) = contents.parse() {
+                        return pid;
+                    }
+                }
+                assert!(
+                    started.elapsed() < Duration::from_secs(5),
+                    "The fixture did not publish its PID"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        pub(super) fn exit_parent(marker: &Path) -> ! {
+            let child_marker = marker.with_extension("child");
+            let child = FixtureChild::spawn("deadline", &child_marker);
+            let _job = super::super::command_job::Job::new(&child.0).unwrap();
+            assert_eq!(marker_pid(&child_marker), child.0.id());
+            std::fs::write(marker.with_extension("ready"), child.0.id().to_string()).unwrap();
+            let started = Instant::now();
+            while !marker.with_extension("exit").is_file() {
+                assert!(started.elapsed() < Duration::from_secs(5));
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            // No Drop runs for either the job or child. Only Windows closing
+            // the process's last private job handle can stop the child here.
+            std::process::exit(0);
+        }
+
+        #[test]
+        fn closing_the_last_job_handle_terminates_the_assigned_process() {
+            let directory = TestDirectory::new();
+            let marker = directory.0.join("pid");
+            let mut child = FixtureChild::spawn("deadline", &marker);
+            let job = super::super::command_job::Job::new(&child.0).unwrap();
+            assert_eq!(marker_pid(&marker), child.0.id());
+            assert!(child.0.try_wait().unwrap().is_none());
+            job.close_without_drop_for_test().unwrap();
+            // Windows does not document the exit code used for job-close
+            // termination; completing before the 15-second fixture sleep is
+            // the observable contract this test verifies.
+            let _ = child.wait();
+        }
+
+        #[test]
+        fn process_exit_without_drop_terminates_the_assigned_helper() {
+            let directory = TestDirectory::new();
+            let marker = directory.0.join("parent-pid");
+            // Deliberately do not put the parent in another Job: an outer Job
+            // could mask a missing close policy on the fixture's own Job.
+            let mut parent = FixtureChild::spawn("job-parent-exit", &marker);
+            let helper = FixtureProcess::open(marker_pid(&marker.with_extension("ready")));
+            assert!(!helper.stopped(0));
+            std::fs::write(marker.with_extension("exit"), []).unwrap();
+            assert!(parent.wait().success());
+            assert!(helper.stopped(5_000), "The helper survived its parent exit");
+        }
     }
 
     #[test]
