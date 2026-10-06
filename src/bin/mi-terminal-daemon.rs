@@ -17,6 +17,11 @@ fn main() {
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
+    if let Err(error) = mi_terminal::utils::app_paths::get() {
+        eprintln!("{error}");
+        std::process::exit(1);
+    }
+
     let Some(dir) = server::resolve_dir() else {
         eprintln!("no se pudo resolver el directorio del daemon");
         std::process::exit(1);

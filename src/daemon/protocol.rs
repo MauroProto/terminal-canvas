@@ -36,8 +36,7 @@ pub fn socket_file_name() -> String {
 
 /// Directorio donde viven socket, token y pid-file.
 pub fn daemon_dir() -> Option<PathBuf> {
-    let dirs = directories::ProjectDirs::from("", "", "terminal-app")?;
-    Some(dirs.data_dir().join("daemon"))
+    Some(crate::utils::app_paths::data_dir()?.join("daemon"))
 }
 
 pub fn socket_path(dir: &Path) -> PathBuf {

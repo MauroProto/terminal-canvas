@@ -157,8 +157,7 @@ pub fn token_matches(expected: &str, provided: Option<&str>) -> bool {
 
 /// Directorio donde vive el endpoint file.
 pub fn hooks_dir() -> Option<PathBuf> {
-    let dirs = directories::ProjectDirs::from("", "", "terminal-app")?;
-    Some(dirs.data_dir().join("agent-hooks"))
+    Some(crate::utils::app_paths::data_dir()?.join("agent-hooks"))
 }
 
 /// Contenido del endpoint file que sourcean los hooks.

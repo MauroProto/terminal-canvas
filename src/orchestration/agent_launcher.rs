@@ -59,9 +59,7 @@ impl PreparedAgentLaunch {
 }
 
 fn request_dir() -> anyhow::Result<PathBuf> {
-    let directories = directories::ProjectDirs::from("", "", "terminal-app")
-        .ok_or_else(|| anyhow::anyhow!("No se pudo resolver el directorio de lanzamientos"))?;
-    Ok(directories.data_dir().join("agent-launches"))
+    Ok(crate::utils::app_paths::get()?.data.join("agent-launches"))
 }
 
 pub fn prepare(
@@ -364,18 +362,7 @@ fn npm_entry_point(shim: &str) -> Option<PathBuf> {
 }
 
 fn attach_parent_console() {
-    #[cfg(windows)]
-    {
-        #[link(name = "kernel32")]
-        unsafe extern "system" {
-            fn AttachConsole(process_id: u32) -> i32;
-        }
-        // SAFETY: ATTACH_PARENT_PROCESS is a documented sentinel, has no
-        // pointer arguments, and failure leaves inherited redirected I/O intact.
-        unsafe {
-            AttachConsole(u32::MAX);
-        }
-    }
+    crate::utils::platform::attach_parent_console();
 }
 
 #[cfg(test)]

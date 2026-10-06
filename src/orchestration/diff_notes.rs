@@ -138,8 +138,7 @@ fn escape_body(body: &str) -> String {
 }
 
 fn notes_dir() -> Option<PathBuf> {
-    let dirs = directories::ProjectDirs::from("", "", "terminal-app")?;
-    Some(dirs.data_dir().join("diff-notes"))
+    Some(crate::utils::app_paths::data_dir()?.join("diff-notes"))
 }
 
 /// Identity of the canonical repository path, without separator collisions.

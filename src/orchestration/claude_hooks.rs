@@ -140,6 +140,9 @@ fn load_settings(path: &std::path::Path) -> anyhow::Result<Value> {
 
 /// Instala los hooks en el settings real del usuario, con escritura durable.
 pub fn install_to_disk() -> anyhow::Result<()> {
+    if !crate::utils::app_paths::permits_global_agent_configuration() {
+        return Ok(());
+    }
     let Some(path) = settings_path() else {
         anyhow::bail!("no se pudo resolver ~/.claude/settings.json");
     };
@@ -155,6 +158,9 @@ pub fn install_to_disk() -> anyhow::Result<()> {
 
 /// Saca los hooks del settings real del usuario.
 pub fn uninstall_from_disk() -> anyhow::Result<()> {
+    if !crate::utils::app_paths::permits_global_agent_configuration() {
+        return Ok(());
+    }
     let Some(path) = settings_path() else {
         anyhow::bail!("no se pudo resolver ~/.claude/settings.json");
     };
