@@ -8,11 +8,41 @@ use mi_terminal::{app, collab, config, terminal, utils};
 use std::sync::Arc;
 use std::{backtrace::Backtrace, fmt::Write as _, fs, io::Write as _};
 
-use utils::platform::panic_log_path;
-
 use anyhow::Result;
 
 fn main() -> Result<()> {
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    let cli_mode = args.iter().any(|arg| {
+        matches!(
+            arg.to_str(),
+            Some("--health-check" | "--version" | "-V" | "--help" | "-h")
+        )
+    });
+    if cli_mode {
+        utils::platform::attach_parent_console();
+        if args.len() != 1 {
+            anyhow::bail!("Read-only CLI flags must be used without additional arguments");
+        }
+    }
+    utils::app_paths::get()?;
+    if cli_mode {
+        if args[0] == "--health-check" {
+            let report = utils::health::check()?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            if report["ok"] != true {
+                anyhow::bail!("Missing bundled helpers; extract or reinstall the complete package");
+            }
+            return Ok(());
+        }
+        if args[0] == "--version" || args[0] == "-V" {
+            println!("TerminalCanvas {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        if args[0] == "--help" || args[0] == "-h" {
+            println!("TerminalCanvas {}\n  --health-check  Inspect this package and its profile without starting the app\n  --version       Print version\n  TERMINAL_CANVAS_HOME  Absolute directory for an isolated application profile", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+    }
     if let Some(code) =
         mi_terminal::orchestration::agent_launcher::run_from_cli(std::env::args_os())?
     {
@@ -100,8 +130,7 @@ fn log_terminal_backends() {
 fn install_panic_logging() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        if let Some(home) = utils::platform::home_dir() {
-            let path = panic_log_path(&home);
+        if let Some(path) = utils::app_paths::panic_log_path() {
             if let Some(parent) = path.parent() {
                 let _ = fs::create_dir_all(parent);
             }
@@ -152,7 +181,8 @@ fn format_panic_report(message: &str, location: Option<&str>, backtrace: &str) -
 
 #[cfg(test)]
 mod tests {
-    use super::{format_panic_report, panic_log_path};
+    use super::format_panic_report;
+    use mi_terminal::utils::platform::panic_log_path;
     use std::path::Path;
 
     #[test]

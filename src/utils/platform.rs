@@ -6,6 +6,38 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
+/// GUI-subsystem binaries still support CLI modes. Preserve redirected stdio
+/// when attaching to a parent console, as AttachConsole initializes handles.
+pub fn attach_parent_console() {
+    #[cfg(windows)]
+    {
+        use std::ffi::c_void;
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn AttachConsole(process_id: u32) -> i32;
+            fn GetStdHandle(kind: u32) -> *mut c_void;
+            fn SetStdHandle(kind: u32, handle: *mut c_void) -> i32;
+        }
+        // SAFETY: these are documented standard-handle/parent sentinels; saved
+        // handles remain borrowed and are never closed or dereferenced here.
+        unsafe {
+            let kinds = [(-10_i32) as u32, (-11_i32) as u32, (-12_i32) as u32];
+            let handles = kinds.map(|kind| GetStdHandle(kind));
+            let valid = |handle: *mut c_void| !handle.is_null() && handle as isize != -1;
+            if valid(handles[1]) && valid(handles[2]) {
+                return;
+            }
+            if AttachConsole(u32::MAX) != 0 {
+                for (kind, handle) in kinds.into_iter().zip(handles) {
+                    if valid(handle) {
+                        SetStdHandle(kind, handle);
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub fn default_shell() -> String {
     #[cfg(target_os = "windows")]
     {
@@ -221,8 +253,7 @@ pub fn notify(title: &str, message: &str) {
 
 /// Directorio donde guardar las capturas de pantalla que se mandan al agente.
 pub fn screenshots_dir() -> Option<PathBuf> {
-    let dirs = directories::ProjectDirs::from("", "", "terminal-app")?;
-    Some(dirs.data_dir().join("screenshots"))
+    Some(super::app_paths::data_dir()?.join("screenshots"))
 }
 
 /// Captura interactiva de pantalla: el usuario selecciona un área y el SO la
