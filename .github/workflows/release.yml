@@ -25,10 +25,10 @@ jobs:
       version: ${{ steps.version.outputs.version }}
       artifact-prefix: ${{ steps.version.outputs.artifact-prefix }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0, Node 24
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0, Node 24
         with:
           python-version: "3.12"
       - name: Verify version and publication trigger
@@ -68,12 +68,12 @@ jobs:
       PACKAGE_VERSION: ${{ needs.metadata.outputs.version }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0, Node 24
         with:
           persist-credentials: false
 
       - name: Install Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0, Node 24
         with:
           python-version: "3.12"
 
@@ -159,7 +159,7 @@ jobs:
         run: python scripts/package-verify.py --dmg "dist/TerminalCanvas-$PACKAGE_VERSION-macos-${{ matrix.arch }}.dmg" --target '${{ matrix.target }}' --require-signature --team-id "$APPLE_TEAM_ID"
 
       - name: Upload verified macOS artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0, Node 24
         with:
           name: ${{ needs.metadata.outputs.artifact-prefix }}-macos-${{ matrix.arch }}
           if-no-files-found: error
@@ -192,12 +192,12 @@ jobs:
       PACKAGE_VERSION: ${{ needs.metadata.outputs.version }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0, Node 24
         with:
           persist-credentials: false
 
       - name: Install Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0, Node 24
         with:
           python-version: "3.12"
 
@@ -283,7 +283,7 @@ jobs:
         run: python scripts/package-verify.py --archive "dist/TerminalCanvas-$PACKAGE_VERSION-linux-x86_64.tar.gz" --target '${{ matrix.target }}' --smoke
 
       - name: Upload verified portable and installer artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0, Node 24
         with:
           name: ${{ needs.metadata.outputs.artifact-prefix }}-${{ matrix.platform }}-x86_64
           if-no-files-found: error
@@ -309,14 +309,14 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0, Node 24
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0, Node 24
         with:
           python-version: "3.12"
       - name: Download all verified packages
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0, Node 24
         with:
           pattern: ${{ needs.metadata.outputs.artifact-prefix }}-*
           merge-multiple: true
@@ -344,14 +344,14 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0, Node 24
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0, Node 24
         with:
           python-version: "3.12"
       - name: Download verified publication packages
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0, Node 24
         with:
           pattern: release-*
           merge-multiple: true
@@ -363,7 +363,7 @@ jobs:
           test "$GITHUB_REF" = "refs/tags/v$PACKAGE_VERSION"
           python scripts/package-verify.py --release-dir dist --version "$PACKAGE_VERSION"
       - name: Publish GitHub release assets
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3, Node 24
         with:
           fail_on_unmatched_files: true
           generate_release_notes: true
