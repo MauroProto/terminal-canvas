@@ -575,8 +575,7 @@ pub fn default_db_path() -> Option<PathBuf> {
 }
 
 fn platform_default_db_path() -> Option<PathBuf> {
-    directories::ProjectDirs::from("", "", "terminal-app")
-        .map(|dirs| dirs.data_dir().join("memory").join("memory.db"))
+    crate::utils::app_paths::data_dir().map(|dir| dir.join("memory").join("memory.db"))
 }
 
 fn configure(conn: &Connection) -> Result<()> {

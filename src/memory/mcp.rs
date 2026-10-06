@@ -57,6 +57,7 @@ impl McpScope {
 }
 
 pub fn serve_stdio() -> Result<()> {
+    crate::utils::app_paths::get()?;
     let db = super::store::default_db_path().unwrap_or_else(|| PathBuf::from("memory.db"));
     let store = MemoryStore::open(db)?;
     let root = std::env::var_os("TC_MEMORY_ROOT")

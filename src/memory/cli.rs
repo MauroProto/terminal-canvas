@@ -10,6 +10,7 @@ use super::model::{Actor, HandoffRequest, MemoryKind, RememberRequest, ScopeKind
 use super::store::MemoryStore;
 
 pub fn run(args: &[String]) -> Result<String> {
+    crate::utils::app_paths::get()?;
     if args
         .iter()
         .any(|arg| matches!(arg.as_str(), "--help" | "-h"))
