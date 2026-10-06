@@ -6,6 +6,8 @@ on:
       - master
       - "codex/**"
   pull_request:
+  # Also verify an exact selected branch after a token-driven delivery.
+  workflow_dispatch:
 
 permissions:
   contents: read
