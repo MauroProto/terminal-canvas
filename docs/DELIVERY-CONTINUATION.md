@@ -6,17 +6,19 @@ este pase es `f0458dd1dae08b3aca080a914042deb5a9454cf3`. Este pase agrega
 perfiles aislados, diagnóstico de paquetes, actualización verificada,
 instalador Windows, validaciones de distribución, limpieza de dependencias y
 correcciones de persistencia al cerrar. El checkpoint de entrega contiene
-24 microcommits locales sobre esa base remota.
+29 microcommits locales sobre esa base remota.
 Online e invitaciones no reciben cambios funcionales en este pase.
 
 ## Verificación realizada en esta PC
 
 - Rust/Cargo/Clippy 1.98.0, Windows x86_64, máximo dos jobs de compilación y
-  dos threads de pruebas. No se usó WSL ni se inició un servidor persistente.
+  dos threads de pruebas. El último pase usó un solo job con prioridad baja.
+  No se usó WSL ni se inició un servidor persistente.
 - Formato y Clippy de todos los targets, con warnings como errores.
-- Suite completa de todos los targets: **887 pruebas aprobadas y tres ignoradas**,
-  incluyendo **848 pruebas de librería aprobadas y tres ignoradas**, más los tres
-  benchmarks en modo smoke. El código comprobado termina en `071871e`; la
+- Suite completa de todos los targets: **889 pruebas aprobadas y tres ignoradas**,
+  incluyendo **850 pruebas de librería aprobadas y tres ignoradas**, más los tres
+  benchmarks en modo smoke. El código comprobado termina en el commit local
+  `c2faf67`; la
   documentación de relevo se agregó después.
   Dos pruebas ignoradas son fixtures que las regresiones normales invocan
   explícitamente en procesos hijos; la tercera depende de sesiones Claude reales.
@@ -45,26 +47,39 @@ Online e invitaciones no reciben cambios funcionales en este pase.
   que el registro de Inno nombre la copia que está ejecutándose y entrega esa
   carpeta mediante `/DIR`; una copia portable firmada usa actualización manual.
   Las regresiones incluyen Unicode, espacios y rutas UNC.
-- 14 pruebas del validador de paquetes y 9 de la extensión.
-- En el pase anterior se extrajo y comprobó un ZIP **debug sin firma**, con arquitectura, manifiesto,
+- Windows configura el Job para terminar los helpers asociados cuando el SO
+  cierra su último handle, incluso si la app sale sin ejecutar `Drop`. Dos
+  pruebas reales comprueban cierre del handle y salida abrupta del padre.
+  La ventana entre lanzamiento y asociación al Job sigue pendiente.
+- 15 pruebas del validador de paquetes y 9 de la extensión (éstas del pase
+  anterior, sin cambios posteriores en la extensión). Un TAR con 5.006
+  entradas se rechaza tras leer sólo ocho encabezados, sin extraer archivos.
+- Se extrajo y comprobó un nuevo ZIP **debug sin firma**, con arquitectura, manifiesto,
   SHA256, versión, diagnóstico, helper de memoria y handshake/listado MCP.
   Esto no valida un instalador de producción ni una firma.
 - `cargo-audit 0.22.2`: cero vulnerabilidades conocidas, cuatro avisos de
   mantenimiento (`bincode`, `paste`, `rustls-pemfile`, `ttf-parser`), sin ignores.
 
-Los logs del último cierre se guardan en `dist/validation-clippy-persistence.log` y
-`dist/validation-tests-persistence.log`; la auditoría previa está en
+Los logs del último cierre se guardan en `dist/validation-clippy-job-cleanup.log`,
+`dist/validation-tests-job-cleanup.log` y `dist/validation-package-job-cleanup.log`;
+la auditoría previa está en
 `dist/validation-audit.json`. No se deben confundir
 los resultados locales con una nueva CI multiplataforma del candidato.
-La última CI pública exitosa sigue siendo la de `f0458dd`; no hay ejecuciones
-de `Release` ni releases publicadas en la consulta del 6 de octubre.
+Al preparar este checkpoint, la última CI pública exitosa era la de `f0458dd`;
+no había ejecuciones de `Release` ni releases publicadas. Comprobar los runs y
+el HEAD actual después de publicar; la CI también permite `workflow_dispatch`.
 Los logs y herramientas dentro de `dist` son locales y no forman parte del bundle.
 
 ## Pendientes concretos
 
-1. Subir este pase. La cuenta `ainiagent` autenticada en esta PC tiene lectura,
-   sin permiso `push`; no se puede publicar con esas credenciales. Autenticar
-   GitHub con una cuenta con escritura y permiso para actualizar workflows.
+1. Confirmar que este pase está publicado. La cuenta `ainiagent` del CLI tiene
+   sólo lectura; el conector de la app está vinculado a `MauroProto` y permite
+   escribir contenidos. Comprobar además permiso para actualizar workflows.
+   La publicación mediante Git Data API conserva árboles, mensajes y secuencia,
+   pero asigna nuevos IDs y fechas. Los commits locales originales se conservan
+   en el bundle y una rama de respaldo. Verificar cada árbol y actualizar la
+   rama principal sólo mediante fast-forward, con la base remota esperada.
+   Si se usa el CLI, autenticar una cuenta con escritura y permiso de workflows.
    No pegar tokens, certificados ni contraseñas en una conversación.
 2. Ejecutar la CI del candidato en Windows, Linux, macOS Intel y Apple Silicon,
    incluyendo el daemon en Unix. Corregir cualquier fallo sin bajar aserciones.
@@ -78,25 +93,30 @@ Los logs y herramientas dentro de `dist` son locales y no forman parte del bundl
    Probar upgrade desde una versión firmada por el mismo editor/certificado.
    Comprobar cancelación, error de disco, publisher distinto y sesiones vivas.
    Comprobar el árbol de procesos en Windows: la asociación al Job ocurre
-   después del lanzamiento y las pruebas locales de plazo sólo comprueban
-   terminación del hijo directo. No afirmar contención total de descendientes.
+   después del lanzamiento. Las pruebas comprueban el helper asociado y el
+   cierre abrupto del padre; no demuestran contención de procesos que escaparon
+   antes de asociar el Job.
 6. Publicar sólo después de validar el dry-run y el candidato. Los tags deben
    coincidir con Cargo; el workflow impide publicación sin firmas verificadas.
    Descargar y verificar los paquetes que se publicaron realmente.
 7. Reemplazar placeholders de versión/SHA256 del cask con los DMG finales y
    publicar el tap con acceso real. Revisar protección de rama y permisos de
    archivos en instalaciones reales. No afirmar que ya existe una release/tap.
-8. Revisar los cuatro avisos de mantenimiento. Eliminarlos exige migraciones
-   de dependencias y validación multiplataforma; no sustituirlos por ignores.
+8. Ejecutar las migraciones de mantenimiento descritas en
+   [DEPENDENCY-MAINTENANCE.md](DEPENDENCY-MAINTENANCE.md), respetando la exclusión
+   de Online/invitaciones. Requieren validación multiplataforma, sin ignores.
 
 ## Prompt para continuar en otra máquina
 
 > Continuá Terminal Canvas (`MauroProto/terminal-canvas`) desde el pase local
 > de entrega de octubre de 2026. Leé `docs/DELIVERY-CONTINUATION.md`,
-> `docs/RELEASE.md`, `docs/PORTABLE.md` y `docs/SUPPORT.md`. Conservá todos los
+> `docs/RELEASE.md`, `docs/PORTABLE.md`, `docs/SUPPORT.md` y
+> `docs/DEPENDENCY-MAINTENANCE.md`. Conservá todos los
 > microcommits e integrá mediante fast-forward en la rama principal `master`.
 > Antes de trabajar comprobá el HEAD, el remoto, los permisos y si el pase
-> local fue subido; si no, importá el bundle entregado, que requiere la base
+> local fue subido. Si se publicó por Git Data API, sus IDs pueden diferir de
+> los locales: compará árboles y usá la rama publicada; no fuerces la mezcla
+> de los dos historiales. Si aún no se publicó, importá el bundle, que requiere la base
 > remota `f0458dd`. No descartes cambios ni reescribas historial. No modifiques
 > Online/invitaciones. Cerrá los pendientes enumerados con evidencia real:
 > CI multiplataforma, dry-run de release, instaladores, preservación de datos,
@@ -109,14 +129,14 @@ Los logs y herramientas dentro de `dist` son locales y no forman parte del bundl
 
 Si el pase aún no está en GitHub, el bundle de continuación guarda los commits
 de este pase sobre `origin/master`. El archivo actualizado es
-`terminal-canvas-delivery-20261006-persistence.bundle`; los bundles anteriores
+`terminal-canvas-delivery-20261006-verified.bundle`; los bundles anteriores
 conservan sus pases previos y no incluyen estas últimas correcciones.
 En la otra máquina, dentro del checkout:
 
 ```bash
 git fetch origin
-git bundle verify /ruta/terminal-canvas-delivery-20261006-persistence.bundle
-git fetch /ruta/terminal-canvas-delivery-20261006-persistence.bundle master
+git bundle verify /ruta/terminal-canvas-delivery-20261006-verified.bundle
+git fetch /ruta/terminal-canvas-delivery-20261006-verified.bundle master
 git switch master
 git merge --ff-only FETCH_HEAD
 ```
