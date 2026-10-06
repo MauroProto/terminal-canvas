@@ -102,7 +102,7 @@ impl LaunchMemoryWorker {
         completions
     }
 
-    fn in_flight(&self) -> bool {
+    pub(super) fn in_flight(&self) -> bool {
         self.in_flight > 0
     }
 }

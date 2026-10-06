@@ -1,5 +1,4 @@
-#[path = "../../src/update.rs"]
-mod update;
+use mi_terminal::update;
 
 use std::time::{Duration, Instant};
 

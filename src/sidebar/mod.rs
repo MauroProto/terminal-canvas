@@ -54,6 +54,12 @@ pub enum SidebarResponse {
     OpenBroadcast,
     ExportScrollback,
     OpenUpdate(String),
+    CheckUpdates,
+    DownloadUpdate,
+    CancelUpdateDownload,
+    InstallUpdate,
+    OpenUpdateFolder,
+    QuitAfterUpdate,
     /// Abrir este archivo en el visor interno (desde el explorador).
     OpenFileInViewer(std::path::PathBuf),
 }
@@ -377,38 +383,142 @@ fn update_download_target(state: &UpdateState) -> Option<&str> {
 }
 
 fn draw_update_notice(ui: &mut Ui, state: &UpdateState) -> Option<SidebarResponse> {
-    if !matches!(state.status, UpdateStatus::Available) {
+    if matches!(state.status, UpdateStatus::Disabled) {
         return None;
     }
     let version = state.latest_version.as_deref().unwrap_or("new");
-    let target = update_download_target(state);
-    let mut open = false;
+    let mut response = None;
     egui::Frame::new()
         .fill(SURFACE)
         .corner_radius(6.0)
         .inner_margin(egui::Margin::symmetric(10, 7))
         .show(ui, |ui| {
             ui.set_width((ui.available_width() - 20.0).max(80.0));
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(format!("TerminalCanvas v{version}"))
-                        .size(10.5)
-                        .color(TEXT_PRIMARY),
-                );
-                if target.is_some()
-                    && ui
-                        .button(RichText::new("Download").size(10.0).color(TEXT_PRIMARY))
-                        .clicked()
-                {
-                    open = true;
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+            match &state.status {
+                UpdateStatus::Disabled => {}
+                UpdateStatus::Checking => {
+                    ui.label("Checking for updates…");
                 }
-            });
+                UpdateStatus::UpToDate => {
+                    ui.horizontal(|ui| {
+                        let label = if state.latest_version.is_some() {
+                            "Up to date"
+                        } else {
+                            "No published release yet"
+                        };
+                        ui.label(RichText::new(label).size(10.5).color(TEXT_MUTED));
+                        if ui.small_button("Check").clicked() {
+                            response = Some(SidebarResponse::CheckUpdates);
+                        }
+                    });
+                }
+                UpdateStatus::Available => {
+                    ui.label(
+                        RichText::new(format!("TerminalCanvas v{version}"))
+                            .size(10.5)
+                            .color(TEXT_PRIMARY),
+                    );
+                    if update_download_target(state).is_some() {
+                        if ui.small_button("Download update").clicked() {
+                            response = Some(SidebarResponse::DownloadUpdate);
+                        }
+                    } else {
+                        ui.label("No package is available for this system.");
+                        if ui.small_button("View releases").clicked() {
+                            response = Some(SidebarResponse::OpenUpdate(
+                                "https://github.com/MauroProto/terminal-canvas/releases".to_owned(),
+                            ));
+                        }
+                    }
+                }
+                UpdateStatus::Downloading => {
+                    let downloaded = state.downloaded_bytes as f64 / (1024.0 * 1024.0);
+                    let label = if state.cancellation_requested {
+                        "Cancelling…".to_owned()
+                    } else {
+                        format!("Downloading: {downloaded:.1} MiB")
+                    };
+                    if let Some(total) = state.total_bytes.filter(|total| *total > 0) {
+                        ui.add(
+                            egui::ProgressBar::new(
+                                (state.downloaded_bytes as f64 / total as f64).min(1.0) as f32,
+                            )
+                            .text(label),
+                        );
+                    } else {
+                        ui.label(label);
+                    }
+                    if ui
+                        .add_enabled(
+                            !state.cancellation_requested,
+                            egui::Button::new("Cancel download"),
+                        )
+                        .clicked()
+                    {
+                        response = Some(SidebarResponse::CancelUpdateDownload);
+                    }
+                }
+                UpdateStatus::Ready => {
+                    ui.label(format!("v{version}: checksum verified"));
+                    if state.install_available {
+                        ui.label("Close terminal sessions before installing.");
+                        let label = if cfg!(target_os = "windows") {
+                            "Close app and install"
+                        } else {
+                            "Install update"
+                        };
+                        if ui.small_button(label).clicked() {
+                            response = Some(SidebarResponse::InstallUpdate);
+                        }
+                    } else {
+                        ui.label("Open the download folder and install manually.");
+                    }
+                    if ui.small_button("Show download folder").clicked() {
+                        response = Some(SidebarResponse::OpenUpdateFolder);
+                    }
+                }
+                UpdateStatus::Installing => {
+                    ui.label("Verifying publisher and installing…");
+                }
+                UpdateStatus::PreparedInstallation => {
+                    ui.label("Saving before opening the verified installer…");
+                }
+                UpdateStatus::Installed => {
+                    ui.label(format!(
+                        "v{version} installed. Reopen TerminalCanvas after quitting."
+                    ));
+                    if ui.small_button("Quit TerminalCanvas").clicked() {
+                        response = Some(SidebarResponse::QuitAfterUpdate);
+                    }
+                }
+                UpdateStatus::Error(error) => {
+                    ui.label(RichText::new(error).color(ui.visuals().error_fg_color));
+                    ui.horizontal_wrapped(|ui| {
+                        if state.install_available
+                            && state.installer_path.is_some()
+                            && ui.small_button("Retry install").clicked()
+                        {
+                            response = Some(SidebarResponse::InstallUpdate);
+                        }
+                        if state.download_url.is_some()
+                            && ui.small_button("Retry download").clicked()
+                        {
+                            response = Some(SidebarResponse::DownloadUpdate);
+                        }
+                        if ui.small_button("Check again").clicked() {
+                            response = Some(SidebarResponse::CheckUpdates);
+                        }
+                    });
+                    if state.installer_path.is_some()
+                        && ui.small_button("Show download folder").clicked()
+                    {
+                        response = Some(SidebarResponse::OpenUpdateFolder);
+                    }
+                }
+            }
         });
-    if open {
-        target.map(|url| SidebarResponse::OpenUpdate(url.to_owned()))
-    } else {
-        None
-    }
+    response
 }
 
 /// Lista de sesiones que piden atención: un click lleva el foco al panel.
@@ -622,6 +732,7 @@ mod tests {
             download_url: Some("https://github.com/example/release.dmg".to_owned()),
             installer_path: None,
             status: UpdateStatus::Available,
+            ..UpdateState::default()
         };
         assert_eq!(
             update_download_target(&available),
@@ -630,6 +741,29 @@ mod tests {
 
         let disabled = UpdateState::default();
         assert!(update_download_target(&disabled).is_none());
+    }
+
+    #[test]
+    fn update_download_cancel_is_visible_and_does_not_open_an_external_url() {
+        let action = Arc::new(Mutex::new(None));
+        let action_from_ui = Arc::clone(&action);
+        let state = UpdateState {
+            status: UpdateStatus::Downloading,
+            downloaded_bytes: 128,
+            total_bytes: Some(1024),
+            ..UpdateState::default()
+        };
+        let mut harness = egui_kittest::Harness::new_ui(move |ui| {
+            if let Some(response) = super::draw_update_notice(ui, &state) {
+                *action_from_ui.lock().unwrap() = Some(response);
+            }
+        });
+        harness.get_by_label("Cancel download").click();
+        harness.run();
+        assert_eq!(
+            *action.lock().unwrap(),
+            Some(super::SidebarResponse::CancelUpdateDownload)
+        );
     }
 
     #[test]

@@ -957,6 +957,54 @@ impl TerminalApp {
                         self.toast_error(format!("No se pudo abrir la actualización: {err}"));
                     }
                 }
+                SidebarResponse::CheckUpdates => self.update_checker.check_again(ctx),
+                SidebarResponse::DownloadUpdate => self.update_checker.download(ctx),
+                SidebarResponse::CancelUpdateDownload => self.update_checker.cancel_download(),
+                SidebarResponse::OpenUpdateFolder => {
+                    if let Some(path) = self
+                        .update_checker
+                        .snapshot()
+                        .installer_path
+                        .and_then(|path| path.parent().map(std::path::Path::to_owned))
+                    {
+                        if let Err(error) = crate::utils::platform::open_in_file_manager(&path) {
+                            self.toast_error(format!("Cannot open update folder: {error}"));
+                        }
+                    }
+                }
+                SidebarResponse::InstallUpdate | SidebarResponse::QuitAfterUpdate => {
+                    let live_sessions = self
+                        .workspaces
+                        .iter()
+                        .any(|workspace| workspace.panels.iter().any(|panel| panel.is_alive()));
+                    if live_sessions
+                        || !matches!(self.collab.mode(), CollabMode::Inactive)
+                        || self.collab.join_in_flight()
+                        || self.orchestrator.has_pending_launches()
+                        || self.launch_memory_worker.in_flight()
+                    {
+                        self.toast_error("Close terminal sessions, wait for pending agent launches, and stop sharing before installing or quitting for an update.".to_owned());
+                        continue;
+                    }
+                    if matches!(response, SidebarResponse::QuitAfterUpdate) {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    } else {
+                        if !cfg!(target_os = "windows") {
+                            if self.preferences_worker.busy()
+                                || self.persistence_worker.state_in_flight()
+                                || self.persistence_worker.scrollback_in_flight()
+                            {
+                                self.toast_error("Pending saves are still finishing. Try installing again once they finish.".to_owned());
+                                continue;
+                            }
+                            if let Err(error) = self.persist_before_update() {
+                                self.toast_error(format!("Cannot install before saving: {error}"));
+                                continue;
+                            }
+                        }
+                        self.update_checker.install(ctx);
+                    }
+                }
                 SidebarResponse::OpenFileInViewer(path) => self.open_file_viewer(path),
             }
         }
@@ -1008,6 +1056,70 @@ impl TerminalApp {
                     ctx.request_repaint_after(Duration::from_millis(50));
                 }
             }
+        }
+    }
+
+    fn persist_before_update(&mut self) -> anyhow::Result<()> {
+        self.preferences_worker.drain()?;
+        if !self.ensure_persistence_ownership() {
+            anyhow::bail!("Cannot install while this app does not own its saved profile");
+        }
+        self.persistence_worker.wait_until_idle();
+        crate::state::persistence::try_save_state(&self.snapshot_state())?;
+        let directory = crate::state::scrollback_store::scrollback_dir()
+            .ok_or_else(|| anyhow::anyhow!("Terminal history directory is unavailable"))?;
+        self.remember_scrollback_layout();
+        let entries = self.full_scrollback_entries(&directory, None);
+        let expected = entries.len();
+        let acknowledgements = persistence_worker::persist_full_entries(entries);
+        if acknowledgements.len() != expected {
+            anyhow::bail!("Some terminal history could not be saved; the app will stay open");
+        }
+        self.acknowledge_persisted_logs(acknowledgements);
+        Ok(())
+    }
+
+    fn finish_prepared_update(&mut self, ctx: &egui::Context) {
+        if !matches!(
+            self.update_checker.snapshot().status,
+            crate::update::UpdateStatus::PreparedInstallation
+        ) {
+            return;
+        }
+        if self
+            .workspaces
+            .iter()
+            .any(|workspace| workspace.panels.iter().any(|panel| panel.is_alive()))
+            || !matches!(self.collab.mode(), CollabMode::Inactive)
+            || self.collab.join_in_flight()
+            || self.orchestrator.has_pending_launches()
+            || self.launch_memory_worker.in_flight()
+        {
+            let error = "Close terminal sessions, wait for pending agent launches, and stop sharing before installing an update.".to_owned();
+            self.update_checker
+                .refuse_prepared_installation(error.clone());
+            self.toast_error(error);
+            return;
+        }
+        if self.preferences_worker.busy()
+            || self.persistence_worker.state_in_flight()
+            || self.persistence_worker.scrollback_in_flight()
+        {
+            ctx.request_repaint_after(Duration::from_millis(80));
+            return;
+        }
+        let saved = self.persist_before_update();
+        if let Err(error) = saved {
+            let error = format!("Update installation stopped because saving failed: {error}");
+            self.update_checker
+                .refuse_prepared_installation(error.clone());
+            self.toast_error(error);
+            return;
+        }
+        if let Err(error) = self.update_checker.launch_prepared_installation(ctx) {
+            self.update_checker
+                .refuse_prepared_installation(error.clone());
+            self.toast_error(error);
         }
     }
 
@@ -1098,6 +1210,21 @@ impl TerminalApp {
     }
 
     fn update_impl(&mut self, ctx: &egui::Context) {
+        if cfg!(target_os = "windows")
+            && matches!(
+                self.update_checker.snapshot().status,
+                crate::update::UpdateStatus::Installing
+            )
+        {
+            // Keep the native window responsive while verification and launch
+            // run off-thread, and prevent opening sessions during final launch.
+            CentralPanel::default().show(ctx, |ui| {
+                ui.spinner();
+                ui.label("Verifying the update publisher and opening the installer…");
+            });
+            ctx.request_repaint_after(Duration::from_millis(100));
+            return;
+        }
         let frame_started_at = Instant::now();
         let mut perf_snapshot = FramePerfSnapshot::default();
         self.begin_frame(ctx);
@@ -2039,6 +2166,7 @@ impl TerminalApp {
         self.show_memory_hub(ctx);
         self.show_broadcast(ctx);
         self.show_resume_picker(ctx);
+        self.finish_prepared_update(ctx);
         // Los toasts van último: se dibujan por encima de cualquier overlay.
         self.show_toasts(ctx);
         self.maybe_persist_state(ctx);
