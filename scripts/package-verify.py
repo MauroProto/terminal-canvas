@@ -3,6 +3,7 @@
 
 import argparse
 import hashlib
+from itertools import islice
 import json
 import os
 import platform as host_platform
@@ -76,11 +77,12 @@ def extract_portable(archive, destination, root, platform):
     seen, actual, entries = set(), set(), []
     if platform == "windows":
         handle = zipfile.ZipFile(archive)
-        members = handle.infolist()
     else:
         handle = tarfile.open(archive, "r:gz")
-        members = handle.getmembers()
     with handle:
+        # Inspect only enough TAR headers to detect an oversized manifest.
+        # getmembers() would parse and retain the entire archive before the gate.
+        members = handle.infolist() if platform == "windows" else list(islice(handle, len(expected) + 2))
         require(len(members) <= len(expected) + 1, "Unexpected archive entries")
         for member in members:
             name = member.filename if platform == "windows" else member.name

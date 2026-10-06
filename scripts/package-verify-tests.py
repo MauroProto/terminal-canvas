@@ -12,6 +12,7 @@ import sys
 import tarfile
 import tempfile
 import unittest
+from unittest import mock
 import warnings
 import zipfile
 
@@ -88,6 +89,27 @@ class PackageValidationTests(unittest.TestCase):
         self.assertEqual((directory / "mi-terminal-daemon").read_bytes(), elf())
         if os.name != "nt":
             self.assertTrue((directory / "mi-terminal-daemon").stat().st_mode & 0o111)
+
+    def test_large_tar_manifest_is_rejected_without_parsing_all_members(self):
+        archive = self.archive("linux", mutate=lambda files, root: files.extend(
+            (root + f"/unexpected-{index}", b"x") for index in range(5000)
+        ))
+        read_members = set()
+        original_next = tarfile.TarFile.next
+
+        def counted_next(handle):
+            member = original_next(handle)
+            if member is not None:
+                # TarFile.next() can return the already cached first member.
+                read_members.add((member.offset, member.name))
+            return member
+
+        # Exercise the real compressed archive reader, counting parsed headers.
+        with mock.patch.object(tarfile.TarFile, "next", counted_next):
+            with self.assertRaisesRegex(ValueError, "Unexpected archive entries"):
+                self.validate(archive, "linux")
+        self.assertEqual(len(read_members), len(verify.package_files("linux")[1]) + 2)
+        self.assertFalse((self.root / "extracted").exists())
 
     def test_missing_helper_is_rejected_before_extracting(self):
         archive = self.archive(mutate=lambda files, root: files.pop(0))
