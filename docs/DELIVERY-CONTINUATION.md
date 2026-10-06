@@ -12,21 +12,31 @@ Online e invitaciones no reciben cambios funcionales en este pase.
 - Rust/Cargo/Clippy 1.98.0, Windows x86_64, máximo dos jobs de compilación y
   dos threads de pruebas. No se usó WSL ni se inició un servidor persistente.
 - Formato y Clippy de todos los targets, con warnings como errores.
-- Suite completa de todos los targets: **862 pruebas aprobadas**, incluyendo
-  **828 pruebas de librería**, más los tres benchmarks en modo smoke. El código
-  comprobado termina en `9e714bc`; la documentación de relevo se agregó después.
+- Suite completa de todos los targets: **872 pruebas aprobadas y dos ignoradas**,
+  incluyendo **836 pruebas de librería aprobadas y dos ignoradas**, más los tres
+  benchmarks en modo smoke. El código comprobado termina en `f7893e4`; la
+  documentación de relevo se agregó después.
 - Pruebas de perfil mediante procesos independientes: layout, configuración,
   historial de dos hojas, notas y memoria conservan datos entre ejecuciones.
   Los argumentos CLI inválidos no abren la app ni generan archivos.
+- Se agregaron pruebas con un servidor HTTPS local y certificado propio para
+  descarga completa, progreso, checksum incorrecto, respuesta incompleta,
+  límites, redirección rechazada y cancelación de una respuesta detenida.
+  Usan caches temporales independientes y no modifican el perfil habitual.
+- Los comandos del instalador tienen plazo y límite de salida. Windows exige
+  que el registro de Inno nombre la copia que está ejecutándose y entrega esa
+  carpeta mediante `/DIR`; una copia portable firmada usa actualización manual.
+  Las regresiones incluyen Unicode, espacios y rutas UNC.
 - 14 pruebas del validador de paquetes y 9 de la extensión.
-- Se extrajo y comprobó un ZIP **debug sin firma**, con arquitectura, manifiesto,
+- En el pase anterior se extrajo y comprobó un ZIP **debug sin firma**, con arquitectura, manifiesto,
   SHA256, versión, diagnóstico, helper de memoria y handshake/listado MCP.
   Esto no valida un instalador de producción ni una firma.
 - `cargo-audit 0.22.2`: cero vulnerabilidades conocidas, cuatro avisos de
   mantenimiento (`bincode`, `paste`, `rustls-pemfile`, `ttf-parser`), sin ignores.
 
-Los logs locales se guardan en `dist/validation-clippy.log`,
-`dist/validation-tests.log` y `dist/validation-audit.json`. No se deben confundir
+Los logs del último cierre se guardan en `dist/validation-clippy-final.log` y
+`dist/validation-tests-final.log`; la auditoría previa está en
+`dist/validation-audit.json`. No se deben confundir
 los resultados locales con una nueva CI multiplataforma del candidato.
 
 ## Pendientes concretos
@@ -46,6 +56,9 @@ los resultados locales con una nueva CI multiplataforma del candidato.
    Authenticode con timestamp; macOS Developer ID, notarización y Team ID.
    Probar upgrade desde una versión firmada por el mismo editor/certificado.
    Comprobar cancelación, error de disco, publisher distinto y sesiones vivas.
+   Comprobar el árbol de procesos en Windows: la asociación al Job ocurre
+   después del lanzamiento y las pruebas locales de plazo sólo comprueban
+   terminación del hijo directo. No afirmar contención total de descendientes.
 6. Publicar sólo después de validar el dry-run y el candidato. Los tags deben
    coincidir con Cargo; el workflow impide publicación sin firmas verificadas.
    Descargar y verificar los paquetes que se publicaron realmente.
@@ -74,12 +87,14 @@ los resultados locales con una nueva CI multiplataforma del candidato.
 > comprobado, lo publicado y lo que necesita credenciales o hardware externo.
 
 Si el pase aún no está en GitHub, el bundle de continuación guarda los commits
-de este pase sobre `origin/master`. En la otra máquina, dentro del checkout:
+de este pase sobre `origin/master`. El archivo actualizado es
+`terminal-canvas-delivery-20261006.bundle`; el bundle anterior conserva el pase
+previo y no incluye estas últimas correcciones. En la otra máquina, dentro del checkout:
 
 ```bash
 git fetch origin
-git bundle verify /ruta/terminal-canvas-delivery.bundle
-git fetch /ruta/terminal-canvas-delivery.bundle master
+git bundle verify /ruta/terminal-canvas-delivery-20261006.bundle
+git fetch /ruta/terminal-canvas-delivery-20261006.bundle master
 git switch master
 git merge --ff-only FETCH_HEAD
 ```
