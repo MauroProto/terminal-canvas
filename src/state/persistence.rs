@@ -367,8 +367,7 @@ impl AutosaveController {
 }
 
 pub fn state_file_path() -> Option<PathBuf> {
-    let dirs = directories::ProjectDirs::from("", "", "terminal-app")?;
-    Some(dirs.data_dir().join("layout.json"))
+    Some(crate::utils::app_paths::data_dir()?.join("layout.json"))
 }
 
 pub fn load_state() -> Option<AppState> {

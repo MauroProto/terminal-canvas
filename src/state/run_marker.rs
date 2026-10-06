@@ -106,7 +106,7 @@ pub fn acquire_write_guard() -> std::io::Result<Option<RunWriteGuard>> {
 }
 
 fn data_dir() -> Option<PathBuf> {
-    directories::ProjectDirs::from("", "", "terminal-app").map(|dirs| dirs.data_dir().to_path_buf())
+    crate::utils::app_paths::data_dir()
 }
 
 fn marker_path_in(dir: &Path) -> PathBuf {

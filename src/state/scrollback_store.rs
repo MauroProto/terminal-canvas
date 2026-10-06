@@ -25,8 +25,7 @@ pub fn scrollback_dir() -> Option<PathBuf> {
             return Some(PathBuf::from(path));
         }
     }
-    let dirs = directories::ProjectDirs::from("", "", "terminal-app")?;
-    Some(dirs.data_dir().join("scrollback"))
+    Some(crate::utils::app_paths::data_dir()?.join("scrollback"))
 }
 
 /// Nombre de archivo de un panel. Usa el UUID en hexadecimal, que nunca

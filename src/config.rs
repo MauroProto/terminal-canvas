@@ -97,8 +97,7 @@ struct TerminalSection {
 static RUNTIME_CONFIG: RwLock<Option<AppConfig>> = RwLock::new(None);
 
 pub fn config_file_path() -> Option<PathBuf> {
-    let dirs = directories::ProjectDirs::from("", "", "terminal-app")?;
-    Some(dirs.config_dir().join("config.toml"))
+    Some(crate::utils::app_paths::config_dir()?.join("config.toml"))
 }
 
 /// Carga la config desde disco, resolviendo ausentes/inválidos a defaults.
