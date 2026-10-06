@@ -159,7 +159,7 @@ jobs:
         run: python scripts/package-verify.py --dmg "dist/TerminalCanvas-$PACKAGE_VERSION-macos-${{ matrix.arch }}.dmg" --target '${{ matrix.target }}' --require-signature --team-id "$APPLE_TEAM_ID"
 
       - name: Upload verified macOS artifacts
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0, Node 24
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v6.0.0, Node 24
         with:
           name: ${{ needs.metadata.outputs.artifact-prefix }}-macos-${{ matrix.arch }}
           if-no-files-found: error
@@ -283,7 +283,7 @@ jobs:
         run: python scripts/package-verify.py --archive "dist/TerminalCanvas-$PACKAGE_VERSION-linux-x86_64.tar.gz" --target '${{ matrix.target }}' --smoke
 
       - name: Upload verified portable and installer artifacts
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0, Node 24
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v6.0.0, Node 24
         with:
           name: ${{ needs.metadata.outputs.artifact-prefix }}-${{ matrix.platform }}-x86_64
           if-no-files-found: error
