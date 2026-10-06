@@ -5,12 +5,221 @@
 //! Windows/Linux archives are downloaded and verified but opened for manual
 //! extraction, never executed as installers.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 pub const APP_BUNDLE_NAME: &str = "TerminalCanvas.app";
 pub const APP_BUNDLE_ID: &str = "com.terminalcanvas.app";
 const APPLICATIONS_DIR: &str = "/Applications";
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+const MOUNT_TIMEOUT: Duration = Duration::from_secs(60);
+const COPY_TIMEOUT: Duration = Duration::from_secs(120);
+const MAX_COMMAND_OUTPUT_BYTES: u64 = 256 * 1024;
+
+/// Capture to private files so neither a full pipe nor an inherited pipe held
+/// open by another process can make waiting unbounded. Polling enforces both a
+/// deadline and a small output budget, and every path kills/reaps the child.
+fn bounded_output(command: &mut Command, timeout: Duration) -> anyhow::Result<Output> {
+    let capture = CommandCapture::new()?;
+    let stdout = capture.create_file("stdout")?;
+    let stderr = capture.create_file("stderr")?;
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr));
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
+    let spawned = command.spawn();
+    // Command retains its configured handles: release them before cleanup on
+    // Windows, including when spawning failed.
+    command.stdout(Stdio::null()).stderr(Stdio::null());
+    let mut process = ScopedCommand::new(spawned?)?;
+    let started = Instant::now();
+    loop {
+        if capture.exceeds_limit() {
+            anyhow::bail!("Update verification command exceeded its output limit");
+        }
+        if let Some(status) = process.child.try_wait()? {
+            // Stop any subprocess that outlived its parent before reading or
+            // removing its output files.
+            process.terminate_descendants();
+            return Ok(Output {
+                status,
+                stdout: capture.read("stdout")?,
+                stderr: capture.read("stderr")?,
+            });
+        }
+        if started.elapsed() >= timeout {
+            anyhow::bail!("Update verification command timed out; installation was stopped");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+struct CommandCapture {
+    directory: PathBuf,
+}
+
+impl CommandCapture {
+    fn new() -> anyhow::Result<Self> {
+        let directory = std::env::temp_dir().join(format!(
+            "terminalcanvas-update-command-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(&directory)?;
+        Ok(Self { directory })
+    }
+
+    fn create_file(&self, name: &str) -> anyhow::Result<std::fs::File> {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        Ok(options.open(self.directory.join(name))?)
+    }
+
+    fn exceeds_limit(&self) -> bool {
+        ["stdout", "stderr"].into_iter().any(|name| {
+            std::fs::metadata(self.directory.join(name))
+                .map(|metadata| metadata.len() > MAX_COMMAND_OUTPUT_BYTES)
+                .unwrap_or(true)
+        })
+    }
+
+    fn read(&self, name: &str) -> anyhow::Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        std::fs::File::open(self.directory.join(name))?
+            .take(MAX_COMMAND_OUTPUT_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_COMMAND_OUTPUT_BYTES {
+            anyhow::bail!("Update verification command exceeded its output limit");
+        }
+        Ok(bytes)
+    }
+}
+
+impl Drop for CommandCapture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.directory);
+    }
+}
+
+struct ScopedCommand {
+    child: Child,
+    #[cfg(windows)]
+    job: command_job::Job,
+}
+
+impl ScopedCommand {
+    fn new(child: Child) -> anyhow::Result<Self> {
+        #[cfg(windows)]
+        let mut child = child;
+        #[cfg(windows)]
+        let job = match command_job::Job::new(&child) {
+            Ok(job) => job,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error.into());
+            }
+        };
+        Ok(Self {
+            child,
+            #[cfg(windows)]
+            job,
+        })
+    }
+
+    fn terminate_descendants(&self) {
+        #[cfg(unix)]
+        {
+            // SAFETY: this child was spawned in a fresh process group whose
+            // identifier is its PID; the negative PID targets that group only.
+            unsafe { libc::kill(-(self.child.id() as libc::pid_t), libc::SIGKILL) };
+        }
+        #[cfg(windows)]
+        self.job.terminate();
+    }
+}
+
+impl Drop for ScopedCommand {
+    fn drop(&mut self) {
+        self.terminate_descendants();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[cfg(windows)]
+mod command_job {
+    use std::ffi::c_void;
+    use std::os::windows::io::AsRawHandle;
+    use std::process::Child;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn CreateJobObjectW(attributes: *const c_void, name: *const u16) -> *mut c_void;
+        fn AssignProcessToJobObject(job: *mut c_void, process: *mut c_void) -> i32;
+        fn TerminateJobObject(job: *mut c_void, exit_code: u32) -> i32;
+        fn CloseHandle(handle: *mut c_void) -> i32;
+    }
+
+    pub(super) struct Job(*mut c_void);
+
+    impl Job {
+        pub(super) fn new(child: &Child) -> std::io::Result<Self> {
+            // SAFETY: null attributes/name create an unnamed, private job. The
+            // Child owns a live process handle during assignment, and the job
+            // handle is closed exactly once by Job::drop.
+            unsafe {
+                let handle = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+                if handle.is_null() {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let job = Self(handle);
+                if AssignProcessToJobObject(handle, child.as_raw_handle()) == 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(job)
+            }
+        }
+
+        pub(super) fn terminate(&self) {
+            // SAFETY: this owned handle names only the private job containing
+            // this verification command and its children.
+            unsafe { TerminateJobObject(self.0, 1) };
+        }
+    }
+
+    impl Drop for Job {
+        fn drop(&mut self) {
+            self.terminate();
+            // SAFETY: this handle was created by CreateJobObjectW and is owned
+            // solely by this Job.
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+}
 
 /// Salida de `hdiutil attach -plist`: nos quedamos con el primer
 /// `mount-point`. Puro para poder testear el parseo sin montar nada.
@@ -51,11 +260,11 @@ pub fn bundle_in_volume(mount_point: &Path) -> PathBuf {
 
 /// Monta el dmg y devuelve el punto de montaje.
 pub fn mount_dmg(dmg: &Path) -> Option<PathBuf> {
-    let output = Command::new("/usr/bin/hdiutil")
+    let mut command = Command::new("/usr/bin/hdiutil");
+    command
         .args(["attach", "-nobrowse", "-readonly", "-noautoopen", "-plist"])
-        .arg(dmg)
-        .output()
-        .ok()?;
+        .arg(dmg);
+    let output = bounded_output(&mut command, MOUNT_TIMEOUT).ok()?;
     if !output.status.success() {
         return None;
     }
@@ -67,10 +276,9 @@ pub fn detach_dmg(mount_point: &Path) {
     if !mount_point.starts_with("/Volumes") || mount_point.parent() != Some(Path::new("/Volumes")) {
         return;
     }
-    let _ = Command::new("/usr/bin/hdiutil")
-        .args(["detach", "-quiet"])
-        .arg(mount_point)
-        .output();
+    let mut command = Command::new("/usr/bin/hdiutil");
+    command.args(["detach", "-quiet"]).arg(mount_point);
+    let _ = bounded_output(&mut command, COMMAND_TIMEOUT);
 }
 
 /// Verifica la firma del bundle. Sin firma válida, no se instala.
@@ -127,10 +335,9 @@ fn running_installed_bundle() -> anyhow::Result<PathBuf> {
 
 fn trusted_team_id() -> anyhow::Result<String> {
     let current = running_installed_bundle()?;
-    let details = Command::new("/usr/bin/codesign")
-        .args(["--display", "--verbose=4"])
-        .arg(&current)
-        .output()?;
+    let mut command = Command::new("/usr/bin/codesign");
+    command.args(["--display", "--verbose=4"]).arg(&current);
+    let details = bounded_output(&mut command, COMMAND_TIMEOUT)?;
     if !details.status.success() {
         anyhow::bail!("The running app has no trusted Developer ID signature");
     }
@@ -146,9 +353,10 @@ fn trusted_team_id() -> anyhow::Result<String> {
 pub fn automatic_install_supported() -> bool {
     #[cfg(target_os = "windows")]
     {
-        std::env::current_exe()
-            .ok()
-            .is_some_and(|path| windows_publisher(&path, None).is_ok())
+        std::env::current_exe().ok().is_some_and(|path| {
+            windows_registered_install_directory(&path).is_ok()
+                && windows_publisher(&path, None).is_ok()
+        })
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -161,7 +369,7 @@ pub fn automatic_install_supported() -> bool {
 pub fn prepare_or_install_verified_update(path: &Path, version: &str) -> anyhow::Result<()> {
     #[cfg(target_os = "windows")]
     {
-        verify_windows_installer(path, version)
+        verify_windows_installer(path, version).map(|_| ())
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -187,10 +395,22 @@ finally { $sha.Dispose() }
 "#;
 
 #[cfg(target_os = "windows")]
-fn windows_publisher(path: &Path, version: Option<&str>) -> anyhow::Result<String> {
-    use std::os::windows::process::CommandExt;
-    use std::process::Stdio;
-    use std::time::{Duration, Instant};
+const WINDOWS_INSTALL_LOCATION_SCRIPT: &str = r#"
+$ErrorActionPreference = 'Stop'
+$base = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::CurrentUser, [Microsoft.Win32.RegistryView]::Registry64)
+try {
+    $key = $base.OpenSubKey('Software\Microsoft\Windows\CurrentVersion\Uninstall\{760E17BA-7188-4C02-9467-590D1092B47D}_is1', $false)
+    if ($null -eq $key) { throw 'This copy is portable. Install a signed release manually before using automatic installation.' }
+    try {
+        $location = $key.GetValue('InstallLocation', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+        if ($location -isnot [string] -or [string]::IsNullOrWhiteSpace($location)) { throw 'The installer registration has no installation directory.' }
+        [Console]::Out.Write($location)
+    } finally { $key.Dispose() }
+} finally { $base.Dispose() }
+"#;
+
+#[cfg(target_os = "windows")]
+fn windows_system_command(script: &str) -> anyhow::Result<Command> {
     let system_root = std::env::var_os("SystemRoot")
         .map(PathBuf::from)
         .ok_or_else(|| anyhow::anyhow!("Windows system directory is unavailable"))?;
@@ -199,33 +419,70 @@ fn windows_publisher(path: &Path, version: Option<&str>) -> anyhow::Result<Strin
     }
     let mut command =
         Command::new(system_root.join("System32/WindowsPowerShell/v1.0/powershell.exe"));
+    // Windows PowerShell otherwise redirects text using the legacy console
+    // code page, which corrupts installation paths with non-ASCII characters.
+    let script =
+        format!("[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)\n{script}");
     command
         .args([
             "-NoLogo",
             "-NoProfile",
             "-NonInteractive",
             "-Command",
-            WINDOWS_SIGNATURE_SCRIPT,
+            &script,
         ])
         .current_dir(system_root.join("System32"))
-        .env("TC_UPDATE_SIGNATURE_PATH", path)
-        .env("TC_UPDATE_EXPECTED_VERSION", version.unwrap_or_default())
-        .env_remove("PSModulePath")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .creation_flags(0x0800_0000);
-    let mut child = command.spawn()?;
-    let started = Instant::now();
-    while child.try_wait()?.is_none() {
-        if started.elapsed() >= Duration::from_secs(30) {
-            let _ = child.kill();
-            let _ = child.wait();
-            anyhow::bail!("Authenticode verification timed out; the update was not launched");
-        }
-        std::thread::sleep(Duration::from_millis(50));
+        .env_remove("PSModulePath");
+    Ok(command)
+}
+
+/// The registry is only evidence of an installation when it names the exact
+/// directory containing this running executable. A signed portable copy must
+/// never upgrade a different registered installation.
+#[cfg(any(target_os = "windows", test))]
+fn validate_registered_install_directory(
+    running: &Path,
+    registered: &Path,
+) -> anyhow::Result<PathBuf> {
+    if !registered.is_absolute() {
+        anyhow::bail!("The registered installation directory must be absolute");
     }
-    let output = child.wait_with_output()?;
+    let directory = std::fs::canonicalize(registered)?;
+    if !directory.is_dir() {
+        anyhow::bail!("The registered installation directory does not exist");
+    }
+    let executable = std::fs::canonicalize(running)?;
+    let registered_executable = std::fs::canonicalize(directory.join("mi-terminal.exe"))?;
+    if executable != registered_executable || executable.parent() != Some(directory.as_path()) {
+        anyhow::bail!("This copy does not run from its registered installation directory; update the portable copy manually");
+    }
+    Ok(directory)
+}
+
+#[cfg(target_os = "windows")]
+fn windows_registered_install_directory(running: &Path) -> anyhow::Result<PathBuf> {
+    let mut command = windows_system_command(WINDOWS_INSTALL_LOCATION_SCRIPT)?;
+    let output = bounded_output(&mut command, COMMAND_TIMEOUT)?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "Cannot prove this copy is installed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let location = String::from_utf8(output.stdout)?;
+    if location.is_empty() || location.contains(['\0', '\r', '\n']) {
+        anyhow::bail!("The registered installation directory is invalid");
+    }
+    validate_registered_install_directory(running, Path::new(&location))
+}
+
+#[cfg(target_os = "windows")]
+fn windows_publisher(path: &Path, version: Option<&str>) -> anyhow::Result<String> {
+    let mut command = windows_system_command(WINDOWS_SIGNATURE_SCRIPT)?;
+    command
+        .env("TC_UPDATE_SIGNATURE_PATH", path)
+        .env("TC_UPDATE_EXPECTED_VERSION", version.unwrap_or_default());
+    let output = bounded_output(&mut command, COMMAND_TIMEOUT)?;
     if !output.status.success() {
         anyhow::bail!(
             "Authenticode verification failed: {}",
@@ -240,7 +497,7 @@ fn windows_publisher(path: &Path, version: Option<&str>) -> anyhow::Result<Strin
 }
 
 #[cfg(target_os = "windows")]
-fn verify_windows_installer(path: &Path, version: &str) -> anyhow::Result<()> {
+fn verify_windows_installer(path: &Path, version: &str) -> anyhow::Result<PathBuf> {
     if !crate::update::version_newer(version, env!("CARGO_PKG_VERSION")) {
         anyhow::bail!("An update must be newer than the running application");
     }
@@ -254,12 +511,51 @@ fn verify_windows_installer(path: &Path, version: &str) -> anyhow::Result<()> {
         anyhow::bail!("The installer does not match this system, architecture, and version");
     }
     let running = std::env::current_exe()?;
+    let install_directory = windows_registered_install_directory(&running)?;
     let installed_publisher = windows_publisher(&running, None)?;
     let downloaded_publisher = windows_publisher(path, Some(version))?;
     if installed_publisher != downloaded_publisher {
         anyhow::bail!("The update signing certificate differs from the running application; install this publisher change manually");
     }
-    Ok(())
+    Ok(install_directory)
+}
+
+#[cfg(target_os = "windows")]
+fn windows_install_directory_arg(directory: &Path) -> anyhow::Result<std::ffi::OsString> {
+    use std::path::{Component, Prefix};
+    if !directory.is_absolute() {
+        anyhow::bail!("The installation directory must be absolute");
+    }
+    let mut components = directory.components();
+    let first = components.next();
+    let normalized = match first {
+        Some(Component::Prefix(prefix)) => match prefix.kind() {
+            Prefix::VerbatimDisk(drive) => {
+                let mut path = PathBuf::from(format!("{}:\\", char::from(drive)));
+                path.extend(
+                    components.filter(|component| !matches!(component, Component::RootDir)),
+                );
+                path
+            }
+            Prefix::VerbatimUNC(server, share) => {
+                let mut root = std::ffi::OsString::from("\\\\");
+                root.push(server);
+                root.push("\\");
+                root.push(share);
+                let mut path = PathBuf::from(root);
+                path.extend(
+                    components.filter(|component| !matches!(component, Component::RootDir)),
+                );
+                path
+            }
+            Prefix::Disk(_) | Prefix::UNC(_, _) => directory.to_path_buf(),
+            _ => anyhow::bail!("The installation directory uses an unsupported Windows path"),
+        },
+        _ => anyhow::bail!("The installation directory must be absolute"),
+    };
+    let mut argument = std::ffi::OsString::from("/DIR=");
+    argument.push(normalized);
+    Ok(argument)
 }
 
 /// Called only after the app has drained accepted saves and checked again that
@@ -281,9 +577,11 @@ pub fn launch_verified_windows_installer(
         if !crate::update::verify_checksum(path, hash) {
             anyhow::bail!("The prepared update changed; download it again");
         }
-        verify_windows_installer(path, version)?;
+        let directory = verify_windows_installer(path, version)?;
         let mut command = Command::new(path);
-        command.args(["/NOCLOSEAPPLICATIONS", "/NORESTART", "/SP-"]);
+        command
+            .args(["/NOCLOSEAPPLICATIONS", "/NORESTART", "/SP-"])
+            .arg(windows_install_directory_arg(&directory)?);
         let result =
             crate::utils::platform::spawn_detached("verified-update-installer", &mut command);
         drop(locked_file);
@@ -297,10 +595,11 @@ pub fn launch_verified_windows_installer(
 }
 
 fn plist_value(bundle: &Path, key: &str) -> anyhow::Result<String> {
-    let output = Command::new("/usr/libexec/PlistBuddy")
+    let mut command = Command::new("/usr/libexec/PlistBuddy");
+    command
         .args(["-c", &format!("Print :{key}")])
-        .arg(bundle.join("Contents/Info.plist"))
-        .output()?;
+        .arg(bundle.join("Contents/Info.plist"));
+    let output = bounded_output(&mut command, COMMAND_TIMEOUT)?;
     if !output.status.success() {
         anyhow::bail!("The downloaded app is missing {key}");
     }
@@ -332,8 +631,7 @@ fn verify_bundle_metadata(bundle: &Path, version: &str) -> anyhow::Result<()> {
 }
 
 fn command_succeeds(command: &mut Command) -> bool {
-    command
-        .output()
+    bounded_output(command, COMMAND_TIMEOUT)
         .map(|output| output.status.success())
         .unwrap_or(false)
 }
@@ -383,10 +681,9 @@ fn swap_verified_bundle(
     let backup = target.with_file_name(format!(".TerminalCanvas-previous-{operation}.app"));
     // `ditto` preserva permisos, symlinks y metadata del bundle; un copy
     // recursivo común rompe la firma.
-    let copied = Command::new("/usr/bin/ditto")
-        .arg(new_bundle)
-        .arg(&staging)
-        .output()
+    let mut copy = Command::new("/usr/bin/ditto");
+    copy.arg(new_bundle).arg(&staging);
+    let copied = bounded_output(&mut copy, COPY_TIMEOUT)
         .map(|output| output.status.success())
         .unwrap_or(false);
     if !copied
@@ -450,6 +747,210 @@ mod tests {
         APP_BUNDLE_NAME,
     };
     use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("update-test-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn fixture_command(mode: &str, marker: &Path) -> Command {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "update_install::tests::bounded_command_fixture",
+                "--nocapture",
+            ])
+            .env("TC_UPDATE_COMMAND_FIXTURE", mode)
+            .env("TC_UPDATE_COMMAND_MARKER", marker);
+        command
+    }
+
+    /// A subprocess fixture inside the test executable avoids relying on an
+    /// installed shell or running platform signature/installer utilities.
+    #[test]
+    fn bounded_command_fixture() {
+        let Some(mode) = std::env::var_os("TC_UPDATE_COMMAND_FIXTURE") else {
+            return;
+        };
+        let marker = std::env::var_os("TC_UPDATE_COMMAND_MARKER").unwrap();
+        std::fs::write(marker, std::process::id().to_string()).unwrap();
+        match mode.to_str().unwrap() {
+            "success" => {
+                println!("bounded_stdout");
+                eprintln!("bounded_stderr");
+            }
+            "failure" => std::process::exit(17),
+            "deadline" => std::thread::sleep(Duration::from_secs(15)),
+            "output" => {
+                let line = "x".repeat(1024);
+                for _ in 0..1024 {
+                    println!("{line}");
+                    eprintln!("{line}");
+                }
+                std::thread::sleep(Duration::from_secs(15));
+            }
+            other => panic!("Unknown subprocess fixture mode: {other}"),
+        }
+    }
+
+    fn assert_fixture_process_stopped(marker: &Path) {
+        let pid: u32 = std::fs::read_to_string(marker).unwrap().parse().unwrap();
+        #[cfg(unix)]
+        {
+            // SAFETY: signal zero only queries the PID recorded by our own
+            // subprocess; it does not signal or mutate another process.
+            let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+            assert_eq!(result, -1, "The verification subprocess was not reaped");
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ESRCH)
+            );
+        }
+        #[cfg(windows)]
+        {
+            use std::ffi::c_void;
+            #[link(name = "kernel32")]
+            unsafe extern "system" {
+                fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut c_void;
+                fn GetExitCodeProcess(process: *mut c_void, exit_code: *mut u32) -> i32;
+                fn CloseHandle(handle: *mut c_void) -> i32;
+            }
+            // SAFETY: OpenProcess requests only query access to our fixture's
+            // PID; the owned handle is closed before asserting the result.
+            unsafe {
+                let handle = OpenProcess(0x1000, 0, pid);
+                if !handle.is_null() {
+                    let mut code = 259;
+                    let queried = GetExitCodeProcess(handle, &mut code);
+                    CloseHandle(handle);
+                    assert_ne!(queried, 0);
+                    assert_ne!(code, 259, "The verification subprocess is still running");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bounded_command_captures_both_streams_and_preserves_exit_status() {
+        let directory = TestDirectory::new();
+        let marker = directory.0.join("pid");
+        let output = super::bounded_output(
+            &mut fixture_command("success", &marker),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert!(output.status.success());
+        assert!(String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("bounded_stdout"));
+        assert!(String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("bounded_stderr"));
+        assert_fixture_process_stopped(&marker);
+        let output = super::bounded_output(
+            &mut fixture_command("failure", &marker),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(output.status.code(), Some(17));
+        assert_fixture_process_stopped(&marker);
+    }
+
+    #[test]
+    fn bounded_command_deadline_kills_and_reaps_the_subprocess() {
+        let directory = TestDirectory::new();
+        let marker = directory.0.join("pid");
+        let started = Instant::now();
+        let error = super::bounded_output(
+            &mut fixture_command("deadline", &marker),
+            Duration::from_secs(2),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(8));
+        assert_fixture_process_stopped(&marker);
+    }
+
+    #[test]
+    fn bounded_command_rejects_excess_output_without_waiting_for_deadline() {
+        let directory = TestDirectory::new();
+        let marker = directory.0.join("pid");
+        let started = Instant::now();
+        let error = super::bounded_output(
+            &mut fixture_command("output", &marker),
+            Duration::from_secs(10),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("output limit"));
+        assert!(started.elapsed() < Duration::from_secs(8));
+        assert_fixture_process_stopped(&marker);
+    }
+
+    #[test]
+    fn registered_installation_must_contain_the_exact_running_copy() {
+        let directory = TestDirectory::new();
+        let installed = directory.0.join("installed Mauro ñ");
+        let portable = directory.0.join("portable");
+        std::fs::create_dir(&installed).unwrap();
+        std::fs::create_dir(&portable).unwrap();
+        std::fs::write(installed.join("mi-terminal.exe"), "installed").unwrap();
+        std::fs::write(portable.join("mi-terminal.exe"), "portable").unwrap();
+        assert_eq!(
+            super::validate_registered_install_directory(
+                &installed.join("mi-terminal.exe"),
+                &installed
+            )
+            .unwrap(),
+            std::fs::canonicalize(&installed).unwrap(),
+        );
+        assert!(super::validate_registered_install_directory(
+            &portable.join("mi-terminal.exe"),
+            &installed
+        )
+        .is_err());
+        assert!(super::validate_registered_install_directory(
+            &installed.join("mi-terminal.exe"),
+            Path::new("relative")
+        )
+        .is_err());
+        assert!(super::validate_registered_install_directory(
+            &installed.join("mi-terminal.exe"),
+            &directory.0.join("absent")
+        )
+        .is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn inno_directory_argument_preserves_spaces_and_normalizes_verbatim_paths() {
+        assert_eq!(
+            super::windows_install_directory_arg(Path::new(
+                r"\\?\C:\Users\Test User\TerminalCanvas"
+            ))
+            .unwrap(),
+            std::ffi::OsString::from(r"/DIR=C:\Users\Test User\TerminalCanvas"),
+        );
+        assert_eq!(
+            super::windows_install_directory_arg(Path::new(r"\\?\UNC\server\share\TerminalCanvas"))
+                .unwrap(),
+            std::ffi::OsString::from(r"/DIR=\\server\share\TerminalCanvas"),
+        );
+        assert!(super::windows_install_directory_arg(Path::new("relative")).is_err());
+    }
 
     const PLIST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <plist version="1.0">
