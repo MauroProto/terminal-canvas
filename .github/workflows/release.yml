@@ -4,12 +4,54 @@ on:
   push:
     tags:
       - "v*"
+  # Manual runs build and exercise unsigned packages, and never publish.
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+env:
+  CARGO_BUILD_JOBS: 2
+
+concurrency:
+  group: release-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: false
+
 jobs:
+  metadata:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      artifact-prefix: ${{ steps.version.outputs.artifact-prefix }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Verify version and publication trigger
+        id: version
+        shell: bash
+        run: |
+          version="$(python scripts/package-verify.py --version-only)"
+          prefix="dry-run"
+          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
+            test "$GITHUB_REF" = "refs/tags/v$version"
+            prefix="release"
+          else
+            test "$GITHUB_EVENT_NAME" = "workflow_dispatch"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "artifact-prefix=$prefix" >> "$GITHUB_OUTPUT"
+          echo "Package version: $version; mode: $prefix" >> "$GITHUB_STEP_SUMMARY"
+      - name: Test package validation regressions
+        run: python scripts/package-verify-tests.py
+
   macos-dmg:
+    needs: metadata
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -23,9 +65,47 @@ jobs:
     runs-on: ${{ matrix.runner }}
     env:
       TC_BUNDLE_TARGET: ${{ matrix.target }}
+      PACKAGE_VERSION: ${{ needs.metadata.outputs.version }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Import signing certificate for publication
+        if: github.event_name == 'push'
+        env:
+          CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.MACOS_KEYCHAIN_PASSWORD }}
+          CODESIGN_IDENTITY: ${{ secrets.CODESIGN_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        shell: bash
+        run: |
+          for name in CERTIFICATE_P12 CERTIFICATE_PASSWORD KEYCHAIN_PASSWORD CODESIGN_IDENTITY APPLE_ID APPLE_TEAM_ID APPLE_APP_PASSWORD; do
+            if [[ -z "${!name}" ]]; then
+              echo "Missing required publication secret: $name" >&2
+              exit 1
+            fi
+          done
+          [[ "$CODESIGN_IDENTITY" == "Developer ID Application:"* ]]
+          keychain="$RUNNER_TEMP/terminalcanvas.keychain-db"
+          certificate="$RUNNER_TEMP/terminalcanvas.p12"
+          umask 077
+          printf '%s' "$CERTIFICATE_P12" | base64 --decode > "$certificate"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$keychain"
+          security import "$certificate" -P "$CERTIFICATE_PASSWORD" -t cert -f pkcs12 -k "$keychain"
+          security list-keychains -d user -s "$keychain"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$keychain"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
@@ -37,90 +117,66 @@ jobs:
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: Verify tag matches Cargo version
-        shell: bash
-        run: |
-          version="$(awk -F'"' '/^version[[:space:]]*=/ {print $2; exit}' Cargo.toml)"
-          test "${GITHUB_REF_NAME}" = "v${version}"
-
       - name: Release preflight
         run: |
           cargo fmt --all -- --check
           cargo clippy --all-targets --locked --features daemon -- -D warnings
           cargo test --all-targets --locked --features daemon --quiet
 
-      - name: Import signing certificate
-        env:
-          CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
-          CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
-          KEYCHAIN_PASSWORD: ${{ secrets.MACOS_KEYCHAIN_PASSWORD }}
-        run: |
-          if [[ -z "$CERTIFICATE_P12" || -z "$CERTIFICATE_PASSWORD" || -z "$KEYCHAIN_PASSWORD" ]]; then
-            echo "Faltan secrets del certificado de firma" >&2
-            exit 1
-          fi
-          keychain="$RUNNER_TEMP/terminalcanvas.keychain-db"
-          certificate="$RUNNER_TEMP/terminalcanvas.p12"
-          echo "$CERTIFICATE_P12" | base64 --decode > "$certificate"
-          security create-keychain -p "$KEYCHAIN_PASSWORD" "$keychain"
-          security set-keychain-settings -lut 21600 "$keychain"
-          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$keychain"
-          security import "$certificate" -P "$CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
-          security list-keychain -d user -s "$keychain"
-          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$keychain"
+      - name: Build unsigned DMG for dry-run
+        if: github.event_name == 'workflow_dispatch'
+        run: scripts/bundle.sh --dmg
 
-      - name: Build signed DMG
+      - name: Build signed app and DMG for publication
+        if: github.event_name == 'push'
         env:
           CODESIGN_IDENTITY: ${{ secrets.CODESIGN_IDENTITY }}
         run: |
-          if [[ -z "$CODESIGN_IDENTITY" ]]; then
-            echo "Falta el secret CODESIGN_IDENTITY" >&2
-            exit 1
-          fi
           scripts/bundle.sh --dmg
+          codesign --force --timestamp --sign "$CODESIGN_IDENTITY" "dist/TerminalCanvas-$PACKAGE_VERSION-macos-${{ matrix.arch }}.dmg"
 
-      - name: Notarize and staple
+      - name: Notarize and staple publication DMG
+        if: github.event_name == 'push'
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
         run: |
-          if [[ -z "$APPLE_ID" || -z "$APPLE_TEAM_ID" || -z "$APPLE_APP_PASSWORD" ]]; then
-            echo "Faltan credenciales de notarización Apple" >&2
-            exit 1
-          fi
-          version="${GITHUB_REF_NAME#v}"
-          dmg="dist/TerminalCanvas-${version}-macos-${{ matrix.arch }}.dmg"
-          xcrun notarytool submit "$dmg" --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait
+          dmg="dist/TerminalCanvas-$PACKAGE_VERSION-macos-${{ matrix.arch }}.dmg"
+          xcrun notarytool submit "$dmg" --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait --output-format json > "$RUNNER_TEMP/notary.json"
+          python -c 'import json, os; result=json.load(open(os.path.join(os.environ["RUNNER_TEMP"], "notary.json"))); print("Notarization status:", result.get("status")); assert result.get("status") == "Accepted", "Notarization was not accepted"'
           xcrun stapler staple "$dmg"
-          xcrun stapler validate "$dmg"
-          (cd dist && shasum -a 256 "$(basename "$dmg")") | tee "$dmg.sha256"
+          (cd dist && shasum -a 256 "$(basename "$dmg")") > "$dmg.sha256"
 
-      - name: Verify bundle and checksum
-        run: |
-          version="${GITHUB_REF_NAME#v}"
-          test -x dist/TerminalCanvas.app/Contents/MacOS/mi-terminal-daemon
-          test -x dist/TerminalCanvas.app/Contents/MacOS/tc-memory
-          test -x dist/TerminalCanvas.app/Contents/MacOS/tc-memory-mcp
-          (cd dist && shasum -a 256 -c "TerminalCanvas-${version}-macos-${{ matrix.arch }}.dmg.sha256")
-          codesign --verify --deep --strict --verbose=2 dist/TerminalCanvas.app
+      - name: Verify mounted dry-run DMG and bundled helpers
+        if: github.event_name == 'workflow_dispatch'
+        run: python scripts/package-verify.py --dmg "dist/TerminalCanvas-$PACKAGE_VERSION-macos-${{ matrix.arch }}.dmg" --target '${{ matrix.target }}'
+
+      - name: Verify mounted signed and notarized publication DMG
+        if: github.event_name == 'push'
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: python scripts/package-verify.py --dmg "dist/TerminalCanvas-$PACKAGE_VERSION-macos-${{ matrix.arch }}.dmg" --target '${{ matrix.target }}' --require-signature --team-id "$APPLE_TEAM_ID"
 
       - name: Upload verified macOS artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: release-macos-${{ matrix.arch }}
+          name: ${{ needs.metadata.outputs.artifact-prefix }}-macos-${{ matrix.arch }}
           if-no-files-found: error
+          retention-days: 14
           path: |
             dist/TerminalCanvas-*.dmg
             dist/TerminalCanvas-*.dmg.sha256
 
       - name: Remove temporary signing material
-        if: always()
+        if: always() && github.event_name == 'push'
         run: |
           security delete-keychain "$RUNNER_TEMP/terminalcanvas.keychain-db" || true
           rm -f "$RUNNER_TEMP/terminalcanvas.p12"
 
   portable:
+    needs: metadata
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -132,9 +188,47 @@ jobs:
             target: x86_64-unknown-linux-gnu
             platform: linux
     runs-on: ${{ matrix.runner }}
+    env:
+      PACKAGE_VERSION: ${{ needs.metadata.outputs.version }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Import Windows signing certificate for publication
+        if: runner.os == 'Windows' && github.event_name == 'push'
+        shell: pwsh
+        env:
+          CERTIFICATE_PFX: ${{ secrets.WINDOWS_CERTIFICATE_PFX }}
+          CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          TIMESTAMP_URL: ${{ secrets.WINDOWS_TIMESTAMP_URL }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not $env:CERTIFICATE_PFX -or -not $env:CERTIFICATE_PASSWORD -or -not $env:TIMESTAMP_URL) {
+            throw 'Windows publication requires WINDOWS_CERTIFICATE_PFX, WINDOWS_CERTIFICATE_PASSWORD and WINDOWS_TIMESTAMP_URL'
+          }
+          $certificatePath = Join-Path $env:RUNNER_TEMP 'terminalcanvas-signing.pfx'
+          try {
+            [IO.File]::WriteAllBytes($certificatePath, [Convert]::FromBase64String($env:CERTIFICATE_PFX))
+            $password = ConvertTo-SecureString $env:CERTIFICATE_PASSWORD -AsPlainText -Force
+            $certificates = @(Import-PfxCertificate -FilePath $certificatePath -CertStoreLocation Cert:\CurrentUser\My -Password $password | Where-Object HasPrivateKey)
+            if ($certificates.Count -ne 1) { throw 'The PFX must contain exactly one signing certificate with a private key' }
+            $env:TC_WINDOWS_CERT_THUMBPRINT = $certificates[0].Thumbprint
+            $env:TC_WINDOWS_TIMESTAMP_URL = $env:TIMESTAMP_URL
+            "TC_WINDOWS_CERT_THUMBPRINT=$env:TC_WINDOWS_CERT_THUMBPRINT" >> $env:GITHUB_ENV
+            "TC_WINDOWS_TIMESTAMP_URL=$env:TC_WINDOWS_TIMESTAMP_URL" >> $env:GITHUB_ENV
+            . ./scripts/package-sign-windows.ps1
+            Assert-TerminalCanvasWindowsSigningConfiguration
+            Get-TerminalCanvasSignTool | Out-Null
+          } finally {
+            Remove-Item -LiteralPath $certificatePath -Force -ErrorAction SilentlyContinue
+          }
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
@@ -145,12 +239,6 @@ jobs:
 
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
-
-      - name: Verify tag matches Cargo version
-        shell: bash
-        run: |
-          version="$(awk -F'"' '/^version[[:space:]]*=/ {print $2; exit}' Cargo.toml)"
-          test "${GITHUB_REF_NAME}" = "v${version}"
 
       - name: Format check
         run: cargo fmt --all -- --check
@@ -172,19 +260,17 @@ jobs:
         shell: pwsh
         run: ./scripts/package-portable.ps1 -Target '${{ matrix.target }}'
 
-      - name: Verify Windows checksum and helper
+      - name: Verify extracted Windows package
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $archives = @(Get-ChildItem -LiteralPath dist -Filter '*.zip')
-          if ($archives.Count -ne 1) { throw 'Se esperaba exactamente un ZIP' }
-          $archive = $archives[0]
-          $expected = (Get-Content -LiteralPath ($archive.FullName + '.sha256')).Split(' ')[0]
-          if ((Get-FileHash -LiteralPath $archive.FullName -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) {
-            throw 'Checksum del paquete no coincide'
-          }
-          & './target/${{ matrix.target }}/release/tc-memory.exe' --help
-          if ($LASTEXITCODE -ne 0) { throw 'Helper de memoria no ejecutable' }
+          python scripts/package-verify.py --archive "dist/TerminalCanvas-$env:PACKAGE_VERSION-windows-x86_64.zip" --target '${{ matrix.target }}' --smoke
+          if ($LASTEXITCODE -ne 0) { throw 'Windows package verification failed' }
+
+      - name: Build and exercise Windows installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/package-installer.ps1 -VerifyInstall
 
       - name: Build Linux portable tarball
         if: runner.os == 'Linux'
@@ -192,44 +278,93 @@ jobs:
           TC_PORTABLE_TARGET: ${{ matrix.target }}
         run: scripts/package-portable.sh
 
-      - name: Verify Linux checksum and helper
+      - name: Verify extracted Linux package
         if: runner.os == 'Linux'
-        run: |
-          (cd dist && sha256sum -c *.sha256)
-          target/${{ matrix.target }}/release/tc-memory --help
+        run: python scripts/package-verify.py --archive "dist/TerminalCanvas-$PACKAGE_VERSION-linux-x86_64.tar.gz" --target '${{ matrix.target }}' --smoke
 
-      - name: Upload verified portable artifacts
+      - name: Upload verified portable and installer artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: release-${{ matrix.platform }}-x86_64
+          name: ${{ needs.metadata.outputs.artifact-prefix }}-${{ matrix.platform }}-x86_64
           if-no-files-found: error
+          retention-days: 14
           path: |
             dist/TerminalCanvas-*.zip
             dist/TerminalCanvas-*.zip.sha256
             dist/TerminalCanvas-*.tar.gz
             dist/TerminalCanvas-*.tar.gz.sha256
+            dist/TerminalCanvas-*-setup.exe
+            dist/TerminalCanvas-*-setup.exe.sha256
+
+      - name: Remove Windows signing certificate
+        if: always() && runner.os == 'Windows' && github.event_name == 'push'
+        shell: pwsh
+        run: |
+          if ($env:TC_WINDOWS_CERT_THUMBPRINT -match '^[0-9a-fA-F]{40}$') {
+            Remove-Item -LiteralPath "Cert:/CurrentUser/My/$env:TC_WINDOWS_CERT_THUMBPRINT" -Force -ErrorAction SilentlyContinue
+          }
+
+  verify-set:
+    needs: [metadata, macos-dmg, portable]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Download all verified packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ${{ needs.metadata.outputs.artifact-prefix }}-*
+          merge-multiple: true
+          path: dist
+      - name: Verify exact complete release asset set and checksums
+        env:
+          PACKAGE_VERSION: ${{ needs.metadata.outputs.version }}
+        run: python scripts/package-verify.py --release-dir dist --version "$PACKAGE_VERSION"
+      - name: Record completed validation
+        env:
+          MODE: ${{ needs.metadata.outputs.artifact-prefix }}
+        run: |
+          if [[ "$MODE" == "dry-run" ]]; then
+            echo 'Dry-run passed: five packages, extracted helper smoke tests, Windows install/uninstall. These artifacts are unsigned test builds; nothing was published.' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'Five publication packages verified. macOS Developer ID/notarization and Windows Authenticode signatures passed.' >> "$GITHUB_STEP_SUMMARY"
+          fi
 
   publish:
-    needs: [macos-dmg, portable]
+    # A manual dispatch can never gain publication permissions or bypass signing.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [metadata, verify-set]
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     permissions:
       contents: write
     steps:
-      - name: Download all verified packages
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Download verified publication packages
         uses: actions/download-artifact@v4
         with:
           pattern: release-*
           merge-multiple: true
           path: dist
-
-      - name: Verify complete release checksums
+      - name: Recheck publication files and tag
+        env:
+          PACKAGE_VERSION: ${{ needs.metadata.outputs.version }}
         run: |
-          cd dist
-          test "$(find . -maxdepth 1 -name '*.sha256' | wc -l)" -eq 4
-          sha256sum -c *.sha256
-
+          test "$GITHUB_REF" = "refs/tags/v$PACKAGE_VERSION"
+          python scripts/package-verify.py --release-dir dist --version "$PACKAGE_VERSION"
       - name: Publish GitHub release assets
         uses: softprops/action-gh-release@v2
         with:
+          fail_on_unmatched_files: true
           generate_release_notes: true
           files: dist/TerminalCanvas-*
