@@ -1,4 +1,6 @@
+pub mod app_paths;
 pub mod diagnostics;
+pub mod health;
 pub mod platform;
 
 pub fn ascii_icontains(haystack: &str, needle: &str) -> bool {
