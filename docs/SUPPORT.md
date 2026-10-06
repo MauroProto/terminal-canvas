@@ -29,6 +29,36 @@ historial, notas y `memory/memory.db` están en datos. En Windows estos dos
 directorios pueden ser distintos. `TC_MEMORY_DB` permite cambiar la ubicación
 de la base de memoria. El log de panic está en `~/.mi-terminal/logs/panic.log`.
 
+`mi-terminal --health-check` informa versión, plataforma, presencia de los
+helpers y las rutas exactas de esta instalación sin abrir la interfaz, una
+terminal ni la base de memoria. Si falta un helper, devuelve un error: extraé
+el paquete completo antes de volver a probar. El informe contiene rutas locales;
+revisalas antes de compartirlo.
+
+## Probar con un perfil aislado
+
+Para reproducir un problema sin abrir tus datos habituales, configurá
+`TERMINAL_CANVAS_HOME` con una carpeta absoluta dedicada. La app, el daemon y
+los helpers usan sus subcarpetas `config`, `data` y `cache`; todos los exports se
+exportan a `exports` y el log de panic queda dentro de `data/logs`.
+La app no instala ni elimina hooks en la configuración global de Claude en
+este modo. No migra, copia ni elimina datos del perfil habitual.
+
+```powershell
+$env:TERMINAL_CANVAS_HOME = Join-Path $env:TEMP 'TerminalCanvas-prueba'
+.\mi-terminal.exe --health-check
+.\mi-terminal.exe
+# En otra ejecución con la misma carpeta se restaura ese perfil.
+```
+
+En Unix: `TERMINAL_CANVAS_HOME=/tmp/tc-prueba ./mi-terminal`. Usá una ruta
+corta si activás el daemon, porque los sockets Unix limitan su longitud.
+Una ruta relativa, vacía o con `..` se rechaza antes de iniciar la app.
+La variable dura sólo en el proceso/consola donde se define. Para volver al
+perfil habitual, quitála del entorno. Los overrides específicos
+`TC_MEMORY_DB`, `MI_TERMINAL_SCROLLBACK_DIR` y `MI_TERMINAL_DAEMON_DIR` conservan
+su precedencia; quitálos también para una prueba completamente aislada.
+
 Para hacer una copia antes de investigar un problema de persistencia, cerrá
 las instancias de la app y los procesos que escriben sus datos. En Unix,
 cerrar la ventana no detiene el daemon: finalizá sus sesiones y detenelo
@@ -53,8 +83,12 @@ reportar un problema de interfaz.
 ## Instalación y actualización
 
 Consultá [PORTABLE.md](PORTABLE.md) para elegir arquitectura, verificar el
-checksum y conservar los helpers junto a la app. La actualización se instala
-manualmente; el comprobador abre la descarga correspondiente. Los scripts y
+checksum y conservar los helpers junto a la app. El comprobador descarga el
+paquete exacto y verifica su SHA256. La instalación automática exige una app
+firmada instalada y el mismo editor; Windows usa un instalador Authenticode,
+macOS exige Developer ID y notarización. Las sesiones deben estar cerradas y
+los cambios guardados antes de instalar. Linux y builds sin firma requieren
+extraer manualmente el paquete verificado. Los scripts y
 workflows de empaquetado no significan que exista una release firmada publicada.
 
 ## Desarrollo en Windows
