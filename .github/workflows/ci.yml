@@ -36,7 +36,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0, Node 24
         with:
           persist-credentials: false
 
@@ -82,7 +82,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0, Node 24
         with:
           persist-credentials: false
       - name: Verify browser extension
@@ -91,13 +91,13 @@ jobs:
   bench:
     # Presupuesto de performance (Ship-it 7.3): compara las rutas calientes
     # contra el commit anterior y falla si algo se degrada más de 15%.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     if: github.event_name == 'pull_request'
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0, Node 24
         with:
           persist-credentials: false
           # El script necesita el commit base para armar el worktree.
@@ -117,12 +117,12 @@ jobs:
         run: scripts/bench-compare.sh "origin/$BASE_REF" 15
 
   audit:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0, Node 24
         with:
           persist-credentials: false
 
