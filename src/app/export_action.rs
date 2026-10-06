@@ -2,7 +2,6 @@
 //! carpeta de descargas, con aviso (toast) del resultado.
 
 use crate::terminal::export::{export_file_name, export_timestamp};
-use crate::utils::platform::downloads_dir;
 
 use super::TerminalApp;
 
@@ -32,9 +31,13 @@ impl TerminalApp {
         }
 
         let name = export_file_name(&title, &export_timestamp(chrono::Local::now()));
-        let path = downloads_dir().join(&name);
-        match std::fs::write(&path, text.as_bytes()) {
-            Ok(()) => {
+        let Some(directory) = crate::utils::app_paths::exports_dir() else {
+            self.toast_error("No se pudo resolver la carpeta de exportación");
+            return;
+        };
+        let path = directory.join(&name);
+        match crate::state::durable_write::write_atomic(&path, text.as_bytes()) {
+            Ok(_) => {
                 let lines = text.lines().count();
                 self.toast_success(format!("{lines} líneas exportadas a {}", path.display()));
             }

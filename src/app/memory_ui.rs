@@ -12,7 +12,6 @@ use crate::memory::{
     ScopeKind,
 };
 use crate::theme::colors as palette;
-use crate::utils::platform::downloads_dir;
 
 use super::TerminalApp;
 
@@ -169,7 +168,7 @@ fn run_memory_job(job: MemoryJob) -> MemoryCompletion {
             let result = MemoryStore::open_default()
                 .and_then(|store| store.export_markdown_scoped(&cwd, task_id))
                 .and_then(|text| {
-                    std::fs::write(&path, text)
+                    crate::state::durable_write::write_atomic(&path, text.as_bytes())
                         .map_err(anyhow::Error::from)
                         .map(|_| ())
                 });
@@ -433,12 +432,17 @@ impl TerminalApp {
                         .add_enabled(!state.busy, egui::Button::new("Export markdown"))
                         .clicked()
                     {
-                        if let Some(cwd) = state.cwd.clone() {
+                        if let (Some(cwd), Some(directory)) =
+                            (state.cwd.clone(), crate::utils::app_paths::exports_dir())
+                        {
                             state.submit(MemoryJob::Export {
                                 cwd,
-                                path: downloads_dir().join("terminalcanvas-memory.md"),
+                                path: directory.join("terminalcanvas-memory.md"),
                                 task_id: state.task_id,
                             });
+                        } else {
+                            state.status =
+                                Some("No se pudo resolver la carpeta de exportación.".into());
                         }
                     }
                 });

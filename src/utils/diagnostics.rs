@@ -241,19 +241,17 @@ pub fn write_zip(path: &Path, entries: &[DiagnosticEntry]) -> anyhow::Result<()>
 
 /// Exporta el diagnóstico a Descargas y devuelve el path escrito.
 pub fn export(version: &str) -> anyhow::Result<PathBuf> {
-    let dirs = directories::ProjectDirs::from("", "", "terminal-app")
-        .ok_or_else(|| anyhow::anyhow!("no se pudo resolver el data dir"))?;
-    let home = super::platform::home_dir()
-        .ok_or_else(|| anyhow::anyhow!("no se pudo resolver el directorio del usuario"))?;
+    let dirs = super::app_paths::get()?;
+    let panic_path = super::app_paths::panic_log_path()
+        .ok_or_else(|| anyhow::anyhow!("no se pudo resolver el log de errores"))?;
     let entries = collect_entries(
-        dirs.data_dir(),
-        &dirs.config_dir().join("config.toml"),
-        &super::platform::panic_log_path(&home),
+        &dirs.data,
+        &dirs.config.join("config.toml"),
+        &panic_path,
         version,
     );
-    let downloads = directories::UserDirs::new()
-        .and_then(|dirs| dirs.download_dir().map(Path::to_path_buf))
-        .unwrap_or_else(std::env::temp_dir);
+    let downloads = super::app_paths::exports_dir()
+        .ok_or_else(|| anyhow::anyhow!("no se pudo resolver el directorio de diagnóstico"))?;
     let path = downloads.join(diagnostics_file_name(chrono::Local::now()));
     write_zip(&path, &entries)?;
     Ok(path)
