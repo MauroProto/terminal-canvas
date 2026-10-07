@@ -22,6 +22,31 @@ fn register_bold_family(fonts: &mut egui::FontDefinitions, font_name: &str) {
     BOLD_FONT_AVAILABLE.store(true, Ordering::Relaxed);
 }
 
+/// Complete the bold family after every platform font has been installed.
+/// In particular, macOS adds Apple Symbols after registering Menlo Bold.
+/// Keep the bold face first while retaining the final monospace fallback order.
+fn complete_bold_family_fallbacks(fonts: &mut egui::FontDefinitions) {
+    let fallbacks = fonts
+        .families
+        .get(&FontFamily::Monospace)
+        .cloned()
+        .unwrap_or_default();
+    let Some(bold_family) = fonts
+        .families
+        .get_mut(&FontFamily::Name(TERMINAL_BOLD_FONT.into()))
+    else {
+        return;
+    };
+
+    let mut complete = Vec::with_capacity(bold_family.len() + fallbacks.len());
+    for name in bold_family.iter().chain(fallbacks.iter()) {
+        if !complete.contains(name) {
+            complete.push(name.clone());
+        }
+    }
+    *bold_family = complete;
+}
+
 pub fn setup_fonts(cc: &eframe::CreationContext<'_>) {
     let mut fonts = egui::FontDefinitions::default();
 
@@ -132,5 +157,110 @@ pub fn setup_fonts(cc: &eframe::CreationContext<'_>) {
         }
     }
 
+    complete_bold_family_fallbacks(&mut fonts);
     cc.egui_ctx.set_fonts(fonts);
+}
+
+#[cfg(test)]
+mod tests {
+    use egui::{FontDefinitions, FontFamily, FontId, RawInput};
+
+    use super::{complete_bold_family_fallbacks, TERMINAL_BOLD_FONT};
+
+    fn bold_family() -> FontFamily {
+        FontFamily::Name(TERMINAL_BOLD_FONT.into())
+    }
+
+    #[test]
+    fn bold_family_retains_primary_and_final_monospace_fallback_order() {
+        let mut fonts = FontDefinitions::empty();
+        // Install the bold face first, then the symbols, just as on macOS.
+        fonts
+            .families
+            .insert(bold_family(), vec!["bold".into(), "bold".into()]);
+        fonts.families.insert(
+            FontFamily::Monospace,
+            vec!["normal".into(), "emoji".into(), "bold".into()],
+        );
+        fonts
+            .families
+            .get_mut(&FontFamily::Monospace)
+            .unwrap()
+            .extend(["symbols".into(), "emoji".into()]);
+
+        complete_bold_family_fallbacks(&mut fonts);
+
+        assert_eq!(
+            fonts.families[&bold_family()],
+            ["bold", "normal", "emoji", "symbols"]
+        );
+        assert_eq!(
+            fonts.families[&FontFamily::Monospace],
+            ["normal", "emoji", "bold", "symbols", "emoji"]
+        );
+        let first = fonts.clone();
+        complete_bold_family_fallbacks(&mut fonts);
+        assert_eq!(fonts, first, "completing a family twice must be idempotent");
+    }
+
+    #[test]
+    fn completing_fallbacks_does_not_create_an_unavailable_bold_family() {
+        let mut fonts = FontDefinitions::default();
+        let original = fonts.clone();
+
+        complete_bold_family_fallbacks(&mut fonts);
+
+        assert_eq!(fonts, original);
+        assert!(!fonts.families.contains_key(&bold_family()));
+    }
+
+    #[test]
+    fn bold_family_keeps_its_primary_without_a_monospace_family() {
+        let mut fonts = FontDefinitions::empty();
+        fonts.families.remove(&FontFamily::Monospace);
+        fonts
+            .families
+            .insert(bold_family(), vec!["bold".into(), "bold".into()]);
+
+        complete_bold_family_fallbacks(&mut fonts);
+
+        assert_eq!(fonts.families[&bold_family()], ["bold"]);
+        assert!(!fonts.families.contains_key(&FontFamily::Monospace));
+    }
+
+    #[test]
+    fn bold_family_can_render_an_embedded_emoji_added_after_its_primary() {
+        // These are egui's embedded fonts, not files from the operating system.
+        // Hack is only a stand-in for the primary bold face; this test covers
+        // fallback selection, not the visual weight of a system font.
+        let mut fonts = FontDefinitions::default();
+        fonts.families.insert(bold_family(), vec!["Hack".into()]);
+        fonts.families.insert(
+            FontFamily::Monospace,
+            vec!["Hack".into(), "NotoEmoji-Regular".into()],
+        );
+        let font = FontId::new(15.0, bold_family());
+        let before = font_context(fonts.clone());
+        assert!(before.fonts(|fonts| fonts.has_glyph(&font, 'A')));
+        assert!(!before.fonts(|fonts| fonts.has_glyph(&font, '\u{1f600}')));
+        assert!(before.fonts(|fonts| { fonts.has_glyph(&FontId::monospace(15.0), '\u{1f600}') }));
+
+        complete_bold_family_fallbacks(&mut fonts);
+
+        let after = font_context(fonts);
+        assert!(after.fonts(|fonts| fonts.has_glyph(&font, 'A')));
+        assert!(after.fonts(|fonts| fonts.has_glyph(&font, '\u{1f600}')));
+        let galley = after.fonts(|fonts| {
+            fonts.layout_no_wrap("A\u{1f600}".into(), font.clone(), egui::Color32::WHITE)
+        });
+        assert_eq!(galley.text(), "A\u{1f600}");
+        assert!(galley.size().x.is_finite() && galley.size().x > 0.0);
+    }
+
+    fn font_context(fonts: FontDefinitions) -> egui::Context {
+        let ctx = egui::Context::default();
+        ctx.set_fonts(fonts);
+        let _ = ctx.run(RawInput::default(), |_| {});
+        ctx
+    }
 }
