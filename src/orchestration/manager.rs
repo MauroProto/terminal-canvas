@@ -1621,6 +1621,15 @@ impl Orchestrator {
             .iter()
             .map(|event| (event.id, (event.resolved, event.archived, event.created_at)))
             .collect::<HashMap<_, _>>();
+        // Conflict events are refreshed separately. Carry their episode state
+        // through this rebuild so a poll cannot reopen an acknowledged alert.
+        let previous_conflicts = self
+            .state
+            .inbox
+            .iter()
+            .filter(|event| event.kind == InboxEventKind::ConflictRisk)
+            .cloned()
+            .collect::<Vec<_>>();
 
         self.state.inbox = desired
             .into_values()
@@ -1633,6 +1642,7 @@ impl Orchestrator {
                 event
             })
             .collect();
+        self.state.inbox.extend(previous_conflicts);
     }
 
     fn refresh_conflict_risk(&mut self) {
@@ -1680,6 +1690,10 @@ impl Orchestrator {
             .state
             .inbox
             .drain(..)
+            .filter(|event| {
+                event.kind != InboxEventKind::ConflictRisk
+                    || event.session_id.is_some_and(|id| conflicts.contains(&id))
+            })
             .map(|event| (event.id, event))
             .collect::<HashMap<_, _>>();
         for session_id in conflicts {
@@ -1689,7 +1703,7 @@ impl Orchestrator {
                 .sessions
                 .iter()
                 .find(|session| session.session_id == session_id);
-            let event = InboxEvent {
+            let mut event = InboxEvent {
                 id: event_id,
                 session_id: Some(session_id),
                 task_id: session.and_then(|session| session.task_id),
@@ -1702,6 +1716,11 @@ impl Orchestrator {
                 resolved: false,
                 archived: false,
             };
+            if let Some(previous) = by_id.get(&event_id) {
+                event.created_at = previous.created_at;
+                event.resolved = previous.resolved;
+                event.archived = previous.archived;
+            }
             by_id.insert(event_id, event);
         }
         let mut inbox = by_id.into_values().collect::<Vec<_>>();
