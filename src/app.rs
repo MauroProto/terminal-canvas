@@ -1580,7 +1580,7 @@ impl TerminalApp {
                 && self
                     .ctx
                     .as_ref()
-                    .is_some_and(file_viewer_selection::viewer_has_keyboard_focus))
+                    .is_some_and(file_viewer_selection::viewer_keyboard_input_is_active))
             || matches!(self.collab.mode(), CollabMode::Guest))
     }
 

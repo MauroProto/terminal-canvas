@@ -15,19 +15,137 @@ use super::file_viewer_document::{SourceDocument, SourceSelection, FRAGMENT_BYTE
 const FONT_SIZE: f32 = 12.5;
 const ROW_SPACING: f32 = 3.0;
 const CODE_INSET: f32 = 10.0;
+const MAX_VIEWER_CONTROL_IDS: usize = 16;
 
 fn owner_id() -> Id {
     Id::new("file-viewer-source-selection")
+}
+
+fn controls_id() -> Id {
+    Id::new("file-viewer-keyboard-controls")
+}
+
+fn released_pass_id() -> Id {
+    Id::new("file-viewer-keyboard-released-pass")
+}
+
+fn backward_navigation_pass_id() -> Id {
+    Id::new("file-viewer-keyboard-backward-navigation-pass")
+}
+
+fn viewer_control_ids(ctx: &egui::Context) -> Vec<Id> {
+    ctx.data(|data| data.get_temp::<Vec<Id>>(controls_id()).unwrap_or_default())
+}
+
+/// Clear after checking Escape/modal/blur against the previous pass's controls,
+/// before drawing this pass's header and body. This does not change real focus.
+pub(super) fn begin_viewer_controls(ctx: &egui::Context) {
+    let backward_navigation = ctx.input(|input| {
+        input.events.iter().any(|event| {
+            matches!(
+                event,
+                Event::Key {
+                    key: Key::Tab,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } if modifiers.shift_only()
+            )
+        })
+    });
+    let owned_backward_navigation = backward_navigation && viewer_keyboard_input_is_active(ctx);
+    let current_pass = ctx.cumulative_pass_nr();
+    ctx.data_mut(|data| {
+        if owned_backward_navigation {
+            data.insert_temp(backward_navigation_pass_id(), current_pass);
+        }
+        data.get_temp_mut_or_default::<Vec<Id>>(controls_id())
+            .clear();
+    });
+}
+
+/// Register the actual egui response ID, never a guessed label/auto-ID. Keep
+/// repeated standalone widget passes bounded even if no header clears the list.
+pub(super) fn register_viewer_control(response: &egui::Response) {
+    let ctx = &response.ctx;
+    ctx.data_mut(|data| {
+        let ids = data.get_temp_mut_or_default::<Vec<Id>>(controls_id());
+        if !ids.contains(&response.id) && ids.len() < MAX_VIEWER_CONTROL_IDS {
+            ids.push(response.id);
+        }
+    });
+    // egui only installs this filter after the widget also had focus in the
+    // previous pass. The first-focus Escape case is covered by Memory below.
+    ctx.memory_mut(|memory| {
+        if memory.had_focus_last_frame(response.id) && memory.has_focus(response.id) {
+            memory.set_focus_lock_filter(
+                response.id,
+                egui::EventFilter {
+                    escape: true,
+                    ..Default::default()
+                },
+            );
+        }
+    });
 }
 
 pub(super) fn viewer_has_keyboard_focus(ctx: &egui::Context) -> bool {
     ctx.input(|input| input.raw.focused) && ctx.memory(|memory| memory.has_focus(owner_id()))
 }
 
+/// Include native viewer buttons when deciding whether input may reach a PTY.
+/// Source copy/selection continues to use viewer_has_keyboard_focus instead.
+pub(super) fn viewer_keyboard_input_is_active(ctx: &egui::Context) -> bool {
+    if !ctx.input(|input| input.raw.focused) {
+        return false;
+    }
+    let controls = viewer_control_ids(ctx);
+    ctx.memory(|memory| {
+        memory
+            .focused()
+            .is_some_and(|id| id == owner_id() || controls.contains(&id))
+    })
+}
+
+/// egui's default first-focus filter can surrender a button on Escape before
+/// UI runs. Only recover that actual previous owner while nobody else is focused.
+/// The caller must additionally gate this on its current modal/enabled state.
+pub(super) fn viewer_handles_escape(ctx: &egui::Context) -> bool {
+    if !ctx.input(|input| input.raw.focused) {
+        return false;
+    }
+    let controls = viewer_control_ids(ctx);
+    let current_pass = ctx.cumulative_pass_nr();
+    let released_this_pass =
+        ctx.data(|data| data.get_temp::<u64>(released_pass_id()) == Some(current_pass));
+    let backward_navigation_pending = ctx.data(|data| {
+        data.get_temp::<u64>(backward_navigation_pass_id())
+            .is_some_and(|pass| pass.checked_add(1) == Some(current_pass))
+    });
+    ctx.memory(|memory| match memory.focused() {
+        Some(id) => id == owner_id() || controls.contains(&id),
+        None => {
+            !released_this_pass
+                && !backward_navigation_pending
+                && (memory.had_focus_last_frame(owner_id())
+                    || controls.iter().any(|id| memory.had_focus_last_frame(*id)))
+        }
+    })
+}
+
 /// Call before opening a palette/TextEdit, closing the viewer, or routing focus
 /// to a terminal. This never surrenders a different widget's focus.
 pub(super) fn release_keyboard_focus(ctx: &egui::Context) {
-    ctx.memory_mut(|memory| memory.surrender_focus(owner_id()));
+    let controls = viewer_control_ids(ctx);
+    ctx.memory_mut(|memory| {
+        memory.surrender_focus(owner_id());
+        for id in controls {
+            memory.surrender_focus(id);
+        }
+    });
+    begin_viewer_controls(ctx);
+    let released_pass = ctx.cumulative_pass_nr();
+    ctx.data_mut(|data| data.insert_temp(released_pass_id(), released_pass));
 }
 
 pub(super) fn request_keyboard_focus(ctx: &egui::Context) {
@@ -622,6 +740,9 @@ pub(super) fn draw_widget(
                 !document.source().is_empty(),
                 egui::Button::new("Copiar archivo"),
             );
+            for response in [&selection_button, &line_button, &file_button] {
+                register_viewer_control(response);
+            }
             #[cfg(test)]
             {
                 output.copy_selection_button = selection_button.rect;
@@ -894,6 +1015,7 @@ pub(super) fn draw_widget(
                 ("Seleccionar todo", !document.source().is_empty()),
             ] {
                 let button = ui.add_enabled(allow_input && enabled, egui::Button::new(label));
+                register_viewer_control(&button);
                 #[cfg(test)]
                 output.menu_buttons.push((label, button.rect));
                 if allow_input && button.clicked() {
@@ -975,6 +1097,114 @@ mod tests {
         size: Vec2,
         field: Option<String>,
         take_field_focus: bool,
+    }
+
+    struct ControlsFrame {
+        ids: Vec<Id>,
+        field_id: Option<Id>,
+        focus_at_start: Option<Id>,
+        escape_at_start: bool,
+        active_after: bool,
+        escape_after: bool,
+    }
+
+    struct ControlsHarness {
+        ctx: egui::Context,
+        time: f64,
+        count: usize,
+        clear_controls: bool,
+        focused: bool,
+        focus_control: Option<usize>,
+        field: Option<String>,
+        field_before_controls: bool,
+        focus_field: bool,
+    }
+
+    impl ControlsHarness {
+        fn new() -> Self {
+            Self {
+                ctx: egui::Context::default(),
+                time: 0.0,
+                count: 3,
+                clear_controls: true,
+                focused: true,
+                focus_control: None,
+                field: None,
+                field_before_controls: false,
+                focus_field: false,
+            }
+        }
+
+        fn frame(&mut self, mut events: Vec<Event>) -> ControlsFrame {
+            self.time += 0.1;
+            let modifiers = events
+                .iter()
+                .rev()
+                .find_map(|event| match event {
+                    Event::Key { modifiers, .. } => Some(*modifiers),
+                    _ => None,
+                })
+                .unwrap_or(Modifiers::NONE);
+            events.insert(0, Event::ModifiersChanged(modifiers));
+            let mut frame = ControlsFrame {
+                ids: Vec::new(),
+                field_id: None,
+                focus_at_start: None,
+                escape_at_start: false,
+                active_after: false,
+                escape_after: false,
+            };
+            let mut output = self.ctx.run_ui(
+                RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(620.0, 900.0))),
+                    events,
+                    focused: self.focused,
+                    time: Some(self.time),
+                    ..Default::default()
+                },
+                |ui| {
+                    // Match the app: inspect the real previous controls after
+                    // egui begins the pass, before clearing them for new UI.
+                    frame.focus_at_start = ui.ctx().memory(|memory| memory.focused());
+                    frame.escape_at_start = viewer_handles_escape(ui.ctx());
+                    if self.clear_controls {
+                        begin_viewer_controls(ui.ctx());
+                    }
+                    if let (true, Some(field)) = (self.field_before_controls, self.field.as_mut()) {
+                        let response = ui.add(egui::TextEdit::singleline(field));
+                        if self.focus_field {
+                            response.request_focus();
+                        }
+                        frame.field_id = Some(response.id);
+                    }
+                    for index in 0..self.count {
+                        let response = ui
+                            .push_id(index, |ui| ui.button(format!("Control {index}")))
+                            .inner;
+                        if self.focus_control == Some(index) {
+                            response.request_focus();
+                        }
+                        register_viewer_control(&response);
+                        frame.ids.push(response.id);
+                    }
+                    if let (false, Some(field)) = (self.field_before_controls, self.field.as_mut())
+                    {
+                        let response = ui.add(egui::TextEdit::singleline(field));
+                        if self.focus_field {
+                            response.request_focus();
+                        }
+                        frame.field_id = Some(response.id);
+                    }
+                    frame.active_after = viewer_keyboard_input_is_active(ui.ctx());
+                    frame.escape_after = viewer_handles_escape(ui.ctx());
+                },
+            );
+            self.focus_control = None;
+            self.focus_field = false;
+            output.textures_delta.clear();
+            output.drop_without_applying_deltas();
+            frame
+        }
     }
 
     impl Harness {
@@ -1512,6 +1742,8 @@ mod tests {
             Some(Id::new("test-viewer-palette-field"))
         );
         assert!(!viewer_has_keyboard_focus(&harness.ctx));
+        assert!(!viewer_keyboard_input_is_active(&harness.ctx));
+        assert!(!viewer_handles_escape(&harness.ctx));
         let frame = harness.frame(vec![key(Key::A, Modifiers::COMMAND), Event::Copy]);
         assert_eq!(frame.copied(), vec!["palette text"]);
         assert_eq!(
@@ -1524,6 +1756,256 @@ mod tests {
             harness.ctx.memory(|memory| memory.focused()),
             Some(Id::new("test-viewer-palette-field"))
         );
+        assert!(viewer_control_ids(&harness.ctx).is_empty());
+    }
+
+    #[test]
+    fn native_controls_keep_tab_input_out_of_source_owner_and_release_cleanly() {
+        let mut harness = ControlsHarness::new();
+        harness.focus_control = Some(0);
+        let initial = harness.frame(Vec::new());
+        assert_eq!(
+            harness.ctx.memory(|memory| memory.focused()),
+            Some(initial.ids[0])
+        );
+        assert!(initial.active_after);
+        assert!(!viewer_has_keyboard_focus(&harness.ctx));
+
+        let tabbed = harness.frame(vec![key(Key::Tab, Modifiers::NONE)]);
+        assert_eq!(
+            harness.ctx.memory(|memory| memory.focused()),
+            Some(tabbed.ids[1])
+        );
+        assert!(tabbed.active_after);
+        assert!(!viewer_has_keyboard_focus(&harness.ctx));
+        release_keyboard_focus(&harness.ctx);
+        assert_eq!(harness.ctx.memory(|memory| memory.focused()), None);
+        assert!(viewer_control_ids(&harness.ctx).is_empty());
+        assert!(!viewer_keyboard_input_is_active(&harness.ctx));
+        assert!(!viewer_handles_escape(&harness.ctx));
+    }
+
+    #[test]
+    fn first_focus_escape_recovers_real_button_before_registry_clear() {
+        let mut harness = ControlsHarness::new();
+        harness.focus_control = Some(1);
+        let initial = harness.frame(Vec::new());
+        // No idle pass: the fresh native focus still has egui's default filter.
+        let escaped = harness.frame(vec![key(Key::Escape, Modifiers::NONE)]);
+        assert_eq!(escaped.focus_at_start, None);
+        assert!(escaped.escape_at_start);
+        assert!(harness
+            .ctx
+            .memory(|memory| memory.had_focus_last_frame(initial.ids[1])));
+        assert!(harness
+            .ctx
+            .input_mut(|input| input.consume_key(Modifiers::NONE, Key::Escape)));
+        release_keyboard_focus(&harness.ctx);
+        assert!(!viewer_handles_escape(&harness.ctx));
+        let next = harness.frame(vec![key(Key::Escape, Modifiers::NONE)]);
+        assert!(!next.escape_at_start);
+    }
+
+    #[test]
+    fn explicit_source_release_blocks_same_pass_escape_fallback_until_real_reacquisition() {
+        let ctx = egui::Context::default();
+        for pass in 0..3 {
+            let events = if pass == 0 {
+                Vec::new()
+            } else {
+                vec![key(Key::Escape, Modifiers::NONE)]
+            };
+            let mut output = ctx.run_ui(
+                RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(620.0, 400.0))),
+                    events,
+                    focused: true,
+                    time: Some(f64::from(pass) * 0.1),
+                    ..Default::default()
+                },
+                |ui| {
+                    if pass != 0 {
+                        assert_eq!(ctx.memory(|memory| memory.focused()), None);
+                        assert!(ctx.memory(|memory| memory.had_focus_last_frame(owner_id())));
+                        assert!(viewer_handles_escape(&ctx));
+                        release_keyboard_focus(&ctx);
+                        assert!(!viewer_handles_escape(&ctx));
+                        // A terminal receives the original unconsumed Escape
+                        // after the viewer has explicitly relinquished focus.
+                        assert!(ctx.input(|input| input.key_pressed(Key::Escape)));
+                    }
+                    let rect = ui.available_rect_before_wrap();
+                    register_placeholder_keyboard_owner(ui, rect, false);
+                    if pass < 2 {
+                        request_keyboard_focus(&ctx);
+                        assert!(viewer_has_keyboard_focus(&ctx));
+                        assert!(viewer_handles_escape(&ctx));
+                    } else {
+                        assert!(!viewer_keyboard_input_is_active(&ctx));
+                        assert!(!viewer_handles_escape(&ctx));
+                    }
+                },
+            );
+            output.textures_delta.clear();
+            output.drop_without_applying_deltas();
+        }
+    }
+
+    #[test]
+    fn established_control_filter_preserves_real_focus_on_escape() {
+        let mut harness = ControlsHarness::new();
+        harness.focus_control = Some(2);
+        let initial = harness.frame(Vec::new());
+        harness.frame(Vec::new());
+        let escaped = harness.frame(vec![key(Key::Escape, Modifiers::NONE)]);
+        assert_eq!(escaped.focus_at_start, Some(initial.ids[2]));
+        assert!(escaped.escape_at_start);
+        assert!(escaped.active_after);
+        assert!(escaped.escape_after);
+        assert_eq!(
+            harness.ctx.memory(|memory| memory.focused()),
+            Some(initial.ids[2])
+        );
+    }
+
+    #[test]
+    fn backward_tab_to_foreign_textedit_does_not_claim_its_immediate_escape() {
+        let mut harness = ControlsHarness::new();
+        harness.field = Some("foreign palette text".to_owned());
+        harness.field_before_controls = true;
+        harness.focus_control = Some(0);
+        let initial = harness.frame(Vec::new());
+        let field_id = initial.field_id.expect("real preceding TextEdit response");
+        assert_ne!(field_id, initial.ids[0]);
+        harness.frame(vec![key(Key::Tab, Modifiers::SHIFT)]);
+        harness.frame(Vec::new());
+        assert_eq!(
+            harness.ctx.memory(|memory| memory.focused()),
+            Some(field_id),
+            "the actual deferred destination is the foreign TextEdit"
+        );
+        harness.focus_control = Some(0);
+        harness.frame(Vec::new());
+        let backward = harness.frame(vec![key(Key::Tab, Modifiers::SHIFT)]);
+        // egui schedules the preceding TextEdit for the next pass while this
+        // button remains the publicly observable focused widget in this one.
+        assert_eq!(
+            harness.ctx.memory(|memory| memory.focused()),
+            Some(backward.ids[0])
+        );
+        let escaped = harness.frame(vec![key(Key::Escape, Modifiers::NONE)]);
+        assert_eq!(escaped.focus_at_start, None);
+        assert!(harness
+            .ctx
+            .memory(|memory| memory.had_focus_last_frame(backward.ids[0])));
+        assert!(!escaped.escape_at_start);
+        assert!(!escaped.escape_after);
+        assert!(!escaped.active_after);
+        assert!(harness.ctx.input(|input| input.key_pressed(Key::Escape)));
+    }
+
+    #[test]
+    fn native_control_textedit_takeover_and_blur_never_claim_foreign_focus() {
+        let mut harness = ControlsHarness::new();
+        harness.focus_control = Some(0);
+        harness.frame(Vec::new());
+        harness.field = Some("palette text".to_owned());
+        harness.focus_field = true;
+        let taken = harness.frame(Vec::new());
+        assert!(taken.escape_at_start);
+        assert_eq!(
+            harness.ctx.memory(|memory| memory.focused()),
+            taken.field_id
+        );
+        assert!(!taken.active_after);
+        assert!(!taken.escape_after);
+        release_keyboard_focus(&harness.ctx);
+        assert_eq!(
+            harness.ctx.memory(|memory| memory.focused()),
+            taken.field_id
+        );
+        assert!(viewer_control_ids(&harness.ctx).is_empty());
+        let escaped = harness.frame(vec![key(Key::Escape, Modifiers::NONE)]);
+        assert!(!escaped.escape_at_start);
+        assert!(!escaped.escape_after);
+        harness.focus_control = Some(0);
+        harness.frame(Vec::new());
+        harness.focused = false;
+        let blurred = harness.frame(vec![key(Key::Escape, Modifiers::NONE)]);
+        assert!(!blurred.escape_at_start);
+        assert!(!blurred.active_after);
+        assert!(!blurred.escape_after);
+        assert!(!viewer_has_keyboard_focus(&harness.ctx));
+    }
+
+    #[test]
+    fn standalone_control_registry_deduplicates_real_ids_and_stays_bounded() {
+        let mut harness = ControlsHarness::new();
+        harness.clear_controls = false;
+        let first = harness.frame(Vec::new());
+        for _ in 0..8 {
+            let repeated = harness.frame(Vec::new());
+            assert_eq!(repeated.ids, first.ids);
+            assert_eq!(viewer_control_ids(&harness.ctx), first.ids);
+        }
+        harness.count = MAX_VIEWER_CONTROL_IDS + 4;
+        harness.focus_control = Some(MAX_VIEWER_CONTROL_IDS - 1);
+        let expanded = harness.frame(Vec::new());
+        let registered = viewer_control_ids(&harness.ctx);
+        assert_eq!(registered, expanded.ids[..MAX_VIEWER_CONTROL_IDS]);
+        let unique = registered.iter().collect::<std::collections::HashSet<_>>();
+        assert_eq!(unique.len(), MAX_VIEWER_CONTROL_IDS);
+        assert!(expanded.active_after);
+        let actual_focus = harness.ctx.memory(|memory| memory.focused());
+        begin_viewer_controls(&harness.ctx);
+        assert!(viewer_control_ids(&harness.ctx).is_empty());
+        assert_eq!(harness.ctx.memory(|memory| memory.focused()), actual_focus);
+    }
+
+    #[test]
+    fn toolbar_keyboard_copy_uses_native_button_without_copying_source_selection_twice() {
+        let source = "source 漢🙂\r\nlast";
+        let mut harness = Harness::new(source);
+        let initial = harness.settled();
+        let file_rect = initial.report.copy_file_button;
+        initial.discard();
+        let control_ids = viewer_control_ids(&harness.ctx);
+        assert_eq!(control_ids.len(), 3);
+        let file_id = control_ids
+            .iter()
+            .copied()
+            .find(|id| {
+                harness
+                    .ctx
+                    .read_response(*id)
+                    .is_some_and(|response| response.rect == file_rect)
+            })
+            .expect("actual copy-file button response");
+        for _ in 0..6 {
+            harness.frame(Vec::new()).discard();
+            assert_eq!(viewer_control_ids(&harness.ctx), control_ids);
+        }
+        let selection = SourceSelection {
+            anchor: 0,
+            caret: "source".len(),
+        };
+        harness
+            .state
+            .set_selection(&harness.document, selection)
+            .unwrap();
+        harness
+            .ctx
+            .memory_mut(|memory| memory.request_focus(file_id));
+        let copy = harness.frame(vec![key(Key::A, Modifiers::COMMAND), Event::Copy]);
+        assert!(copy.copied().is_empty());
+        assert!(viewer_keyboard_input_is_active(&harness.ctx));
+        assert!(!viewer_has_keyboard_focus(&harness.ctx));
+        assert_eq!(harness.state.selection(), Some(selection));
+        copy.discard();
+        let entered = harness.frame(vec![key(Key::Enter, Modifiers::NONE)]);
+        assert_eq!(entered.copied(), vec![source]);
+        assert!(viewer_has_keyboard_focus(&harness.ctx));
+        entered.discard();
     }
 
     #[test]

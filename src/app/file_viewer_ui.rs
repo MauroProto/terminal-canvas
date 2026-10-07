@@ -79,9 +79,30 @@ impl FileViewerState {
 
 impl TerminalApp {
     pub(super) fn open_file_viewer(&mut self, path: PathBuf) {
+        self.start_file_viewer_load(path, false);
+    }
+
+    fn start_file_viewer_load(&mut self, path: PathBuf, preserve_keyboard_focus: bool) {
         self.highlighter.cancel();
-        if let Some(ctx) = &self.ctx {
-            file_viewer_selection::release_keyboard_focus(ctx);
+        let restore_focus = preserve_keyboard_focus
+            && self
+                .ctx
+                .as_ref()
+                .is_some_and(file_viewer_selection::viewer_keyboard_input_is_active);
+        if !preserve_keyboard_focus {
+            if let Some(ctx) = &self.ctx {
+                file_viewer_selection::release_keyboard_focus(ctx);
+            }
+        }
+        // Un lector cerrado ya no ejecuta lecturas. Un lector ocupado sigue
+        // disponible y se reutiliza: reintentar no crea otro worker para una
+        // llamada al filesystem que todavía no retornó.
+        if self
+            .file_viewer_reader
+            .as_ref()
+            .is_some_and(|reader| !reader.is_available())
+        {
+            self.file_viewer_reader = None;
         }
         let reader = self
             .file_viewer_reader
@@ -98,6 +119,11 @@ impl TerminalApp {
             if let Some(viewer) = self.file_viewer.as_mut() {
                 viewer.loading = false;
                 viewer.read_error = Some(FileReadError::WorkerUnavailable);
+            }
+        }
+        if restore_focus {
+            if let Some(ctx) = &self.ctx {
+                file_viewer_selection::request_keyboard_focus(ctx);
             }
         }
     }
@@ -191,11 +217,14 @@ impl TerminalApp {
         if self.file_viewer.is_none() {
             return;
         }
-        let can_focus = !self.modal_input_is_active() && ctx.input(|input| input.raw.focused);
+        let can_focus = root_ui.is_enabled()
+            && !self.modal_input_is_active()
+            && ctx.input(|input| input.raw.focused);
         if !can_focus {
             file_viewer_selection::release_keyboard_focus(&ctx);
         }
-        if file_viewer_selection::viewer_has_keyboard_focus(&ctx)
+        if can_focus
+            && file_viewer_selection::viewer_handles_escape(&ctx)
             && ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
         {
             self.highlighter.cancel();
@@ -210,6 +239,7 @@ impl TerminalApp {
         let mut close = false;
         let mut open_external: Option<PathBuf> = None;
         let mut open_dropped: Option<PathBuf> = None;
+        let mut retry: Option<PathBuf> = None;
 
         egui::Panel::right("code-viewer")
             .resizable(true)
@@ -245,6 +275,7 @@ impl TerminalApp {
                 } else {
                     false
                 };
+                file_viewer_selection::begin_viewer_controls(&ctx);
 
                 // Soltar un archivo sobre el visor lo abre (si el puntero
                 // está dentro de la región del panel).
@@ -260,7 +291,7 @@ impl TerminalApp {
                     )
                 });
                 if let (Some(path), Some(pointer)) = (dropped, pointer) {
-                    if panel_rect.contains(pointer) {
+                    if can_focus && panel_rect.contains(pointer) {
                         open_dropped = Some(path);
                     }
                 }
@@ -270,7 +301,12 @@ impl TerminalApp {
                     palette::LINE,
                 );
 
-                draw_header(ui, viewer, &mut close, &mut open_external);
+                ui.scope(|ui| {
+                    if !can_focus {
+                        ui.disable();
+                    }
+                    draw_header(ui, viewer, &mut close, &mut open_external);
+                });
                 ui.separator();
 
                 if viewer.binary
@@ -312,9 +348,16 @@ impl TerminalApp {
                 }
 
                 if let Some(error) = viewer.read_error {
-                    let (message, _) = read_error_message(error);
                     ui.add_space(16.0);
+                    let (message, help) = read_error_message(error);
                     ui.label(RichText::new(message).size(11.0).color(palette::DIM));
+                    ui.label(RichText::new(help).size(11.0).color(palette::DIM));
+                    ui.label(RichText::new(viewer.path.to_string_lossy()).size(11.0));
+                    let button = ui.add_enabled(can_focus, egui::Button::new("Reintentar"));
+                    file_viewer_selection::register_viewer_control(&button);
+                    if button.clicked() {
+                        retry = Some(viewer.path.clone());
+                    }
                     return;
                 }
 
@@ -331,9 +374,12 @@ impl TerminalApp {
             }
             self.file_viewer = None;
             file_viewer_selection::release_keyboard_focus(&ctx);
-        }
-        if let Some(path) = open_dropped {
+        } else if let Some(path) = open_dropped {
             self.open_file_viewer(path);
+        } else if let Some(path) = retry {
+            // El botón pertenece al visor actual: conservar el owner y su
+            // filtro de eventos permite cerrar con Esc durante el reintento.
+            self.start_file_viewer_load(path, true);
         }
         if let Some(path) = open_external {
             if let Err(err) = crate::utils::platform::open_path_external(&path) {
@@ -365,39 +411,67 @@ fn draw_header(
     open_external: &mut Option<PathBuf>,
 ) {
     ui.add_space(8.0);
+    // Reservar primero los botones mantiene las acciones dentro del panel,
+    // incluso con nombres muy largos y el ancho mínimo del visor.
     ui.horizontal(|ui| {
-        ui.add_space(10.0);
-        ui.label(
-            RichText::new(viewer.file_name())
-                .size(12.5)
-                .color(palette::TEXT_STRONG),
-        );
-        if let Some(language) = &viewer.language {
-            ui.label(RichText::new(language).size(10.0).color(palette::DIM));
-        }
-        // Los botones van pegados a la derecha.
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.add_space(8.0);
-            if ui.small_button("✕").on_hover_text("Cerrar (Esc)").clicked() {
+            let close_button = ui.small_button("✕");
+            file_viewer_selection::register_viewer_control(&close_button);
+            if close_button.on_hover_text("Cerrar (Esc)").clicked() {
                 *close = true;
             }
-            if ui
-                .small_button("↗")
+            let external_button = ui.small_button("↗");
+            file_viewer_selection::register_viewer_control(&external_button);
+            if external_button
                 .on_hover_text("Abrir en el editor externo")
                 .clicked()
             {
                 *open_external = Some(viewer.path.clone());
             }
+            let path_button = ui.small_button("Ruta");
+            file_viewer_selection::register_viewer_control(&path_button);
+            if path_button.on_hover_text("Copiar ruta completa").clicked() {
+                ui.ctx()
+                    .copy_text(viewer.path.to_string_lossy().into_owned());
+            }
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                ui.add_space(10.0);
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(viewer.file_name())
+                            .size(12.5)
+                            .color(palette::TEXT_STRONG),
+                    )
+                    .truncate()
+                    .selectable(false)
+                    .halign(egui::Align::LEFT)
+                    .show_tooltip_when_elided(false),
+                )
+                .on_hover_text(viewer.path.to_string_lossy());
+            });
         });
     });
     ui.add_space(4.0);
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         ui.add_space(10.0);
         let line_count = viewer
             .document
             .as_ref()
             .map_or(0, |document| document.logical_lines().len());
-        let mut status = format!("{line_count} líneas");
+        let mut status = if viewer.loading {
+            "Leyendo archivo…".to_owned()
+        } else if viewer.read_error.is_some() {
+            "No se pudo leer el archivo".to_owned()
+        } else if viewer.binary {
+            "Archivo binario".to_owned()
+        } else {
+            format!("{line_count} líneas")
+        };
+        if let Some(language) = &viewer.language {
+            status.push_str(" · ");
+            status.push_str(language);
+        }
         if viewer.truncated {
             status.push_str(" · truncado por límite seguro");
         }
