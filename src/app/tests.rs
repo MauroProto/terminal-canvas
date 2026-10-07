@@ -24,6 +24,30 @@ use crate::panel::CanvasPanel;
 use crate::state::{SnapSlot, Workspace};
 use crate::terminal::panel::{PanelHitArea, TerminalPanel, PANEL_BG};
 
+fn detached_test_app_with_panel(ctx: &egui::Context) -> super::TerminalApp {
+    // The default test constructor starts a terminal. Load an empty workspace
+    // instead, then add a panel without a session spec so logic and UI stay PTY-free.
+    let workspace = Workspace::new("Detached regression", None);
+    let state = crate::state::AppState {
+        schema_version: crate::state::persistence::APP_STATE_SCHEMA_VERSION,
+        workspaces: vec![workspace.to_saved()],
+        active_ws: 0,
+        sidebar_visible: true,
+        legacy_canvas_ui: Default::default(),
+        local_device_id: Uuid::new_v4().to_string(),
+        trusted_devices: Vec::new(),
+        orchestration: Default::default(),
+    };
+    let mut app = super::TerminalApp::build(ctx, None, Some(state), None, false, false);
+    app.ws_mut().add_restored_terminal(TerminalPanel::new(
+        pos2(0.0, 0.0),
+        vec2(300.0, 200.0),
+        Color32::WHITE,
+        1,
+    ));
+    app
+}
+
 #[test]
 fn test_app_never_owns_the_users_run_marker() {
     let ctx = egui::Context::default();
@@ -36,7 +60,8 @@ fn test_app_never_owns_the_users_run_marker() {
 #[test]
 fn hidden_logic_ignores_stale_ui_input_and_keeps_ui_state_between_passes() {
     let ctx = egui::Context::default();
-    let mut app = super::TerminalApp::new_for_tests(&ctx);
+    let mut app = detached_test_app_with_panel(&ctx);
+    assert!(app.ws().panels[0].runtime_session_id().is_none());
     let panel_id = app.ws().panels[0].id();
     app.ws_mut().bring_to_front(panel_id);
     app.ws_mut().panels[0].set_unread(true);
@@ -87,6 +112,7 @@ fn hidden_logic_ignores_stale_ui_input_and_keeps_ui_state_between_passes() {
     });
     for _ in 0..3 {
         let output = ctx.run_logic(&hidden, |ctx| app.logic_impl(ctx));
+        assert!(app.ws().panels[0].runtime_session_id().is_none());
         assert_eq!(output.platform_output.num_completed_passes, 0);
         assert!(!app.settings_open, "a stale shortcut must not be executed");
         assert!(
@@ -115,7 +141,8 @@ fn hidden_logic_ignores_stale_ui_input_and_keeps_ui_state_between_passes() {
 fn successful_logic_cannot_reset_a_repeated_ui_panic() {
     use super::UpdatePhase;
     let ctx = egui::Context::default();
-    let mut app = super::TerminalApp::new_for_tests(&ctx);
+    let mut app = detached_test_app_with_panel(&ctx);
+    assert!(app.ws().panels[0].runtime_session_id().is_none());
     for expected in 1..=super::MAX_CONSECUTIVE_UPDATE_PANICS {
         assert_eq!(app.record_update_outcome(UpdatePhase::Logic, false), 0);
         assert_eq!(app.record_update_outcome(UpdatePhase::Ui, true), expected);
@@ -129,6 +156,7 @@ fn successful_logic_cannot_reset_a_repeated_ui_panic() {
         );
     }
     assert_eq!(app.record_update_outcome(UpdatePhase::Logic, false), 0);
+    assert!(app.ws().panels[0].runtime_session_id().is_none());
 }
 
 /// Run real closing writes in a fresh process: cached paths and the writer
@@ -1508,26 +1536,7 @@ fn taskbar_reveals_a_focused_terminal_beyond_the_window_width() {
 #[test]
 fn docked_panels_share_the_root_ui_and_overlays_keep_the_remaining_canvas_bounds() {
     let ctx = egui::Context::default();
-    // The default test constructor starts a terminal. Load an empty workspace
-    // instead, then add a panel without a session spec so rendering stays PTY-free.
-    let workspace = Workspace::new("Bounds regression", None);
-    let state = crate::state::AppState {
-        schema_version: crate::state::persistence::APP_STATE_SCHEMA_VERSION,
-        workspaces: vec![workspace.to_saved()],
-        active_ws: 0,
-        sidebar_visible: true,
-        legacy_canvas_ui: Default::default(),
-        local_device_id: Uuid::new_v4().to_string(),
-        trusted_devices: Vec::new(),
-        orchestration: Default::default(),
-    };
-    let mut app = super::TerminalApp::build(&ctx, None, Some(state), None, false, false);
-    app.ws_mut().add_restored_terminal(TerminalPanel::new(
-        pos2(0.0, 0.0),
-        vec2(300.0, 200.0),
-        Color32::WHITE,
-        1,
-    ));
+    let mut app = detached_test_app_with_panel(&ctx);
     app.onboarding_dismissed = true;
     assert!(app.ws().panels[0].runtime_session_id().is_none());
     let panel_id = app.ws().panels[0].id();
