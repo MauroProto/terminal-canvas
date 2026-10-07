@@ -514,6 +514,189 @@ mod tests {
         assert_eq!(notes.notes[0].file_path, "src/vivo.rs");
     }
 
+    #[test]
+    fn bounded_note_reads_share_current_and_legacy_limits_without_changing_bytes() {
+        let directory = TemporaryNotesDirectory::new();
+        let path = directory.0.join("bounded.json");
+        let backup = crate::state::durable_write::backup_path(&path, 0);
+        std::fs::write(&backup, b"preserved backup").unwrap();
+        let raw = br#"{"notes":[]}"#;
+        std::fs::write(&path, raw).unwrap();
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        for limit in [raw.len(), raw.len() + 1] {
+            assert_eq!(
+                super::load_notes_from_path_with_limit(&path, limit).unwrap(),
+                DiffNotes::default()
+            );
+            assert_eq!(
+                super::load_existing_notes_from_path(&path, limit).unwrap(),
+                DiffNotes::default()
+            );
+        }
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            modified
+        );
+        for bytes in [raw.as_slice(), b"{malformed notes".as_slice()] {
+            std::fs::write(&path, bytes).unwrap();
+            let limit = bytes.len() - 1;
+            for result in [
+                super::load_notes_from_path_with_limit(&path, limit),
+                super::load_existing_notes_from_path(&path, limit),
+            ] {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains(&path.display().to_string()));
+                assert!(error.contains(&format!("límite de {limit} bytes")));
+                assert!(!error.contains("no contiene JSON válido"));
+            }
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        }
+        std::fs::write(&path, raw).unwrap();
+        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert!(super::load_notes_from_path_with_limit(&path, raw.len() - 1).is_err());
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            before
+        );
+        assert_eq!(std::fs::read(&backup).unwrap(), b"preserved backup");
+    }
+
+    #[test]
+    fn bounded_missing_current_notes_are_empty_but_missing_legacy_notes_are_errors() {
+        let directory = TemporaryNotesDirectory::new();
+        let path = directory.0.join("absent.json");
+        assert_eq!(
+            super::load_notes_from_path_with_limit(&path, 16).unwrap(),
+            DiffNotes::default()
+        );
+        let error = super::load_existing_notes_from_path(&path, 16).unwrap_err();
+        assert!(format!("{error:#}").contains(&path.display().to_string()));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn bounded_notes_reject_an_advertised_huge_file_before_reading() {
+        struct NeverRead;
+        impl std::io::Read for NeverRead {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                panic!("an excessive advertised size must not read or allocate its payload");
+            }
+        }
+        let error = super::read_notes_bytes_with_limit(NeverRead, u64::MAX, 32).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("32 bytes"));
+    }
+
+    #[test]
+    fn bounded_notes_reject_growth_after_metadata_without_accepting_a_json_prefix() {
+        let raw = br#"{"notes":[]}"#;
+        let mut grown = raw.to_vec();
+        grown.extend_from_slice(b" more data");
+        let consumed = std::cell::Cell::new(0);
+        let reader = CountedNotesReader {
+            inner: std::io::Cursor::new(grown),
+            consumed: &consumed,
+        };
+        let error =
+            super::read_notes_bytes_with_limit(reader, raw.len() as u64, raw.len()).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(consumed.get(), raw.len() + 1);
+    }
+
+    #[test]
+    fn bounded_notes_retry_interrupted_reads_and_preserve_other_io_errors() {
+        struct InterruptOnce {
+            interrupted: bool,
+            inner: std::io::Cursor<Vec<u8>>,
+        }
+        impl std::io::Read for InterruptOnce {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                if !self.interrupted {
+                    self.interrupted = true;
+                    return Err(std::io::ErrorKind::Interrupted.into());
+                }
+                std::io::Read::read(&mut self.inner, buffer)
+            }
+        }
+        struct Denied;
+        impl std::io::Read for Denied {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::PermissionDenied.into())
+            }
+        }
+        let raw = br#"{"notes":[]}"#;
+        let reader = InterruptOnce {
+            interrupted: false,
+            inner: std::io::Cursor::new(raw.to_vec()),
+        };
+        assert_eq!(
+            super::read_notes_bytes_with_limit(reader, raw.len() as u64, raw.len()).unwrap(),
+            raw
+        );
+        let error = super::read_notes_bytes_with_limit(Denied, 2, 16).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn bounded_note_serialization_preserves_pretty_json_and_rejects_before_writing() {
+        let directory = TemporaryNotesDirectory::new();
+        let path = directory.0.join("notes.json");
+        let backup = crate::state::durable_write::backup_path(&path, 0);
+        std::fs::write(&path, b"preserve current bytes").unwrap();
+        std::fs::write(&backup, b"preserve backup bytes").unwrap();
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let names_before = std::fs::read_dir(&directory.0).unwrap().count();
+        let mut notes = DiffNotes::default();
+        notes.add(
+            "unicode.rs",
+            Some(2),
+            4,
+            "Español: ñ, \"quotes\", newline\n and \\",
+        );
+        let golden = serde_json::to_vec_pretty(&notes).unwrap();
+        let error =
+            super::save_notes_to_path_with_limit(&path, &notes, golden.len() - 1).unwrap_err();
+        assert!(format!("{error:#}").contains(&path.display().to_string()));
+        assert_eq!(std::fs::read(&path).unwrap(), b"preserve current bytes");
+        assert_eq!(std::fs::read(&backup).unwrap(), b"preserve backup bytes");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            modified
+        );
+        assert_eq!(
+            std::fs::read_dir(&directory.0).unwrap().count(),
+            names_before
+        );
+        super::save_notes_to_path_with_limit(&path, &notes, golden.len()).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), golden);
+        assert_eq!(
+            super::load_notes_from_path_with_limit(&path, golden.len()).unwrap(),
+            notes
+        );
+    }
+
+    #[test]
+    fn bounded_empty_notes_keep_the_existing_explicit_deletion_contract() {
+        let directory = TemporaryNotesDirectory::new();
+        let path = directory.0.join("notes.json");
+        std::fs::write(&path, b"previous collection").unwrap();
+        super::save_notes_to_path_with_limit(&path, &DiffNotes::default(), 0).unwrap();
+        assert!(!path.exists());
+    }
+
+    struct CountedNotesReader<'a> {
+        inner: std::io::Cursor<Vec<u8>>,
+        consumed: &'a std::cell::Cell<usize>,
+    }
+
+    impl std::io::Read for CountedNotesReader<'_> {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            let size = std::io::Read::read(&mut self.inner, buffer)?;
+            self.consumed.set(self.consumed.get() + size);
+            Ok(size)
+        }
+    }
+
     struct TemporaryNotesDirectory(std::path::PathBuf);
 
     impl TemporaryNotesDirectory {
