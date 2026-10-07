@@ -724,6 +724,457 @@ mod tests {
         super::TerminalApp::build(ctx, None, Some(state), None, false, false)
     }
 
+    fn viewer_frame(
+        app: &mut super::TerminalApp,
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+        focused: bool,
+        width: f32,
+    ) -> egui::FullOutput {
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, 600.0),
+                )),
+                focused,
+                events,
+                ..Default::default()
+            },
+            |ui| app.show_file_viewer(ui),
+        );
+        output.textures_delta.clear();
+        output
+    }
+
+    fn painted_text_center(output: &egui::FullOutput, text: &str) -> egui::Pos2 {
+        output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::epaint::Shape::Text(value) if value.galley.text() == text => {
+                    Some(value.pos + value.galley.size() * 0.5)
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing painted text {text:?}"))
+    }
+
+    fn click_viewer(
+        app: &mut super::TerminalApp,
+        ctx: &egui::Context,
+        point: egui::Pos2,
+        focused: bool,
+        width: f32,
+    ) -> egui::FullOutput {
+        let mut last = None;
+        for pressed in [true, false] {
+            let output = viewer_frame(
+                app,
+                ctx,
+                vec![
+                    egui::Event::PointerMoved(point),
+                    egui::Event::PointerButton {
+                        pos: point,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                focused,
+                width,
+            );
+            if let Some(previous) = last.replace(output) {
+                previous.drop_without_applying_deltas();
+            }
+        }
+        last.expect("pointer release frame")
+    }
+
+    fn wait_for_viewer(app: &mut super::TerminalApp, ctx: &egui::Context) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app
+            .file_viewer
+            .as_ref()
+            .is_some_and(|viewer| viewer.loading)
+        {
+            app.poll_file_viewer_updates(ctx);
+            assert!(std::time::Instant::now() < deadline, "bounded viewer load");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn retry_button_recovers_a_missing_file_without_changing_its_path() {
+        let ctx = egui::Context::default();
+        let mut app = detached_app(&ctx);
+        let path = temp_path("retry-café");
+        app.file_viewer = Some(load_file_for_view(&path));
+        viewer_frame(&mut app, &ctx, Vec::new(), true, 900.0).drop_without_applying_deltas();
+        let output = viewer_frame(&mut app, &ctx, Vec::new(), true, 900.0);
+        let retry = painted_text_center(&output, "Reintentar");
+        assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
+            egui::epaint::Shape::Text(value) if value.galley.text() == path.to_string_lossy())));
+        output.drop_without_applying_deltas();
+        let source = "const título = \"café 🐈\";\r\n";
+        std::fs::write(&path, source).expect("restore missing file");
+        click_viewer(&mut app, &ctx, retry, true, 900.0).drop_without_applying_deltas();
+        let loading = app.file_viewer.as_ref().unwrap();
+        assert_eq!(loading.path, path);
+        assert!(loading.loading);
+        assert!(loading.read_error.is_none());
+        assert!(loading.document.is_none());
+        wait_for_viewer(&mut app, &ctx);
+        std::fs::remove_file(&path).expect("remove restored fixture");
+        let loaded = app.file_viewer.as_ref().unwrap();
+        assert_eq!(loaded.path, path);
+        assert!(loaded.read_error.is_none());
+        assert_eq!(loaded.document.as_ref().unwrap().source(), source);
+    }
+
+    #[test]
+    fn retry_keeps_escape_working_while_the_reader_is_busy() {
+        let ctx = egui::Context::default();
+        let mut app = detached_app(&ctx);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (cancelled_tx, cancelled_rx) = std::sync::mpsc::channel();
+        app.file_viewer_reader = Some(super::FileViewerReader::with_test_loader(
+            move |_, cancelled| {
+                entered_tx.send(()).expect("announce active read");
+                release_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("release active read");
+                cancelled_tx
+                    .send(cancelled())
+                    .expect("observe Escape cancellation");
+                None
+            },
+        ));
+        let mut state = super::loading_file_state("retry.rs".into());
+        state.loading = false;
+        state.read_error = Some(super::FileReadError::WorkerUnavailable);
+        app.file_viewer = Some(state);
+        viewer_frame(&mut app, &ctx, Vec::new(), true, 900.0).drop_without_applying_deltas();
+        let output = viewer_frame(&mut app, &ctx, Vec::new(), true, 900.0);
+        let retry = painted_text_center(&output, "Reintentar");
+        output.drop_without_applying_deltas();
+        click_viewer(&mut app, &ctx, retry, true, 900.0).drop_without_applying_deltas();
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("retry started");
+        assert!(super::file_viewer_selection::viewer_has_keyboard_focus(
+            &ctx
+        ));
+        viewer_frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            true,
+            900.0,
+        )
+        .drop_without_applying_deltas();
+        release_tx.send(()).expect("release cancelled worker");
+        assert!(cancelled_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("worker observes Escape before app Drop"));
+        assert!(app.file_viewer.is_none());
+        assert!(app.terminal_input_is_routable());
+        assert!(!ctx.input(|input| input.events.iter().any(|event| matches!(
+            event,
+            egui::Event::Key {
+                key: egui::Key::Escape,
+                pressed: true,
+                ..
+            }
+        ))));
+    }
+
+    #[test]
+    fn tab_activates_retry_without_routing_enter_or_immediate_escape_to_the_terminal() {
+        let ctx = egui::Context::default();
+        let mut app = detached_app(&ctx);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (cancelled_tx, cancelled_rx) = std::sync::mpsc::channel();
+        app.file_viewer_reader = Some(super::FileViewerReader::with_test_loader(
+            move |_, cancelled| {
+                entered_tx.send(()).expect("announce keyboard retry");
+                release_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("release keyboard retry");
+                cancelled_tx
+                    .send(cancelled())
+                    .expect("observe keyboard Escape cancellation");
+                None
+            },
+        ));
+        let mut state = super::loading_file_state("keyboard-retry.rs".into());
+        state.loading = false;
+        state.read_error = Some(super::FileReadError::WorkerUnavailable);
+        app.file_viewer = Some(state);
+        viewer_frame(&mut app, &ctx, Vec::new(), true, 900.0).drop_without_applying_deltas();
+        let output = viewer_frame(&mut app, &ctx, Vec::new(), true, 900.0);
+        let retry = painted_text_center(&output, "Reintentar");
+        output.drop_without_applying_deltas();
+        let key = |key, pressed| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let mut reached_retry = false;
+        for _ in 0..8 {
+            viewer_frame(&mut app, &ctx, vec![key(egui::Key::Tab, true)], true, 900.0)
+                .drop_without_applying_deltas();
+            reached_retry = !super::file_viewer_selection::viewer_has_keyboard_focus(&ctx)
+                && super::file_viewer_selection::viewer_keyboard_input_is_active(&ctx)
+                && ctx
+                    .memory(|memory| memory.focused())
+                    .and_then(|id| ctx.read_response(id))
+                    .is_some_and(|response| response.rect.contains(retry));
+            if reached_retry {
+                break;
+            }
+            viewer_frame(
+                &mut app,
+                &ctx,
+                vec![key(egui::Key::Tab, false)],
+                true,
+                900.0,
+            )
+            .drop_without_applying_deltas();
+        }
+        assert!(reached_retry, "Tab reaches the actual retry button");
+        assert!(
+            !app.terminal_input_is_routable(),
+            "focused viewer control owns input"
+        );
+        viewer_frame(
+            &mut app,
+            &ctx,
+            vec![key(egui::Key::Tab, false), key(egui::Key::Enter, true)],
+            true,
+            900.0,
+        )
+        .drop_without_applying_deltas();
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("keyboard retry started");
+        assert!(app.file_viewer.as_ref().unwrap().loading);
+        assert!(super::file_viewer_selection::viewer_has_keyboard_focus(
+            &ctx
+        ));
+        assert!(!app.terminal_input_is_routable());
+        viewer_frame(
+            &mut app,
+            &ctx,
+            vec![key(egui::Key::Enter, false), key(egui::Key::Escape, true)],
+            true,
+            900.0,
+        )
+        .drop_without_applying_deltas();
+        release_tx
+            .send(())
+            .expect("release keyboard-cancelled generation");
+        assert!(cancelled_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("worker observes keyboard Escape before app Drop"));
+        assert!(app.file_viewer.is_none());
+        assert!(app.terminal_input_is_routable());
+        assert!(!ctx.input(|input| input.events.iter().any(|event| matches!(
+            event,
+            egui::Event::Key {
+                key: egui::Key::Escape,
+                pressed: true,
+                ..
+            }
+        ))));
+    }
+
+    #[test]
+    fn reopening_a_busy_reader_reuses_it_and_loads_only_the_latest_generation() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let ctx = egui::Context::default();
+        let mut app = detached_app(&ctx);
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let worker_calls = calls.clone();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        app.file_viewer_reader = Some(super::FileViewerReader::with_test_loader(
+            move |path, cancelled| {
+                assert_eq!(path, std::path::Path::new("busy.txt"));
+                if worker_calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                    entered_tx.send(()).expect("first read active");
+                    release_rx
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .expect("release stale read");
+                    assert!(cancelled());
+                    return None;
+                }
+                Some(super::FileContents::Text {
+                    document: std::sync::Arc::new(super::SourceDocument::prepare("latest".into())),
+                    truncated: false,
+                    language: None,
+                })
+            },
+        ));
+        app.open_file_viewer("busy.txt".into());
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("busy reader started");
+        for _ in 0..32 {
+            app.start_file_viewer_load("busy.txt".into(), true);
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert!(!app.file_viewer_reader.as_ref().unwrap().is_current(1));
+        release_tx.send(()).expect("release stale generation");
+        wait_for_viewer(&mut app, &ctx);
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            app.file_viewer
+                .as_ref()
+                .unwrap()
+                .document
+                .as_ref()
+                .unwrap()
+                .source(),
+            "latest"
+        );
+    }
+
+    #[test]
+    fn retry_replaces_a_reader_that_has_exited() {
+        let ctx = egui::Context::default();
+        let mut app = detached_app(&ctx);
+        let path = temp_path("reader-exit");
+        std::fs::write(&path, "recovered\r\n").expect("recovery source");
+        app.file_viewer_reader = Some(super::FileViewerReader::with_test_loader(|_, _| {
+            panic!("synthetic reader exit");
+        }));
+        app.open_file_viewer(path.clone());
+        wait_for_viewer(&mut app, &ctx);
+        assert_eq!(
+            app.file_viewer.as_ref().unwrap().read_error,
+            Some(super::FileReadError::WorkerUnavailable)
+        );
+        assert!(!app.file_viewer_reader.as_ref().unwrap().is_available());
+        app.start_file_viewer_load(path.clone(), true);
+        wait_for_viewer(&mut app, &ctx);
+        std::fs::remove_file(&path).expect("remove recovery source");
+        assert!(app.file_viewer_reader.as_ref().unwrap().is_available());
+        let viewer = app.file_viewer.as_ref().unwrap();
+        assert_eq!(viewer.path, path);
+        assert!(viewer.read_error.is_none());
+        assert_eq!(viewer.document.as_ref().unwrap().source(), "recovered\r\n");
+    }
+
+    #[test]
+    fn modal_and_window_blur_block_retry_and_path_copy() {
+        for (modal, focused) in [(true, true), (false, false)] {
+            let ctx = egui::Context::default();
+            let mut app = detached_app(&ctx);
+            let mut state = super::loading_file_state("disabled.txt".into());
+            state.loading = false;
+            state.read_error = Some(super::FileReadError::WorkerUnavailable);
+            app.file_viewer = Some(state);
+            viewer_frame(&mut app, &ctx, Vec::new(), true, 900.0).drop_without_applying_deltas();
+            let output = viewer_frame(&mut app, &ctx, Vec::new(), true, 900.0);
+            let retry = painted_text_center(&output, "Reintentar");
+            let copy = painted_text_center(&output, "Ruta");
+            let header = painted_text_center(&output, "disabled.txt");
+            output.drop_without_applying_deltas();
+            click_viewer(&mut app, &ctx, header, true, 900.0).drop_without_applying_deltas();
+            assert!(super::file_viewer_selection::viewer_has_keyboard_focus(
+                &ctx
+            ));
+            app.command_palette.open = modal;
+            for point in [retry, copy] {
+                let output = click_viewer(&mut app, &ctx, point, focused, 900.0);
+                assert!(!output
+                    .platform_output
+                    .commands
+                    .iter()
+                    .any(|command| matches!(command, egui::OutputCommand::CopyText(_))));
+                output.drop_without_applying_deltas();
+                assert!(app.file_viewer_reader.is_none());
+                assert!(!app.file_viewer.as_ref().unwrap().loading);
+                assert!(!super::file_viewer_selection::viewer_has_keyboard_focus(
+                    &ctx
+                ));
+            }
+            viewer_frame(
+                &mut app,
+                &ctx,
+                vec![egui::Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                focused,
+                900.0,
+            )
+            .drop_without_applying_deltas();
+            assert!(
+                app.file_viewer.is_some(),
+                "modal or blurred Escape cannot close the viewer"
+            );
+            assert!(ctx.input(|input| input.events.iter().any(|event| matches!(
+                event,
+                egui::Event::Key {
+                    key: egui::Key::Escape,
+                    pressed: true,
+                    ..
+                }
+            ))));
+        }
+    }
+
+    #[test]
+    fn minimum_width_header_keeps_actions_visible_and_copies_the_complete_unicode_path() {
+        let ctx = egui::Context::default();
+        let mut app = detached_app(&ctx);
+        let path = std::path::PathBuf::from(format!(
+            "/parent folder/{}/{}.rs",
+            "café".repeat(40),
+            "漢字🙂".repeat(80)
+        ));
+        let mut state = super::loading_file_state(path.clone());
+        state.loading = false;
+        state.read_error = Some(super::FileReadError::WorkerUnavailable);
+        app.file_viewer = Some(state);
+        viewer_frame(&mut app, &ctx, Vec::new(), true, 320.0).drop_without_applying_deltas();
+        let output = viewer_frame(&mut app, &ctx, Vec::new(), true, 320.0);
+        for label in ["✕", "↗", "Ruta"] {
+            let center = painted_text_center(&output, label);
+            assert!((0.0..=320.0).contains(&center.x), "{label}");
+            assert!((0.0..=60.0).contains(&center.y), "{label}");
+        }
+        let point = painted_text_center(&output, "Ruta");
+        output.drop_without_applying_deltas();
+        let output = click_viewer(&mut app, &ctx, point, true, 320.0);
+        let copied: Vec<_> = output
+            .platform_output
+            .commands
+            .iter()
+            .filter_map(|command| match command {
+                egui::OutputCommand::CopyText(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(copied, vec![path.to_string_lossy().as_ref()]);
+        output.drop_without_applying_deltas();
+    }
+
     #[test]
     fn loading_shares_the_original_buffer_with_the_highlighter() {
         let source: std::sync::Arc<str> = std::sync::Arc::from("fn main() {}\r\n");
