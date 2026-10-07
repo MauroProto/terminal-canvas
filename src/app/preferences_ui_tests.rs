@@ -1531,3 +1531,148 @@ fn oversized_import_merge_survives_review_reopen_and_reduced_notes_reload_durabl
         Err(TryRecvError::Empty)
     ));
 }
+
+#[test]
+fn malformed_legacy_note_import_reports_the_parse_cause_without_saving_or_replacing_notes() {
+    let temporary = TemporaryConfig::new();
+    std::fs::create_dir_all(&temporary.0).unwrap();
+    let root = temporary.0.join("synthetic-malformed-import-repository");
+    let current_path = temporary.0.join("current.json");
+    let legacy_path = temporary.0.join("legacy.json");
+    let backup_path = crate::state::durable_write::backup_path(&current_path, 0);
+    let current = notes_with("Existing notes stay ready: café, \"quotes\", \\ and 日本語");
+    let current_bytes = serde_json::to_vec_pretty(&current).unwrap();
+    let malformed = b"{\n  \"notes\": [,\n}\n";
+    let limit = current_bytes.len() + malformed.len() + 32;
+    assert!(limit <= 2048 && malformed.len() < limit);
+    std::fs::write(&current_path, &current_bytes).unwrap();
+    std::fs::write(&legacy_path, malformed).unwrap();
+    std::fs::write(&backup_path, b"preserved earlier backup").unwrap();
+    let before: Vec<_> = [&current_path, &legacy_path, &backup_path]
+        .into_iter()
+        .map(|path| {
+            (
+                path.to_path_buf(),
+                std::fs::read(path).unwrap(),
+                std::fs::metadata(path).unwrap().modified().unwrap(),
+            )
+        })
+        .collect();
+    let entries = || {
+        let mut names: Vec<_> = std::fs::read_dir(&temporary.0)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        names.sort();
+        names
+    };
+    let names_before = entries();
+    let assert_preserved = || {
+        for (path, bytes, modified) in &before {
+            assert_eq!(&std::fs::read(path).unwrap(), bytes);
+            assert_eq!(
+                &std::fs::metadata(path).unwrap().modified().unwrap(),
+                modified
+            );
+        }
+        assert_eq!(entries(), names_before);
+    };
+    let (worker, control) = bounded_notes_writer(
+        root.clone(),
+        current_path.clone(),
+        legacy_path.clone(),
+        limit,
+    );
+    let mut app = detached_app();
+    app.preferences_worker = worker;
+    let key = Uuid::new_v4();
+    app.code_review = Some(review_state(
+        key,
+        Uuid::new_v4(),
+        root.clone(),
+        DiffNotes::default(),
+    ));
+    // Warm the headless UI before starting the bounded ACK clock.
+    let mut harness = preferences_harness(app);
+    let request = harness
+        .state_mut()
+        .preferences_worker
+        .load_notes(key, root.clone());
+    harness
+        .state_mut()
+        .code_review
+        .as_mut()
+        .unwrap()
+        .notes_request = request;
+    let (job, error) = next_bounded_notes_io(&mut harness, &control);
+    assert!(
+        matches!(job, AcceptedJob::Load(actual_key, actual_request, ref actual_root)
+        if actual_key == key && actual_request == request && actual_root == &root)
+    );
+    assert!(error.is_none());
+    control.release();
+    wait_for_idle(&mut harness);
+
+    harness.get_by_label("Importar notas anteriores").click();
+    harness.step();
+    let (job, error) = next_bounded_notes_io(&mut harness, &control);
+    let AcceptedJob::Import(actual_key, import_request, actual_root) = job else {
+        panic!("expected real malformed legacy import");
+    };
+    assert_eq!((actual_key, actual_root), (key, root.clone()));
+    let error = error.expect("malformed legacy JSON must fail in the real parser");
+    assert!(error.contains(&legacy_path.display().to_string()));
+    assert!(
+        error.contains("line 2 column"),
+        "the parser cause must include its location: {error}"
+    );
+    control.release();
+    wait_for_idle(&mut harness);
+    let state = harness.state().code_review.as_ref().unwrap();
+    assert_eq!(state.notes, current);
+    assert!(state.notes_ready && !state.notes_loading && state.notes_error.is_none());
+    assert!(state.legacy_notes_available && !state.importing_notes);
+    assert!(
+        painted_contains(harness.output(), &error),
+        "the visible import toast must contain the complete real parser error"
+    );
+    assert_preserved();
+    assert!(harness.state().preferences_worker.warning().is_none());
+    assert!(harness
+        .state()
+        .preferences_worker
+        .retained_notes_for_repository(&root)
+        .is_none());
+    assert!(
+        matches!(control.observed.try_recv(), Err(TryRecvError::Empty)),
+        "failed import must never queue SaveNotes"
+    );
+
+    // A real second click proves that retry remains enabled; it must produce
+    // a fresh import request, not save or replace the valid current collection.
+    harness.get_by_label("Importar notas anteriores").click();
+    harness.step();
+    let (job, second_error) = next_bounded_notes_io(&mut harness, &control);
+    let AcceptedJob::Import(actual_key, retry_request, actual_root) = job else {
+        panic!("retry must issue another real legacy read");
+    };
+    assert_eq!((actual_key, actual_root), (key, root.clone()));
+    assert_ne!(retry_request, import_request);
+    assert_eq!(second_error.as_deref(), Some(error.as_str()));
+    control.release();
+    wait_for_idle(&mut harness);
+    let state = harness.state().code_review.as_ref().unwrap();
+    assert_eq!(state.notes, current);
+    assert!(
+        state.notes_ready
+            && state.notes_error.is_none()
+            && state.legacy_notes_available
+            && !state.importing_notes
+    );
+    assert_preserved();
+    assert!(matches!(
+        control.observed.try_recv(),
+        Err(TryRecvError::Empty)
+    ));
+    assert!(harness.state().preferences_worker.warning().is_none());
+}
