@@ -711,3 +711,357 @@ fn an_older_settings_ack_does_not_announce_success_while_the_latest_save_is_pend
         "superseded pending settings must not be replayed"
     );
 }
+
+#[test]
+fn explicit_retained_notes_recovery_after_reopen_restores_latest_ram_and_saves_reduction() {
+    let root = PathBuf::from("retained-repository-a");
+    let other_root = PathBuf::from("retained-repository-b");
+    let old = notes_with("Original pending payload that is too long for the small fake policy");
+    let mut latest = notes_with(
+        "Latest pending edit that must be reduced before the small fake policy can save it",
+    );
+    latest.notes[0].old_side = true;
+    latest.notes[0].start_line = Some(1);
+    latest.notes[0].review_identity = Some("retained-review-identity".to_owned());
+    latest.notes[0].sent_at = Some(chrono::Utc::now());
+    latest.add("outside-current-diff.rs", None, 9, "pending imported note");
+    let other = notes_with("Repository B keeps an independent write error");
+    let (worker, control) = controlled_writer(None);
+    let mut app = detached_app();
+    app.preferences_worker = worker;
+    let mut state = review_state(Uuid::new_v4(), Uuid::new_v4(), root.clone(), old.clone());
+    state.notes_ready = true;
+    state.notes_loading = false;
+    app.code_review = Some(state);
+    app.preferences_worker.save_notes(root.clone(), old.clone());
+    let mut harness = preferences_harness(app);
+    let AcceptedJob::Notes(saved_root, value) = next_job(&mut harness, &control) else {
+        panic!("expected the original notes save");
+    };
+    assert_eq!(saved_root, root);
+    assert_eq!(value, old);
+    control.respond(Completion::NotesSaved(Err(anyhow::anyhow!(
+        "synthetic permanent notes size limit"
+    ))));
+    wait_for_idle(&mut harness);
+
+    harness.state_mut().code_review.as_mut().unwrap().notes = latest.clone();
+    harness
+        .state_mut()
+        .preferences_worker
+        .save_notes(root.clone(), latest.clone());
+    let AcceptedJob::Notes(saved_root, value) = next_job(&mut harness, &control) else {
+        panic!("expected the latest notes save");
+    };
+    assert_eq!(saved_root, root);
+    assert_eq!(value, latest);
+    assert!(
+        value
+            .notes
+            .iter()
+            .map(|note| note.body.len())
+            .sum::<usize>()
+            > 48
+    );
+    control.respond(Completion::NotesSaved(Err(anyhow::anyhow!(
+        "synthetic permanent notes size limit"
+    ))));
+    wait_for_idle(&mut harness);
+    harness
+        .state_mut()
+        .preferences_worker
+        .save_notes(other_root.clone(), other.clone());
+    let AcceptedJob::Notes(saved_root, value) = next_job(&mut harness, &control) else {
+        panic!("expected repository B's save");
+    };
+    assert_eq!(saved_root, other_root);
+    assert_eq!(value, other);
+    control.respond(Completion::NotesSaved(Err(anyhow::anyhow!(
+        "repository B remains read-only"
+    ))));
+    wait_for_idle(&mut harness);
+
+    // Closing removes the view, not the writer's retained accepted payload.
+    harness.state_mut().code_review = None;
+    let key = Uuid::new_v4();
+    let request = harness
+        .state_mut()
+        .preferences_worker
+        .load_notes(key, root.clone());
+    harness.state_mut().code_review = Some(review_state(
+        key,
+        request,
+        root.clone(),
+        DiffNotes::default(),
+    ));
+    let AcceptedJob::Notes(saved_root, value) = next_job(&mut harness, &control) else {
+        panic!("ordinary reopening must retry the retained write before reading disk");
+    };
+    assert_eq!(saved_root, root);
+    assert_eq!(value, latest);
+    control.respond(Completion::NotesSaved(Err(anyhow::anyhow!(
+        "synthetic permanent notes size limit"
+    ))));
+    wait_for_idle(&mut harness);
+    let state = harness.state().code_review.as_ref().unwrap();
+    assert!(!state.notes_ready && !state.notes_loading && state.notes_error.is_some());
+    assert_eq!(state.notes, DiffNotes::default());
+    assert!(matches!(
+        control.accepted.try_recv(),
+        Err(TryRecvError::Empty)
+    ));
+    let warning = harness.state().preferences_worker.warning();
+    assert!(warning
+        .as_deref()
+        .unwrap()
+        .contains("synthetic permanent notes size limit"));
+    {
+        let state = harness.state_mut().code_review.as_mut().unwrap();
+        state.import_request = Some(Uuid::new_v4());
+        state.importing_notes = true;
+    }
+    harness.run_steps(2);
+    harness.get_by_label("Editar notas pendientes").click();
+    harness.step();
+    let state = harness.state().code_review.as_ref().unwrap();
+    assert_eq!(state.notes, latest);
+    assert!(state.notes_ready && state.show_all_notes && !state.notes_loading);
+    assert!(
+        state.notes_error.is_none() && state.import_request.is_none() && !state.importing_notes
+    );
+    assert_ne!(state.notes_request, request);
+    assert_eq!(harness.state().preferences_worker.warning(), warning);
+    assert!(!harness.state().preferences_worker.busy());
+    assert!(
+        matches!(control.accepted.try_recv(), Err(TryRecvError::Empty)),
+        "recovery must not submit a save or retry"
+    );
+
+    let id = latest.notes[0].id;
+    harness.state_mut().apply_note_action(NoteAction::Edit(id));
+    harness
+        .state_mut()
+        .code_review
+        .as_mut()
+        .unwrap()
+        .editing_note
+        .as_mut()
+        .unwrap()
+        .body = "small".to_owned();
+    harness
+        .state_mut()
+        .apply_note_action(NoteAction::SaveEditor);
+    let AcceptedJob::Notes(saved_root, value) = next_job(&mut harness, &control) else {
+        panic!("the explicit reduction must submit the corrected notes");
+    };
+    assert_eq!(saved_root, root);
+    assert_eq!(value.notes[0].id, id);
+    assert_eq!(value.notes[0].body, "small");
+    assert!(value.notes[0].sent_at.is_none());
+    assert_eq!(value.notes[1], latest.notes[1]);
+    assert!(
+        value
+            .notes
+            .iter()
+            .map(|note| note.body.len())
+            .sum::<usize>()
+            <= 48
+    );
+    assert!(
+        harness.state().preferences_worker.warning().is_some(),
+        "submission is not an ACK"
+    );
+    control.respond(Completion::NotesSaved(Ok(())));
+    wait_for_idle(&mut harness);
+    assert!(harness
+        .state()
+        .preferences_worker
+        .retained_notes_for_repository(&root)
+        .is_none());
+    assert_eq!(
+        harness
+            .state()
+            .preferences_worker
+            .retained_notes_for_repository(&other_root),
+        Some(&other)
+    );
+    let remaining = harness.state().preferences_worker.warning().unwrap();
+    assert!(remaining.contains("retained-repository-b"));
+    assert!(!remaining.contains("retained-repository-a"));
+}
+
+#[test]
+fn explicit_retained_notes_recovery_ignores_stale_load_and_import_completions() {
+    for successful_old_read in [false, true] {
+        let root = PathBuf::from("retained-stale-repository");
+        let key = Uuid::new_v4();
+        let retained = notes_with("exact accepted RAM payload");
+        let (worker, control) = controlled_writer(None);
+        let mut app = detached_app();
+        app.preferences_worker = worker;
+        let old_request = app.preferences_worker.load_notes(key, root.clone());
+        app.preferences_worker
+            .save_notes(root.clone(), retained.clone());
+        let old_import = app.preferences_worker.import_notes(key, root.clone());
+        let mut state = review_state(key, old_request, root.clone(), DiffNotes::default());
+        // Stage an older in-flight request while this view still records its
+        // preceding read error; the explicit handler must invalidate both IDs.
+        state.notes_loading = false;
+        state.notes_error = Some("preceding controlled notes read failed".to_owned());
+        state.import_request = Some(old_import);
+        state.importing_notes = true;
+        app.code_review = Some(state);
+        let mut harness = preferences_harness(app);
+        let AcceptedJob::Load(actual_key, actual_request, actual_root) =
+            next_job(&mut harness, &control)
+        else {
+            panic!("expected the old in-flight read");
+        };
+        assert_eq!(
+            (actual_key, actual_request, actual_root),
+            (key, old_request, root.clone())
+        );
+        assert!(harness
+            .state_mut()
+            .recover_retained_review_notes(key, &root));
+        let current_request = harness.state().code_review.as_ref().unwrap().notes_request;
+        assert_ne!(current_request, old_request);
+        control.respond(Completion::NotesLoaded {
+            key,
+            request: old_request,
+            repo_root: root.clone(),
+            result: if successful_old_read {
+                Ok((notes_with("stale disk payload"), true))
+            } else {
+                Err(anyhow::anyhow!("stale read error"))
+            },
+        });
+        let AcceptedJob::Notes(saved_root, value) = next_job(&mut harness, &control) else {
+            panic!("expected the already accepted pending save");
+        };
+        assert_eq!(saved_root, root);
+        assert_eq!(value, retained);
+        let state = harness.state().code_review.as_ref().unwrap();
+        assert_eq!(state.notes, retained);
+        assert!(state.notes_ready && state.notes_error.is_none());
+        assert_eq!(state.notes_request, current_request);
+        control.respond(Completion::NotesSaved(Err(anyhow::anyhow!(
+            "synthetic permanent notes size limit"
+        ))));
+        let AcceptedJob::Import(actual_key, request, actual_root) =
+            next_job(&mut harness, &control)
+        else {
+            panic!("expected the old queued import");
+        };
+        assert_eq!(
+            (actual_key, request, actual_root),
+            (key, old_import, root.clone())
+        );
+        control.respond(Completion::NotesImported {
+            key,
+            request: old_import,
+            repo_root: root.clone(),
+            result: Ok(notes_with("stale imported payload")),
+        });
+        wait_for_idle(&mut harness);
+        let state = harness.state().code_review.as_ref().unwrap();
+        assert_eq!(state.notes, retained);
+        assert!(state.notes_ready && state.notes_error.is_none());
+        assert_eq!(state.notes_request, current_request);
+        assert!(state.import_request.is_none() && !state.importing_notes);
+        assert!(harness.state().preferences_worker.warning().is_some());
+        assert!(matches!(
+            control.accepted.try_recv(),
+            Err(TryRecvError::Empty)
+        ));
+    }
+}
+
+#[test]
+fn retained_notes_recovery_requires_failed_matching_review_and_same_root_snapshot() {
+    let root = PathBuf::from("retained-guard-repository");
+    let other = PathBuf::from("retained-other-repository");
+    let key = Uuid::new_v4();
+    let (worker, control) = controlled_writer(None);
+    let mut app = detached_app();
+    app.preferences_worker = worker;
+    let mut state = review_state(key, Uuid::new_v4(), root.clone(), DiffNotes::default());
+    state.notes_loading = false;
+    state.notes_error = Some("corrupt disk notes without any accepted save".to_owned());
+    app.code_review = Some(state);
+    let mut harness = preferences_harness(app);
+    assert!(!harness
+        .state_mut()
+        .recover_retained_review_notes(key, &root));
+    harness.run_steps(2);
+    assert!(!painted_contains(
+        harness.output(),
+        "Editar notas pendientes"
+    ));
+    assert!(matches!(
+        control.accepted.try_recv(),
+        Err(TryRecvError::Empty)
+    ));
+
+    harness
+        .state_mut()
+        .preferences_worker
+        .save_notes(other.clone(), notes_with("other root"));
+    let AcceptedJob::Notes(saved_root, _) = next_job(&mut harness, &control) else {
+        panic!("expected the other repository save");
+    };
+    assert_eq!(saved_root, other);
+    assert!(!harness
+        .state_mut()
+        .recover_retained_review_notes(key, &root));
+    harness
+        .state_mut()
+        .preferences_worker
+        .save_notes(root.clone(), notes_with("accepted same root"));
+    assert!(!harness
+        .state_mut()
+        .recover_retained_review_notes(Uuid::new_v4(), &root));
+    assert!(!harness
+        .state_mut()
+        .recover_retained_review_notes(key, &other));
+    harness
+        .state_mut()
+        .code_review
+        .as_mut()
+        .unwrap()
+        .notes_ready = true;
+    assert!(!harness
+        .state_mut()
+        .recover_retained_review_notes(key, &root));
+    {
+        let state = harness.state_mut().code_review.as_mut().unwrap();
+        state.notes_ready = false;
+        state.notes_loading = true;
+    }
+    assert!(!harness
+        .state_mut()
+        .recover_retained_review_notes(key, &root));
+    {
+        let state = harness.state_mut().code_review.as_mut().unwrap();
+        state.notes_loading = false;
+        state.notes_error = None;
+    }
+    assert!(!harness
+        .state_mut()
+        .recover_retained_review_notes(key, &root));
+    assert_eq!(
+        harness.state().code_review.as_ref().unwrap().notes,
+        DiffNotes::default()
+    );
+    control.respond(Completion::NotesSaved(Err(anyhow::anyhow!(
+        "other root denied"
+    ))));
+    let AcceptedJob::Notes(saved_root, _) = next_job(&mut harness, &control) else {
+        panic!("expected the accepted same-root pending save");
+    };
+    assert_eq!(saved_root, root);
+    control.respond(Completion::NotesSaved(Err(anyhow::anyhow!(
+        "synthetic permanent notes size limit"
+    ))));
+    wait_for_idle(&mut harness);
+}
