@@ -2932,6 +2932,7 @@ dependencies = [
  "tower",
  "tungstenite",
  "two-face",
+ "unicode-segmentation",
  "url",
  "uuid",
  "winit",
