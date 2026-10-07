@@ -92,7 +92,14 @@ fn fixture_server(
         tls.write_all(status.as_bytes()).expect("fixture response");
         tls.conn.send_close_notify();
         tls.flush().expect("fixture TLS close_notify");
-        tls.sock.shutdown(Shutdown::Write).unwrap();
+        match tls.sock.shutdown(Shutdown::Write) {
+            Ok(()) => {}
+            // The response and TLS alert were flushed above. A peer that has
+            // already closed can make this cleanup-only shutdown return
+            // ENOTCONN; client-side certificate/status assertions remain strict.
+            Err(error) if error.kind() == std::io::ErrorKind::NotConnected => return,
+            Err(error) => panic!("fixture write shutdown: {error}"),
+        }
         // Allow the peer to consume the response and close. Cleanup is bounded
         // and never changes the client-side certificate/status assertions.
         let mut ignored = [0u8; 1024];
