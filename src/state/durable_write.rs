@@ -145,7 +145,53 @@ pub fn write_private_durable(path: &Path, bytes: &[u8]) -> std::io::Result<bool>
 }
 
 fn content_matches(path: &Path, bytes: &[u8]) -> bool {
-    std::fs::read(path).is_ok_and(|existing| existing == bytes)
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Follow regular-file symlinks as before, but never wait for a FIFO
+        // writer before descriptor metadata can reject the non-regular file.
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let Ok(mut file) = retry_interrupted(|| options.open(path)) else {
+        return false;
+    };
+    let Ok(metadata) = retry_interrupted(|| file.metadata()) else {
+        return false;
+    };
+    metadata.is_file() && content_matches_reader(&mut file, metadata.len(), bytes)
+}
+
+const CONTENT_COMPARE_CHUNK_BYTES: usize = 8 * 1024;
+
+fn content_matches_reader(reader: &mut impl std::io::Read, len: u64, bytes: &[u8]) -> bool {
+    if u64::try_from(bytes.len()).ok() != Some(len) {
+        return false;
+    }
+    let mut buffer = [0_u8; CONTENT_COMPARE_CHUNK_BYTES];
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let requested = (bytes.len() - offset).min(buffer.len());
+        let Ok(read) = retry_interrupted(|| reader.read(&mut buffer[..requested])) else {
+            return false;
+        };
+        if read == 0 || buffer[..read] != bytes[offset..offset + read] {
+            return false;
+        }
+        offset += read;
+    }
+    // A matching metadata length is only a hint: reject growth after stat.
+    matches!(retry_interrupted(|| reader.read(&mut buffer[..1])), Ok(0))
+}
+
+fn retry_interrupted<T>(mut operation: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+    loop {
+        match operation() {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            result => return result,
+        }
+    }
 }
 
 /// Carga el primer contenido válido en el orden principal → `.bak.0..4`.
