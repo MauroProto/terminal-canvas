@@ -8,21 +8,20 @@
 //! - La lista se dibuja virtualizada (`show_rows`): sólo se pintan las líneas
 //!   visibles, así un archivo de 20k líneas cuesta lo mismo que uno de 50.
 
-use std::io::Read;
-use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::path::Path;
+use std::path::PathBuf;
 
 use egui::{vec2, Color32, FontId, RichText, ScrollArea};
 
 use crate::theme::colors as palette;
 
 use super::code_highlight::HighlightedLine;
+use super::file_viewer_reader::{FileContents, FileViewerReader};
 use super::TerminalApp;
 
-/// Tope de bytes a leer para no bloquear la UI con archivos enormes.
-const MAX_VIEW_BYTES: u64 = 2 * 1024 * 1024;
-/// Evita la amplificación de memoria de un archivo compuesto por millones de
-/// líneas vacías: cada `String` tiene overhead aunque el archivo pese poco.
-const MAX_VIEW_LINES: usize = 100_000;
+#[cfg(test)]
+use super::file_viewer_reader::{MAX_VIEW_BYTES, MAX_VIEW_LINES};
 const DEFAULT_WIDTH: f32 = 620.0;
 const MIN_WIDTH: f32 = 320.0;
 const MAX_WIDTH: f32 = 1200.0;
@@ -87,22 +86,18 @@ impl TerminalApp {
     pub(super) fn open_file_viewer(&mut self, path: PathBuf) {
         self.highlighter.cancel();
         self.file_viewer_keyboard_active = false;
-        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-        let worker_path = path.clone();
+        let reader = self
+            .file_viewer_reader
+            .get_or_insert_with(|| FileViewerReader::new(super::code_highlight::detect_language));
         let repaint = self.ctx.clone();
-        let spawned = std::thread::Builder::new()
-            .name("file-viewer-reader".to_owned())
-            .spawn(move || {
-                let state = load_file_for_view(&worker_path);
-                let _ = sender.send(state);
-                if let Some(ctx) = repaint {
-                    ctx.request_repaint();
-                }
-            })
-            .is_ok();
+        reader.request(path.clone(), move || {
+            if let Some(ctx) = repaint {
+                ctx.request_repaint();
+            }
+        });
+        let available = reader.is_available();
         self.file_viewer = Some(loading_file_state(path));
-        self.file_viewer_rx = spawned.then_some(receiver);
-        if !spawned {
+        if !available {
             if let Some(viewer) = self.file_viewer.as_mut() {
                 viewer.loading = false;
                 viewer.lines = vec!["(no se pudo iniciar la lectura del archivo)".to_owned()];
@@ -110,15 +105,16 @@ impl TerminalApp {
         }
     }
 
-    fn activate_loaded_file(&mut self, mut state: FileViewerState) {
-        if !state.binary && !state.lines.is_empty() && self.highlighter.is_available() {
+    fn activate_loaded_file(&mut self, mut state: FileViewerState, source: Option<String>) {
+        if let Some(source) = source
+            .filter(|_| !state.binary && !state.lines.is_empty() && self.highlighter.is_available())
+        {
             let name = state.file_name();
-            // El texto se reensambla para el worker; el visor ya puede pintar
-            // el plano mientras tanto.
-            let text = state.lines.join("\n");
+            // Mover el texto original conserva los terminadores y evita
+            // reconstruir/copiar el archivo completo en el hilo de UI.
             let repaint = self.ctx.clone();
             state.highlight_token =
-                Some(self.highlighter.request_with_notify(name, text, move || {
+                Some(self.highlighter.request_with_notify(name, source, move || {
                     if let Some(ctx) = repaint {
                         ctx.request_repaint();
                     }
@@ -129,31 +125,39 @@ impl TerminalApp {
 
     fn poll_file_viewer_load(&mut self, ctx: &egui::Context) {
         let result = self
-            .file_viewer_rx
-            .as_ref()
-            .map(std::sync::mpsc::Receiver::try_recv);
+            .file_viewer_reader
+            .as_mut()
+            .and_then(FileViewerReader::poll);
         match result {
-            Some(Ok(state)) => {
-                self.file_viewer_rx = None;
-                let still_expected = self
-                    .file_viewer
+            Some(result) => {
+                let current_generation = self
+                    .file_viewer_reader
                     .as_ref()
-                    .is_some_and(|viewer| viewer.path == state.path);
+                    .is_some_and(|reader| reader.is_current(result.token));
+                let still_expected = current_generation
+                    && self
+                        .file_viewer
+                        .as_ref()
+                        .is_some_and(|viewer| viewer.loading && viewer.path == result.path);
                 if still_expected {
-                    self.activate_loaded_file(state);
+                    let (state, source) = loaded_file_state(result.path, result.contents);
+                    self.activate_loaded_file(state, source);
                 }
             }
-            Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
-                self.file_viewer_rx = None;
-                if let Some(viewer) = self.file_viewer.as_mut() {
-                    viewer.loading = false;
-                    viewer.lines = vec!["(no se pudo leer el archivo)".to_owned()];
+            None => {
+                if let Some(viewer) = self.file_viewer.as_mut().filter(|viewer| viewer.loading) {
+                    if self
+                        .file_viewer_reader
+                        .as_ref()
+                        .is_some_and(FileViewerReader::is_available)
+                    {
+                        ctx.request_repaint_after(std::time::Duration::from_millis(50));
+                    } else {
+                        viewer.loading = false;
+                        viewer.lines = vec!["(no se pudo leer el archivo)".to_owned()];
+                    }
                 }
             }
-            Some(Err(std::sync::mpsc::TryRecvError::Empty)) => {
-                ctx.request_repaint_after(std::time::Duration::from_millis(50));
-            }
-            None => {}
         }
     }
 
@@ -181,8 +185,10 @@ impl TerminalApp {
             && ctx.input(|input| input.key_pressed(egui::Key::Escape))
         {
             self.highlighter.cancel();
+            if let Some(reader) = self.file_viewer_reader.as_mut() {
+                reader.cancel();
+            }
             self.file_viewer = None;
-            self.file_viewer_rx = None;
             return;
         }
 
@@ -266,8 +272,10 @@ impl TerminalApp {
 
         if close {
             self.highlighter.cancel();
+            if let Some(reader) = self.file_viewer_reader.as_mut() {
+                reader.cancel();
+            }
             self.file_viewer = None;
-            self.file_viewer_rx = None;
         }
         if let Some(path) = open_dropped {
             self.open_file_viewer(path);
@@ -432,76 +440,42 @@ fn line_layout_job(
     }
     job
 }
+fn loaded_file_state(path: PathBuf, contents: FileContents) -> (FileViewerState, Option<String>) {
+    let mut state = loading_file_state(path);
+    state.loading = false;
+    let source = match contents {
+        FileContents::Text {
+            lines,
+            source,
+            truncated,
+            language,
+        } => {
+            state.lines = lines;
+            state.truncated = truncated;
+            state.language = language;
+            Some(source)
+        }
+        FileContents::Binary => {
+            state.binary = true;
+            None
+        }
+        FileContents::Unreadable => {
+            state.lines = vec!["(no se pudo leer el archivo)".to_owned()];
+            None
+        }
+    };
+    (state, source)
+}
+
+#[cfg(test)]
 fn load_file_for_view(path: &Path) -> FileViewerState {
-    let unreadable = || FileViewerState {
-        path: path.to_path_buf(),
-        lines: vec!["(no se pudo leer el archivo)".to_owned()],
-        truncated: false,
-        binary: false,
-        highlighted: Vec::new(),
-        highlight_token: None,
-        language: None,
-        loading: false,
-    };
-
-    // Lectura acotada: leemos como máximo un byte más que el tope para poder
-    // distinguir "justo del tamaño del tope" de "más grande que el tope", sin
-    // reservar memoria proporcional al archivo real.
-    let file = match std::fs::File::open(path) {
-        Ok(file) => file,
-        Err(_) => return unreadable(),
-    };
-    let mut bytes = Vec::new();
-    if file
-        .take(MAX_VIEW_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .is_err()
-    {
-        return unreadable();
-    }
-    let truncated = bytes.len() as u64 > MAX_VIEW_BYTES;
-    if truncated {
-        bytes.truncate(MAX_VIEW_BYTES as usize);
-    }
-
-    if bytes.contains(&0) {
-        return FileViewerState {
-            path: path.to_path_buf(),
-            lines: Vec::new(),
-            truncated: false,
-            binary: true,
-            highlighted: Vec::new(),
-            highlight_token: None,
-            language: None,
-            loading: false,
-        };
-    }
-    let text = String::from_utf8_lossy(&bytes);
-    let mut source_lines = text.lines();
-    let lines: Vec<String> = source_lines
-        .by_ref()
-        .take(MAX_VIEW_LINES)
-        .map(str::to_owned)
-        .collect();
-    let truncated = truncated || source_lines.next().is_some();
-    let language = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .and_then(|name| {
-            lines
-                .first()
-                .and_then(|first| super::code_highlight::detect_language(name, first))
-        });
-    FileViewerState {
-        path: path.to_path_buf(),
-        lines,
-        truncated,
-        binary: false,
-        highlighted: Vec::new(),
-        highlight_token: None,
-        language,
-        loading: false,
-    }
+    let contents = super::file_viewer_reader::load_file_for_view(
+        path,
+        &|| false,
+        &super::code_highlight::detect_language,
+    )
+    .expect("test file read is not cancelled");
+    loaded_file_state(path.to_path_buf(), contents).0
 }
 
 #[cfg(test)]

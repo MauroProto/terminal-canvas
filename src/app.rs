@@ -34,6 +34,7 @@ mod collab_ui;
 mod desktop;
 mod dialogs;
 mod export_action;
+mod file_viewer_reader;
 mod file_viewer_ui;
 mod memory_ui;
 mod notify_policy;
@@ -108,7 +109,7 @@ pub struct TerminalApp {
     screenshot_target: Option<(Uuid, Uuid, Uuid)>,
     file_viewer: Option<file_viewer_ui::FileViewerState>,
     file_viewer_keyboard_active: bool,
-    file_viewer_rx: Option<std::sync::mpsc::Receiver<file_viewer_ui::FileViewerState>>,
+    file_viewer_reader: Option<file_viewer_reader::FileViewerReader>,
     settings_open: bool,
     settings_draft: Option<settings_ui::SettingsDraft>,
     broadcast: Option<broadcast_ui::BroadcastState>,
@@ -313,7 +314,7 @@ impl TerminalApp {
                 screenshot_target: None,
                 file_viewer: None,
                 file_viewer_keyboard_active: false,
-                file_viewer_rx: None,
+                file_viewer_reader: None,
                 settings_open: false,
                 settings_draft: None,
                 broadcast: None,
@@ -420,7 +421,7 @@ impl TerminalApp {
                 screenshot_target: None,
                 file_viewer: None,
                 file_viewer_keyboard_active: false,
-                file_viewer_rx: None,
+                file_viewer_reader: None,
                 settings_open: false,
                 settings_draft: None,
                 broadcast: None,
