@@ -107,7 +107,10 @@ PowerShell podés seleccionar el toolchain de esta sesión así:
 ```powershell
 $taskRustBin = Split-Path (rustup which --toolchain 1.98.0 cargo)
 $env:PATH = "$taskRustBin;$env:PATH"
+$env:RUSTC = Join-Path $taskRustBin 'rustc.exe'
+$env:RUSTDOC = Join-Path $taskRustBin 'rustdoc.exe'
 rustc -V
+rustdoc -V
 cargo clippy -V
 cargo fmt --all -- --check
 cargo clippy --all-targets --locked -- -D warnings
@@ -117,3 +120,16 @@ node --test extension/tests/*.test.cjs
 
 En Unix ejecutá también Clippy y tests con `--features daemon`. La matriz de
 CI cubre Windows x86_64, Linux x86_64 y macOS Intel/Apple Silicon.
+
+## Visor de archivos
+
+El visor lee archivos regulares: no abre dispositivos, pipes ni sockets.
+Muestra como máximo 2 MiB de bytes originales y 100.000 líneas, con un aviso
+cuando recorta el contenido. Colorea las primeras 20.000 líneas; el resto
+permanece legible como texto plano. Los archivos con bytes NUL se identifican
+como binarios. Abrir otro archivo o cerrar el visor descarta el trabajo anterior.
+
+La lectura tiene un único worker. Una llamada al sistema detenida en una unidad
+de red puede seguir esperando; cambiar de archivo no crea más hilos ni cancela
+instantáneamente esa llamada. La app conserva el texto original para el parser,
+incluidos CRLF y EOF, y pide repintado cuando termina de leer o colorear.
