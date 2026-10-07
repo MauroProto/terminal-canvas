@@ -1,13 +1,12 @@
 # Estado de entrega y continuación — 7 de octubre de 2026
 
 El último checkpoint completamente validado es
-`65d81a75eba0d5cb4f243d476f25fc580fc0b75a`: **45 microcommits** desde la base
-revisada. Su [CI completa](https://github.com/MauroProto/terminal-canvas/actions/runs/37558769570)
-y su [ensayo de distribución](https://github.com/MauroProto/terminal-canvas/actions/runs/37558823335)
+`0dd00e83e10dbc484a7b1a6c9c2d9f6a642e8d96`: **60 microcommits** desde la base
+revisada. Su [CI completa](https://github.com/MauroProto/terminal-canvas/actions/runs/37565219411)
+y su [ensayo de distribución](https://github.com/MauroProto/terminal-canvas/actions/runs/37565273400)
 terminaron correctamente en Windows, Linux y macOS Intel/Apple Silicon.
-La CI pasó 908 pruebas en Windows; Linux pasó 956 normales y 996 con daemon;
-ambos macOS pasaron 955 normales y 995 con daemon, con tres ignoradas en cada
-suite. Estas suites no se suman como casos distintos. Formato, Clippy,
+Pasaron las suites de todos los targets y las suites con daemon en Unix.
+Esas suites no se suman como casos distintos. Formato, Clippy,
 regresiones de seguridad, extensión 9/9 y auditoría pasaron; siguen los cuatro
 avisos de mantenimiento. El benchmark comparativo no corre en pushes.
 El ensayo comprobó exactamente cinco paquetes y cinco checksums, incluyendo
@@ -24,16 +23,24 @@ un grid que falló puede rescatar su log sano sin reemplazar el checkpoint.
 Los errores de lectura inicial se propagan y bloquean escrituras/poda del
 historial durante esa ejecución, incluso si se cierra el panel afectado. La app
 avisa que la salida nueva queda en memoria y debe copiarse antes de reiniciar.
+Las lecturas fallidas posteriores tampoco permiten resetear logs ni confirmar
+bytes; las secuencias avanzan después del append durable. La generación de un
+checkpoint nuevo excluye también la del log que podría quedar retenido si
+falla borrarlo, incluido el wraparound. Un manager PTY no disponible tampoco
+puede hacer desaparecer una hoja del conjunto que debe guardarse.
 El visor mantiene un lector y un resaltador, cada uno con un pedido y resultado
 reemplazables; cancela trabajo obsoleto y conserva los saltos de línea originales.
 Online e invitaciones no reciben cambios funcionales.
 
 Las comprobaciones locales de componentes pasaron: resaltador 25 casos,
 lector de archivos 13, fallback de fuentes 4 y log/durable write 22, además de
-Clippy de cada harness. El componente de captura estricta pasó 52 casos,
+Clippy de cada harness. El componente de captura, guardas de escritura y
+generaciones retenidas pasó 58 casos,
 incluyendo un bloqueo de lectura real de Windows que permitía reemplazar el
 archivo anterior. Ese harness incluye pruebas de store/log/durable write;
 sus casos se solapan con el componente de append y no deben sumarse como únicos.
+Las dos regresiones de colisión de generación fallaron antes del fix y pasaron
+después; incluyen un fallo de borrado del log anterior.
 Se ejecutaron sin GUI, con un job y prioridad baja.
 Formato y revisión independiente del diff completo también pasaron. Los seis
 casos nuevos de cierre/restauración, los de snapshot no disponible, captura
@@ -43,6 +50,12 @@ indicado: no validan estos cambios nuevos. Comprobar la CI y el ensayo de
 distribución del nuevo HEAD antes de distribuirlo.
 
 ## Checkpoints anteriores
+
+El checkpoint de contención Windows `65d81a7`, de 45 microcommits, pasó
+[CI](https://github.com/MauroProto/terminal-canvas/actions/runs/37558769570)
+y [paquetes](https://github.com/MauroProto/terminal-canvas/actions/runs/37558823335).
+Su CI histórica pasó 908 pruebas en Windows; Linux 956 normales y 996 con
+daemon; ambos macOS 955 normales y 995 con daemon, con tres ignoradas por suite.
 
 La rama principal del repositorio se llama `master`. La reversión pedida en
 septiembre quedó integrada mediante `bc5768d`; la base remota revisada para
