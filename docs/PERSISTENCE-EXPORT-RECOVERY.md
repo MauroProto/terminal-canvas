@@ -33,10 +33,10 @@ resultado. La captura del grid permanece en el hilo de UI. El polling funciona
 también con la ventana oculta, y el cierre normal espera el trabajo aceptado.
 Los errores de creación del worker y escritura se muestran al usuario.
 
-Copiar una selección entre líneas del visor excluye los números del gutter y
-conserva el texto Unicode. Esta corrección no resuelve el coste de renderizar o
-resaltar una línea extraordinariamente larga: el límite de archivo de 2 MiB
-todavía permite ese caso.
+La selección del visor conserva el texto Unicode, CRLF y el salto final, sin
+los números del gutter. El visor fragmenta las líneas largas antes de
+renderizarlas y aplica un presupuesto separado al resaltado, según
+[LONG-LINE-VIEWER.md](LONG-LINE-VIEWER.md).
 
 ## Verificación
 
@@ -44,6 +44,13 @@ Las regresiones cubren colisiones de nombres, worker ocupado/cierre/fallo,
 polling oculto, aviso persistente, sharing de lectura en Windows, permisos de
 historial en Unix, ACK, generaciones y rechazo/fallo de replay. La prueba de
 clipboard usa eventos de puntero y copia sobre galleys reales de egui.
+
+La regresión del guardado oculto fuerza una actualización de la actividad de
+sesión mientras hay escrituras pendientes. Espera la confirmación del estado
+vigente y el drenaje de comandos e historial, y coteja `layout.json` con ese
+mismo estado. Una captura anterior puede quedar obsoleta aunque el guardado
+sea correcto. Se mantienen el plazo de tres segundos y el aislamiento en un
+perfil temporal; no se abre un shell ni se ejecuta una pasada de UI.
 
 El pase necesita CI completa en Windows, Linux y ambos macOS, incluyendo daemon
 en Unix, y ensayo de paquetes del mismo SHA. Los recibos externos de entrega
