@@ -31,7 +31,8 @@ const MAX_COMMAND_OUTPUT_BYTES: u64 = 256 * 1024;
 
 /// Capture to private files so neither a full pipe nor an inherited pipe held
 /// open by another process can make waiting unbounded. Polling enforces both a
-/// deadline and a small output budget, and every path kills/reaps the child.
+/// deadline and a small output budget; guards terminate the child and its
+/// descendants on every exit path. Windows bounds the final teardown wait too.
 fn bounded_output(command: &mut VerificationCommand, timeout: Duration) -> anyhow::Result<Output> {
     let capture = CommandCapture::new()?;
     let stdout = capture.create_file("stdout")?;
@@ -796,6 +797,12 @@ mod tests {
                     CloseHandle(handle);
                     assert_ne!(queried, 0);
                     assert_ne!(code, 259, "The verification subprocess is still running");
+                } else {
+                    let error = std::io::Error::last_os_error();
+                    // A nonexistent PID produces ERROR_INVALID_PARAMETER.
+                    // Access denied or a failed query must never look like a
+                    // successfully stopped verification process.
+                    assert_eq!(error.raw_os_error(), Some(87), "{error}");
                 }
             }
         }
