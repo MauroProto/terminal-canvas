@@ -124,15 +124,17 @@ fn check_transition(pump_first: bool, checkpoint_first: bool) {
     for marker in [&primary, &tui, &returned] {
         assert!(!command.contains(marker));
     }
-    let id = state.spawn_with_pty(
-        WireSpec {
-            panel_id: Some(Uuid::new_v4()),
-            startup_command: Some(command),
-            ..WireSpec::default()
-        },
-        &scheduler,
-        None,
-    );
+    let id = state
+        .spawn_with_pty(
+            WireSpec {
+                panel_id: Some(Uuid::new_v4()),
+                startup_command: Some(command),
+                ..WireSpec::default()
+            },
+            &scheduler,
+            None,
+        )
+        .unwrap();
     wait_for_screen(&state, id, true, &tui);
     let mut first = View::attached(handle_request(&mut state, Request::Attach { id }, None));
     assert!(first.term.mode().contains(TermMode::ALT_SCREEN));

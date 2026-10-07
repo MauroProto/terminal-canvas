@@ -200,9 +200,13 @@ pub fn try_load_leaf_scrollback_checkpoint(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
-    if (bytes.starts_with(CHECKPOINT_MAGIC) || bytes.starts_with(SNAPSHOT_MAGIC))
-        && bytes.len() >= CHECKPOINT_MAGIC.len() + 4
-    {
+    if bytes.starts_with(CHECKPOINT_MAGIC) || bytes.starts_with(SNAPSHOT_MAGIC) {
+        if bytes.len() < CHECKPOINT_MAGIC.len() + 4 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "history checkpoint header is truncated",
+            ));
+        }
         let offset = CHECKPOINT_MAGIC.len();
         let generation = u32::from_le_bytes([
             bytes[offset],
@@ -227,7 +231,9 @@ pub fn load_leaf_scrollback(dir: &Path, panel_id: Uuid, leaf_id: Option<Uuid>) -
     }
 }
 
-/// Load one coherent checkpoint/log generation before starting a new shell.
+/// Compatibility reader for callers which only inspect available history.
+/// Recovery and persistence must use `try_load_leaf_session` so read failures
+/// cannot authorize a new PTY or a replacement checkpoint.
 pub fn load_leaf_session(
     dir: &Path,
     panel_id: Uuid,
@@ -255,6 +261,89 @@ pub fn load_leaf_session(
         .map(|(_, text)| replay_body(&text))
         .unwrap_or_default();
     (body, frames)
+}
+
+/// An absent history is a new session. An unreadable or invalid artifact is
+/// not: recovery and writers must use this strict boundary before opening a
+/// new PTY or replacing old data, even when the UI has paused its own saves.
+#[derive(Default)]
+pub struct LeafSessionHistory {
+    pub generation: u32,
+    pub checkpoint: Vec<u8>,
+    pub log_generation: Option<u32>,
+    pub frames: Vec<crate::state::scrollback_log::Frame>,
+}
+
+pub fn try_load_leaf_session(
+    dir: &Path,
+    panel_id: Uuid,
+    leaf_id: Option<Uuid>,
+) -> std::io::Result<LeafSessionHistory> {
+    let checkpoint = try_load_leaf_scrollback_checkpoint(dir, panel_id, leaf_id)?;
+    let generation = match checkpoint.as_ref().and_then(|(generation, _)| *generation) {
+        Some(generation) => generation,
+        None => match read_optional_history_file(
+            &dir.join(scrollback_leaf_gen_file_name(panel_id, leaf_id)),
+        )? {
+            None => 0,
+            Some(bytes) => decode_generation_sidecar(&bytes)?,
+        },
+    };
+    let log =
+        read_optional_history_file(&dir.join(scrollback_leaf_log_file_name(panel_id, leaf_id)))?;
+    let (log_generation, frames) = match log {
+        Some(bytes) => {
+            let (log_generation, frames) = crate::state::scrollback_log::read_frames(&bytes)
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "history log has an invalid header or sequence gap",
+                    )
+                })?;
+            (
+                Some(log_generation),
+                if log_generation == generation {
+                    frames
+                } else {
+                    Vec::new()
+                },
+            )
+        }
+        None => (None, Vec::new()),
+    };
+    Ok(LeafSessionHistory {
+        generation,
+        checkpoint: checkpoint
+            .map(|(_, text)| replay_body(&text))
+            .unwrap_or_default(),
+        log_generation,
+        frames,
+    })
+}
+
+fn read_optional_history_file(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn decode_generation_sidecar(bytes: &[u8]) -> std::io::Result<u32> {
+    // Current writers use four little-endian bytes. Older decimal sidecars
+    // remain readable when their length differs from that binary format.
+    if bytes.len() == 4 {
+        return Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
+    }
+    std::str::from_utf8(bytes)
+        .ok()
+        .and_then(|text| text.trim().parse().ok())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "history generation sidecar is invalid",
+            )
+        })
 }
 
 pub fn save_scrollback(dir: &Path, panel_id: Uuid, text: &str) -> anyhow::Result<()> {
@@ -478,6 +567,127 @@ mod tests {
             b"tail"
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn strict_session_load_distinguishes_absence_and_a_stale_valid_log() {
+        let dir = temp_dir("strict-missing-stale");
+        let panel = Uuid::new_v4();
+        let empty = super::try_load_leaf_session(&dir, panel, None).unwrap();
+        assert_eq!(empty.generation, 0);
+        assert!(empty.checkpoint.is_empty());
+        assert_eq!(empty.log_generation, None);
+        assert!(empty.frames.is_empty());
+
+        super::save_leaf_scrollback_versioned(&dir, panel, None, 7, "SAVED\n").unwrap();
+        let path = dir.join(super::scrollback_log_file_name(panel));
+        crate::state::scrollback_log::reset_log(&path, 6).unwrap();
+        crate::state::scrollback_log::append_frames(
+            &path,
+            &crate::state::scrollback_log::encode_frame(
+                1,
+                crate::state::scrollback_log::FrameKind::Output,
+                b"STALE",
+            ),
+        )
+        .unwrap();
+        let before = fs::read(&path).unwrap();
+        let loaded = super::try_load_leaf_session(&dir, panel, None).unwrap();
+        assert_eq!(loaded.generation, 7);
+        assert_eq!(loaded.checkpoint, b"SAVED\r\n");
+        assert_eq!(loaded.log_generation, Some(6));
+        assert!(loaded.frames.is_empty());
+        assert_eq!(fs::read(&path).unwrap(), before);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn strict_session_load_accepts_complete_prefix_of_a_truncated_tail() {
+        use crate::state::scrollback_log::{encode_frame, encode_header, FrameKind};
+        let dir = temp_dir("strict-truncated-tail");
+        fs::create_dir_all(&dir).unwrap();
+        let panel = Uuid::new_v4();
+        let path = dir.join(super::scrollback_log_file_name(panel));
+        let mut bytes = encode_header(0);
+        bytes.extend_from_slice(&encode_frame(8, FrameKind::Output, b"COMPLETE"));
+        let partial = encode_frame(9, FrameKind::Output, b"INCOMPLETE");
+        bytes.extend_from_slice(&partial[..partial.len() - 3]);
+        fs::write(&path, &bytes).unwrap();
+        let loaded = super::try_load_leaf_session(&dir, panel, None).unwrap();
+        assert_eq!(loaded.log_generation, Some(0));
+        assert_eq!(loaded.frames.len(), 1);
+        assert_eq!(loaded.frames[0].seq, 8);
+        assert_eq!(loaded.frames[0].payload, b"COMPLETE");
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            bytes,
+            "loading never repairs on disk"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn strict_session_load_keeps_binary_and_legacy_decimal_sidecars() {
+        let dir = temp_dir("strict-generation-sidecars");
+        fs::create_dir_all(&dir).unwrap();
+        let panel = Uuid::new_v4();
+        let path = dir.join(super::scrollback_gen_file_name(panel));
+        fs::write(&path, 12_u32.to_le_bytes()).unwrap();
+        assert_eq!(
+            super::try_load_leaf_session(&dir, panel, None)
+                .unwrap()
+                .generation,
+            12
+        );
+        fs::write(&path, b"12\n").unwrap();
+        assert_eq!(
+            super::try_load_leaf_session(&dir, panel, None)
+                .unwrap()
+                .generation,
+            12
+        );
+
+        // A versioned checkpoint replaces the sidecar's authority. Its old
+        // sidecar may be malformed without making the atomic snapshot invalid.
+        super::save_leaf_scrollback_versioned(&dir, panel, None, 14, "CURRENT\n").unwrap();
+        fs::write(&path, b"broken sidecar").unwrap();
+        assert_eq!(
+            super::try_load_leaf_session(&dir, panel, None)
+                .unwrap()
+                .generation,
+            14
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn strict_session_load_rejects_truncated_checkpoint_invalid_log_and_generation() {
+        use crate::state::scrollback_log::{encode_frame, encode_header, FrameKind};
+        let dir = temp_dir("strict-invalid-artifacts");
+        fs::create_dir_all(&dir).unwrap();
+        let panel = Uuid::new_v4();
+        let checkpoint = dir.join(super::scrollback_file_name(panel));
+        fs::write(&checkpoint, super::CHECKPOINT_MAGIC).unwrap();
+        assert!(super::try_load_leaf_session(&dir, panel, None).is_err());
+        assert_eq!(fs::read(&checkpoint).unwrap(), super::CHECKPOINT_MAGIC);
+        fs::remove_file(&checkpoint).unwrap();
+
+        let log = dir.join(super::scrollback_log_file_name(panel));
+        fs::write(&log, b"bad log").unwrap();
+        assert!(super::try_load_leaf_session(&dir, panel, None).is_err());
+        let mut gap = encode_header(0);
+        gap.extend_from_slice(&encode_frame(1, FrameKind::Output, b"ONE"));
+        gap.extend_from_slice(&encode_frame(3, FrameKind::Output, b"THREE"));
+        fs::write(&log, &gap).unwrap();
+        assert!(super::try_load_leaf_session(&dir, panel, None).is_err());
+        assert_eq!(fs::read(&log).unwrap(), gap);
+        fs::remove_file(&log).unwrap();
+
+        let sidecar = dir.join(super::scrollback_gen_file_name(panel));
+        fs::write(&sidecar, [1_u8, 0]).unwrap();
+        assert!(super::try_load_leaf_session(&dir, panel, None).is_err());
+        assert_eq!(fs::read(&sidecar).unwrap(), [1_u8, 0]);
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

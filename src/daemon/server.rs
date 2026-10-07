@@ -303,7 +303,35 @@ impl DaemonState {
         spec: WireSpec,
         scheduler: &Arc<Mutex<RuntimeScheduler>>,
         desired_id: Option<Uuid>,
-    ) -> Uuid {
+    ) -> anyhow::Result<Uuid> {
+        let history_dir = spec
+            .panel_id
+            .map(|_| {
+                crate::state::scrollback_store::scrollback_dir()
+                    .ok_or_else(|| anyhow::anyhow!("no se pudo resolver el historial del daemon"))
+            })
+            .transpose()?;
+        self.spawn_with_pty_in_history_dir(spec, scheduler, desired_id, history_dir.as_deref())
+    }
+
+    fn spawn_with_pty_in_history_dir(
+        &mut self,
+        spec: WireSpec,
+        scheduler: &Arc<Mutex<RuntimeScheduler>>,
+        desired_id: Option<Uuid>,
+        history_dir: Option<&Path>,
+    ) -> anyhow::Result<Uuid> {
+        // Validate before registering the session or opening a PTY. Starting
+        // a fresh shell after a failed read would let its later autosave
+        // replace history which neither the daemon nor the UI recovered.
+        let history = match spec.panel_id {
+            Some(panel_id) => crate::state::scrollback_store::try_load_leaf_session(
+                history_dir.ok_or_else(|| anyhow::anyhow!("falta el directorio de historial"))?,
+                panel_id,
+                spec.leaf_id,
+            )?,
+            None => crate::state::scrollback_store::LeafSessionHistory::default(),
+        };
         // Se respeta el id que propone el cliente para que el id de la app y
         // el del daemon coincidan; si ya está tomado, se genera uno nuevo.
         let id = match desired_id.filter(|id| !self.sessions.contains_key(id)) {
@@ -314,17 +342,6 @@ impl DaemonState {
             None => self.spawn(spec.clone()),
         };
         let cwd = spec.cwd.as_deref().map(std::path::Path::new);
-        let (checkpoint, frames) = spec
-            .panel_id
-            .and_then(|panel_id| {
-                let dir = crate::state::scrollback_store::scrollback_dir()?;
-                Some(crate::state::scrollback_store::load_leaf_session(
-                    &dir,
-                    panel_id,
-                    spec.leaf_id,
-                ))
-            })
-            .unwrap_or_default();
         match PtyHandle::spawn_with_history(
             cwd,
             spec.cols.max(1),
@@ -337,8 +354,8 @@ impl DaemonState {
                 workspace_id: spec.workspace_id,
                 leaf_id: spec.leaf_id,
             },
-            &checkpoint,
-            &frames,
+            &history.checkpoint,
+            &history.frames,
         ) {
             Ok(handle) => {
                 if let Some(command) = spec.startup_command.as_deref().map(str::trim) {
@@ -357,7 +374,7 @@ impl DaemonState {
                 }
             }
         }
-        id
+        Ok(id)
     }
 
     /// Escribe bytes en el PTY de la sesión. `false` si no existe.
@@ -711,12 +728,6 @@ impl DaemonState {
     }
 }
 
-fn leaf_generation(dir: &Path, panel_id: Uuid, leaf_id: Option<Uuid>) -> u32 {
-    crate::state::scrollback_store::load_leaf_scrollback_checkpoint(dir, panel_id, leaf_id)
-        .and_then(|(generation, _)| generation)
-        .unwrap_or(0)
-}
-
 fn persist_scrollback_targets(targets: Vec<ScrollbackTarget>) -> (Vec<(Uuid, usize)>, Vec<Uuid>) {
     if targets.is_empty() {
         return (Vec::new(), Vec::new());
@@ -730,12 +741,33 @@ fn persist_scrollback_targets(targets: Vec<ScrollbackTarget>) -> (Vec<(Uuid, usi
                 .collect(),
         );
     };
+    persist_scrollback_targets_in_dir(&dir, targets)
+}
+
+fn persist_scrollback_targets_in_dir(
+    dir: &Path,
+    targets: Vec<ScrollbackTarget>,
+) -> (Vec<(Uuid, usize)>, Vec<Uuid>) {
     let mut acknowledgements = Vec::new();
     let mut failed = Vec::new();
     for target in targets {
-        let generation = leaf_generation(&dir, target.panel_id, target.leaf_id).saturating_add(1);
+        let history = match crate::state::scrollback_store::try_load_leaf_session(
+            dir,
+            target.panel_id,
+            target.leaf_id,
+        ) {
+            Ok(history) => history,
+            Err(error) => {
+                log::warn!(
+                    "el daemon conserva el historial ilegible antes del checkpoint: {error}"
+                );
+                failed.push(target.session_id);
+                continue;
+            }
+        };
+        let generation = next_checkpoint_generation(&history);
         if let Err(err) = crate::state::scrollback_store::save_leaf_scrollback_versioned(
-            &dir,
+            dir,
             target.panel_id,
             target.leaf_id,
             generation,
@@ -769,22 +801,35 @@ fn persist_incremental_targets(targets: Vec<IncrementalTarget>) -> (Vec<(Uuid, u
     let Some(dir) = crate::state::scrollback_store::scrollback_dir() else {
         return (Vec::new(), Vec::new());
     };
+    persist_incremental_targets_in_dir(&dir, targets)
+}
+
+fn persist_incremental_targets_in_dir(
+    dir: &Path,
+    targets: Vec<IncrementalTarget>,
+) -> (Vec<(Uuid, usize)>, Vec<Uuid>) {
     let mut acknowledgements = Vec::new();
     let mut rollover = Vec::new();
     for target in targets {
-        let generation = leaf_generation(&dir, target.panel_id, target.leaf_id);
+        let history = match crate::state::scrollback_store::try_load_leaf_session(
+            dir,
+            target.panel_id,
+            target.leaf_id,
+        ) {
+            Ok(history) => history,
+            Err(error) => {
+                log::warn!("el daemon conserva el historial ilegible antes del append: {error}");
+                continue;
+            }
+        };
+        let generation = history.generation;
         let log_path = dir.join(
             crate::state::scrollback_store::scrollback_leaf_log_file_name(
                 target.panel_id,
                 target.leaf_id,
             ),
         );
-        let existing = std::fs::read(&log_path)
-            .ok()
-            .and_then(|bytes| crate::state::scrollback_log::read_frames(&bytes));
-        let current = existing
-            .as_ref()
-            .is_some_and(|(log_generation, _)| *log_generation == generation);
+        let current = history.log_generation == Some(generation);
         if !current && crate::state::scrollback_log::reset_log(&log_path, generation).is_err() {
             continue;
         }
@@ -793,11 +838,7 @@ fn persist_incremental_targets(targets: Vec<IncrementalTarget>) -> (Vec<(Uuid, u
         // existing log ending at seq N, creating a gap that invalidates the
         // entire log on the next cold restore.
         let first_seq = if current {
-            match existing
-                .as_ref()
-                .and_then(|(_, frames)| frames.last())
-                .map(|frame| frame.seq.checked_add(1))
-            {
+            match history.frames.last().map(|frame| frame.seq.checked_add(1)) {
                 Some(Some(next)) => next,
                 Some(None) => {
                     log::warn!("secuencia durable agotada; se fuerza checkpoint completo");
@@ -823,7 +864,7 @@ fn persist_incremental_targets(targets: Vec<IncrementalTarget>) -> (Vec<(Uuid, u
         if target.alternate
             && std::fs::metadata(&log_path).is_ok_and(|meta| meta.len() > MAX_ALTERNATE_LOG_BYTES)
         {
-            if let Err(error) = compact_alternate_log(&dir, &target, generation) {
+            if let Err(error) = compact_alternate_log(dir, &target, generation) {
                 log::warn!(
                     "could not compact alternate-screen history; preserving its log: {error}"
                 );
@@ -839,6 +880,17 @@ fn persist_incremental_targets(targets: Vec<IncrementalTarget>) -> (Vec<(Uuid, u
     (acknowledgements, rollover)
 }
 
+fn next_checkpoint_generation(history: &crate::state::scrollback_store::LeafSessionHistory) -> u32 {
+    // If publication succeeds but log rotation fails, neither a current nor
+    // an already stale retained log may become eligible for replay again.
+    let next = history.generation.wrapping_add(1);
+    if history.log_generation == Some(next) {
+        next.wrapping_add(1)
+    } else {
+        next
+    }
+}
+
 fn compact_alternate_log(
     dir: &Path,
     target: &IncrementalTarget,
@@ -849,8 +901,15 @@ fn compact_alternate_log(
     use alacritty_terminal::term::test::TermSize;
     use alacritty_terminal::term::{Config, Term, TermMode};
     use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
-    let (checkpoint, frames) =
-        crate::state::scrollback_store::load_leaf_session(dir, target.panel_id, target.leaf_id);
+    let history = crate::state::scrollback_store::try_load_leaf_session(
+        dir,
+        target.panel_id,
+        target.leaf_id,
+    )?;
+    anyhow::ensure!(
+        history.generation == generation,
+        "history generation changed before compaction"
+    );
     let (tx, _rx) = std::sync::mpsc::channel();
     let mut term = Term::new(
         Config {
@@ -861,8 +920,8 @@ fn compact_alternate_log(
         crate::terminal::pty::EventProxy::new(tx),
     );
     let mut parser = Processor::<StdSyncHandler>::new();
-    parser.advance(&mut term, &checkpoint);
-    for frame in frames {
+    parser.advance(&mut term, &history.checkpoint);
+    for frame in &history.frames {
         match frame.kind {
             FrameKind::Output => parser.advance(&mut term, &frame.payload),
             FrameKind::Resize => {
@@ -897,9 +956,7 @@ fn compact_alternate_log(
     // Store the screen mode inside the same atomic checkpoint as the primary
     // text. A crash before log rotation must still confine later TUI output.
     primary.push_str(alternate_entry);
-    let next = generation
-        .checked_add(1)
-        .ok_or_else(|| anyhow::anyhow!("checkpoint generation exhausted"))?;
+    let next = next_checkpoint_generation(&history);
     crate::state::scrollback_store::save_leaf_snapshot_versioned(
         dir,
         target.panel_id,
@@ -953,7 +1010,16 @@ fn handle_request_for_client(
         },
         Request::Spawn { spec, id } => {
             let id = match scheduler {
-                Some(scheduler) => state.spawn_with_pty(spec, scheduler, id),
+                Some(scheduler) => match state.spawn_with_pty(spec, scheduler, id) {
+                    Ok(id) => id,
+                    Err(error) => {
+                        return Response::Error {
+                            message: format!(
+                                "no se pudo recuperar el historial del terminal: {error}"
+                            ),
+                        };
+                    }
+                },
                 // Sin scheduler (tests del registro) no se espawnea nada.
                 None => match id.filter(|id| state.session(*id).is_none()) {
                     Some(id) => {
@@ -1420,7 +1486,9 @@ mod tests {
         use std::sync::{Arc, Mutex};
         let mut state = DaemonState::new();
         let scheduler = Arc::new(Mutex::new(crate::runtime::RuntimeScheduler::new()));
-        let id = state.spawn_with_pty(WireSpec::default(), &scheduler, None);
+        let id = state
+            .spawn_with_pty(WireSpec::default(), &scheduler, None)
+            .unwrap();
         let handle = state.session(id).unwrap().handle.clone().expect("real PTY");
         // Shell startup may prepend bracketed-paste control bytes to the first
         // output line. Delimit the burst so all 3000 markers remain whole lines.
@@ -1467,7 +1535,9 @@ mod tests {
         use std::sync::{Arc, Mutex};
         let mut state = DaemonState::new();
         let scheduler = Arc::new(Mutex::new(crate::runtime::RuntimeScheduler::new()));
-        let id = state.spawn_with_pty(WireSpec::default(), &scheduler, None);
+        let id = state
+            .spawn_with_pty(WireSpec::default(), &scheduler, None)
+            .unwrap();
         let handle = state.session(id).unwrap().handle.clone().expect("real PTY");
         state.priority_session = Some(id);
         // Model a process-exit notification while the reader is still active.
@@ -1668,6 +1738,366 @@ mod tests {
 
         std::env::remove_var("MI_TERMINAL_SCROLLBACK_DIR");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn strict_history_fixture(label: &str) -> (std::path::PathBuf, Uuid, Uuid, Uuid) {
+        use crate::state::{scrollback_log, scrollback_store};
+        let dir = std::env::temp_dir().join(format!("tc-daemon-{label}-{}", Uuid::new_v4()));
+        let panel = Uuid::new_v4();
+        let leaf = Uuid::new_v4();
+        let session = Uuid::new_v4();
+        // Legacy checkpoints require the sidecar. All three artifacts must
+        // be read successfully before either the new PTY or a writer starts.
+        scrollback_store::save_leaf_scrollback(&dir, panel, Some(leaf), "CHECKPOINT\n").unwrap();
+        std::fs::write(
+            dir.join(scrollback_store::scrollback_leaf_gen_file_name(
+                panel,
+                Some(leaf),
+            )),
+            3_u32.to_le_bytes(),
+        )
+        .unwrap();
+        let log = dir.join(scrollback_store::scrollback_leaf_log_file_name(
+            panel,
+            Some(leaf),
+        ));
+        scrollback_log::reset_log(&log, 3).unwrap();
+        scrollback_log::append_frames(
+            &log,
+            &scrollback_log::encode_frame(1, scrollback_log::FrameKind::Output, b"OLD\r\n"),
+        )
+        .unwrap();
+        (dir, panel, leaf, session)
+    }
+
+    fn strict_history_paths(
+        dir: &std::path::Path,
+        panel: Uuid,
+        leaf: Uuid,
+    ) -> Vec<std::path::PathBuf> {
+        use crate::state::scrollback_store;
+        [
+            scrollback_store::scrollback_leaf_file_name(panel, Some(leaf)),
+            scrollback_store::scrollback_leaf_log_file_name(panel, Some(leaf)),
+            scrollback_store::scrollback_leaf_gen_file_name(panel, Some(leaf)),
+        ]
+        .into_iter()
+        .map(|name| dir.join(name))
+        .collect()
+    }
+
+    fn strict_incremental_target(
+        panel: Uuid,
+        leaf: Uuid,
+        session: Uuid,
+        text: &[u8],
+    ) -> super::IncrementalTarget {
+        super::IncrementalTarget {
+            session_id: session,
+            panel_id: panel,
+            leaf_id: Some(leaf),
+            frames: crate::state::scrollback_log::encode_frame(
+                1,
+                crate::state::scrollback_log::FrameKind::Output,
+                text,
+            ),
+            alternate: false,
+            cols: 80,
+            rows: 24,
+        }
+    }
+
+    fn assert_daemon_rejects_unread_history(
+        dir: &std::path::Path,
+        panel: Uuid,
+        leaf: Uuid,
+        session: Uuid,
+    ) {
+        let scheduler = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::runtime::RuntimeScheduler::new(),
+        ));
+        let mut state = DaemonState::new();
+        let result = state.spawn_with_pty_in_history_dir(
+            WireSpec {
+                panel_id: Some(panel),
+                leaf_id: Some(leaf),
+                ..WireSpec::default()
+            },
+            &scheduler,
+            Some(session),
+            Some(dir),
+        );
+        assert!(
+            result.is_err(),
+            "the real cold-spawn path must fail before opening its PTY"
+        );
+        assert!(state.session_ids().is_empty());
+        assert!(state.session_claimants.is_empty());
+
+        let (acks, rollover) = super::persist_incremental_targets_in_dir(
+            dir,
+            vec![strict_incremental_target(panel, leaf, session, b"NEW\r\n")],
+        );
+        assert!(
+            acks.is_empty(),
+            "unread output cannot authorize an incremental ACK"
+        );
+        assert!(rollover.is_empty());
+        let (acks, failed) = super::persist_scrollback_targets_in_dir(
+            dir,
+            vec![super::ScrollbackTarget {
+                session_id: session,
+                panel_id: panel,
+                leaf_id: Some(leaf),
+                text: "CHECKPOINT\nOLD\nNEW\n".to_owned(),
+                pending_bytes: 20,
+            }],
+        );
+        assert!(
+            acks.is_empty(),
+            "unread history cannot authorize a full ACK"
+        );
+        assert_eq!(failed, vec![session]);
+        let target = strict_incremental_target(panel, leaf, session, b"NEW\r\n");
+        assert!(super::compact_alternate_log(dir, &target, 3).is_err());
+    }
+
+    #[test]
+    fn unreadable_artifacts_block_cold_spawn_full_incremental_and_compaction() {
+        use std::os::unix::fs::PermissionsExt;
+        struct ReadBlock(std::path::PathBuf);
+        impl Drop for ReadBlock {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o600));
+            }
+        }
+        for blocked in 0..3 {
+            let (dir, panel, leaf, session) = strict_history_fixture("unreadable");
+            let paths = strict_history_paths(&dir, panel, leaf);
+            let before = paths
+                .iter()
+                .map(|path| std::fs::read(path).unwrap())
+                .collect::<Vec<_>>();
+            // The owner may write and the directory allows rename, so the old
+            // code could replace these artifacts despite being unable to read.
+            std::fs::set_permissions(&paths[blocked], std::fs::Permissions::from_mode(0o200))
+                .unwrap();
+            let guard = ReadBlock(paths[blocked].clone());
+            assert_eq!(
+                std::fs::read(&guard.0).unwrap_err().kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+            assert_daemon_rejects_unread_history(&dir, panel, leaf, session);
+            drop(guard);
+            for (path, bytes) in paths.iter().zip(&before) {
+                assert_eq!(
+                    std::fs::read(path).unwrap(),
+                    *bytes,
+                    "no unread artifact may be replaced"
+                );
+            }
+            let target = strict_incremental_target(panel, leaf, session, b"NEW\r\n");
+            let expected_bytes = target.frames.len();
+            let (acks, rollover) = super::persist_incremental_targets_in_dir(&dir, vec![target]);
+            assert_eq!(acks, vec![(session, expected_bytes)]);
+            assert!(rollover.is_empty());
+            let loaded =
+                crate::state::scrollback_store::try_load_leaf_session(&dir, panel, Some(leaf))
+                    .unwrap();
+            assert_eq!(loaded.checkpoint, b"CHECKPOINT\r\n");
+            assert_eq!(
+                loaded
+                    .frames
+                    .iter()
+                    .map(|frame| (frame.seq, frame.payload.as_slice()))
+                    .collect::<Vec<_>>(),
+                vec![(1, b"OLD\r\n".as_slice()), (2, b"NEW\r\n".as_slice())]
+            );
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn invalid_artifacts_are_retained_without_a_pty_or_persistence_ack() {
+        use crate::state::{scrollback_log, scrollback_store};
+        for invalid in 0..4 {
+            let (dir, panel, leaf, session) = strict_history_fixture("invalid");
+            let paths = strict_history_paths(&dir, panel, leaf);
+            match invalid {
+                0 => std::fs::write(&paths[0], b"TC-SCROLLBACK\x00\x02").unwrap(),
+                1 => std::fs::write(&paths[1], b"invalid log header").unwrap(),
+                2 => {
+                    let mut gap = scrollback_log::encode_header(3);
+                    gap.extend_from_slice(&scrollback_log::encode_frame(
+                        1,
+                        scrollback_log::FrameKind::Output,
+                        b"ONE",
+                    ));
+                    gap.extend_from_slice(&scrollback_log::encode_frame(
+                        3,
+                        scrollback_log::FrameKind::Output,
+                        b"THREE",
+                    ));
+                    std::fs::write(&paths[1], gap).unwrap();
+                }
+                3 => std::fs::write(&paths[2], [3_u8, 0]).unwrap(),
+                _ => unreachable!(),
+            }
+            let before = paths
+                .iter()
+                .map(|path| std::fs::read(path).unwrap())
+                .collect::<Vec<_>>();
+            assert!(scrollback_store::try_load_leaf_session(&dir, panel, Some(leaf)).is_err());
+            assert_daemon_rejects_unread_history(&dir, panel, leaf, session);
+            for (path, bytes) in paths.iter().zip(&before) {
+                assert_eq!(std::fs::read(path).unwrap(), *bytes);
+            }
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn absent_history_and_valid_stale_logs_allow_incremental_progress() {
+        use crate::state::{scrollback_log, scrollback_store};
+        for stale in [false, true] {
+            let dir =
+                std::env::temp_dir().join(format!("tc-daemon-missing-stale-{}", Uuid::new_v4()));
+            let panel = Uuid::new_v4();
+            let leaf = Uuid::new_v4();
+            let session = Uuid::new_v4();
+            if stale {
+                scrollback_store::save_leaf_scrollback_versioned(
+                    &dir,
+                    panel,
+                    Some(leaf),
+                    5,
+                    "PRIMARY\n",
+                )
+                .unwrap();
+                let log = dir.join(scrollback_store::scrollback_leaf_log_file_name(
+                    panel,
+                    Some(leaf),
+                ));
+                scrollback_log::reset_log(&log, 4).unwrap();
+                scrollback_log::append_frames(
+                    &log,
+                    &scrollback_log::encode_frame(7, scrollback_log::FrameKind::Output, b"STALE"),
+                )
+                .unwrap();
+            } else {
+                assert!(
+                    scrollback_store::try_load_leaf_session(&dir, panel, Some(leaf))
+                        .unwrap()
+                        .frames
+                        .is_empty()
+                );
+            }
+            let target = strict_incremental_target(panel, leaf, session, b"NEW");
+            let expected = target.frames.len();
+            let (acks, rollover) = super::persist_incremental_targets_in_dir(&dir, vec![target]);
+            assert_eq!(acks, vec![(session, expected)]);
+            assert!(rollover.is_empty());
+            let history = scrollback_store::try_load_leaf_session(&dir, panel, Some(leaf)).unwrap();
+            assert_eq!(history.generation, if stale { 5 } else { 0 });
+            assert_eq!(history.frames.len(), 1);
+            assert_eq!(history.frames[0].seq, 1);
+            assert_eq!(history.frames[0].payload, b"NEW");
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn daemon_append_repairs_truncated_tail_and_retries_at_exact_next_sequence() {
+        use crate::state::{scrollback_log, scrollback_store};
+        let (dir, panel, leaf, session) = strict_history_fixture("truncated-tail");
+        let log = dir.join(scrollback_store::scrollback_leaf_log_file_name(
+            panel,
+            Some(leaf),
+        ));
+        let mut bytes = std::fs::read(&log).unwrap();
+        let truncated =
+            scrollback_log::encode_frame(2, scrollback_log::FrameKind::Output, b"INCOMPLETE");
+        bytes.extend_from_slice(&truncated[..truncated.len() - 2]);
+        std::fs::write(&log, bytes).unwrap();
+        for (index, payload) in [b"NEW".as_slice(), b"THIRD".as_slice()]
+            .into_iter()
+            .enumerate()
+        {
+            let target = strict_incremental_target(panel, leaf, session, payload);
+            let expected = target.frames.len();
+            let (acks, rollover) = super::persist_incremental_targets_in_dir(&dir, vec![target]);
+            assert_eq!(acks, vec![(session, expected)]);
+            assert!(rollover.is_empty());
+            let history = scrollback_store::try_load_leaf_session(&dir, panel, Some(leaf)).unwrap();
+            assert_eq!(history.frames.len(), index + 2);
+            assert_eq!(history.frames.last().unwrap().seq, (index + 2) as u64);
+            assert_eq!(history.frames.last().unwrap().payload, payload);
+        }
+        let history = scrollback_store::try_load_leaf_session(&dir, panel, Some(leaf)).unwrap();
+        assert_eq!(
+            history
+                .frames
+                .iter()
+                .map(|frame| frame.payload.as_slice())
+                .collect::<Vec<_>>(),
+            vec![
+                b"OLD\r\n".as_slice(),
+                b"NEW".as_slice(),
+                b"THIRD".as_slice()
+            ]
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn full_daemon_checkpoint_excludes_current_and_retained_stale_generations() {
+        use crate::state::{scrollback_log, scrollback_store};
+        for (generation, retained_log, expected) in
+            [(3, 4, 5), (u32::MAX, u32::MAX, 0), (u32::MAX, 0, 1)]
+        {
+            let dir =
+                std::env::temp_dir().join(format!("tc-daemon-next-generation-{}", Uuid::new_v4()));
+            let panel = Uuid::new_v4();
+            let leaf = Uuid::new_v4();
+            let session = Uuid::new_v4();
+            scrollback_store::save_leaf_scrollback_versioned(
+                &dir,
+                panel,
+                Some(leaf),
+                generation,
+                "OLD\n",
+            )
+            .unwrap();
+            let log = dir.join(scrollback_store::scrollback_leaf_log_file_name(
+                panel,
+                Some(leaf),
+            ));
+            scrollback_log::reset_log(&log, retained_log).unwrap();
+            scrollback_log::append_frames(
+                &log,
+                &scrollback_log::encode_frame(1, scrollback_log::FrameKind::Output, b"RETAINED"),
+            )
+            .unwrap();
+            let (acks, failed) = super::persist_scrollback_targets_in_dir(
+                &dir,
+                vec![super::ScrollbackTarget {
+                    session_id: session,
+                    panel_id: panel,
+                    leaf_id: Some(leaf),
+                    text: "OLD\nNEW\n".to_owned(),
+                    pending_bytes: 17,
+                }],
+            );
+            assert_eq!(acks, vec![(session, 17)]);
+            assert!(failed.is_empty());
+            let history = scrollback_store::try_load_leaf_session(&dir, panel, Some(leaf)).unwrap();
+            assert_eq!(history.generation, expected);
+            assert_ne!(history.generation, generation);
+            assert_ne!(history.generation, retained_log);
+            assert!(history.frames.is_empty());
+            assert_eq!(history.checkpoint, b"OLD\r\nNEW\r\n");
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 
     #[test]
