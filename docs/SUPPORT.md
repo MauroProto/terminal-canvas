@@ -150,8 +150,10 @@ CI cubre Windows x86_64, Linux x86_64 y macOS Intel/Apple Silicon.
 
 El visor lee archivos regulares: no abre dispositivos, pipes ni sockets.
 Muestra como máximo 2 MiB de bytes originales y 100.000 líneas, con un aviso
-cuando recorta el contenido. Colorea las primeras 20.000 líneas; el resto
-permanece legible como texto plano. Los archivos con bytes NUL se identifican
+cuando recorta el contenido. Colorea las primeras 20.000 líneas de los archivos
+sin líneas extensas; el resto permanece legible como texto plano. Una línea
+extensa se muestra en continuaciones indicadas por `↳`, sin cortar el texto
+retenido ni agregar saltos de línea a la copia. Los archivos con bytes NUL se identifican
 como binarios. Abrir otro archivo o cerrar el visor descarta el trabajo anterior.
 
 La lectura tiene un único worker. Una llamada al sistema detenida en una unidad
@@ -159,3 +161,11 @@ de red puede seguir esperando; cambiar de archivo no crea más hilos ni cancela
 instantáneamente esa llamada. La app conserva el texto original para el parser,
 incluidos CRLF y EOF, y pide repintado cuando termina de leer o colorear.
 Los números de línea no forman parte del texto seleccionado al copiar código.
+
+Podés seleccionar con arrastre o Shift+clic, y extender la selección con
+Shift+flechas, Shift+Inicio y Shift+Fin. Ctrl+A (Cmd+A en macOS) selecciona todo el contenido
+retenido, incluso fuera de pantalla. Copiar selección conserva los terminadores
+originales; Copiar línea incluye la línea lógica completa aunque se muestre en
+varias continuaciones. La barra y el menú contextual permiten copiar el archivo
+completo. Los atajos pertenecen al visor sólo mientras tiene el foco; abrir la
+paleta o volver a la terminal entrega el teclado a esa superficie.

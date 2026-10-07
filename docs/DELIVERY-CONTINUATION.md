@@ -1,22 +1,24 @@
 # Estado de entrega y continuación — 7 de octubre de 2026
 
 El último checkpoint publicado y validado es
-`6d6c3f655d3e61f46646d1cf8c7814288d5a201c`, de **112 microcommits** desde
+`d226a0ce1376bb615ac13bdcf85d4f94ddd1d9d0`, de **125 microcommits** desde
 `f0458dd1dae08b3aca080a914042deb5a9454cf3`.
-Su [CI candidata](https://github.com/MauroProto/terminal-canvas/actions/runs/37590871052),
-[CI de master](https://github.com/MauroProto/terminal-canvas/actions/runs/37597403375)
-y [ensayo de distribución](https://github.com/MauroProto/terminal-canvas/actions/runs/37591012832)
+Su [CI candidata](https://github.com/MauroProto/terminal-canvas/actions/runs/37604909916)
+y [ensayo de distribución](https://github.com/MauroProto/terminal-canvas/actions/runs/37606620931)
 terminaron SUCCESS. El ensayo produjo cinco paquetes de prueba sin firma;
 firma, notarización y publicación de producción quedaron omitidas.
-El checkpoint amplía gramáticas y aliases del visor y registra la investigación
-del serializador; no integra el fork experimental ni cambia Online/invitaciones.
+El checkpoint agrega recuperación estricta de layout e historial, exports fuera
+del hilo de UI y una advertencia persistente cuando las escrituras están bloqueadas.
+Conserva las gramáticas y aliases previos; no integra el fork experimental del
+serializador ni cambia Online/invitaciones.
 Ver [HIGHLIGHT-SUPPORT.md](HIGHLIGHT-SUPPORT.md) y
 [DEPENDENCY-MAINTENANCE.md](DEPENDENCY-MAINTENANCE.md).
 
-El pase posterior de recuperación y exports se describe en
+El pase de recuperación y exports se describe en
 [PERSISTENCE-EXPORT-RECOVERY.md](PERSISTENCE-EXPORT-RECOVERY.md).
-Necesita evidencia de CI y paquetes de su propio SHA antes de publicarse;
-los resultados del checkpoint anterior no validan sus nuevas fuentes.
+La ampliación posterior del visor está en [LONG-LINE-VIEWER.md](LONG-LINE-VIEWER.md).
+Necesita CI y paquetes de su propio SHA antes de acreditar su distribución;
+las corridas de recuperación no validan estas fuentes nuevas.
 
 ## Checkpoint gráfico anterior
 
