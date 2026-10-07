@@ -563,6 +563,21 @@ impl Orchestrator {
                 session_id,
             },
         );
+        // A silent tool/prompt hook is real activity even when it reports the
+        // same status and produces no PTY output. Date its arrival once.
+        if let Some(session) = self
+            .state
+            .sessions
+            .iter_mut()
+            .find(|session| session.panel_id == Some(panel_id))
+        {
+            session.last_activity_at = now;
+            if let Some(task_id) = session.task_id {
+                if let Some(task) = self.state.tasks.iter_mut().find(|task| task.id == task_id) {
+                    task.updated_at = now;
+                }
+            }
+        }
     }
 
     /// Id de sesión que reportó el último hook de ese panel, para el resume
@@ -2610,6 +2625,31 @@ mod tests {
                 assert_eq!(serde_json::to_vec(&orchestrator.snapshot()).unwrap(), bytes);
             }
         }
+    }
+
+    #[test]
+    fn silent_hooks_date_real_activity_once_without_turning_polls_into_activity() {
+        let (mut orchestrator, observation, _) = activity_fixture(true);
+        let event = hook_event(
+            observation.panel_id,
+            crate::orchestration::HookKind::PreToolUse,
+        );
+        let arrival = Utc::now();
+        orchestrator.apply_hook_event(&event, true, arrival);
+        assert_eq!(orchestrator.state.sessions[0].last_activity_at, arrival);
+        assert_eq!(orchestrator.state.tasks[0].updated_at, arrival);
+        let baseline = orchestrator.snapshot();
+        for _ in 0..8 {
+            orchestrator.apply_observations(vec![observation.clone()]);
+            assert_eq!(orchestrator.snapshot(), baseline);
+        }
+        let next_arrival = arrival + chrono::Duration::milliseconds(1);
+        orchestrator.apply_hook_event(&event, true, next_arrival);
+        assert_eq!(
+            orchestrator.state.sessions[0].last_activity_at,
+            next_arrival
+        );
+        assert_eq!(orchestrator.state.tasks[0].updated_at, next_arrival);
     }
 
     #[test]

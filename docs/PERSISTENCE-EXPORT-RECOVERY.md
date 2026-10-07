@@ -13,7 +13,8 @@ es el daemon local de terminales Unix.
 - La UI conserva una franja visible con el motivo; no depende del toast inicial.
   La pérdida de propiedad de escritura también mantiene ese aviso.
 - Las consultas periódicas de terminales no actualizan por sí solas las fechas
-  de actividad ni de tareas. La entrada aceptada, la salida nueva y los cambios
+  de actividad ni de tareas. La entrada aceptada, la salida nueva, los hooks
+  recibidos y los cambios
   reales de identidad, estado o resumen sí las actualizan. El contador de
   actividad vive sólo en memoria, separado del repintado, replay y ACK; no
   agrega campos al formato del layout. El historial mantiene su propia
