@@ -43,6 +43,8 @@ mod orchestration_ui;
 mod perf;
 mod persistence_worker;
 #[cfg(test)]
+mod preferences_shutdown_tests;
+#[cfg(test)]
 mod preferences_ui_tests;
 mod preferences_worker;
 mod quick_open_ui;
