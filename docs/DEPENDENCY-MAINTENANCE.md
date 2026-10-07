@@ -3,7 +3,9 @@
 La auditoría local guardada en `dist/validation-audit.json` usa la base de
 RustSec del 3 de octubre de 2026: cero vulnerabilidades conocidas y cuatro
 avisos de mantenimiento. Es un resultado de esa consulta, no una garantía
-permanente. El lockfile no cambió durante la revisión del 6 de octubre.
+permanente. La [auditoría de GitHub del 6 de octubre](https://github.com/MauroProto/terminal-canvas/actions/runs/37544616708/job/112545511009)
+actualizó RustSec, revisó 634 dependencias y pasó con los mismos cuatro avisos,
+sin vulnerabilidades reportadas. El lockfile no cambió durante esta revisión.
 No se agregaron ignores para ocultar los avisos.
 
 ## Rutas que deben migrarse
@@ -44,3 +46,25 @@ plataformas/features, ejecutar una auditoría nueva sin ignores, pasar la CI
 del candidato y las pruebas nativas del componente migrado. Mantener las
 migraciones en commits separados de las correcciones de persistencia y de
 los cambios de distribución.
+
+## Acciones de CI y distribución
+
+GitHub señaló la retirada de Node 20 durante la CI del checkpoint. `ci.yml`
+y `release.yml` ahora fijan por SHA versiones compatibles con Node 24:
+[checkout 5.1.0](https://github.com/actions/checkout/tree/v5.1.0),
+[setup-python 6.3.0](https://github.com/actions/setup-python/tree/v6.3.0),
+[upload-artifact 6.0.0](https://github.com/actions/upload-artifact/tree/v6.0.0),
+[download-artifact 7.0.0](https://github.com/actions/download-artifact/tree/v7.0.0)
+y [action-gh-release 3.0.3](https://github.com/softprops/action-gh-release/tree/v3.0.3).
+Conservan los inputs de checkout, Python, artefactos y publicación. La acción
+de publicación sólo corre para tags, con firmas verificadas; el ensayo manual
+no comprueba esa publicación ni sustituye las credenciales reales.
+
+Estas acciones requieren runner 2.327.1 o posterior. El runner observado del
+checkpoint usa 2.337.0; la matriz conserva Windows 2025, Ubuntu 24.04 y macOS 15
+Intel/Apple Silicon. Se fijó Ubuntu 24.04 también para auditoría y benchmarks
+ante la [migración anunciada del alias ubuntu-latest](https://github.blog/changelog/2026-09-17-ubuntu-26-generally-available-and-latest-migration/).
+Las ejecuciones de GitHub enlazadas en `DELIVERY-CONTINUATION.md` registran el
+estado de validación del candidato y los resultados de estos cambios.
+Los workflows manuales de reparación de pases
+anteriores no recibieron cambios en esta revisión.
