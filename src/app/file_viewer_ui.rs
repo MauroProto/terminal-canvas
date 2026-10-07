@@ -207,6 +207,7 @@ impl TerminalApp {
 
         egui::Panel::right("code-viewer")
             .resizable(true)
+            .show_separator_line(false)
             .default_size(DEFAULT_WIDTH)
             .size_range(MIN_WIDTH..=MAX_WIDTH)
             .frame(
