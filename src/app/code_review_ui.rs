@@ -43,6 +43,10 @@ pub(super) struct CodeReviewState {
     /// Notas por línea sobre el diff, persistidas por repo.
     pub(super) notes: crate::orchestration::DiffNotes,
     pub(super) notes_loading: bool,
+    pub(super) notes_request: Uuid,
+    pub(super) import_request: Option<Uuid>,
+    pub(super) notes_ready: bool,
+    pub(super) notes_error: Option<String>,
     pub(super) legacy_notes_available: bool,
     pub(super) importing_notes: bool,
     pub(super) show_all_notes: bool,
@@ -99,6 +103,7 @@ impl TerminalApp {
             return;
         };
         let key = Uuid::new_v4();
+        let notes_request = self.preferences_worker.load_notes(key, repo_root.clone());
         self.code_review = Some(CodeReviewState {
             key,
             repo_root: repo_root.clone(),
@@ -116,13 +121,16 @@ impl TerminalApp {
             worktree_error: None,
             notes: Default::default(),
             notes_loading: true,
+            notes_request,
+            import_request: None,
+            notes_ready: false,
+            notes_error: None,
             legacy_notes_available: false,
             importing_notes: false,
             show_all_notes: false,
             editing_note: None,
             note_target_picker: false,
         });
-        self.preferences_worker.load_notes(key, repo_root.clone());
         self.diff_loader.request(key, repo_root);
     }
 
@@ -353,13 +361,13 @@ impl TerminalApp {
                     }
                 }
                 if let Some(state) = self.code_review.as_mut() {
-                    if state.legacy_notes_available && !state.importing_notes
+                    if state.notes_ready && state.legacy_notes_available && !state.importing_notes
                         && ui.small_button("Importar notas anteriores")
                             .on_hover_text("Importa al repositorio actual. El formato anterior podía mezclar carpetas con nombres parecidos; revisá las notas antes de enviarlas.")
                             .clicked()
                     {
                         state.importing_notes = true;
-                        self.preferences_worker.import_notes(state.key, state.repo_root.clone());
+                        state.import_request = Some(self.preferences_worker.import_notes(state.key, state.repo_root.clone()));
                     }
                 }
                 // "Enviar N notas": las pendientes de entregar al agente.
@@ -397,6 +405,26 @@ impl TerminalApp {
             });
         });
         ui.add_space(8.0);
+        if let Some(reason) = self
+            .code_review
+            .as_ref()
+            .and_then(|state| state.notes_error.clone())
+        {
+            ui.horizontal_wrapped(|ui| {
+                ui.colored_label(DEL_FG, reason);
+                let loading = self
+                    .code_review
+                    .as_ref()
+                    .is_some_and(|state| state.notes_loading);
+                if ui
+                    .add_enabled(!loading, egui::Button::new("Reintentar lectura de notas"))
+                    .clicked()
+                {
+                    self.retry_review_notes();
+                }
+            });
+            ui.label("El diff sigue disponible. Las notas sólo se pueden editar después de cargarlas correctamente.");
+        }
     }
 
     fn code_review_body(&mut self, ui: &mut egui::Ui, size: egui::Vec2, body_height: f32) {
@@ -1001,7 +1029,15 @@ impl TerminalApp {
 
     /// Aplica las acciones de notas colectadas durante el render (el render no
     /// puede mutar el estado: las filas se construyen desde un snapshot).
-    fn apply_note_action(&mut self, action: NoteAction) {
+    pub(super) fn apply_note_action(&mut self, action: NoteAction) {
+        if !self
+            .code_review
+            .as_ref()
+            .is_some_and(|state| state.notes_ready)
+            && !matches!(&action, NoteAction::CancelEditor)
+        {
+            return;
+        }
         match action {
             NoteAction::Create {
                 file_path,
@@ -1049,6 +1085,13 @@ impl TerminalApp {
     }
 
     fn save_note_editor(&mut self) {
+        if !self
+            .code_review
+            .as_ref()
+            .is_some_and(|state| state.notes_ready)
+        {
+            return;
+        }
         let Some(editing) = self
             .code_review
             .as_ref()
@@ -1099,34 +1142,63 @@ impl TerminalApp {
         for completion in self.preferences_worker.poll() {
             match completion {
                 Completion::NotesSaved(Err(err)) => {
-                    self.toast_error(format!("No se pudieron guardar las notas: {err}"))
+                    self.toast_error(format!("No se pudieron guardar las notas: {err:#}"))
                 }
                 Completion::SettingsSaved(Ok(())) => {
-                    self.toast_success("Configuración guardada en config.toml")
+                    if !self.preferences_worker.settings_pending() {
+                        self.toast_success("Configuración guardada en config.toml")
+                    }
                 }
                 Completion::SettingsSaved(Err(err)) => {
                     self.toast_error(format!("No se pudo guardar config.toml: {err}"))
                 }
                 Completion::NotesLoaded {
                     key,
-                    notes,
-                    legacy_available,
+                    request,
+                    repo_root,
+                    result,
                 } => {
-                    if let Some(state) = self.code_review.as_mut().filter(|state| state.key == key)
-                    {
-                        state.notes = notes;
-                        state.notes_loading = false;
-                        state.legacy_notes_available = legacy_available;
+                    let Some(state) = self.code_review.as_mut().filter(|state| {
+                        state.key == key
+                            && state.notes_request == request
+                            && state.repo_root == repo_root
+                    }) else {
+                        continue;
+                    };
+                    state.notes_loading = false;
+                    match result {
+                        Ok((notes, legacy_available)) => {
+                            state.notes = notes;
+                            state.notes_ready = true;
+                            state.notes_error = None;
+                            state.legacy_notes_available = legacy_available;
+                        }
+                        Err(error) => {
+                            let reason = format!("No se pudieron cargar las notas: {error:#}");
+                            state.notes_ready = false;
+                            state.notes_error = Some(reason.clone());
+                            self.toast_error(reason);
+                        }
                     }
                 }
-                Completion::NotesImported { key, result } => {
-                    let Some(state) = self.code_review.as_mut().filter(|state| state.key == key)
-                    else {
+                Completion::NotesImported {
+                    key,
+                    request,
+                    repo_root,
+                    result,
+                } => {
+                    let Some(state) = self.code_review.as_mut().filter(|state| {
+                        state.key == key
+                            && state.import_request == Some(request)
+                            && state.repo_root == repo_root
+                            && state.notes_ready
+                    }) else {
                         continue;
                     };
                     state.importing_notes = false;
                     match result {
                         Ok(imported) => {
+                            state.import_request = None;
                             for note in imported.notes {
                                 if !state
                                     .notes
@@ -1156,11 +1228,26 @@ impl TerminalApp {
         let Some((repo_root, notes)) = self
             .code_review
             .as_ref()
+            .filter(|state| state.notes_ready)
             .map(|state| (state.repo_root.clone(), state.notes.clone()))
         else {
             return;
         };
         self.preferences_worker.save_notes(repo_root, notes);
+    }
+
+    pub(super) fn retry_review_notes(&mut self) {
+        let Some(state) = self
+            .code_review
+            .as_mut()
+            .filter(|state| !state.notes_ready && !state.notes_loading)
+        else {
+            return;
+        };
+        state.notes_loading = true;
+        state.notes_request = self
+            .preferences_worker
+            .load_notes(state.key, state.repo_root.clone());
     }
 
     /// Fila del editor de notas: un TextEdit de una línea + Guardar/Cancelar.
@@ -1217,7 +1304,7 @@ impl TerminalApp {
 
     /// Manda todas las notas pendientes al agente con el formato de contrato.
     fn send_pending_notes(&mut self, panel_id: Uuid) {
-        let Some((pending, repo_root)) = self.code_review.as_ref().map(|state| {
+        let Some((pending, repo_root)) = self.code_review.as_ref().filter(|state| state.notes_ready).map(|state| {
             (
                 state
                     .notes
@@ -1268,6 +1355,13 @@ impl TerminalApp {
     /// Arranque del envío de notas: si el agente asociado al review está vivo
     /// se manda directo; si no, se abre el selector de destinos.
     fn begin_note_send(&mut self) {
+        if !self
+            .code_review
+            .as_ref()
+            .is_some_and(|state| state.notes_ready)
+        {
+            return;
+        }
         let target_panel = self
             .code_review
             .as_ref()
@@ -1606,7 +1700,7 @@ fn draw_note_row(
 
 /// Acciones que el render de notas produce y el app aplica después (el render
 /// trabaja sobre un snapshot y no puede mutar el estado directamente).
-enum NoteAction {
+pub(super) enum NoteAction {
     Create {
         file_path: String,
         line: u32,

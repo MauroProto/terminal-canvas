@@ -1396,6 +1396,7 @@ impl TerminalApp {
             self.execute_command(command, &ctx, ui.available_rect_before_wrap());
         }
         self.show_persistence_warning(ui);
+        self.show_preferences_warning(ui);
         self.show_sidebar(ui);
         self.show_taskbar(ui);
         // El visor de código es un SidePanel: tiene que declararse antes del
@@ -1442,6 +1443,35 @@ impl TerminalApp {
                     .strong().color(Color32::from_rgb(235, 170, 95)))
                     .on_hover_text(reason);
                 ui.label("Revisá el motivo antes de continuar con cambios; el detalle aparece al pasar el mouse.");
+            });
+    }
+
+    fn show_preferences_warning(&mut self, ui: &mut egui::Ui) {
+        let Some(reason) = self.preferences_worker.warning() else {
+            return;
+        };
+        Panel::top("preferences-write-warning")
+            .resizable(false)
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        egui::RichText::new("El guardado de preferencias requiere atención")
+                            .strong()
+                            .color(Color32::from_rgb(235, 170, 95)),
+                    );
+                    if ui
+                        .add_enabled(
+                            !self.preferences_worker.busy(),
+                            egui::Button::new("Reintentar guardado"),
+                        )
+                        .clicked()
+                    {
+                        self.preferences_worker.retry();
+                        self.retry_review_notes();
+                        ui.ctx().request_repaint();
+                    }
+                });
+                ui.label(reason);
             });
     }
 

@@ -1,19 +1,21 @@
-//! Serial preference I/O. Pending saves coalesce by destination; the worker
-//! drains accepted writes on shutdown so the last edit survives a quick exit.
+//! Serial preference I/O with retained payloads and explicit recovery.
+//! Poll never waits for I/O; shutdown/update drain accepted writes and report
+//! every unsaved destination. Only an explicit retry or new request restarts
+//! a worker that has stopped.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver, SyncSender};
-use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use crate::orchestration::DiffNotes;
 use uuid::Uuid;
 
-enum Job {
+pub(super) enum Job {
     SaveNotes(PathBuf, DiffNotes),
-    LoadNotes(Uuid, PathBuf),
-    ImportNotes(Uuid, PathBuf),
+    LoadNotes(Uuid, Uuid, PathBuf),
+    ImportNotes(Uuid, Uuid, PathBuf),
     SaveSettings(crate::config::AppConfig),
 }
 
@@ -21,25 +23,87 @@ pub(super) enum Completion {
     NotesSaved(anyhow::Result<()>),
     NotesLoaded {
         key: Uuid,
-        notes: DiffNotes,
-        legacy_available: bool,
+        request: Uuid,
+        repo_root: PathBuf,
+        result: anyhow::Result<(DiffNotes, bool)>,
     },
     NotesImported {
         key: Uuid,
+        request: Uuid,
+        repo_root: PathBuf,
         result: anyhow::Result<DiffNotes>,
     },
     SettingsSaved(anyhow::Result<()>),
 }
 
+impl Job {
+    fn same_write_destination(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::SaveNotes(a, _), Self::SaveNotes(b, _)) => a == b,
+            (Self::SaveSettings(_), Self::SaveSettings(_)) => true,
+            _ => false,
+        }
+    }
+
+    fn interrupted(&self, reason: &str) -> Completion {
+        match self {
+            Self::SaveNotes(root, _) => Completion::NotesSaved(Err(anyhow::anyhow!(
+                "No se guardaron las notas de {}: {reason}",
+                root.display()
+            ))),
+            Self::SaveSettings(_) => {
+                Completion::SettingsSaved(Err(anyhow::anyhow!(reason.to_owned())))
+            }
+            Self::LoadNotes(key, request, root) => Completion::NotesLoaded {
+                key: *key,
+                request: *request,
+                repo_root: root.clone(),
+                result: Err(anyhow::anyhow!(
+                    "No se cargaron las notas de {}: {reason}",
+                    root.display()
+                )),
+            },
+            Self::ImportNotes(key, request, root) => Completion::NotesImported {
+                key: *key,
+                request: *request,
+                repo_root: root.clone(),
+                result: Err(anyhow::anyhow!(
+                    "No se importaron las notas de {}: {reason}",
+                    root.display()
+                )),
+            },
+        }
+    }
+}
+
+type Processor = Box<dyn FnMut(&Job) -> Completion + Send>;
+type WorkerTask = Box<dyn FnOnce() + Send>;
+type Spawner = Box<dyn FnMut(WorkerTask) -> std::io::Result<JoinHandle<()>> + Send>;
+
+struct StartedWorker {
+    jobs: SyncSender<Arc<Job>>,
+    results: Receiver<Completion>,
+    thread: JoinHandle<()>,
+}
+
+struct FailedSave {
+    job: Arc<Job>,
+    reason: String,
+}
+
 pub(super) struct PreferencesWorker {
-    jobs: Option<SyncSender<Arc<Job>>>,
-    results: Receiver<(Option<PathBuf>, Completion)>,
-    thread: Option<JoinHandle<()>>,
+    worker: Option<StartedWorker>,
+    processor: Arc<Mutex<Processor>>,
+    spawner: Spawner,
+    retired: Vec<JoinHandle<()>>,
     pending: VecDeque<Arc<Job>>,
     active: Option<Arc<Job>>,
-    busy: bool,
-    notes_write_errors: BTreeMap<PathBuf, String>,
-    settings_write_error: Option<String>,
+    // A job without an ACK precedes the FIFO and never enters coalescing.
+    failed_active: Option<Arc<Job>>,
+    completions: VecDeque<Completion>,
+    unavailable: Option<String>,
+    notes_write_errors: BTreeMap<PathBuf, FailedSave>,
+    settings_write_error: Option<FailedSave>,
 }
 
 impl Default for PreferencesWorker {
@@ -53,166 +117,386 @@ fn run_job(job: &Job) -> Completion {
         Job::SaveNotes(root, notes) => {
             Completion::NotesSaved(crate::orchestration::save_notes(root, notes))
         }
-        Job::LoadNotes(key, root) => Completion::NotesLoaded {
+        Job::LoadNotes(key, request, root) => Completion::NotesLoaded {
             key: *key,
-            notes: crate::orchestration::load_notes(root),
-            legacy_available: crate::orchestration::legacy_notes_available(root),
+            request: *request,
+            repo_root: root.clone(),
+            result: Ok((
+                crate::orchestration::load_notes(root),
+                crate::orchestration::legacy_notes_available(root),
+            )),
         },
-        Job::ImportNotes(key, root) => Completion::NotesImported {
+        Job::ImportNotes(key, request, root) => Completion::NotesImported {
             key: *key,
+            request: *request,
+            repo_root: root.clone(),
             result: crate::orchestration::load_legacy_notes(root),
         },
         Job::SaveSettings(config) => Completion::SettingsSaved(crate::config::save(config)),
     }
 }
 
+fn spawn(task: WorkerTask) -> std::io::Result<JoinHandle<()>> {
+    thread::Builder::new()
+        .name("preferences-writer".to_owned())
+        .spawn(task)
+}
+
 impl PreferencesWorker {
-    fn with_processor(mut process: impl FnMut(&Job) -> Completion + Send + 'static) -> Self {
-        let (tx, rx) = mpsc::sync_channel::<Arc<Job>>(1);
-        let (result_tx, results) = mpsc::channel();
-        let worker = thread::Builder::new()
-            .name("preferences-writer".to_owned())
-            .spawn(move || {
-                while let Ok(job) = rx.recv() {
-                    let notes_root = match job.as_ref() {
-                        Job::SaveNotes(root, _) => Some(root.clone()),
-                        _ => None,
-                    };
-                    let completion = process(job.as_ref());
-                    if let Completion::NotesSaved(Err(error))
-                    | Completion::SettingsSaved(Err(error)) = &completion
-                    {
-                        log::error!("No se pudo persistir una preferencia: {error}");
-                    }
-                    // An absent UI must not abandon writes already accepted.
-                    let _ = result_tx.send((notes_root, completion));
-                }
-            })
-            .expect("preferences writer thread");
+    fn with_processor(process: impl FnMut(&Job) -> Completion + Send + 'static) -> Self {
+        Self::with_spawner(process, spawn)
+    }
+
+    fn with_spawner(
+        process: impl FnMut(&Job) -> Completion + Send + 'static,
+        spawner: impl FnMut(WorkerTask) -> std::io::Result<JoinHandle<()>> + Send + 'static,
+    ) -> Self {
         Self {
-            jobs: Some(tx),
-            results,
-            thread: Some(worker),
+            worker: None,
+            processor: Arc::new(Mutex::new(Box::new(process))),
+            spawner: Box::new(spawner),
+            retired: Vec::new(),
             pending: VecDeque::new(),
             active: None,
-            busy: false,
+            failed_active: None,
+            completions: VecDeque::new(),
+            unavailable: None,
             notes_write_errors: BTreeMap::new(),
             settings_write_error: None,
         }
     }
-}
 
-impl PreferencesWorker {
-    fn submit(&mut self, job: Job) {
-        let job = Arc::new(job);
-        let existing =
-            self.pending
-                .iter_mut()
-                .find(|pending| match (job.as_ref(), pending.as_ref()) {
-                    (Job::SaveNotes(root, _), Job::SaveNotes(other, _)) => root == other,
-                    (Job::SaveSettings(_), Job::SaveSettings(_)) => true,
-                    _ => false,
-                });
-        if let Some(existing) = existing {
+    #[cfg(test)]
+    pub(super) fn with_processor_for_tests(
+        process: impl FnMut(&Job) -> Completion + Send + 'static,
+    ) -> Self {
+        Self::with_processor(process)
+    }
+
+    fn start(&mut self) -> std::io::Result<()> {
+        if self.worker.is_some() {
+            return Ok(());
+        }
+        let (jobs, incoming) = mpsc::sync_channel::<Arc<Job>>(1);
+        // Drop drains a FIFO. The worker must never block waiting for the UI
+        // to consume a bounded result slot during shutdown.
+        let (completed, results) = mpsc::channel();
+        let processor = Arc::clone(&self.processor);
+        let task: WorkerTask = Box::new(move || {
+            while let Ok(job) = incoming.recv() {
+                // A previous callback can unwind. The production processor is
+                // stateless; retain the callback and its payload for retry.
+                let completion = processor.lock().unwrap_or_else(|e| e.into_inner())(job.as_ref());
+                let _ = completed.send(completion);
+            }
+        });
+        let thread = (self.spawner)(task)?;
+        self.worker = Some(StartedWorker {
+            jobs,
+            results,
+            thread,
+        });
+        Ok(())
+    }
+
+    fn queue(&mut self, job: Arc<Job>) {
+        if let Some(existing) = self
+            .pending
+            .iter_mut()
+            .find(|pending| job.same_write_destination(pending.as_ref()))
+        {
             *existing = job;
         } else {
-            // Only the most recent review can receive a load completion.
             if matches!(job.as_ref(), Job::LoadNotes(..)) {
                 self.pending
                     .retain(|pending| !matches!(pending.as_ref(), Job::LoadNotes(..)));
             }
             self.pending.push_back(job);
         }
-        self.schedule();
+    }
+
+    fn submit(&mut self, job: Job) {
+        self.queue(Arc::new(job));
+        if self.unavailable.is_some() {
+            self.retry();
+        } else {
+            self.schedule();
+        }
     }
 
     fn schedule(&mut self) {
-        if self.busy {
+        if self.active.is_some()
+            || self.unavailable.is_some()
+            || (self.failed_active.is_none() && self.pending.is_empty())
+        {
             return;
         }
-        if let Some(job) = self.pending.pop_front() {
-            self.busy = self
-                .jobs
-                .as_ref()
-                .is_some_and(|jobs| jobs.send(Arc::clone(&job)).is_ok());
-            if self.busy {
-                self.active = Some(job);
+        if let Err(error) = self.start() {
+            self.mark_unavailable(format!("No se pudo iniciar el guardado: {error}"));
+            return;
+        }
+        let was_active = self.failed_active.is_some();
+        let Some(job) = self
+            .failed_active
+            .take()
+            .or_else(|| self.pending.pop_front())
+        else {
+            return;
+        };
+        let sent = self
+            .worker
+            .as_ref()
+            .map(|w| w.jobs.try_send(Arc::clone(&job)));
+        match sent {
+            Some(Ok(())) => self.active = Some(job),
+            Some(Err(TrySendError::Full(returned))) => {
+                if was_active {
+                    self.failed_active = Some(returned);
+                } else {
+                    self.pending.push_front(returned);
+                }
             }
+            _ => {
+                if was_active {
+                    self.failed_active = Some(job);
+                } else {
+                    self.pending.push_front(job);
+                }
+                self.mark_unavailable(
+                    "El guardado se interrumpió antes de aceptar el trabajo".to_owned(),
+                );
+            }
+        }
+    }
+
+    fn retire_worker(&mut self) {
+        if let Some(worker) = self.worker.take() {
+            drop(worker.jobs);
+            self.retired.push(worker.thread);
+        }
+        self.reap_finished();
+    }
+
+    fn reap_finished(&mut self) {
+        let mut index = 0;
+        while index < self.retired.len() {
+            if self.retired[index].is_finished() {
+                let _ = self.retired.swap_remove(index).join();
+            } else {
+                index += 1;
+            }
+        }
+    }
+
+    fn mark_unavailable(&mut self, reason: String) {
+        if self.unavailable.is_some() {
+            return;
+        }
+        self.unavailable = Some(reason.clone());
+        self.retire_worker();
+        if let Some(active) = self.active.take() {
+            self.failed_active = Some(active);
+        }
+        let jobs: Vec<_> = self
+            .failed_active
+            .iter()
+            .chain(self.pending.iter())
+            .cloned()
+            .collect();
+        for job in jobs {
+            let completion = job.interrupted(&reason);
+            self.note_write_result(&job, &completion);
+            self.completions.push_back(completion);
+        }
+    }
+
+    fn write_waiting(&self, job: &Job) -> bool {
+        self.active
+            .iter()
+            .chain(self.failed_active.iter())
+            .chain(self.pending.iter())
+            .any(|other| job.same_write_destination(other.as_ref()))
+    }
+
+    fn note_write_result(&mut self, job: &Arc<Job>, completion: &Completion) {
+        match (job.as_ref(), completion) {
+            (Job::SaveNotes(root, _), Completion::NotesSaved(Err(error))) => {
+                self.notes_write_errors.insert(
+                    root.clone(),
+                    FailedSave {
+                        job: Arc::clone(job),
+                        reason: format!("{error:#}"),
+                    },
+                );
+            }
+            (Job::SaveNotes(root, _), Completion::NotesSaved(Ok(()))) => {
+                if !self.write_waiting(job.as_ref()) {
+                    self.notes_write_errors.remove(root);
+                }
+            }
+            (Job::SaveSettings(_), Completion::SettingsSaved(Err(error))) => {
+                self.settings_write_error = Some(FailedSave {
+                    job: Arc::clone(job),
+                    reason: format!("{error:#}"),
+                });
+            }
+            (Job::SaveSettings(_), Completion::SettingsSaved(Ok(()))) => {
+                if !self.write_waiting(job.as_ref()) {
+                    self.settings_write_error = None;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn finish(&mut self, completion: Completion) {
+        if let Some(job) = self.active.take() {
+            self.note_write_result(&job, &completion);
+            self.completions.push_back(completion);
+        } else {
+            self.mark_unavailable(
+                "El guardado devolvió una respuesta sin un trabajo aceptado".to_owned(),
+            );
         }
     }
 
     pub(super) fn save_notes(&mut self, root: PathBuf, notes: DiffNotes) {
         self.submit(Job::SaveNotes(root, notes));
     }
-    pub(super) fn load_notes(&mut self, key: Uuid, root: PathBuf) {
-        self.submit(Job::LoadNotes(key, root));
+    pub(super) fn load_notes(&mut self, key: Uuid, root: PathBuf) -> Uuid {
+        let request = Uuid::new_v4();
+        self.submit(Job::LoadNotes(key, request, root));
+        request
     }
-    pub(super) fn import_notes(&mut self, key: Uuid, root: PathBuf) {
-        self.submit(Job::ImportNotes(key, root));
+    pub(super) fn import_notes(&mut self, key: Uuid, root: PathBuf) -> Uuid {
+        let request = Uuid::new_v4();
+        self.submit(Job::ImportNotes(key, request, root));
+        request
     }
     pub(super) fn save_settings(&mut self, config: crate::config::AppConfig) {
         self.submit(Job::SaveSettings(config));
     }
+
+    /// In-flight or runnable work. An unavailable writer is an error, never
+    /// an endless request to repaint/wait for an update.
     pub(super) fn busy(&self) -> bool {
-        self.busy || self.active.is_some() || !self.pending.is_empty()
+        self.active.is_some()
+            || (self.unavailable.is_none()
+                && (self.failed_active.is_some() || !self.pending.is_empty()))
+    }
+
+    pub(super) fn settings_pending(&self) -> bool {
+        self.active
+            .iter()
+            .chain(self.failed_active.iter())
+            .chain(self.pending.iter())
+            .any(|job| matches!(job.as_ref(), Job::SaveSettings(_)))
+            || self.settings_write_error.is_some()
+    }
+
+    pub(super) fn warning(&self) -> Option<String> {
+        if let Some(reason) = &self.unavailable {
+            let context = self
+                .failed_active
+                .as_ref()
+                .or_else(|| self.pending.front())
+                .map(|job| match job.as_ref() {
+                    Job::SaveNotes(root, _) => format!("Notas sin guardar en {}", root.display()),
+                    Job::LoadNotes(_, _, root) => format!("Notas sin cargar de {}", root.display()),
+                    Job::ImportNotes(_, _, root) => {
+                        format!("Notas sin importar de {}", root.display())
+                    }
+                    Job::SaveSettings(_) => "Configuración sin guardar".to_owned(),
+                });
+            return Some(
+                context.map_or_else(|| reason.clone(), |context| format!("{context}: {reason}")),
+            );
+        }
+        if let Some((root, failure)) = self.notes_write_errors.iter().next() {
+            return Some(format!(
+                "Notas sin guardar en {}: {}",
+                root.display(),
+                failure.reason
+            ));
+        }
+        self.settings_write_error.as_ref().map(|failure| {
+            format!(
+                "Configuración aplicada, pero sin guardar: {}",
+                failure.reason
+            )
+        })
+    }
+
+    /// Explicit retry uses retained snapshots, never defaults or a closed
+    /// settings draft. Known failed saves with a newer active/pending save are
+    /// superseded. A job without an ACK stays separately ahead of the FIFO.
+    pub(super) fn retry(&mut self) {
+        self.unavailable = None;
+        let retries: Vec<_> = self
+            .notes_write_errors
+            .values()
+            .chain(self.settings_write_error.iter())
+            .filter(|failure| !self.write_waiting(failure.job.as_ref()))
+            .map(|failure| Arc::clone(&failure.job))
+            .collect();
+        for job in retries.into_iter().rev() {
+            self.pending.push_front(job);
+        }
+        self.schedule();
     }
 
     pub(super) fn poll(&mut self) -> Vec<Completion> {
-        let results = self.results.try_iter().collect::<Vec<_>>();
-        for (notes_root, completion) in &results {
-            self.note_write_result(notes_root.as_ref(), completion);
-        }
-        if !results.is_empty() {
-            self.busy = false;
-            self.active = None;
+        self.reap_finished();
+        loop {
+            let received = self.worker.as_ref().map(|worker| worker.results.try_recv());
+            match received {
+                Some(Ok(completion)) => self.finish(completion),
+                Some(Err(TryRecvError::Disconnected)) => {
+                    self.mark_unavailable(
+                        "El hilo de guardado se detuvo antes de confirmar el trabajo".to_owned(),
+                    );
+                    break;
+                }
+                _ => break,
+            }
         }
         self.schedule();
-        results
-            .into_iter()
-            .map(|(_, completion)| completion)
-            .collect()
+        self.completions.drain(..).collect()
     }
 
-    fn note_write_result(&mut self, notes_root: Option<&PathBuf>, completion: &Completion) {
-        match (notes_root, completion) {
-            (Some(root), Completion::NotesSaved(result)) => match result {
-                Ok(()) => {
-                    self.notes_write_errors.remove(root);
-                }
-                Err(error) => {
-                    self.notes_write_errors
-                        .insert(root.clone(), error.to_string());
-                }
-            },
-            (_, Completion::SettingsSaved(result)) => {
-                self.settings_write_error = result.as_ref().err().map(ToString::to_string)
-            }
-            _ => {}
-        }
-    }
-
-    /// Update installation must verify accepted preference writes before asking
-    /// the native window to close. Drop alone cannot report a failed write.
+    /// The barrier retains read/import completions for the next UI poll, even
+    /// when an update is refused. A stopped worker returns an error promptly.
     pub(super) fn drain(&mut self) -> anyhow::Result<()> {
-        while self.busy() {
+        loop {
             self.schedule();
-            if self.busy {
-                let (notes_root, completion) = self.results.recv().map_err(|error| {
-                    anyhow::anyhow!("Preference writer stopped before finishing: {error}")
-                })?;
-                self.note_write_result(notes_root.as_ref(), &completion);
-                self.busy = false;
-                self.active = None;
+            if let Some(reason) = &self.unavailable {
+                anyhow::bail!("{reason}");
+            }
+            if self.active.is_some() {
+                let received = self.worker.as_ref().map(|worker| worker.results.recv());
+                match received {
+                    Some(Ok(completion)) => self.finish(completion),
+                    _ => self.mark_unavailable(
+                        "El hilo de guardado se detuvo sin confirmar el trabajo".to_owned(),
+                    ),
+                }
+            } else if self.pending.is_empty() && self.failed_active.is_none() {
+                break;
+            } else {
+                anyhow::bail!(
+                    "El canal de guardado está ocupado; se conservaron los trabajos pendientes"
+                );
             }
         }
-        if let Some((root, error)) = self.notes_write_errors.iter().next() {
+        if let Some((root, failure)) = self.notes_write_errors.iter().next() {
             anyhow::bail!(
-                "An accepted notes save failed for {}: {error}",
-                root.display()
+                "An accepted notes save failed for {}: {}",
+                root.display(),
+                failure.reason
             );
         }
-        if let Some(error) = &self.settings_write_error {
-            anyhow::bail!("An accepted preference save failed: {error}");
+        if let Some(failure) = &self.settings_write_error {
+            anyhow::bail!("An accepted preference save failed: {}", failure.reason);
         }
         Ok(())
     }
@@ -220,16 +504,12 @@ impl PreferencesWorker {
 
 impl Drop for PreferencesWorker {
     fn drop(&mut self) {
-        if let Some(jobs) = self.jobs.take() {
-            for job in self.pending.drain(..) {
-                if jobs.send(job).is_err() {
-                    break;
-                }
-            }
-            drop(jobs);
+        if let Err(error) = self.drain() {
+            log::error!("Preferencias pendientes al cerrar: {error:#}");
         }
-        if let Some(worker) = self.thread.take() {
-            let _ = worker.join();
+        self.retire_worker();
+        for thread in self.retired.drain(..) {
+            let _ = thread.join();
         }
     }
 }
@@ -331,18 +611,16 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::field_reassign_with_default)] // Drop prevents struct-update syntax.
     fn rapid_edits_coalesce_before_a_queued_reload() {
         let mut worker = PreferencesWorker::default();
-        worker.busy = true;
         let root = PathBuf::from("synthetic-repository");
         let key = Uuid::new_v4();
-        worker.save_notes(root.clone(), DiffNotes::default());
-        worker.load_notes(key, root.clone());
+        worker.queue(Arc::new(Job::SaveNotes(root.clone(), DiffNotes::default())));
+        worker.queue(Arc::new(Job::LoadNotes(key, Uuid::new_v4(), root.clone())));
         for index in 0..100 {
             let mut notes = DiffNotes::default();
             notes.add("a.rs", None, 1, &format!("edit {index}"));
-            worker.save_notes(root.clone(), notes);
+            worker.queue(Arc::new(Job::SaveNotes(root.clone(), notes)));
         }
         // Take the queue before assertions: the fixture must never write a
         // user preference file, even if an assertion panics.
@@ -351,21 +629,27 @@ mod tests {
         assert!(
             matches!(pending[0].as_ref(), Job::SaveNotes(_, notes) if notes.notes[0].body == "edit 99")
         );
-        assert!(matches!(pending[1].as_ref(), Job::LoadNotes(actual, _) if *actual == key));
+        assert!(matches!(pending[1].as_ref(), Job::LoadNotes(actual, _, _) if *actual == key));
     }
 
     #[test]
-    #[allow(clippy::field_reassign_with_default)] // Drop prevents struct-update syntax.
     fn abandoned_review_loads_do_not_accumulate() {
         let mut worker = PreferencesWorker::default();
-        worker.busy = true;
         let last = Uuid::new_v4();
         for _ in 0..100 {
-            worker.load_notes(Uuid::new_v4(), PathBuf::from("old"));
+            worker.queue(Arc::new(Job::LoadNotes(
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                PathBuf::from("old"),
+            )));
         }
-        worker.load_notes(last, PathBuf::from("current"));
+        worker.queue(Arc::new(Job::LoadNotes(
+            last,
+            Uuid::new_v4(),
+            PathBuf::from("current"),
+        )));
         let pending = std::mem::take(&mut worker.pending);
         assert_eq!(pending.len(), 1);
-        assert!(matches!(pending[0].as_ref(), Job::LoadNotes(key, _) if *key == last));
+        assert!(matches!(pending[0].as_ref(), Job::LoadNotes(key, _, _) if *key == last));
     }
 }
