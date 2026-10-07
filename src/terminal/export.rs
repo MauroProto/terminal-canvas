@@ -763,7 +763,10 @@ mod tests {
             super::unique_export_file_name("My Project", now),
             super::unique_export_file_name("My/Project", now),
         ];
-        assert_eq!(names.iter().collect::<std::collections::HashSet<_>>().len(), 3);
+        assert_eq!(
+            names.iter().collect::<std::collections::HashSet<_>>().len(),
+            3
+        );
         let prefix = format!("my-project-{}-", super::export_timestamp(now));
         for name in names {
             assert!(name.starts_with(&prefix), "got {name}");
