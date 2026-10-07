@@ -349,6 +349,15 @@ impl TerminalApp {
         self.memory_ui = Some(state);
     }
 
+    pub(super) fn poll_memory_hub(&mut self, ctx: &egui::Context) {
+        if let Some(state) = self.memory_ui.as_mut() {
+            state.poll();
+            if state.busy {
+                ctx.request_repaint_after(std::time::Duration::from_millis(16));
+            }
+        }
+    }
+
     pub(super) fn show_memory_hub(&mut self, ctx: &egui::Context) {
         if self.memory_ui.is_none() {
             return;
@@ -359,13 +368,7 @@ impl TerminalApp {
         }
 
         let mut close = false;
-        if let Some(state) = self.memory_ui.as_mut() {
-            state.poll();
-            if state.busy {
-                ctx.request_repaint_after(std::time::Duration::from_millis(16));
-            }
-        }
-        let screen = ctx.screen_rect();
+        let screen = ctx.content_rect();
 
         egui::Area::new(egui::Id::new("memory-backdrop"))
             .order(egui::Order::Middle)

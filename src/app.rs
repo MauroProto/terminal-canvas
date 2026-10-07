@@ -2,10 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use egui::{
-    pos2, vec2, Area, CentralPanel, Color32, Id, Key, Order, Pos2, Rect, SidePanel, Stroke,
-    TopBottomPanel,
-};
+use egui::{pos2, vec2, Area, CentralPanel, Color32, Id, Key, Order, Panel, Pos2, Rect, Stroke};
 use uuid::Uuid;
 
 use crate::canvas::config::{CANVAS_BG, ZOOM_KEYBOARD_FACTOR};
@@ -182,7 +179,8 @@ pub struct TerminalApp {
     layout_menu_open: bool,
     taskbar_button_rects: HashMap<Uuid, Rect>,
     window_transitions: HashMap<Uuid, WindowTransition>,
-    consecutive_update_panics: u32,
+    consecutive_logic_panics: u32,
+    consecutive_ui_panics: u32,
     /// Sólo una app real crea y elimina el marker global. El harness jamás
     /// debe borrar el marker perteneciente a una instancia viva del usuario.
     run_marker_active: bool,
@@ -385,7 +383,8 @@ impl TerminalApp {
                 layout_menu_open: false,
                 taskbar_button_rects: HashMap::new(),
                 window_transitions: HashMap::new(),
-                consecutive_update_panics: 0,
+                consecutive_logic_panics: 0,
+                consecutive_ui_panics: 0,
                 run_marker_active: side_effects,
                 persistence_writes_enabled,
             }
@@ -492,7 +491,8 @@ impl TerminalApp {
                 layout_menu_open: false,
                 taskbar_button_rects: HashMap::new(),
                 window_transitions: HashMap::new(),
-                consecutive_update_panics: 0,
+                consecutive_logic_panics: 0,
+                consecutive_ui_panics: 0,
                 run_marker_active: side_effects,
                 persistence_writes_enabled,
             }
@@ -934,7 +934,12 @@ impl TerminalApp {
         self.refresh_orchestration();
     }
 
-    fn handle_sidebar_responses(&mut self, responses: Vec<SidebarResponse>, ctx: &egui::Context) {
+    fn handle_sidebar_responses(
+        &mut self,
+        responses: Vec<SidebarResponse>,
+        ctx: &egui::Context,
+        canvas_rect: Rect,
+    ) {
         for response in responses {
             match response {
                 SidebarResponse::SwitchWorkspace(index) => self.switch_workspace(index),
@@ -943,10 +948,10 @@ impl TerminalApp {
                     self.closing_workspace = Some(workspace_id);
                 }
                 SidebarResponse::FocusPanel(panel_id) => {
-                    self.focus_panel_across_workspaces(panel_id, Some(ctx.available_rect()));
+                    self.focus_panel_across_workspaces(panel_id, Some(canvas_rect));
                 }
                 SidebarResponse::ReviewPanelChanges(panel_id) => {
-                    self.focus_panel_across_workspaces(panel_id, Some(ctx.available_rect()));
+                    self.focus_panel_across_workspaces(panel_id, Some(canvas_rect));
                     self.open_code_review();
                 }
                 SidebarResponse::SpawnTerminal(index) => {
@@ -1306,22 +1311,49 @@ fn should_stop_collaboration_on_workspace_close(
 }
 
 impl TerminalApp {
-    /// Un frame de la app, para el harness E2E (Ship-it 7.4).
+    /// The same logic/UI phases that eframe runs for a visible frame.
     #[cfg(test)]
-    pub fn update_for_tests(&mut self, ctx: &egui::Context) {
-        self.update_impl(ctx);
+    pub fn update_for_tests(&mut self, ui: &mut egui::Ui) {
+        self.logic_impl(ui.ctx());
+        self.ui_impl(ui);
     }
 
-    fn update_impl(&mut self, ctx: &egui::Context) {
-        if cfg!(target_os = "windows")
+    fn update_installation_in_progress(&self) -> bool {
+        cfg!(target_os = "windows")
             && matches!(
                 self.update_checker.snapshot().status,
                 crate::update::UpdateStatus::Installing
             )
-        {
+    }
+
+    /// Runs without an egui pass too. Only viewport state is fresh there;
+    /// keyboard/pointer events and egui time still belong to the last UI pass.
+    fn logic_impl(&mut self, ctx: &egui::Context) {
+        if self.update_installation_in_progress() {
+            ctx.request_repaint_after(Duration::from_millis(100));
+            return;
+        }
+        let started_at = Instant::now();
+        let mut perf_snapshot = FramePerfSnapshot::default();
+        self.begin_logic(ctx);
+        self.pump_runtime_updates(&mut perf_snapshot);
+        self.publish_collab_snapshot();
+        self.poll_join_session_result();
+        self.poll_pending_launches(ctx);
+        self.restore_pending_scrollbacks();
+        self.finish_prepared_update(ctx);
+        self.maybe_persist_state(ctx);
+        self.schedule_logic_repaint(ctx, &perf_snapshot);
+        perf_snapshot.frame_time = started_at.elapsed();
+        self.last_perf_snapshot = perf_snapshot;
+    }
+
+    fn ui_impl(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        if self.update_installation_in_progress() {
             // Keep the native window responsive while verification and launch
             // run off-thread, and prevent opening sessions during final launch.
-            CentralPanel::default().show(ctx, |ui| {
+            CentralPanel::default().show(ui, |ui| {
                 ui.spinner();
                 ui.label("Verifying the update publisher and opening the installer…");
             });
@@ -1329,15 +1361,24 @@ impl TerminalApp {
             return;
         }
         let frame_started_at = Instant::now();
-        let mut perf_snapshot = FramePerfSnapshot::default();
-        self.begin_frame(ctx);
-        self.pump_runtime_updates(&mut perf_snapshot);
-        self.forward_input_to_focused_panel(ctx);
-        self.show_sidebar(ctx);
-        self.show_taskbar(ctx);
+        let mut perf_snapshot = FramePerfSnapshot {
+            frame_time: self.last_perf_snapshot.frame_time,
+            attached_sessions: self.last_perf_snapshot.attached_sessions,
+            detached_sessions: self.last_perf_snapshot.detached_sessions,
+            runtime_repaint: self.last_perf_snapshot.runtime_repaint,
+            ..Default::default()
+        };
+        self.sync_window_transitions(&ctx);
+        if let Some(command) = self.handle_shortcuts(&ctx) {
+            self.execute_command(command, &ctx, ui.available_rect_before_wrap());
+        }
+        self.forward_input_to_focused_panel(&ctx);
+        self.show_sidebar(ui);
+        self.show_taskbar(ui);
         // El visor de código es un SidePanel: tiene que declararse antes del
         // CentralPanel para que el canvas se achique en vez de quedar tapado.
-        self.show_file_viewer(ctx);
+        self.show_file_viewer(ui);
+        let canvas_rect = ui.available_rect_before_wrap();
 
         CentralPanel::default()
             .frame(
@@ -1346,29 +1387,27 @@ impl TerminalApp {
                     .inner_margin(egui::Margin::same(0))
                     .outer_margin(egui::Margin::same(0)),
             )
-            .show(ctx, |ui| {
+            .show(ui, |ui| {
                 let canvas_rect = ui.max_rect();
                 ui.painter().rect_filled(canvas_rect, 0.0, CANVAS_BG);
 
                 if matches!(self.collab.mode(), CollabMode::Guest) {
-                    self.show_guest_canvas(ui, ctx, canvas_rect);
+                    self.show_guest_canvas(ui, &ctx, canvas_rect);
                 } else {
-                    self.show_desktop_canvas(ui, ctx, canvas_rect, &mut perf_snapshot);
+                    self.show_desktop_canvas(ui, &ctx, canvas_rect, &mut perf_snapshot);
                 }
             });
 
-        self.finish_frame(ctx, frame_started_at, perf_snapshot);
+        self.finish_ui(&ctx, canvas_rect, frame_started_at, perf_snapshot);
     }
 
-    /// Fase 1: estado por frame — eventos de collab, transiciones de ventana,
-    /// refresh de orquestación y atajos globales.
-    fn begin_frame(&mut self, ctx: &egui::Context) {
+    /// Poll workers without requiring layout, painting, or fresh UI input.
+    fn begin_logic(&mut self, ctx: &egui::Context) {
         self.ctx = Some(ctx.clone());
         self.command_palette.desktop_mode = !matches!(self.collab.mode(), CollabMode::Guest);
-        self.window_focused = ctx.input(|input| input.focused);
+        self.window_focused = ctx.input(|input| input.raw.focused);
         self.poll_persistence_worker(ctx);
         self.handle_collab_events();
-        self.sync_window_transitions(ctx);
         self.maybe_refresh_orchestration();
         self.poll_diff_loader();
         self.poll_preferences_worker();
@@ -1377,6 +1416,9 @@ impl TerminalApp {
         }
         self.poll_worktree_ops();
         self.poll_quick_open();
+        self.poll_file_viewer_updates(ctx);
+        self.poll_memory_hub(ctx);
+        self.poll_resume_picker(ctx);
         self.poll_hook_events();
         self.poll_gh_client();
         self.poll_design_captures();
@@ -1386,11 +1428,6 @@ impl TerminalApp {
         self.poll_screenshot_capture(ctx);
         if self.code_review.as_ref().is_some_and(|state| state.loading) {
             ctx.request_repaint_after(std::time::Duration::from_millis(80));
-        }
-
-        if let Some(command) = self.handle_shortcuts(ctx) {
-            let canvas_rect = ctx.available_rect();
-            self.execute_command(command, ctx, canvas_rect);
         }
     }
 
@@ -1511,15 +1548,16 @@ impl TerminalApp {
             || self.join_session_open
     }
 
-    fn show_sidebar(&mut self, ctx: &egui::Context) {
+    fn show_sidebar(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
         if self.sidebar_visible && !matches!(self.collab.mode(), CollabMode::Guest) {
-            SidePanel::left("sidebar")
+            let response = Panel::left("sidebar")
                 // Un ancho estable evita saltos de layout al pasar entre
                 // Workspaces, Files, Tasks y Online. El contenido largo se
                 // trunca o envuelve dentro del panel en vez de quitarle lugar
                 // de golpe a las terminales.
                 .resizable(false)
-                .exact_width(228.0)
+                .exact_size(228.0)
                 .frame(
                     egui::Frame::NONE
                         .fill(crate::theme::colors::INK)
@@ -1527,7 +1565,7 @@ impl TerminalApp {
                         .outer_margin(egui::Margin::same(0)),
                 )
                 .show_separator_line(false)
-                .show(ctx, |ui| {
+                .show(ui, |ui| {
                     let state = self.update_checker.snapshot();
                     let attention = self.attention_items();
                     // El explorador sigue la carpeta del workspace activo.
@@ -1538,7 +1576,7 @@ impl TerminalApp {
                     if self.sidebar.active_tab == crate::sidebar::SidebarTab::Tasks {
                         self.refresh_github_tasks(false);
                     }
-                    let responses = self.sidebar.show(
+                    self.sidebar.show(
                         ui,
                         self.brand_texture.as_ref(),
                         &self.workspaces,
@@ -1549,9 +1587,9 @@ impl TerminalApp {
                         &attention,
                         &mut self.file_tree,
                         &self.tasks_state,
-                    );
-                    self.handle_sidebar_responses(responses, ctx);
+                    )
                 });
+            self.handle_sidebar_responses(response.inner, &ctx, ui.available_rect_before_wrap());
         }
     }
 
@@ -2312,103 +2350,135 @@ impl TerminalApp {
         Some(hit.index)
     }
 
-    /// Fase final: paleta de comandos, diálogos, autosave y programación del
-    /// próximo repintado.
-    fn finish_frame(
+    /// UI input and rendering only run during a visible egui pass.
+    fn finish_ui(
         &mut self,
         ctx: &egui::Context,
+        canvas_rect: Rect,
         frame_started_at: Instant,
         mut perf_snapshot: FramePerfSnapshot,
     ) {
-        if let Some(command) = self.command_palette.show(ctx) {
-            self.execute_command(command, ctx, ctx.available_rect());
+        if let Some(command) = self.command_palette.show(ctx, canvas_rect) {
+            self.execute_command(command, ctx, canvas_rect);
         }
 
-        self.publish_collab_snapshot();
-        self.poll_join_session_result();
-        self.poll_pending_launches(ctx);
         self.show_share_workspace_dialog(ctx);
         self.show_join_session_dialog(ctx);
-        // Los eventos de collab (transporte y worker HTTP) llegan de hilos de
-        // fondo: con una sesión activa o un join en vuelo hay que repintar
-        // periódicamente para drenarlos aunque no haya input local.
-        if self.collab.mode() != CollabMode::Inactive || self.collab.join_in_flight() {
-            ctx.request_repaint_after(Duration::from_millis(100));
-        }
         self.show_launch_dialog(ctx);
         self.show_rename_dialog(ctx);
         self.show_close_workspace_dialog(ctx);
         self.show_search_bar(ctx);
         self.show_code_review(ctx);
-        self.show_quick_open(ctx);
+        self.show_quick_open(ctx, canvas_rect);
         self.show_onboarding(ctx);
-        self.restore_pending_scrollbacks();
         self.show_settings(ctx);
         self.show_memory_hub(ctx);
         self.show_broadcast(ctx);
         self.show_resume_picker(ctx);
-        self.finish_prepared_update(ctx);
         // Los toasts van último: se dibujan por encima de cualquier overlay.
         self.show_toasts(ctx);
+        // Catch edits from this UI pass immediately. Hidden logic performs
+        // the same autosave without needing any widgets to be rendered.
         self.maybe_persist_state(ctx);
 
+        if let Some(delay) = self.cursor_blink_repaint_delay(ctx) {
+            ctx.request_repaint_after(delay);
+        }
+        perf_snapshot.frame_time += frame_started_at.elapsed();
+        self.last_perf_snapshot = perf_snapshot;
+    }
+
+    fn schedule_logic_repaint(&self, ctx: &egui::Context, perf_snapshot: &FramePerfSnapshot) {
+        // Keep background polling alive even when a future-schema profile
+        // disables autosave, or there is no focused terminal to blink.
+        ctx.request_repaint_after(AUTOSAVE_INTERVAL);
+        // Transport and join results retain their existing polling cadence.
+        if self.collab.mode() != CollabMode::Inactive || self.collab.join_in_flight() {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
         if perf_snapshot.runtime_repaint {
             ctx.request_repaint();
         }
 
         if let Some(delay) = self.repaint_policy.next_repaint_delay(Instant::now()) {
             ctx.request_repaint_after(delay.max(Duration::from_millis(1)));
-        } else if let Some(delay) = self.cursor_blink_repaint_delay(ctx) {
-            ctx.request_repaint_after(delay);
         }
         // A writer draining its queue need not produce terminal output. Retry
         // deferred input even when the app is unfocused or its workspace hidden.
         if self.workspaces.iter().any(Workspace::has_pending_inputs) {
             ctx.request_repaint_after(Duration::from_millis(50));
         }
-        perf_snapshot.frame_time = frame_started_at.elapsed();
-        self.last_perf_snapshot = perf_snapshot;
     }
 }
 
 const MAX_CONSECUTIVE_UPDATE_PANICS: u32 = 5;
 
+#[derive(Clone, Copy)]
+enum UpdatePhase {
+    Logic,
+    Ui,
+}
+
+impl TerminalApp {
+    fn record_update_outcome(&mut self, phase: UpdatePhase, panicked: bool) -> u32 {
+        let count = match phase {
+            UpdatePhase::Logic => &mut self.consecutive_logic_panics,
+            UpdatePhase::Ui => &mut self.consecutive_ui_panics,
+        };
+        *count = if panicked { count.saturating_add(1) } else { 0 };
+        *count
+    }
+
+    fn handle_update_outcome(
+        &mut self,
+        ctx: &egui::Context,
+        phase: UpdatePhase,
+        outcome: std::thread::Result<()>,
+    ) {
+        let count = self.record_update_outcome(phase, outcome.is_err());
+        if outcome.is_ok() {
+            return;
+        }
+        let label = match phase {
+            UpdatePhase::Logic => "logic",
+            UpdatePhase::Ui => "ui",
+        };
+        log::error!("{label} loop panicked ({count} consecutive); attempting to continue");
+        if count >= MAX_CONSECUTIVE_UPDATE_PANICS {
+            // Preserve the same final recovery save and owner checks as a
+            // fatal failure in the former combined update callback.
+            if self.persistence_writes_enabled
+                && (!self.run_marker_active
+                    || crate::state::run_marker::current_process_may_write())
+            {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    if let Err(error) = self.persist_final_state() {
+                        log::error!("Final crash recovery save failed: {error}");
+                    }
+                }));
+            }
+            std::process::exit(1);
+        }
+        ctx.request_repaint();
+    }
+}
+
 impl eframe::App for TerminalApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Contain panics from a single frame so one rendering/logic bug does
         // not close the whole app; bail out only if every frame keeps
         // panicking, saving state first.
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.update_impl(ctx);
+            self.logic_impl(ctx);
         }));
-        match outcome {
-            Ok(()) => self.consecutive_update_panics = 0,
-            Err(_) => {
-                self.consecutive_update_panics = self.consecutive_update_panics.saturating_add(1);
-                log::error!(
-                    "update loop panicked ({} consecutive); attempting to continue",
-                    self.consecutive_update_panics
-                );
-                if self.consecutive_update_panics >= MAX_CONSECUTIVE_UPDATE_PANICS {
-                    // Camino catastrófico: acá se pierde todo lo que no esté en
-                    // disco, así que se guarda lo mismo que en una salida
-                    // limpia. Antes sólo se guardaba el layout y el scrollback
-                    // de la sesión se perdía entero.
-                    if self.persistence_writes_enabled
-                        && (!self.run_marker_active
-                            || crate::state::run_marker::current_process_may_write())
-                    {
-                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            if let Err(error) = self.persist_final_state() {
-                                log::error!("Final crash recovery save failed: {error}");
-                            }
-                        }));
-                    }
-                    std::process::exit(1);
-                }
-                ctx.request_repaint();
-            }
-        }
+        self.handle_update_outcome(ctx, UpdatePhase::Logic, outcome);
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.ui_impl(ui);
+        }));
+        self.handle_update_outcome(ui.ctx(), UpdatePhase::Ui, outcome);
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
@@ -2749,9 +2819,9 @@ mod smoke_e2e {
     /// de los últimos frames, y devuelve las etiquetas de accesibilidad.
     fn run_app(frames: usize, events: Vec<egui::Event>) -> Vec<String> {
         let mut app: Option<TerminalApp> = None;
-        let mut harness = egui_kittest::Harness::new(|ctx| {
-            let app = app.get_or_insert_with(|| TerminalApp::new_for_tests(ctx));
-            app.update_for_tests(ctx);
+        let mut harness = egui_kittest::Harness::new_ui(|ui| {
+            let app = app.get_or_insert_with(|| TerminalApp::new_for_tests(ui.ctx()));
+            app.update_for_tests(ui);
         });
         // La app tiene repaints periódicos legítimos (cursor y polling de los
         // workers). `Harness::run` exige que la UI llegue a reposo y por eso

@@ -94,7 +94,7 @@ impl TerminalApp {
         });
     }
 
-    pub(super) fn show_resume_picker(&mut self, ctx: &egui::Context) {
+    pub(super) fn poll_resume_picker(&mut self, ctx: &egui::Context) {
         if let Some(state) = self.resume_picker.as_mut() {
             match state.receiver.as_ref().map(|rx| rx.try_recv()) {
                 Some(Ok(sessions)) => {
@@ -111,6 +111,9 @@ impl TerminalApp {
                 None => {}
             }
         }
+    }
+
+    pub(super) fn show_resume_picker(&mut self, ctx: &egui::Context) {
         if self.resume_picker.is_none() {
             return;
         }
@@ -144,7 +147,7 @@ impl TerminalApp {
             None
         };
         let mut cancel = false;
-        let screen = ctx.screen_rect();
+        let screen = ctx.content_rect();
 
         egui::Area::new(egui::Id::new("resume-backdrop"))
             .order(egui::Order::Middle)

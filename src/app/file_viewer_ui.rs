@@ -180,9 +180,13 @@ impl TerminalApp {
         }
     }
 
-    pub(super) fn show_file_viewer(&mut self, ctx: &egui::Context) {
+    pub(super) fn poll_file_viewer_updates(&mut self, ctx: &egui::Context) {
         self.poll_file_viewer_load(ctx);
         self.poll_highlighter();
+    }
+
+    pub(super) fn show_file_viewer(&mut self, root_ui: &mut egui::Ui) {
+        let ctx = root_ui.ctx().clone();
         if self.file_viewer.is_none() {
             return;
         }
@@ -201,16 +205,16 @@ impl TerminalApp {
         let mut open_external: Option<PathBuf> = None;
         let mut open_dropped: Option<PathBuf> = None;
 
-        egui::SidePanel::right("code-viewer")
+        egui::Panel::right("code-viewer")
             .resizable(true)
-            .default_width(DEFAULT_WIDTH)
-            .width_range(MIN_WIDTH..=MAX_WIDTH)
+            .default_size(DEFAULT_WIDTH)
+            .size_range(MIN_WIDTH..=MAX_WIDTH)
             .frame(
                 egui::Frame::NONE
                     .fill(code_bg())
                     .inner_margin(egui::Margin::same(0)),
             )
-            .show(ctx, |ui| {
+            .show(root_ui, |ui| {
                 let Some(viewer) = self.file_viewer.as_ref() else {
                     return;
                 };
@@ -357,7 +361,7 @@ fn draw_code(ui: &mut egui::Ui, viewer: &FileViewerState) {
     let font = FontId::monospace(CODE_FONT_SIZE);
     // La fila que reserva `show_rows` tiene que coincidir exactamente con la
     // que ocupa cada renglón, si no el gutter se desalinea del código.
-    let row_height = ui.fonts(|fonts| fonts.row_height(&font)) + LINE_SPACING;
+    let row_height = ui.fonts_mut(|fonts| fonts.row_height(&font)) + LINE_SPACING;
     let gutter_width = viewer.gutter_width();
     let total_rows = viewer.lines.len();
 

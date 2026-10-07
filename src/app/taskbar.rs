@@ -317,7 +317,8 @@ pub(super) fn truncate_taskbar_title(title: &str) -> String {
 impl TerminalApp {
     /// Barra inferior de ventanas: un botón por panel (con títulos
     /// desambiguados) y restauración animada desde el botón.
-    pub(super) fn show_taskbar(&mut self, ctx: &egui::Context) {
+    pub(super) fn show_taskbar(&mut self, root_ui: &mut egui::Ui) {
+        let ctx = root_ui.ctx().clone();
         if !matches!(self.collab.mode(), CollabMode::Guest) {
             let mut requested_panel = None;
             let focused_id = self.ws().focused_panel().map(|panel| panel.id());
@@ -383,16 +384,16 @@ impl TerminalApp {
                     (id, display, minimized, focused, provider, unread)
                 })
                 .collect();
-            TopBottomPanel::bottom("window-taskbar")
+            egui::Panel::bottom("window-taskbar")
                 .resizable(false)
-                .exact_height(44.0)
+                .exact_size(44.0)
                 .frame(
                     egui::Frame::NONE
                         .fill(palette::INK)
                         .inner_margin(egui::Margin::symmetric(14, 6)),
                 )
                 .show_separator_line(false)
-                .show(ctx, |ui| {
+                .show(root_ui, |ui| {
                     egui::ScrollArea::horizontal()
                         .id_salt("taskbar-overflow")
                         .show(ui, |ui| {
@@ -403,7 +404,7 @@ impl TerminalApp {
                                 {
                                     let truncated = truncate_taskbar_title(title);
                                     let font = egui::FontId::proportional(11.5);
-                                    let text_w = ui.fonts(|f| {
+                                    let text_w = ui.fonts_mut(|f| {
                                         f.layout_no_wrap(
                                             truncated.clone(),
                                             font.clone(),
@@ -507,7 +508,7 @@ impl TerminalApp {
                     .unwrap_or(false)
                 {
                     if let (Some(canvas_rect), Some(button_rect)) = (
-                        Some(ctx.available_rect()),
+                        Some(root_ui.available_rect_before_wrap()),
                         self.taskbar_button_rects.get(&panel_id).copied(),
                     ) {
                         let desktop_rect = desktop_canvas_rect(canvas_rect);
@@ -525,10 +526,16 @@ impl TerminalApp {
                             );
                         }
                     } else {
-                        self.focus_panel_across_workspaces(panel_id, Some(ctx.available_rect()));
+                        self.focus_panel_across_workspaces(
+                            panel_id,
+                            Some(root_ui.available_rect_before_wrap()),
+                        );
                     }
                 } else {
-                    self.focus_panel_across_workspaces(panel_id, Some(ctx.available_rect()));
+                    self.focus_panel_across_workspaces(
+                        panel_id,
+                        Some(root_ui.available_rect_before_wrap()),
+                    );
                 }
             }
         }

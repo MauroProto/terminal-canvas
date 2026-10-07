@@ -133,7 +133,7 @@ impl TerminalApp {
         }
     }
 
-    pub(super) fn show_quick_open(&mut self, ctx: &egui::Context) {
+    pub(super) fn show_quick_open(&mut self, ctx: &egui::Context, canvas_rect: egui::Rect) {
         if self.quick_open.is_none() {
             return;
         }
@@ -230,7 +230,7 @@ impl TerminalApp {
             match item.kind {
                 QuickOpenKind::File => open_file = Some(root.join(&item.label)),
                 QuickOpenKind::Panel(panel_id) => {
-                    self.focus_panel_across_workspaces(panel_id, Some(ctx.available_rect()));
+                    self.focus_panel_across_workspaces(panel_id, Some(canvas_rect));
                 }
                 QuickOpenKind::Command => {
                     if let Some(entry) = COMMANDS
@@ -238,7 +238,6 @@ impl TerminalApp {
                         .find(|entry| entry.label == item.label)
                         .copied()
                     {
-                        let canvas_rect = ctx.available_rect();
                         self.quick_open = None;
                         self.execute_command(entry.command, ctx, canvas_rect);
                     }

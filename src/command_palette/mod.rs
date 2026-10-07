@@ -33,12 +33,12 @@ impl CommandPalette {
         self.selected = 0;
     }
 
-    pub fn show(&mut self, ctx: &egui::Context) -> Option<Command> {
+    pub fn show(&mut self, ctx: &egui::Context, canvas_rect: egui::Rect) -> Option<Command> {
         if !self.open {
             return None;
         }
 
-        let screen = ctx.available_rect();
+        let screen = canvas_rect;
         let width = (screen.width() - 40.0).min(500.0);
 
         let backdrop = ctx.layer_painter(egui::LayerId::new(Order::Debug, Id::new("cp-backdrop")));
@@ -188,9 +188,9 @@ mod tests {
         let expected = palette.filtered_entries()[15];
         let mut harness = Harness::builder()
             .with_size(vec2(700.0, 580.0))
-            .build_state(
-                |ctx, state: &mut (CommandPalette, Option<Command>)| {
-                    if let Some(command) = state.0.show(ctx) {
+            .build_ui_state(
+                |ui, state: &mut (CommandPalette, Option<Command>)| {
+                    if let Some(command) = state.0.show(ui.ctx(), ui.available_rect_before_wrap()) {
                         state.1 = Some(command);
                     }
                 },
@@ -216,9 +216,9 @@ mod tests {
     fn opening_the_palette_focuses_search_and_updates_results_in_the_same_frame() {
         let mut palette = CommandPalette::default();
         palette.toggle();
-        let mut harness = Harness::new_state(
-            |ctx, palette: &mut CommandPalette| {
-                palette.show(ctx);
+        let mut harness = Harness::new_ui_state(
+            |ui, palette: &mut CommandPalette| {
+                palette.show(ui.ctx(), ui.available_rect_before_wrap());
             },
             palette,
         );
