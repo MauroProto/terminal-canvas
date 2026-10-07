@@ -663,3 +663,143 @@ fn reopened_notes_do_not_expose_disk_before_failed_snapshot_is_saved() {
     assert!(worker.warning().is_none());
     assert!(!worker.busy());
 }
+
+fn snapshot_only_worker() -> PreferencesWorker {
+    PreferencesWorker::with_spawner(
+        |job| job.interrupted("snapshot-only fixture"),
+        |_| Err(std::io::ErrorKind::PermissionDenied.into()),
+    )
+}
+
+fn notes_in_job(job: &Arc<Job>) -> &DiffNotes {
+    let Job::SaveNotes(_, notes) = job.as_ref() else {
+        panic!("fixture expected a notes save");
+    };
+    notes
+}
+
+#[test]
+fn retained_notes_snapshot_prefers_the_last_pending_payload_without_side_effects() {
+    let root = PathBuf::from("retained-a");
+    let mut worker = snapshot_only_worker();
+    let known = Arc::new(Job::SaveNotes(root.clone(), notes("known failed")));
+    let failed = Arc::new(Job::SaveNotes(root.clone(), notes("failed active")));
+    let active = Arc::new(Job::SaveNotes(root.clone(), notes("active")));
+    let oldest_pending = Arc::new(Job::SaveNotes(root.clone(), notes("older pending")));
+    let latest = Arc::new(Job::SaveNotes(root.clone(), notes("latest pending")));
+    worker.notes_write_errors.insert(
+        root.clone(),
+        FailedSave {
+            job: known,
+            reason: "permanent synthetic cap".to_owned(),
+        },
+    );
+    worker.failed_active = Some(failed);
+    worker.active = Some(active);
+    worker.pending.push_back(oldest_pending);
+    worker.pending.push_back(Arc::clone(&latest));
+    worker
+        .pending
+        .push_back(Arc::new(Job::SaveSettings(settings(16.0))));
+    worker.pending.push_back(Arc::new(Job::SaveNotes(
+        PathBuf::from("retained-b"),
+        notes("other root"),
+    )));
+    let warning = worker.warning();
+    let count = Arc::strong_count(&latest);
+    for _ in 0..3 {
+        let selected = worker.retained_notes_for_repository(&root).unwrap();
+        assert!(std::ptr::eq(selected, notes_in_job(&latest)));
+        assert_eq!(selected, notes_in_job(&latest));
+    }
+    assert_eq!(Arc::strong_count(&latest), count);
+    assert_eq!(worker.pending.len(), 4);
+    assert!(worker.active.is_some() && worker.failed_active.is_some());
+    assert_eq!(worker.warning(), warning);
+    assert!(worker.worker.is_none());
+    retire_synthetic(&mut worker);
+}
+
+#[test]
+fn retained_notes_snapshot_falls_back_from_active_to_failed_active_to_known_failure() {
+    let root = PathBuf::from("retained-a");
+    let mut worker = snapshot_only_worker();
+    let known = Arc::new(Job::SaveNotes(root.clone(), notes("known failed")));
+    let failed = Arc::new(Job::SaveNotes(root.clone(), notes("failed active")));
+    let active = Arc::new(Job::SaveNotes(root.clone(), notes("active")));
+    worker.notes_write_errors.insert(
+        root.clone(),
+        FailedSave {
+            job: Arc::clone(&known),
+            reason: "permanent synthetic cap".to_owned(),
+        },
+    );
+    worker.failed_active = Some(Arc::clone(&failed));
+    worker.active = Some(Arc::clone(&active));
+    assert!(std::ptr::eq(
+        worker.retained_notes_for_repository(&root).unwrap(),
+        notes_in_job(&active)
+    ));
+    worker.active = None;
+    assert!(std::ptr::eq(
+        worker.retained_notes_for_repository(&root).unwrap(),
+        notes_in_job(&failed)
+    ));
+    worker.failed_active = None;
+    assert!(std::ptr::eq(
+        worker.retained_notes_for_repository(&root).unwrap(),
+        notes_in_job(&known)
+    ));
+    assert!(worker.notes_write_errors.contains_key(&root));
+}
+
+#[test]
+fn retained_notes_snapshot_never_returns_other_roots_or_non_notes_jobs() {
+    let root = PathBuf::from("retained-a");
+    let other = PathBuf::from("retained-b");
+    let mut worker = snapshot_only_worker();
+    worker.active = Some(Arc::new(Job::SaveNotes(other.clone(), notes("other root"))));
+    worker.failed_active = Some(Arc::new(Job::SaveSettings(settings(16.0))));
+    worker.pending.push_back(Arc::new(Job::LoadNotes(
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        root.clone(),
+    )));
+    worker.pending.push_back(Arc::new(Job::ImportNotes(
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        root.clone(),
+    )));
+    worker.notes_write_errors.insert(
+        other.clone(),
+        FailedSave {
+            job: Arc::new(Job::SaveNotes(other.clone(), notes("other failure"))),
+            reason: "other root denied".to_owned(),
+        },
+    );
+    assert!(worker.retained_notes_for_repository(&root).is_none());
+    assert!(worker
+        .retained_notes_for_repository(Path::new("missing-root"))
+        .is_none());
+    assert_eq!(
+        worker.retained_notes_for_repository(&other).unwrap().notes[0].body,
+        "other root"
+    );
+    retire_synthetic(&mut worker);
+}
+
+#[test]
+fn retained_notes_snapshot_tracks_the_latest_coalesced_pending_save() {
+    let root = PathBuf::from("retained-a");
+    let mut worker = snapshot_only_worker();
+    worker.queue(Arc::new(Job::SaveNotes(root.clone(), notes("older"))));
+    let latest = Arc::new(Job::SaveNotes(root.clone(), notes("newer")));
+    worker.queue(Arc::clone(&latest));
+    assert_eq!(worker.pending.len(), 1);
+    assert!(std::ptr::eq(
+        worker.retained_notes_for_repository(&root).unwrap(),
+        notes_in_job(&latest)
+    ));
+    assert!(worker.worker.is_none());
+    retire_synthetic(&mut worker);
+}
