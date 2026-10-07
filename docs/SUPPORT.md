@@ -95,6 +95,20 @@ No borres el original ni reemplaces `layout.json` por un backup mientras no
 se pueda leer. Un archivo ausente permite crear un perfil; un error de lectura
 en un archivo existente detiene la recuperación automática desde backups.
 
+El layout admite hasta 16 MiB de JSON completo en UTF-8, incluido el salto
+final que agrega el guardado. El historial de terminales y las notas tienen
+sus propios archivos y límites. Si la carga encuentra un layout o backup
+que supera el máximo, lo trata como un archivo que no se pudo leer: conserva
+los archivos y pausa el guardado de layout e historial, aunque exista otro
+backup legible. Un layout válido no requiere leer los backups posteriores. No se
+recorta ni se reemplaza automáticamente. Respaldá el perfil completo antes
+de investigar su tamaño; no borres metadatos del original para ocultar el aviso.
+
+Si falla una escritura por una entrada inválida en los backups, conservá
+también las cinco entradas del ring al respaldar el perfil. Esos lugares
+deben estar ausentes o ser archivos regulares directos; una carpeta, un
+archivo especial o un enlace no se rota automáticamente.
+
 ## Notas de revisión y guardados pendientes
 
 Una colección de notas admite hasta 4 MiB de JSON codificado en UTF-8, incluidos

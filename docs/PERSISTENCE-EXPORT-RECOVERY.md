@@ -10,6 +10,21 @@ es el daemon local de terminales Unix.
   candidato existente detiene el loader y desactiva las escrituras de layout e
   historial por la UI, incluso si hay un backup legible. No se puede asumir que
   ese backup representa el contenido del archivo bloqueado.
+- La carga y el guardado de layout admiten hasta 16 MiB para el JSON completo
+  en UTF-8, incluido el salto final del guardado. El historial de terminales y
+  las notas de revisión usan archivos y límites separados. Un candidato que
+  excede el máximo devuelve un error de lectura y conserva el perfil; no se
+  interpreta un prefijo ni se sustituye desde un backup más antiguo.
+- Un layout demasiado grande se rechaza al serializar, antes de crear un
+  temporal o rotar backups. No se confirma el snapshot como guardado, y una
+  instalación pendiente se detiene si falla el guardado final.
+- Antes de una escritura con cambios, el destino debe estar ausente, ser un
+  archivo regular o un enlace cuyo destino sea regular. Los cinco lugares del
+  ring de backups deben ser archivos regulares directos o estar ausentes. Una
+  entrada especial o un enlace en ese ring devuelve un error antes de rotarlo.
+  El escritor genérico mantiene
+  el no-op sin rotación; los guardados privados conservan sus controles más
+  estrictos.
 - La UI conserva una franja visible con el motivo; no depende del toast inicial.
   La pérdida de propiedad de escritura también mantiene ese aviso.
 - Las consultas periódicas de terminales no actualizan por sí solas las fechas
