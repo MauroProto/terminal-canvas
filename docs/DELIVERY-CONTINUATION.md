@@ -41,7 +41,7 @@ archivo anterior. Ese harness incluye pruebas de store/log/durable write;
 sus casos se solapan con el componente de append y no deben sumarse como únicos.
 Las dos regresiones de colisión de generación fallaron antes del fix y pasaron
 después; incluyen un fallo de borrado del log anterior.
-Se ejecutaron sin GUI, con un job y prioridad baja.
+Se ejecutaron sin GUI, con un job y uno o dos threads de pruebas.
 Formato y revisión independiente del diff completo también pasaron. Los seis
 casos nuevos de cierre/restauración, los de snapshot no disponible, captura
 fallida y los cambios de render requieren
@@ -258,61 +258,54 @@ versión y resultados sin adjuntar contenido privado del perfil.
 ## Prompt para continuar en otra máquina
 
 > Continuá Terminal Canvas (`MauroProto/terminal-canvas`) desde la rama publicada
-> `master`; usá el HEAD publicado actual. El código de contención Windows llega
-> a `7097d3a`, seguido por su documentación; conserva los checkpoints anteriores.
-> Leé `docs/DELIVERY-CONTINUATION.md`,
-> `docs/RELEASE.md`, `docs/PORTABLE.md`, `docs/SUPPORT.md` y
-> `docs/DEPENDENCY-MAINTENANCE.md`. Conservá todos los
-> microcommits e integrá mediante fast-forward en la rama principal `master`.
-> Antes de trabajar comprobá el HEAD, el remoto, los permisos y los resultados
-> de la CI 37544616708 y del ensayo Release 37545144493 sobre `d79f0fa`.
-> Verificá también CI 37549072652 y Release 37549143310 sobre `5107f41`.
-> Las dos CI y los dos ensayos completos quedaron aprobados; los ensayos
-> omitieron publicación y generaron paquetes de prueba sin firma del proveedor.
-> El pase posterior a `b6ea26a` modifica el lanzador Windows: crea los helpers
-> asociados a su Job antes de ejecutar código. Sus 21 casos del componente y
-> Clippy pasaron localmente; comprobá también la CI y el ensayo Release del HEAD
-> nuevo en Actions. Los ensayos anteriores no cubren ese código.
+> `master`; usá el HEAD publicado actual y conservá los checkpoints anteriores.
+> Antes de editar comprobá HEAD, estado de trabajo, remoto y permisos. Leé
+> `docs/DELIVERY-CONTINUATION.md`, `docs/RELEASE.md`, `docs/PORTABLE.md`,
+> `docs/SUPPORT.md` y `docs/DEPENDENCY-MAINTENANCE.md`. Comprobá en Actions
+> la CI y el ensayo Release cuyo headSha coincida con ese HEAD; las corridas
+> históricas descritas arriba sólo validan sus respectivos commits.
+> Conservá todos los microcommits e integrá mediante fast-forward en `master`,
+> sin descartar cambios ni reescribir historial. Los IDs del respaldo original
+> difieren de los publicados por Git Data API: no mezcles ambos historiales.
+> Ya están implementados el lanzador Windows contenido en un Job, los ACK
+> por sesión, captura/restauración y escrituras en FIFO, rescate durante replay,
+> alias legacy, rollback de append, lectura estricta y protección ante snapshots
+> o managers indisponibles y colisiones con generaciones de logs retenidos.
+> También el visor acotado y cancelable, saltos de línea del parser, fallback
+> de negrita e invalidación de render al cambiar el tamaño de fuente.
+> Revisá sus regresiones antes de repetir esos arreglos. Una captura inicial
+> fallida pausa la persistencia durante esa ejecución y avisa que la salida
+> nueva debe copiarse antes de reiniciar; cerrar el panel no elimina la guarda.
+> La cancelación del visor no interrumpe una syscall ni regex ya bloqueadas.
 > Para verificar archivos empaquetados del ensayo, usá su mismo checkout.
 > No repitas builds completos sin cambios ni una falla que investigar.
-> Las corridas 9f se reemplazaron: CI 37546104540 se canceló con Windows/Linux,
-> extensión y auditoría aprobados y macOS aún en cola; Release 37546248753
-> se canceló antes de ejecutar.
-> Los IDs del respaldo original difieren de los publicados por Git Data API:
-> usá la rama publicada; no fuerces la mezcla de los dos historiales.
-> No descartes cambios ni reescribas historial. No modifiques
-> Online/invitaciones. Cerrá los pendientes enumerados con evidencia real:
+> No modifiques Online/invitaciones. Cerrá los pendientes con evidencia real:
 > preservación de datos e interfaz en sistemas nativos, pruebas con agentes reales,
 > firma/notarización, upgrade firmado, publicación, Homebrew y las migraciones
 > de mantenimiento compatibles con la exclusión de Online/invitaciones.
-> Los tests locales y el ZIP debug ya probados no equivalen a una entrega
-> firmada. No inventes secretos ni resultados. Usá Rust 1.98.0 y mantené baja
-> la carga local: builds secuenciales con un job y dos threads de pruebas,
-> sin servidores ni procesos
-> innecesarios. Corregí fallos en commits pequeños y reportá por separado lo
+> Los tests y paquetes de ensayo no equivalen a uso nativo ni entrega firmada.
+> No inventes secretos ni resultados. La PC de Mauro se sobrecargó: allí no
+> ejecutar builds completos, GUI, WSL ni servidores; usar GitHub para integración
+> y paquetes. Para componentes pequeños, Rust 1.98.0 con PATH/RUSTC/RUSTDOC
+> coherentes, un job, hasta dos threads, prioridad baja y procesos ocultos.
+> En otra máquina adecuada, usar perfiles aislados para las pruebas nativas.
+> Corregí fallos en commits pequeños y reportá por separado lo
 > comprobado, lo publicado y lo que necesita credenciales o hardware externo.
 
-El pase ya está en GitHub. En la otra máquina, preferir un clon actualizado
-de `master`. También se verificó `terminal-canvas-published-source-20261006.bundle`,
-que contiene exactamente los 32 commits publicados hasta `5107f41` y requiere
-la base `f0458dd`. No incluye cambios posteriores a ese checkpoint ni esta
-actualización final de documentación. El bundle anterior
-`terminal-canvas-published-20261006.bundle` conserva los primeros 29 commits
-publicados hasta `d79f0fa`.
-El archivo `terminal-canvas-delivery-20261006-verified.bundle` conserva el
-historial local original con otros IDs; no mezclarlo con la rama publicada.
-Los bundles anteriores conservan sus pases previos.
-Para recuperar el checkpoint publicado en un checkout compatible:
+En la otra máquina, preferir un clon actualizado de `master`. Si se usa un
+bundle local, comprobar primero su ref anunciada y prerrequisitos mediante
+`git bundle verify`; los bundles anteriores sólo conservan sus respectivos
+checkpoints y no contienen `dist/`. El recibo externo de continuación identifica
+el respaldo del último pase y las corridas exactas. Para actualizar un checkout
+limpio con la historia publicada:
 
 ```bash
 git fetch origin
-git bundle verify /ruta/terminal-canvas-published-source-20261006.bundle
-git fetch /ruta/terminal-canvas-published-source-20261006.bundle master
+git status --short
 git switch master
-git merge --ff-only FETCH_HEAD
+git merge --ff-only origin/master
 ```
 
-Después, integrar con `git merge --ff-only origin/master` cualquier avance
-publicado posterior. Revisar el candidato y ejecutar sus comprobaciones antes
-de publicar nuevos cambios. No pegar tokens, certificados ni contraseñas en
-una conversación.
+Si hay cambios locales o el fast-forward falla, inspeccionarlos sin descartar
+datos. Revisar el candidato y sus comprobaciones antes de publicar cambios.
+No pegar tokens, certificados ni contraseñas en una conversación.
