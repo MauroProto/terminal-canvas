@@ -15,6 +15,17 @@ def verify(root: Path) -> None:
     if retired:
         raise ValueError(f"Retired graphics dependencies returned: {sorted(retired)}")
 
+    # gpu-allocator accepts several incompatible windows crate versions. Cargo
+    # can retain the old binding after a GPU upgrade, breaking Direct3D types.
+    gpu = next(package for package in lock["package"] if package["name"] == "wgpu-hal")
+    allocator = next(package for package in lock["package"] if package["name"] == "gpu-allocator")
+    windows_binding = lambda package: {
+        dependency for dependency in package["dependencies"]
+        if dependency == "windows" or dependency.startswith("windows ")
+    }
+    if not windows_binding(gpu) or windows_binding(gpu) != windows_binding(allocator):
+        raise ValueError("wgpu-hal and gpu-allocator must share their Direct3D Windows binding")
+
     eframe = manifest["dependencies"]["eframe"]
     required = {"accesskit", "default_fonts", "links", "wayland", "wgpu", "x11"}
     if eframe.get("default-features", True) or not required <= set(eframe["features"]):
