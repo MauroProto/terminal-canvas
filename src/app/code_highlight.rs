@@ -892,6 +892,13 @@ mod tests {
             lf.replacen('\n', "\r\n", 2),
         ] {
             let reference = highlight_text("Card.tsx", &source);
+            let after = source.lines().last().expect("following JavaScript line");
+            let standalone = highlight_text("Card.tsx", after);
+            assert_eq!(
+                coloured_characters(&reference).last(),
+                coloured_characters(&standalone).first(),
+                "closing JSX tags must return to the surrounding JavaScript"
+            );
             let colors: std::collections::BTreeSet<_> = reference
                 .iter()
                 .flatten()
