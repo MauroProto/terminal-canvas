@@ -937,6 +937,38 @@ mod tests {
     }
 
     #[test]
+    fn aliases_preserve_native_extensions_filename_tokens_and_shebang_fallback() {
+        for file in [
+            "jsx",
+            "mjs",
+            "cjs",
+            "Card.jsx.backup",
+            "app.mjs.backup",
+            "app.cjs.backup",
+        ] {
+            assert_eq!(detect_language(file, ""), None, "{file}");
+            assert_eq!(
+                detect_language(file, "#!/bin/bash"),
+                detect_language("deploy", "#!/bin/bash"),
+                "{file}"
+            );
+        }
+        for (file, expected) in [
+            ("Card.jsx.rs", "Rust"),
+            ("app.mjs.py", "Python"),
+            ("app.cjs.txt", "Plain Text"),
+            ("Dockerfile", "Dockerfile"),
+            ("Makefile", "Makefile"),
+        ] {
+            assert_eq!(
+                detect_language(file, "#!/bin/bash").as_deref(),
+                Some(expected),
+                "{file}"
+            );
+        }
+    }
+
+    #[test]
     fn theme_background_and_foreground_differ_enough_to_read() {
         let bg = super::theme_background();
         let fg = super::theme_foreground();
