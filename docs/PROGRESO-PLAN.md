@@ -45,8 +45,9 @@ del entorno que ya existía antes de este trabajo (`ghostty-vt`).
 
 ## Ship-it
 - [ ] 7.1 Empaquetado — **parcial**: `.app`/DMG con daemon, workflow de
-      firma/notarización/publicación y checker de releases con descarga manual;
-      faltan credenciales, publicación real del tag/cask e instalación automática
+      firma/notarización/publicación y checker con descarga verificada e instalación
+      automática en Windows/macOS para apps instaladas y firmadas por el mismo editor;
+      faltan credenciales, upgrade real firmado y publicación del tag/cask
 - [x] 7.2 Onboarding (detección de agentes + empty states + overlay)
 - [x] 7.3 Perf budgets (asserts duros + benches con comparación +15% en CI)
 - [x] 7.4 Smoke E2E (egui_kittest sobre la app real)
@@ -105,7 +106,9 @@ pendientes tareas externas y de integración:
 
 - firmar/notarizar con credenciales Apple reales y publicar los artefactos;
 - generar el SHA256 final y publicar el cask en un tap real;
-- completar la instalación automática: el checker ya usa el repositorio real,
-  reconoce el DMG publicado y abre su descarga manual validada.
+- validar el upgrade firmado en instalaciones reales de Windows/macOS, incluidos
+  editor distinto, disco lleno y sesiones vivas. La instalación automática ya
+  está implementada con verificaciones de firma/editor; las builds portables,
+  Linux y los paquetes sin firma conservan la instalación manual verificada.
 
 La secuencia y los límites actuales están documentados en `docs/RELEASE.md`.

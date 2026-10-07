@@ -1,6 +1,26 @@
 # Estado de entrega y continuación — 7 de octubre de 2026
 
-El checkpoint gráfico de código validado es `a93286e77054bbfd803c4503860ab488585103b0`, de
+El último checkpoint publicado y validado es
+`6d6c3f655d3e61f46646d1cf8c7814288d5a201c`, de **112 microcommits** desde
+`f0458dd1dae08b3aca080a914042deb5a9454cf3`.
+Su [CI candidata](https://github.com/MauroProto/terminal-canvas/actions/runs/37590871052),
+[CI de master](https://github.com/MauroProto/terminal-canvas/actions/runs/37597403375)
+y [ensayo de distribución](https://github.com/MauroProto/terminal-canvas/actions/runs/37591012832)
+terminaron SUCCESS. El ensayo produjo cinco paquetes de prueba sin firma;
+firma, notarización y publicación de producción quedaron omitidas.
+El checkpoint amplía gramáticas y aliases del visor y registra la investigación
+del serializador; no integra el fork experimental ni cambia Online/invitaciones.
+Ver [HIGHLIGHT-SUPPORT.md](HIGHLIGHT-SUPPORT.md) y
+[DEPENDENCY-MAINTENANCE.md](DEPENDENCY-MAINTENANCE.md).
+
+El pase posterior de recuperación y exports se describe en
+[PERSISTENCE-EXPORT-RECOVERY.md](PERSISTENCE-EXPORT-RECOVERY.md).
+Necesita evidencia de CI y paquetes de su propio SHA antes de publicarse;
+los resultados del checkpoint anterior no validan sus nuevas fuentes.
+
+## Checkpoint gráfico anterior
+
+El checkpoint gráfico de código validado fue `a93286e77054bbfd803c4503860ab488585103b0`, de
 **97 microcommits** desde `f0458dd1dae08b3aca080a914042deb5a9454cf3`.
 Su [CI completa](https://github.com/MauroProto/terminal-canvas/actions/runs/37576723374)
 y su [ensayo de distribución](https://github.com/MauroProto/terminal-canvas/actions/runs/37576793676)
@@ -15,7 +35,7 @@ instalación/desinstalación Inno y montaje de ambos DMG. Firma, notarización y
 publicación quedaron omitidas; sus paquetes son de prueba, sin firma del
 proveedor. No se acredita una release de producción publicada.
 
-Este cierre actualiza GRAPHICS-MIGRATION y este documento después del código
+El cierre gráfico actualizó GRAPHICS-MIGRATION y este documento después del código
 validado, además de una fixture TLS incluida sólo bajo `#[cfg(test)]`. Los
 documentos no se copian dentro de los paquetes y la fixture no se compila
 para sus binarios de producción. El recibo
@@ -166,20 +186,28 @@ produzca binarios idénticos. Una publicación real reconstruye desde su tag.
    paquetes descargados de la release real. Ver [RELEASE.md](RELEASE.md).
 4. Actualizar versión/SHA256 del cask con los DMG finales y publicar Homebrew
    con acceso real. Revisar protección de rama y permisos en instalaciones reales.
-5. Resolver los dos avisos sin ignores: bincode requiere migrar serializador y
-   assets de syntect/two-face juntos. PEM afecta TLS/colaboración y requiere
+5. Resolver los dos avisos sin ignores: validar la integración del serializador
+   con las APIs, los assets y los límites de memoria de syntect/two-face. El
+   prototipo aislado conservó compatibilidad con los assets antiguos; no prueba
+   que sea obligatorio regenerarlos. PEM afecta TLS/colaboración y requiere
    un alcance compatible con la exclusión de Online/invitaciones.
+6. Acotar el visor cuando una sola línea ocupa gran parte de los 2 MiB: el
+   límite por archivo y la virtualización de filas no limitan el galley ni la
+   regex de esa línea. Segmentar en el worker y conservar offsets originales
+   para copiar selecciones sin añadir saltos visuales. No ocultar ni truncar
+   silenciosamente la fuente para solucionar el coste de render.
 
 ## Prompt para continuar en otra máquina
 
 > Continuá Terminal Canvas (`MauroProto/terminal-canvas`) desde el HEAD publicado
-> de `master`; conservá los checkpoints anteriores. El código gráfico validado
-> es `a93286e77054bbfd803c4503860ab488585103b0`, de 97 microcommits, con CI 37576723374
-> y Release 37576793676 aprobadas. El cierre posterior, con docs y fixture TLS,
-> debe registrarse
-> en el recibo externo con su SHA y CI exacta. Comprobá HEAD, rama, estado,
+> de `master`; conservá los checkpoints anteriores. El último checkpoint cerrado
+> es `6d6c3f655d3e61f46646d1cf8c7814288d5a201c`, de 112 microcommits, con CI
+> 37590871052/37597403375 y Release 37591012832 aprobadas. El pase posterior de
+> persistencia/exports necesita sus propios recibos con SHA exacta.
+> Comprobá HEAD, rama, estado,
 > remoto y SHAs de las corridas antes de editar; no atribuyas éxito a otro SHA.
-> Leé este documento, GRAPHICS-MIGRATION, DEPENDENCY-MAINTENANCE, RELEASE,
+> Leé este documento, PERSISTENCE-EXPORT-RECOVERY, HIGHLIGHT-SUPPORT,
+> GRAPHICS-MIGRATION, DEPENDENCY-MAINTENANCE, RELEASE,
 > PORTABLE y SUPPORT. Conservá todos los microcommits y el revert bc5768d;
 > integrá por fast-forward en master, sin force push ni descartar datos.
 > Los IDs originales difieren de los publicados por Git Data API: no mezcles
