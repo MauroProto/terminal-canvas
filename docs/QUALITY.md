@@ -1,5 +1,10 @@
 # Revisión de calidad de septiembre de 2026
 
+Este documento conserva la revisión histórica de septiembre. El estado vigente
+y las corridas de cada candidato se registran en
+[DELIVERY-CONTINUATION.md](DELIVERY-CONTINUATION.md) y
+[GRAPHICS-MIGRATION.md](GRAPHICS-MIGRATION.md).
+
 Base revisada: `88f67656700bac4cef83b094864d18d22d91e503`.
 Los cambios se desarrollan en `codex/premium-quality` mediante commits pequeños
 que permiten revisar y revertir cada corrección. Online, invitaciones y el
@@ -236,15 +241,19 @@ los requisitos operativos. Una CI verde no certifica ausencia de otras fallas.
   monitores, escalas, drivers y sistemas de accesibilidad reales.
 - Los tests de la extensión usan el runtime JavaScript con mocks; no certifican
   todas las páginas ni todas las versiones del navegador.
-- La auditoría conserva cinco advertencias por dependencias sin mantenimiento,
-  `bincode`, `paste`, `rustls-pemfile`, `ttf-parser` y `yaml-rust`. No se agregaron
-  excepciones para ocultarlas. Cargo también informa incompatibilidad futura
-  de `block` 0.1.6 en macOS.
+- La auditoría histórica de septiembre tenía cinco advertencias y Cargo
+  informaba incompatibilidad futura de `block` en macOS. El candidato gráfico
+  del 7 de octubre retiró `paste`, `ttf-parser`, `yaml-rust` y `block`; su
+  [auditoría](https://github.com/MauroProto/terminal-canvas/actions/runs/37573217610)
+  conserva dos avisos, `bincode` y `rustls-pemfile`, sin ignores nuevos.
+  [DEPENDENCY-MAINTENANCE.md](DEPENDENCY-MAINTENANCE.md) describe las rutas restantes.
 - La prueba de sesiones reales de Claude sigue requiriendo datos de un entorno
   local y no forma parte de la ejecución automática. El fixture de subprocess
   marcado como ignorado se invoca explícitamente desde sus tests de regresión.
 - No se ha publicado una release firmada, un instalador ni un tap Homebrew en
   esta revisión. El cask requiere los checksums de los DMG finales.
-- La actualización se instala manualmente. El pase de calidad original no
-  modificó Online; la remediación posterior se limita a las fronteras de
-  seguridad y regresiones detalladas arriba, no a una certificación integral.
+- Las copias Windows cuyo registro Inno corresponde a la app ejecutada tienen
+  una vía de actualización verificada; las copias portables requieren
+  instalación manual. El upgrade firmado real sigue pendiente. El pase de
+  calidad original no modificó Online; la remediación posterior se limita a
+  las fronteras de seguridad y regresiones detalladas arriba.
