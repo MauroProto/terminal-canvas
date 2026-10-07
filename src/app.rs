@@ -1100,6 +1100,19 @@ impl TerminalApp {
         self.persist_final_state()
     }
 
+    /// Read/import ACKs remain meaningful during the closing barrier. Applying
+    /// an import can enqueue its merged notes, which must also be durable before
+    /// the profile is marked clean or an installer is allowed to continue.
+    fn drain_preferences_for_shutdown(&mut self) -> anyhow::Result<()> {
+        loop {
+            let saved = self.preferences_worker.drain();
+            self.poll_preferences_worker();
+            if !self.preferences_worker.busy() {
+                return saved;
+            }
+        }
+    }
+
     /// Drain older accepted writes before publishing the final snapshot. A
     /// failed preference save must not prevent rescuing layout and history,
     /// but it still prevents treating the shutdown as clean.
@@ -1107,7 +1120,7 @@ impl TerminalApp {
         if !self.ensure_persistence_ownership() {
             anyhow::bail!("This app does not own its saved profile");
         }
-        let preferences_saved = self.preferences_worker.drain();
+        let preferences_saved = self.drain_preferences_for_shutdown();
         let _ = self.drain_persistence_worker();
         // Ownership may have changed while the worker was finishing its queue.
         if !self.ensure_persistence_ownership() {

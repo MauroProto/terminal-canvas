@@ -409,6 +409,11 @@ fn final_save_rescues_layout_and_history_after_accepted_settings_write_fails() {
 }
 
 #[test]
+fn stopped_preferences_worker_refuses_update_and_rescues_layout_with_dirty_marker() {
+    run_final_save_fixture("preferences-worker-stopped");
+}
+
+#[test]
 fn final_save_does_not_write_or_remove_successor_marker_after_losing_lease() {
     run_final_save_fixture("lease-lost");
 }
@@ -776,6 +781,34 @@ fn final_save_profile_fixture() {
             assert_eq!(saved.workspaces[0].name, "Final workspace");
             assert!(history.is_dir());
             assert!(marker.exists());
+        }
+        "preferences-worker-stopped" => {
+            app.preferences_worker =
+                super::preferences_worker::PreferencesWorker::with_processor_for_tests(|job| {
+                    match job {
+                        super::preferences_worker::Job::SaveSettings(_) => {
+                            panic!("synthetic stopped preferences writer")
+                        }
+                        _ => panic!("fixture only accepts settings"),
+                    }
+                });
+            app.preferences_worker
+                .save_settings(crate::config::AppConfig {
+                    font_size: 19.0,
+                    ..Default::default()
+                });
+            assert!(app.persist_before_update().is_err());
+            assert!(!app.preferences_worker.busy());
+            assert!(app.preferences_worker.settings_pending());
+            assert!(app.preferences_worker.warning().is_some());
+            let saved: crate::state::AppState =
+                serde_json::from_slice(&fs::read(&layout).unwrap()).unwrap();
+            assert_eq!(saved.workspaces[0].name, "Final workspace");
+            assert!(history.is_dir());
+            assert!(marker.exists());
+            app.on_exit(None);
+            assert!(marker.exists());
+            assert!(app.preferences_worker.drain().is_err());
         }
         "lease-lost" => {
             crate::state::persistence::try_save_state(&app.snapshot_state()).unwrap();
