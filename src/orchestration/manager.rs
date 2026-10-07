@@ -739,8 +739,12 @@ impl Orchestrator {
                 .unwrap_or(true)
         });
         for task in &mut self.state.tasks {
+            let previous_members = task.session_ids.len();
             task.session_ids
                 .retain(|session_id| !removed_sessions.contains(session_id));
+            if task.session_ids.len() != previous_members {
+                task.updated_at = Utc::now();
+            }
         }
         self.state.inbox.retain(|event| {
             event
@@ -749,6 +753,8 @@ impl Orchestrator {
                 .unwrap_or(true)
         });
         self.last_git_inspect_at
+            .retain(|session_id, _| !removed_sessions.contains(session_id));
+        self.last_activity_revision
             .retain(|session_id, _| !removed_sessions.contains(session_id));
     }
 
@@ -2698,6 +2704,30 @@ mod tests {
             orchestrator.state.sessions[0].review_summary,
             baseline.sessions[0].review_summary
         );
+    }
+
+    #[test]
+    fn closing_a_panel_updates_task_membership_once_and_prunes_activity_tracking() {
+        let (mut orchestrator, observation, _) = activity_fixture(false);
+        let epoch = orchestrator.state.tasks[0].updated_at;
+        let session_id = orchestrator.state.sessions[0].session_id;
+        assert!(orchestrator
+            .last_activity_revision
+            .contains_key(&session_id));
+        let live_panels = std::collections::HashSet::from([observation.panel_id]);
+        let baseline = orchestrator.snapshot();
+        orchestrator.prune_missing_panels(&live_panels);
+        assert_eq!(orchestrator.snapshot(), baseline);
+        orchestrator.prune_missing_panels(&std::collections::HashSet::new());
+        assert!(orchestrator.state.sessions.is_empty());
+        assert!(orchestrator.state.tasks[0].session_ids.is_empty());
+        assert!(orchestrator.state.tasks[0].updated_at > epoch);
+        assert!(!orchestrator
+            .last_activity_revision
+            .contains_key(&session_id));
+        let closed = orchestrator.snapshot();
+        orchestrator.prune_missing_panels(&std::collections::HashSet::new());
+        assert_eq!(orchestrator.snapshot(), closed);
     }
 
     #[test]
