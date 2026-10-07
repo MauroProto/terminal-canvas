@@ -8,7 +8,11 @@
 //! - El **formato del prompt es un contrato** byte-exacto con el agente, no
 //!   un detalle de presentación; el test lo fija.
 
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+
+/// The same serialized limit applies to reads, imports and saves.
+const MAX_NOTES_FILE_BYTES: usize = 4 * 1024 * 1024;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -165,7 +169,12 @@ fn legacy_notes_file(repo_root: &Path) -> Option<PathBuf> {
 pub fn load_legacy_notes(repo_root: &Path) -> anyhow::Result<DiffNotes> {
     let path = legacy_notes_file(repo_root)
         .ok_or_else(|| anyhow::anyhow!("No se pudo resolver el directorio de notas"))?;
-    Ok(serde_json::from_slice(&std::fs::read(path)?)?)
+    load_existing_notes_from_path(&path, MAX_NOTES_FILE_BYTES)
+}
+
+fn load_existing_notes_from_path(path: &Path, limit: usize) -> anyhow::Result<DiffNotes> {
+    let bytes = read_notes_bytes(path, limit).map_err(|error| notes_read_error(path, error))?;
+    parse_notes_bytes(path, &bytes)
 }
 
 pub fn legacy_notes_available(repo_root: &Path) -> bool {
@@ -182,6 +191,15 @@ pub fn save_notes(repo_root: &Path, notes: &DiffNotes) -> anyhow::Result<()> {
 
 /// An explicit destination keeps storage tests independent of the profile.
 pub fn save_notes_to_path(path: &Path, notes: &DiffNotes) -> anyhow::Result<()> {
+    save_notes_to_path_with_limit(path, notes, MAX_NOTES_FILE_BYTES)
+}
+
+fn save_notes_to_path_with_limit(
+    path: &Path,
+    notes: &DiffNotes,
+    limit: usize,
+) -> anyhow::Result<()> {
+    use anyhow::Context;
     if notes.notes.is_empty() {
         // Sin notas no queda archivo: un repo limpio no arrastra notas viejas.
         match std::fs::remove_file(path) {
@@ -191,8 +209,17 @@ pub fn save_notes_to_path(path: &Path, notes: &DiffNotes) -> anyhow::Result<()> 
         }
         return Ok(());
     }
-    let bytes = serde_json::to_vec_pretty(notes)?;
-    crate::state::durable_write::write_durable(path, &bytes)?;
+    let mut buffer = LimitedNotesBuffer {
+        bytes: Vec::new(),
+        limit,
+    };
+    serde_json::to_writer_pretty(&mut buffer, notes).with_context(|| {
+        format!(
+            "No se pudo guardar {}: el JSON de notas debe ocupar como máximo {limit} bytes",
+            path.display()
+        )
+    })?;
+    crate::state::durable_write::write_durable(path, &buffer.bytes)?;
     Ok(())
 }
 
@@ -210,22 +237,103 @@ pub fn load_notes(repo_root: &Path) -> anyhow::Result<DiffNotes> {
 
 /// Read an explicit destination without changing either its bytes or profile.
 pub fn load_notes_from_path(path: &Path) -> anyhow::Result<DiffNotes> {
-    use anyhow::Context;
-    let bytes = match std::fs::read(path) {
+    load_notes_from_path_with_limit(path, MAX_NOTES_FILE_BYTES)
+}
+
+fn load_notes_from_path_with_limit(path: &Path, limit: usize) -> anyhow::Result<DiffNotes> {
+    let bytes = match read_notes_bytes(path, limit) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(DiffNotes::default())
         }
-        Err(error) => {
-            return Err(error).with_context(|| format!("No se pudo leer {}", path.display()))
-        }
+        Err(error) => return Err(notes_read_error(path, error)),
     };
-    serde_json::from_slice(&bytes).with_context(|| {
+    parse_notes_bytes(path, &bytes)
+}
+
+fn parse_notes_bytes(path: &Path, bytes: &[u8]) -> anyhow::Result<DiffNotes> {
+    use anyhow::Context;
+    serde_json::from_slice(bytes).with_context(|| {
         format!(
             "El archivo de notas {} no contiene JSON válido",
             path.display()
         )
     })
+}
+
+fn notes_read_error(path: &Path, error: std::io::Error) -> anyhow::Error {
+    let message = format!("No se pudo leer {}: {error}", path.display());
+    anyhow::Error::new(error).context(message)
+}
+
+fn notes_size_error(limit: usize) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("El archivo de notas supera el límite de {limit} bytes"),
+    )
+}
+
+fn read_notes_bytes(path: &Path, limit: usize) -> std::io::Result<Vec<u8>> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Las notas deben estar en un archivo regular",
+        ));
+    }
+    read_notes_bytes_with_limit(file, metadata.len(), limit)
+}
+
+fn read_notes_bytes_with_limit(
+    reader: impl Read,
+    declared_len: u64,
+    limit: usize,
+) -> std::io::Result<Vec<u8>> {
+    if declared_len > limit as u64 {
+        return Err(notes_size_error(limit));
+    }
+    let sentinel_limit = limit.checked_add(1).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "Límite de notas inválido")
+    })?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(declared_len as usize)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::OutOfMemory, error))?;
+    reader.take(sentinel_limit as u64).read_to_end(&mut bytes)?;
+    if bytes.len() > limit {
+        return Err(notes_size_error(limit));
+    }
+    Ok(bytes)
+}
+
+struct LimitedNotesBuffer {
+    bytes: Vec<u8>,
+    limit: usize,
+}
+
+impl Write for LimitedNotesBuffer {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() > self.limit.saturating_sub(self.bytes.len()) {
+            return Err(notes_size_error(self.limit));
+        }
+        self.bytes
+            .try_reserve(bytes.len())
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::OutOfMemory, error))?;
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
