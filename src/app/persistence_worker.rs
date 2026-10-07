@@ -386,7 +386,13 @@ fn persist_full_entries_with_remove(
             }
         };
         let generation =
-            super::read_leaf_generation(&entry.dir, entry.panel_id, entry.leaf_id).wrapping_add(1);
+            match super::read_leaf_generation(&entry.dir, entry.panel_id, entry.leaf_id) {
+                Ok(generation) => generation.wrapping_add(1),
+                Err(error) => {
+                    log::warn!("no se pudo leer la generación antes del checkpoint: {error}");
+                    continue;
+                }
+            };
         if let Err(err) = crate::state::scrollback_store::save_leaf_scrollback_versioned(
             &entry.dir,
             entry.panel_id,
@@ -463,25 +469,40 @@ fn persist_incremental_entries(
             ),
         );
         let key = (entry.dir.clone(), entry.panel_id, storage_leaf_id);
-        let first_seq = if log_path.exists() {
-            *next_sequences.entry(key.clone()).or_insert_with(|| {
-                std::fs::read(&log_path)
-                    .ok()
-                    .and_then(|bytes| crate::state::scrollback_log::read_frames(&bytes))
-                    .filter(|(generation, _)| {
-                        *generation
-                            == super::read_leaf_generation(
-                                &entry.dir,
-                                entry.panel_id,
-                                storage_leaf_id,
-                            )
-                    })
-                    .and_then(|(_, frames)| frames.last().map(|frame| frame.seq.saturating_add(1)))
-                    .unwrap_or(1)
-            })
+        let first_seq = if let Some(next_seq) = next_sequences.get(&key) {
+            *next_seq
         } else {
-            next_sequences.insert(key.clone(), 1);
-            1
+            let generation =
+                match super::read_leaf_generation(&entry.dir, entry.panel_id, storage_leaf_id) {
+                    Ok(generation) => generation,
+                    Err(error) => {
+                        log::warn!("no se pudo leer la generación antes del append: {error}");
+                        continue;
+                    }
+                };
+            match super::read_optional_history_bytes(&log_path) {
+                Ok(Some(bytes)) => {
+                    let Some((log_generation, frames)) =
+                        crate::state::scrollback_log::read_frames(&bytes)
+                    else {
+                        log::warn!("log durable inválido; se conserva sin ACK");
+                        continue;
+                    };
+                    if log_generation == generation {
+                        frames
+                            .last()
+                            .map(|frame| frame.seq.saturating_add(1))
+                            .unwrap_or(1)
+                    } else {
+                        1
+                    }
+                }
+                Ok(None) => 1,
+                Err(error) => {
+                    log::warn!("no se pudo leer la secuencia durable: {error}");
+                    continue;
+                }
+            }
         };
         if first_seq == u64::MAX {
             log::warn!("secuencia durable agotada; se fuerza checkpoint completo");
@@ -935,5 +956,138 @@ mod tests {
         assert_eq!(frames[0].seq, 1);
         assert_eq!(frames[0].payload, b"new output");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    fn assert_unreadable_artifact_is_preserved(block_checkpoint: bool) {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        for warm_cache in [false, true] {
+            let root =
+                std::env::temp_dir().join(format!("tc-write-sharing-{}", uuid::Uuid::new_v4()));
+            let panel_id = uuid::Uuid::new_v4();
+            let leaf_id = Some(uuid::Uuid::new_v4());
+            let runtime_session_id = uuid::Uuid::new_v4();
+            crate::state::scrollback_store::save_leaf_scrollback_versioned(
+                &root,
+                panel_id,
+                leaf_id,
+                8,
+                "previous checkpoint\n",
+            )
+            .unwrap();
+            let checkpoint_path = root.join(
+                crate::state::scrollback_store::scrollback_leaf_file_name(panel_id, leaf_id),
+            );
+            let checkpoint_before = std::fs::read(&checkpoint_path).unwrap();
+            let log_path = root.join(
+                crate::state::scrollback_store::scrollback_leaf_log_file_name(panel_id, leaf_id),
+            );
+            crate::state::scrollback_log::reset_log(&log_path, 8).unwrap();
+            crate::state::scrollback_log::append_frames(
+                &log_path,
+                &encode_frame(1, FrameKind::Output, b"previous tail\r\n"),
+            )
+            .unwrap();
+            let log_before = std::fs::read(&log_path).unwrap();
+            let key = (root.clone(), panel_id, leaf_id);
+            let mut sequences = std::collections::HashMap::new();
+            if warm_cache {
+                sequences.insert(key.clone(), 2);
+            }
+            let sequences_before = sequences.clone();
+            let mut legacy_roots = std::collections::HashMap::new();
+            let frames = encode_frame(1, FrameKind::Output, b"new pending output\r\n");
+            let new_entry = || IncrementalEntry {
+                dir: root.clone(),
+                panel_id,
+                leaf_id,
+                runtime_session_id,
+                frames: frames.clone(),
+            };
+            let blocked_path = if block_checkpoint {
+                &checkpoint_path
+            } else {
+                &log_path
+            };
+            let blocker = std::fs::OpenOptions::new()
+                .write(true)
+                .share_mode(4)
+                .open(blocked_path)
+                .unwrap();
+            assert_eq!(
+                std::fs::read(blocked_path).unwrap_err().raw_os_error(),
+                Some(32)
+            );
+            let (rollover, acknowledgements) = super::persist_incremental_entries(
+                vec![new_entry()],
+                &mut sequences,
+                &legacy_roots,
+            );
+            assert!(rollover.is_empty());
+            assert!(
+                acknowledgements.is_empty(),
+                "unreadable durable data cannot be acknowledged"
+            );
+            assert_eq!(
+                sequences, sequences_before,
+                "a failed read must not seed or advance the sequence cache"
+            );
+            if block_checkpoint {
+                let acknowledgements = persist_full_entries(
+                    vec![FullEntry {
+                        dir: root.clone(),
+                        panel_id,
+                        leaf_id,
+                        runtime_session_id,
+                        content: FullContent::Checkpoint {
+                            text: "must not replace unread history\n".to_owned(),
+                            pending_bytes: frames.len(),
+                        },
+                    }],
+                    &mut sequences,
+                    &mut legacy_roots,
+                );
+                assert!(
+                    acknowledgements.is_empty(),
+                    "failed generation reads cannot authorize a full replacement"
+                );
+                assert_eq!(sequences, sequences_before);
+            }
+            drop(blocker);
+            assert_eq!(std::fs::read(&checkpoint_path).unwrap(), checkpoint_before);
+            assert_eq!(std::fs::read(&log_path).unwrap(), log_before);
+            let (_, acknowledgements) = super::persist_incremental_entries(
+                vec![new_entry()],
+                &mut sequences,
+                &legacy_roots,
+            );
+            assert_eq!(acknowledgements.len(), 1);
+            assert_eq!(acknowledgements[0].written_bytes, frames.len());
+            assert_eq!(sequences.get(&key), Some(&3));
+            let (generation, written) =
+                crate::state::scrollback_log::read_frames(&std::fs::read(&log_path).unwrap())
+                    .unwrap();
+            assert_eq!(generation, 8);
+            assert_eq!(
+                written.iter().map(|frame| frame.seq).collect::<Vec<_>>(),
+                vec![1, 2]
+            );
+            assert_eq!(written[0].payload, b"previous tail\r\n");
+            assert_eq!(written[1].payload, b"new pending output\r\n");
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unreadable_incremental_log_is_preserved_with_cold_and_warm_sequence_caches() {
+        assert_unreadable_artifact_is_preserved(false);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unreadable_checkpoint_blocks_incremental_and_full_writes_without_ack() {
+        assert_unreadable_artifact_is_preserved(true);
     }
 }

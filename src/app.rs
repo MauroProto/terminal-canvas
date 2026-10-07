@@ -2485,19 +2485,23 @@ fn start_hook_server() -> Option<crate::orchestration::HookServer> {
     }
 }
 
-fn read_leaf_generation(dir: &std::path::Path, panel_id: Uuid, leaf_id: Option<Uuid>) -> u32 {
+fn read_leaf_generation(
+    dir: &std::path::Path,
+    panel_id: Uuid,
+    leaf_id: Option<Uuid>,
+) -> std::io::Result<u32> {
     if let Some((Some(generation), _)) =
-        crate::state::scrollback_store::load_leaf_scrollback_checkpoint(dir, panel_id, leaf_id)
+        crate::state::scrollback_store::try_load_leaf_scrollback_checkpoint(dir, panel_id, leaf_id)?
     {
-        return generation;
+        return Ok(generation);
     }
     let path =
         dir.join(crate::state::scrollback_store::scrollback_leaf_gen_file_name(panel_id, leaf_id));
-    std::fs::read(path)
-        .ok()
-        .filter(|bytes| bytes.len() >= 4)
-        .map(|bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
-        .unwrap_or(0)
+    Ok(read_optional_history_bytes(&path)?
+        .as_deref()
+        .map(decode_history_generation)
+        .transpose()?
+        .unwrap_or(0))
 }
 
 #[cfg(test)]
@@ -2527,11 +2531,28 @@ fn persist_incremental_frames(
 ) -> Option<bool> {
     let log_path =
         dir.join(crate::state::scrollback_store::scrollback_leaf_log_file_name(panel_id, leaf_id));
-    let generation = read_leaf_generation(dir, panel_id, leaf_id);
-    let log_is_current = std::fs::read(&log_path)
-        .ok()
-        .and_then(|bytes| crate::state::scrollback_log::read_frames(&bytes))
-        .is_some_and(|(log_generation, _)| log_generation == generation);
+    let generation = match read_leaf_generation(dir, panel_id, leaf_id) {
+        Ok(generation) => generation,
+        Err(error) => {
+            log::warn!("No se pudo leer la generación del historial: {error}");
+            return None;
+        }
+    };
+    let log_is_current = match read_optional_history_bytes(&log_path) {
+        Ok(Some(bytes)) => {
+            let Some((log_generation, _)) = crate::state::scrollback_log::read_frames(&bytes)
+            else {
+                log::warn!("Log inválido; se conserva sin reemplazarlo");
+                return None;
+            };
+            log_generation == generation
+        }
+        Ok(None) => false,
+        Err(error) => {
+            log::warn!("No se pudo leer el log del historial: {error}");
+            return None;
+        }
+    };
     if !log_is_current {
         if let Err(err) = crate::state::scrollback_log::reset_log(&log_path, generation) {
             log::warn!("No se pudo inicializar el log del panel: {err}");
@@ -2606,6 +2627,16 @@ fn read_optional_history_bytes(path: &std::path::Path) -> std::io::Result<Option
     }
 }
 
+fn decode_history_generation(bytes: &[u8]) -> std::io::Result<u32> {
+    if bytes.len() < 4 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "history generation sidecar is truncated",
+        ));
+    }
+    Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
 /// Capture one generation coherently. Only actual absence means no history;
 /// unreadable checkpoint/log/sidecar data cannot become an empty replay.
 fn capture_leaf_history(
@@ -2627,18 +2658,10 @@ fn capture_leaf_history(
             panel_id, leaf_id,
         )))?
     };
-    let sidecar_generation = match sidecar.as_deref() {
-        Some(bytes) if bytes.len() >= 4 => {
-            Some(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
-        }
-        Some(_) => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "history generation sidecar is truncated",
-            ));
-        }
-        None => None,
-    };
+    let sidecar_generation = sidecar
+        .as_deref()
+        .map(decode_history_generation)
+        .transpose()?;
     let generation = checkpoint
         .as_ref()
         .and_then(|(generation, _)| *generation)

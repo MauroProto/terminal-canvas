@@ -2246,3 +2246,40 @@ fn history_capture_reports_unreadable_checkpoint_log_and_generation_files() {
     }
     std::fs::remove_dir(dir).unwrap();
 }
+
+#[test]
+fn invalid_history_artifacts_do_not_authorize_resetting_an_existing_log() {
+    let dir = unique_temp_dir("tc-history-write-read-errors");
+    let panel = Uuid::new_v4();
+    let leaf = Some(Uuid::new_v4());
+    let log_path =
+        dir.join(crate::state::scrollback_store::scrollback_leaf_log_file_name(panel, leaf));
+    let frames = crate::state::scrollback_log::encode_frame(
+        1,
+        crate::state::scrollback_log::FrameKind::Output,
+        b"new output\r\n",
+    );
+    std::fs::write(&log_path, b"invalid durable log").unwrap();
+    assert_eq!(
+        super::persist_incremental_frames(&dir, panel, leaf, &frames),
+        None
+    );
+    assert_eq!(std::fs::read(&log_path).unwrap(), b"invalid durable log");
+    crate::state::scrollback_log::reset_log(&log_path, 0).unwrap();
+    let log_before = std::fs::read(&log_path).unwrap();
+    let generation_path =
+        dir.join(crate::state::scrollback_store::scrollback_leaf_gen_file_name(panel, leaf));
+    std::fs::write(&generation_path, b"bad").unwrap();
+    assert_eq!(
+        super::read_leaf_generation(&dir, panel, leaf)
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::InvalidData
+    );
+    assert_eq!(
+        super::persist_incremental_frames(&dir, panel, leaf, &frames),
+        None
+    );
+    assert_eq!(std::fs::read(&log_path).unwrap(), log_before);
+    std::fs::remove_dir_all(dir).unwrap();
+}
