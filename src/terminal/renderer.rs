@@ -1369,6 +1369,18 @@ mod tests {
     #[cfg(feature = "ghostty-vt")]
     use super::{render_ghostty_text_snapshot, GhosttyGridCache};
 
+    // Headless tests inspect shapes but do not upload textures to a painter.
+    // egui requires integrations to explicitly consume or discard these deltas.
+    fn run_headless_ui(
+        ctx: &egui::Context,
+        input: RawInput,
+        run_ui: impl FnMut(&mut egui::Ui),
+    ) -> egui::FullOutput {
+        let mut output = ctx.run_ui(input, run_ui);
+        output.textures_delta.clear();
+        output
+    }
+
     #[test]
     fn unfocused_cursor_is_hidden() {
         assert!(!cursor_visible(false, false, 0.1));
@@ -1455,7 +1467,7 @@ mod tests {
         let content_rect = Rect::from_min_size(pos2(20.0, 20.0), vec2(220.0, 120.0));
         let term = sample_term("first\nsecond");
 
-        let output = ctx.run_ui(raw_input, |ui| {
+        let output = run_headless_ui(&ctx, raw_input, |ui| {
             CentralPanel::default().show(ui, |ui| {
                 render_terminal_reduced(
                     ui.painter(),
@@ -1494,7 +1506,7 @@ mod tests {
         let term = sample_term("hello");
         let expected_fill = terminal_background_color(term.renderable_content().colors);
 
-        let output = ctx.run_ui(raw_input, |ui| {
+        let output = run_headless_ui(&ctx, raw_input, |ui| {
             CentralPanel::default().show(ui, |ui| {
                 render_terminal(
                     ui.painter(),
@@ -1589,7 +1601,7 @@ mod tests {
     #[test]
     fn font_atlas_generation_increments_when_fill_ratio_drops() {
         let ctx = egui::Context::default();
-        let _ = ctx.run_ui(RawInput::default(), |_| {});
+        let _ = run_headless_ui(&ctx, RawInput::default(), |_| {});
 
         let initial = super::font_atlas_generation(&ctx);
         assert_eq!(initial, super::font_atlas_generation(&ctx));
@@ -1705,7 +1717,7 @@ mod tests {
         let mut first_hit = false;
         let mut second_hit = false;
 
-        let _ = ctx.run_ui(raw_input.clone(), |ui| {
+        let _ = run_headless_ui(&ctx, raw_input.clone(), |ui| {
             CentralPanel::default().show(ui, |ui| {
                 first_hit = render_terminal(
                     ui.painter(),
@@ -1721,7 +1733,7 @@ mod tests {
             });
         });
 
-        let _ = ctx.run_ui(raw_input, |ui| {
+        let _ = run_headless_ui(&ctx, raw_input, |ui| {
             CentralPanel::default().show(ui, |ui| {
                 second_hit = render_terminal(
                     ui.painter(),
@@ -1755,7 +1767,7 @@ mod tests {
         let mut first_hit = true;
         let mut second_hit = false;
 
-        let _ = ctx.run_ui(raw_input.clone(), |ui| {
+        let _ = run_headless_ui(&ctx, raw_input.clone(), |ui| {
             CentralPanel::default().show(ui, |ui| {
                 first_hit = render_terminal(
                     ui.painter(),
@@ -1773,7 +1785,7 @@ mod tests {
 
         // Mismo tamaño y revisión, distinta posición: el cache debe seguir
         // valiendo (shapes locales + traslación al pintar).
-        let _ = ctx.run_ui(raw_input, |ui| {
+        let _ = run_headless_ui(&ctx, raw_input, |ui| {
             CentralPanel::default().show(ui, |ui| {
                 second_hit = render_terminal(
                     ui.painter(),
@@ -1807,7 +1819,7 @@ mod tests {
         let mut first_hit = true;
         let mut second_hit = false;
 
-        let _ = ctx.run_ui(raw_input.clone(), |ui| {
+        let _ = run_headless_ui(&ctx, raw_input.clone(), |ui| {
             CentralPanel::default().show(ui, |ui| {
                 first_hit = render_ghostty_text_snapshot(
                     ui.painter(),
@@ -1822,7 +1834,7 @@ mod tests {
             });
         });
 
-        let _ = ctx.run_ui(raw_input, |ui| {
+        let _ = run_headless_ui(&ctx, raw_input, |ui| {
             CentralPanel::default().show(ui, |ui| {
                 second_hit = render_ghostty_text_snapshot(
                     ui.painter(),
@@ -1853,7 +1865,7 @@ mod tests {
         // (12 galleys); con run-batching es 1.
         let term = sample_term("abcdefghijkl");
 
-        let output = ctx.run_ui(raw_input, |ui| {
+        let output = run_headless_ui(&ctx, raw_input, |ui| {
             CentralPanel::default().show(ui, |ui| {
                 render_terminal(
                     ui.painter(),
@@ -1890,7 +1902,7 @@ mod tests {
         let content_rect = Rect::from_min_size(pos2(20.0, 20.0), vec2(220.0, 120.0));
         let term = sample_term("first\nsecond\nthird");
 
-        let output = ctx.run_ui(raw_input, |ui| {
+        let output = run_headless_ui(&ctx, raw_input, |ui| {
             CentralPanel::default().show(ui, |ui| {
                 render_terminal(
                     ui.painter(),
@@ -1942,7 +1954,7 @@ mod tests {
         let content_rect = Rect::from_min_size(pos2(20.0, 20.0), vec2(220.0, 120.0));
         let term = sample_term("\x1b[1mboldtext\x1b[0m");
 
-        let output = ctx.run_ui(raw_input, |ui| {
+        let output = run_headless_ui(&ctx, raw_input, |ui| {
             CentralPanel::default().show(ui, |ui| {
                 render_terminal(
                     ui.painter(),

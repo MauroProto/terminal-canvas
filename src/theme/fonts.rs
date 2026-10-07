@@ -262,7 +262,8 @@ mod tests {
     fn font_context(fonts: FontDefinitions) -> egui::Context {
         let ctx = egui::Context::default();
         ctx.set_fonts(fonts);
-        let _ = ctx.run_ui(RawInput::default(), |_| {});
+        ctx.run_ui(RawInput::default(), |_| {})
+            .drop_without_applying_deltas();
         ctx
     }
 }
