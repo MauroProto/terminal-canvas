@@ -385,14 +385,42 @@ fn persist_full_entries_with_remove(
                 continue;
             }
         };
-        let generation =
+        let checkpoint_generation =
             match super::read_leaf_generation(&entry.dir, entry.panel_id, entry.leaf_id) {
-                Ok(generation) => generation.wrapping_add(1),
+                Ok(generation) => generation,
                 Err(error) => {
                     log::warn!("no se pudo leer la generación antes del checkpoint: {error}");
                     continue;
                 }
             };
+        let log_path = entry.dir.join(
+            crate::state::scrollback_store::scrollback_leaf_log_file_name(
+                entry.panel_id,
+                entry.leaf_id,
+            ),
+        );
+        let retained_log_generation = match super::read_optional_history_bytes(&log_path) {
+            Ok(Some(bytes)) => {
+                let Some((generation, _)) = crate::state::scrollback_log::read_frames(&bytes)
+                else {
+                    log::warn!("log retenido inválido; se conserva sin reemplazar el checkpoint");
+                    continue;
+                };
+                Some(generation)
+            }
+            Ok(None) => None,
+            Err(error) => {
+                log::warn!("no se pudo leer el log antes del checkpoint: {error}");
+                continue;
+            }
+        };
+        // Deletion may fail after checkpoint publication. Exclude both old
+        // generations so even an already stale retained log stays ineligible,
+        // including when the counter wraps through zero.
+        let mut generation = checkpoint_generation.wrapping_add(1);
+        if retained_log_generation == Some(generation) {
+            generation = generation.wrapping_add(1);
+        }
         if let Err(err) = crate::state::scrollback_store::save_leaf_scrollback_versioned(
             &entry.dir,
             entry.panel_id,
@@ -416,12 +444,7 @@ fn persist_full_entries_with_remove(
         // Checkpoint y generation se publican en el mismo rename atómico. Si
         // el proceso cae antes de este remove, el log viejo queda presente
         // pero su generation ya no coincide y el restore no lo reaplica.
-        let _ = remove_file(&entry.dir.join(
-            crate::state::scrollback_store::scrollback_leaf_log_file_name(
-                entry.panel_id,
-                entry.leaf_id,
-            ),
-        ));
+        let _ = remove_file(&log_path);
         let _ = remove_file(&entry.dir.join(
             crate::state::scrollback_store::scrollback_leaf_gen_file_name(
                 entry.panel_id,
@@ -958,13 +981,24 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    fn remove_owned_temp_directory(root: &std::path::Path, expected_name: &str) {
+        let resolved_root = root.canonicalize().unwrap();
+        let resolved_temp = std::env::temp_dir().canonicalize().unwrap();
+        assert_eq!(resolved_root.parent(), Some(resolved_temp.as_path()));
+        assert_eq!(
+            resolved_root.file_name(),
+            Some(std::ffi::OsStr::new(expected_name))
+        );
+        std::fs::remove_dir_all(resolved_root).unwrap();
+    }
+
     #[cfg(windows)]
     fn assert_unreadable_artifact_is_preserved(block_checkpoint: bool) {
         use std::os::windows::fs::OpenOptionsExt;
 
         for warm_cache in [false, true] {
-            let root =
-                std::env::temp_dir().join(format!("tc-write-sharing-{}", uuid::Uuid::new_v4()));
+            let root_name = format!("tc-write-sharing-{}", uuid::Uuid::new_v4());
+            let root = std::env::temp_dir().join(&root_name);
             let panel_id = uuid::Uuid::new_v4();
             let leaf_id = Some(uuid::Uuid::new_v4());
             let runtime_session_id = uuid::Uuid::new_v4();
@@ -1033,27 +1067,25 @@ mod tests {
                 sequences, sequences_before,
                 "a failed read must not seed or advance the sequence cache"
             );
-            if block_checkpoint {
-                let acknowledgements = persist_full_entries(
-                    vec![FullEntry {
-                        dir: root.clone(),
-                        panel_id,
-                        leaf_id,
-                        runtime_session_id,
-                        content: FullContent::Checkpoint {
-                            text: "must not replace unread history\n".to_owned(),
-                            pending_bytes: frames.len(),
-                        },
-                    }],
-                    &mut sequences,
-                    &mut legacy_roots,
-                );
-                assert!(
-                    acknowledgements.is_empty(),
-                    "failed generation reads cannot authorize a full replacement"
-                );
-                assert_eq!(sequences, sequences_before);
-            }
+            let acknowledgements = persist_full_entries(
+                vec![FullEntry {
+                    dir: root.clone(),
+                    panel_id,
+                    leaf_id,
+                    runtime_session_id,
+                    content: FullContent::Checkpoint {
+                        text: "must not replace unread history\n".to_owned(),
+                        pending_bytes: frames.len(),
+                    },
+                }],
+                &mut sequences,
+                &mut legacy_roots,
+            );
+            assert!(
+                acknowledgements.is_empty(),
+                "unreadable checkpoint or retained log cannot authorize a full replacement"
+            );
+            assert_eq!(sequences, sequences_before);
             drop(blocker);
             assert_eq!(std::fs::read(&checkpoint_path).unwrap(), checkpoint_before);
             assert_eq!(std::fs::read(&log_path).unwrap(), log_before);
@@ -1075,7 +1107,7 @@ mod tests {
             );
             assert_eq!(written[0].payload, b"previous tail\r\n");
             assert_eq!(written[1].payload, b"new pending output\r\n");
-            std::fs::remove_dir_all(root).unwrap();
+            remove_owned_temp_directory(&root, &root_name);
         }
     }
 
@@ -1089,5 +1121,82 @@ mod tests {
     #[test]
     fn unreadable_checkpoint_blocks_incremental_and_full_writes_without_ack() {
         assert_unreadable_artifact_is_preserved(true);
+    }
+
+    fn assert_retained_log_cannot_match_next_checkpoint(
+        checkpoint_generation: u32,
+        stale_generation: u32,
+        expected_generation: u32,
+    ) {
+        let root_name = format!("tc-retained-generation-{}", uuid::Uuid::new_v4());
+        let root = std::env::temp_dir().join(&root_name);
+        let panel_id = uuid::Uuid::new_v4();
+        let leaf_id = Some(uuid::Uuid::new_v4());
+        crate::state::scrollback_store::save_leaf_scrollback_versioned(
+            &root,
+            panel_id,
+            leaf_id,
+            checkpoint_generation,
+            "previous complete history\n",
+        )
+        .unwrap();
+        let log_path = root
+            .join(crate::state::scrollback_store::scrollback_leaf_log_file_name(panel_id, leaf_id));
+        crate::state::scrollback_log::reset_log(&log_path, stale_generation).unwrap();
+        crate::state::scrollback_log::append_frames(
+            &log_path,
+            &encode_frame(1, FrameKind::Output, b"stale output already discarded\r\n"),
+        )
+        .unwrap();
+        let log_before = std::fs::read(&log_path).unwrap();
+        let acknowledgements = super::persist_full_entries_with_remove(
+            vec![FullEntry {
+                dir: root.clone(),
+                panel_id,
+                leaf_id,
+                runtime_session_id: uuid::Uuid::new_v4(),
+                content: FullContent::Checkpoint {
+                    text: "complete current history\n".to_owned(),
+                    pending_bytes: 42,
+                },
+            }],
+            &mut std::collections::HashMap::new(),
+            &mut std::collections::HashMap::new(),
+            |_| Err(std::io::ErrorKind::PermissionDenied.into()),
+        );
+        let log_after = std::fs::read(&log_path).unwrap();
+        let (generation, text) = crate::state::scrollback_store::load_leaf_scrollback_checkpoint(
+            &root, panel_id, leaf_id,
+        )
+        .unwrap();
+        let (_, replayed) =
+            crate::state::scrollback_store::load_leaf_session(&root, panel_id, leaf_id);
+        remove_owned_temp_directory(&root, &root_name);
+        assert_eq!(acknowledgements.len(), 1);
+        assert_eq!(acknowledgements[0].written_bytes, 42);
+        assert_eq!(
+            generation,
+            Some(expected_generation),
+            "the new generation must differ from both the checkpoint and the retained log"
+        );
+        assert_eq!(text, "complete current history\n");
+        assert_eq!(
+            log_after, log_before,
+            "the injected deletion failure retains the stale log"
+        );
+        assert!(
+            replayed.is_empty(),
+            "retained stale output must never become eligible for replay"
+        );
+    }
+
+    #[test]
+    fn retained_stale_next_generation_log_is_never_replayed_after_a_full_checkpoint() {
+        assert_retained_log_cannot_match_next_checkpoint(3, 4, 5);
+    }
+
+    #[test]
+    fn retained_stale_wraparound_log_is_never_replayed_after_a_full_checkpoint() {
+        assert_retained_log_cannot_match_next_checkpoint(u32::MAX, 0, 1);
     }
 }

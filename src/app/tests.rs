@@ -2250,6 +2250,7 @@ fn history_capture_reports_unreadable_checkpoint_log_and_generation_files() {
 #[test]
 fn invalid_history_artifacts_do_not_authorize_resetting_an_existing_log() {
     let dir = unique_temp_dir("tc-history-write-read-errors");
+    let expected_directory_name = dir.file_name().unwrap().to_os_string();
     let panel = Uuid::new_v4();
     let leaf = Some(Uuid::new_v4());
     let log_path =
@@ -2281,5 +2282,12 @@ fn invalid_history_artifacts_do_not_authorize_resetting_an_existing_log() {
         None
     );
     assert_eq!(std::fs::read(&log_path).unwrap(), log_before);
-    std::fs::remove_dir_all(dir).unwrap();
+    let resolved_dir = dir.canonicalize().unwrap();
+    let resolved_temp = std::env::temp_dir().canonicalize().unwrap();
+    assert_eq!(resolved_dir.parent(), Some(resolved_temp.as_path()));
+    assert_eq!(
+        resolved_dir.file_name(),
+        Some(expected_directory_name.as_os_str())
+    );
+    std::fs::remove_dir_all(resolved_dir).unwrap();
 }
