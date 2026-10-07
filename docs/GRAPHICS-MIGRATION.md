@@ -48,7 +48,8 @@ Formato, contrato gráfico, extensión 9/9 y auditoría pasaron. El benchmark
 comparativo se omite en pushes; los smoke tests de benchmarks sí corrieron.
 El ensayo verificó exactamente cinco paquetes y cinco checksums, helpers,
 instalación/desinstalación Inno y ambos DMG montados. Firma, notarización y
-publicación se omitieron. El cierre documental posterior y su CI exacta
+publicación se omitieron. El cierre posterior, que sólo añade documentación
+y una corrección de fixture bajo `#[cfg(test)]`, y su CI exacta
 deben registrarse en el recibo externo; los paquetes corresponden al código indicado.
 
 El componente gráfico aislado aprobó **40 pruebas**, incluidas cuatro de
@@ -72,6 +73,19 @@ usa un scheduler aislado, un tick vacío como control y exige un deadline
 positivo y acotado por tick. Retirar el fallback de producción lo hace fallar.
 Las aserciones de entrada retenida, foco, unread, passes UI y ausencia de PTY
 real siguen intactas. El cambio afecta sólo `src/app/tests.rs`.
+
+La [CI del cierre documental previo, 37580301965](https://github.com/MauroProto/terminal-canvas/actions/runs/37580301965),
+de `efa33bb44bd10a8fca9903d24c69dd175368d8b3`, detectó una carrera de cleanup
+en la fixture TLS de Linux. Su suite normal pasó 979 casos, pero el filtro de
+seguridad falló con 19 aprobados y uno fallido: el cliente ya había comprobado
+HTTP 307 y cuerpo vacío cuando `shutdown(Write)` devolvió `NotConnected`.
+La misma fixture había pasado las suites normal, seguridad y daemon del
+checkpoint de código. El arreglo acepta únicamente `NotConnected` después
+de consumir el request y completar los writes y flush estrictos; otros errores
+siguen causando panic y los asserts de certificado, status y cuerpo no cambian.
+El módulo se incluye sólo con `#[cfg(test)]`: no cambia Online, invitaciones
+ni los inputs de producción de los paquetes. La CI del HEAD corregido debe
+registrarse por separado; esta corrida no acredita el arreglo posterior.
 
 El [ensayo anterior, Release37575466330](https://github.com/MauroProto/terminal-canvas/actions/runs/37575466330),
 de `6a7e78e`, terminó CANCELLED después de confirmar la misma fixture en
