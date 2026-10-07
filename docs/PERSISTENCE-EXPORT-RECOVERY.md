@@ -12,6 +12,19 @@ es el daemon local de terminales Unix.
   ese backup representa el contenido del archivo bloqueado.
 - La UI conserva una franja visible con el motivo; no depende del toast inicial.
   La pérdida de propiedad de escritura también mantiene ese aviso.
+- Las consultas periódicas de terminales no actualizan por sí solas las fechas
+  de actividad ni de tareas. La entrada aceptada, la salida nueva y los cambios
+  reales de identidad, estado o resumen sí las actualizan. El contador de
+  actividad vive sólo en memoria, separado del repintado, replay y ACK; no
+  agrega campos al formato del layout. El historial mantiene su propia
+  cadencia de guardado, aunque el layout no cambie.
+- Si el grid está ocupado, oculto por minimización o desconectado, la consulta
+  conserva el último resumen disponible. No interpreta una lectura omitida
+  como texto vacío. Los reports autoritativos disponibles y la salida del
+  proceso siguen siendo observables sin leer el grid.
+- Una alerta de conflicto conserva fecha, confirmación y archivo mientras
+  persista el mismo riesgo. Si el riesgo desaparece, se retira; una aparición
+  posterior abre una alerta nueva, aunque su identificador sea el mismo.
 - El daemon valida checkpoint, generación y log antes de abrir un PTY o escribir
   historial. Un error no autoriza reemplazar archivos ni confirmar salida
   pendiente mediante ACK. Los logs de generaciones antiguas siguen excluidos,
@@ -51,6 +64,14 @@ vigente y el drenaje de comandos e historial, y coteja `layout.json` con ese
 mismo estado. Una captura anterior puede quedar obsoleta aunque el guardado
 sea correcto. Se mantienen el plazo de tres segundos y el aislamiento en un
 perfil temporal; no se abre un shell ni se ejecuta una pasada de UI.
+
+La regresión de inactividad cuenta las publicaciones del worker real en otro
+perfil temporal: después del guardado inicial y su ACK, ocho observaciones
+idénticas no publican layouts. Una actividad nueva con el mismo texto, un
+cambio de estado y un cambio de layout se guardan y se cotejan con el archivo
+durable. Otras regresiones cubren salida idéntica, entrada rechazada, replay,
+grid ocupado, tareas bloqueadas por dependencias y episodios de conflicto.
+Este recuento headless no mide consumo de CPU/GPU ni tiempos de una GUI real.
 
 El pase necesita CI completa en Windows, Linux y ambos macOS, incluyendo daemon
 en Unix, y ensayo de paquetes del mismo SHA. Los recibos externos de entrega
