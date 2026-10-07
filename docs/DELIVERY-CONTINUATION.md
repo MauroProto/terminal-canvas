@@ -1,5 +1,25 @@
 # Estado de entrega y continuación — 6 de octubre de 2026
 
+El último checkpoint completamente validado es
+`65d81a75eba0d5cb4f243d476f25fc580fc0b75a`: **45 microcommits** desde la base
+revisada. Su [CI completa](https://github.com/MauroProto/terminal-canvas/actions/runs/37558769570)
+y su [ensayo de distribución](https://github.com/MauroProto/terminal-canvas/actions/runs/37558823335)
+terminaron correctamente en Windows, Linux y macOS Intel/Apple Silicon.
+La CI pasó 908 pruebas en Windows; Linux pasó 956 normales y 996 con daemon;
+ambos macOS pasaron 955 normales y 995 con daemon, con tres ignoradas en cada
+suite. Estas suites no se suman como casos distintos. Formato, Clippy,
+regresiones de seguridad, extensión 9/9 y auditoría pasaron; siguen los cuatro
+avisos de mantenimiento. El benchmark comparativo no corre en pushes.
+El ensayo comprobó exactamente cinco paquetes y cinco checksums, incluyendo
+instalación/desinstalación de Inno y montaje de ambos DMG. No publicó una
+release y sus paquetes son de prueba, sin firma del proveedor.
+
+El pase siguiente corrige confirmaciones de persistencia, coloreado y fuentes.
+Los resultados anteriores corresponden al SHA indicado: no validan esos
+cambios nuevos. Comprobar la CI del nuevo HEAD antes de distribuirlo.
+
+## Checkpoints anteriores
+
 La rama principal del repositorio se llama `master`. La reversión pedida en
 septiembre quedó integrada mediante `bc5768d`; la base remota revisada para
 este pase es `f0458dd1dae08b3aca080a914042deb5a9454cf3`. Este pase agrega
@@ -20,8 +40,8 @@ El cierre documental posterior llegó a **37 microcommits** en `b6ea26a` y su
 [CI completa](https://github.com/MauroProto/terminal-canvas/actions/runs/37553410152)
 también pasó. El nuevo pase agrega cinco microcommits de contención Windows,
 hasta `7097d3ae51d64b2ec384179f7c38704257e8962d`: **42 microcommits** desde la
-base revisada, antes de su documentación. Ahora cambia código Rust y necesita
-una CI nueva del HEAD publicado; los ensayos anteriores no validan ese cambio.
+base revisada, antes de su documentación. La validación completa posterior
+corresponde al checkpoint de 45 commits descrito arriba.
 Online e invitaciones no reciben cambios funcionales en este pase.
 
 ## Verificación realizada en esta PC
