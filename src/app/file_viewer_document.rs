@@ -47,7 +47,7 @@ impl SourceSelection {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OffsetError {
-    InvalidFragment,
+    UnknownFragment,
     InvalidScalarCursor,
     InvalidSourceOffset,
 }
@@ -178,7 +178,7 @@ impl SourceDocument {
         let fragment = self
             .fragments
             .get(index)
-            .ok_or(OffsetError::InvalidFragment)?;
+            .ok_or(OffsetError::UnknownFragment)?;
         let start = range.start.max(fragment.source.start);
         let end = range.end.min(fragment.source.end);
         if end <= start {
@@ -198,7 +198,7 @@ impl SourceDocument {
         let fragment = self
             .fragments
             .get(index)
-            .ok_or(OffsetError::InvalidFragment)?;
+            .ok_or(OffsetError::UnknownFragment)?;
         let text = &self.source[fragment.source.clone()];
         text.char_indices()
             .map(|(offset, _)| offset)
@@ -218,7 +218,7 @@ impl SourceDocument {
         let fragment = self
             .fragments
             .get(index)
-            .ok_or(OffsetError::InvalidFragment)?;
+            .ok_or(OffsetError::UnknownFragment)?;
         if offset < fragment.source.start
             || offset > fragment.source.end
             || !self.source.is_char_boundary(offset)
@@ -585,7 +585,7 @@ mod tests {
         }
         assert_eq!(
             document.fragment_cursor_to_source(1, 0),
-            Err(OffsetError::InvalidFragment)
+            Err(OffsetError::UnknownFragment)
         );
         assert_eq!(
             document.source_to_fragment_cursor(0, 1),
