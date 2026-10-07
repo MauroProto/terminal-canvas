@@ -173,3 +173,11 @@ firmadas, y las apps sin firma utilizan ZIP y actualización manual; el primer
 cambio a una versión firmada también es manual. Linux conserva la extracción
 manual. El flujo real de actualización
 con un release firmado también queda pendiente de validación externa.
+
+Los helpers de verificación Windows se crean asociados a su Job privado antes
+de ejecutar código del hijo. Se comprueba esa asociación mientras el proceso
+está suspendido y un fallo aborta el lanzamiento. Tienen plazo y límite de
+salida; el Job termina su árbol al finalizar o perder el guard, incluso ante
+salida del padre sin `Drop`. La cancelación disponible corresponde a la descarga.
+Los dry-runs históricos citados arriba preceden este cambio: comprobar la CI y
+el ensayo de distribución del nuevo HEAD antes de publicar un candidato.
