@@ -56,6 +56,23 @@ repositorio no reemplazan la colección actual. Al reabrir un review, los
 snapshots sin guardar deben resolverse antes de ofrecer notas editables del
 disco.
 
+La carga, importación legacy y guardado de notas comparten un máximo de 4 MiB
+para el JSON completo en UTF-8. Un archivo que lo supera se rechaza sin
+interpretar un prefijo como una colección válida. Una serialización demasiado
+grande se rechaza antes de publicar o rotar el archivo guardado; conserva los
+bytes anteriores y el snapshot aceptado de esa sesión.
+
+Si un guardado sigue fallando después de cerrar y reabrir el review,
+**Editar notas pendientes** permite recuperar el último snapshot retenido del
+mismo repositorio. La acción conserva las notas y sus metadatos, habilita
+editar esa copia y no inicia un guardado automático. El aviso de guardado
+permanece hasta recibir la confirmación correspondiente a la colección actual.
+Las respuestas de cargas o imports anteriores no reemplazan la copia recuperada.
+Una colección que excede el máximo requiere reducirla antes de volver a guardar;
+reintentar el mismo snapshot no cambia su tamaño. Esta recuperación no permite
+editar un archivo corrupto si no existe un snapshot pendiente del mismo
+repositorio, no incluye un editor sin guardar y no sobrevive al fin del proceso.
+
 La barrera de cierre aplica las respuestas pendientes de lectura e importación
 y espera también el guardado de las notas fusionadas. Los fallos de
 preferencias no impiden rescatar layout e historial, pero impiden marcar el

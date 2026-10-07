@@ -95,6 +95,32 @@ No borres el original ni reemplaces `layout.json` por un backup mientras no
 se pueda leer. Un archivo ausente permite crear un perfil; un error de lectura
 en un archivo existente detiene la recuperación automática desde backups.
 
+## Notas de revisión y guardados pendientes
+
+Una colección de notas admite hasta 4 MiB de JSON codificado en UTF-8, incluidos
+campos, metadatos y formato. El mismo máximo se aplica a cargar notas, importar
+un archivo legacy y guardar la colección. Importar un archivo que supera el
+máximo devuelve un error; una fusión puede superar el máximo aunque cada
+colección por separado entre. Un guardado rechazado conserva el archivo
+anterior y muestra el motivo. El máximo no se calcula sólo por cantidad de
+notas o caracteres.
+
+Si cerraste el review después de un guardado fallido, reabrilo en el mismo
+repositorio. Cuando aparezca **Editar notas pendientes**, esa acción recupera
+el último snapshot aceptado que todavía está en memoria. Podés reducir o
+corregir la colección y volver a guardarla. La acción no confirma guardado;
+esperá el resultado antes de cerrar la app. **Reintentar guardado** vuelve a
+intentar el contenido pendiente sin modificarlo, por lo que no resuelve por sí
+solo una colección que excede el máximo.
+
+La recuperación conserva IDs, revisión y estado de las notas, pero sólo dura
+durante esa sesión. No incluye texto de un editor que nunca guardaste ni
+garantiza recuperar un proceso terminado. Si no hay un snapshot pendiente del
+mismo repositorio, la acción no aparece: un archivo ilegible o inválido sigue
+bloqueando mutaciones hasta resolver su lectura. Conservá una copia del
+archivo original antes de investigar o adaptar una colección demasiado grande;
+no la trunques ni reemplaces por una colección vacía para ocultar el error.
+
 ## Diagnósticos
 
 La exportación de diagnóstico recoge configuración, layout y logs con límites
