@@ -116,6 +116,25 @@ fn closing_the_app_finishes_an_accepted_export_even_without_layout_ownership() {
 }
 
 #[test]
+fn startup_read_error_blocks_layout_writes_and_reports_the_failed_path() {
+    let path = std::path::PathBuf::from("profile/layout.json");
+    let (loaded, error) =
+        super::initial_persistence_state(crate::state::persistence::StateLoadResult::ReadError {
+            path: path.clone(),
+            error: "controlled sharing violation".to_owned(),
+        });
+    assert!(loaded.is_none());
+    let error = error.expect("startup must disable writes and show the failure");
+    assert!(error.contains(&path.display().to_string()));
+    assert!(error.contains("controlled sharing violation"));
+    let (loaded, error) = super::initial_persistence_state(
+        crate::state::persistence::StateLoadResult::MissingOrUnreadable,
+    );
+    assert!(loaded.is_none());
+    assert!(error.is_none(), "a new profile remains writable");
+}
+
+#[test]
 fn test_app_never_owns_the_users_run_marker() {
     let ctx = egui::Context::default();
     let app = super::TerminalApp::new_for_tests(&ctx);

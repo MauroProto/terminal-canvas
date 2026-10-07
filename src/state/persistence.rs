@@ -377,22 +377,35 @@ pub fn load_state() -> Option<AppState> {
 #[derive(Debug, Clone, PartialEq)]
 pub enum StateLoadResult {
     Loaded(AppState),
+    /// No compatible snapshot was found among missing or readable-invalid files.
     MissingOrUnreadable,
-    IncompatibleFuture { version: u32 },
+    /// An earlier snapshot could not be read. Its contents and schema are unknown.
+    ReadError {
+        path: PathBuf,
+        error: String,
+    },
+    IncompatibleFuture {
+        version: u32,
+    },
 }
 
 impl StateLoadResult {
     pub fn into_state(self) -> Option<AppState> {
         match self {
             Self::Loaded(state) => Some(state),
-            Self::MissingOrUnreadable | Self::IncompatibleFuture { .. } => None,
+            Self::MissingOrUnreadable
+            | Self::ReadError { .. }
+            | Self::IncompatibleFuture { .. } => None,
         }
     }
 }
 
 pub fn load_state_result() -> StateLoadResult {
     let Some(path) = state_file_path() else {
-        return StateLoadResult::MissingOrUnreadable;
+        return StateLoadResult::ReadError {
+            path: PathBuf::from("layout.json"),
+            error: "Could not determine the saved profile directory".to_owned(),
+        };
     };
     load_state_result_from_path(&path)
 }
@@ -411,8 +424,17 @@ pub fn load_state_result_from_path(path: &Path) -> StateLoadResult {
             .map(|slot| crate::state::durable_write::backup_path(path, slot)),
     );
     for candidate in candidates {
-        let Ok(bytes) = std::fs::read(candidate) else {
-            continue;
+        let bytes = match std::fs::read(&candidate) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                // A readable backup cannot authorize replacing a newer primary
+                // whose contents we never inspected (including future schemas).
+                return StateLoadResult::ReadError {
+                    path: candidate,
+                    error: error.to_string(),
+                };
+            }
         };
         if let Some(version) =
             serialized_schema_version(&bytes).filter(|version| *version > APP_STATE_SCHEMA_VERSION)
@@ -577,6 +599,59 @@ mod tests {
         fs::write(&path, "{not valid json").unwrap();
 
         assert_eq!(load_state_from_path(&path), Some(first));
+    }
+
+    #[test]
+    fn a_missing_layout_is_distinct_from_an_unreadable_existing_snapshot() {
+        let dir = unique_temp_dir();
+        let path = dir.join("layout.json");
+        assert_eq!(
+            load_state_result_from_path(&path),
+            StateLoadResult::MissingOrUnreadable
+        );
+        fs::create_dir(&path).unwrap();
+        save_state_to_path(
+            &crate::state::durable_write::backup_path(&path, 0),
+            &sample_state("readable-but-older"),
+        )
+        .unwrap();
+        assert!(matches!(
+            load_state_result_from_path(&path),
+            StateLoadResult::ReadError { path: failed, .. } if failed == path
+        ));
+        assert!(path.is_dir());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unreadable_primary_cannot_authorize_replacing_it_from_an_older_backup() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        for with_backup in [false, true] {
+            let dir = unique_temp_dir();
+            let path = dir.join("layout.json");
+            save_state_to_path(&path, &sample_state("newer-unread-layout")).unwrap();
+            let original = fs::read(&path).unwrap();
+            let backup = crate::state::durable_write::backup_path(&path, 0);
+            if with_backup {
+                save_state_to_path(&backup, &sample_state("older-readable-backup")).unwrap();
+            }
+            let backup_bytes = fs::read(&backup).ok();
+            // Windows can deny reading while allowing replacement/delete.
+            // Treating this as NotFound would enable a destructive fresh save.
+            let held = fs::OpenOptions::new()
+                .read(true)
+                .share_mode(4)
+                .open(&path)
+                .unwrap();
+            assert!(matches!(
+                load_state_result_from_path(&path),
+                StateLoadResult::ReadError { path: failed, .. } if failed == path
+            ));
+            drop(held);
+            assert_eq!(fs::read(&path).unwrap(), original);
+            assert_eq!(fs::read(&backup).ok(), backup_bytes);
+        }
     }
 
     #[test]

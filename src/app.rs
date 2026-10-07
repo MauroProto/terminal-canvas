@@ -186,8 +186,7 @@ pub struct TerminalApp {
     /// Sólo una app real crea y elimina el marker global. El harness jamás
     /// debe borrar el marker perteneciente a una instancia viva del usuario.
     run_marker_active: bool,
-    /// Un layout de schema futuro se abre sin restaurar, pero toda escritura
-    /// durable queda bloqueada para no destruirlo ni podar sus scrollbacks.
+    /// A future or unreadable layout blocks profile writes and history pruning.
     persistence_writes_enabled: bool,
 }
 
@@ -195,26 +194,18 @@ impl TerminalApp {
     pub fn new(cc: &eframe::CreationContext<'_>, pending_join_invite: Option<String>) -> Self {
         setup_fonts(cc);
         let brand_texture = load_brand_texture(cc);
-        let (loaded_state, incompatible_version) =
-            match crate::state::persistence::load_state_result() {
-                crate::state::persistence::StateLoadResult::Loaded(state) => (Some(state), None),
-                crate::state::persistence::StateLoadResult::MissingOrUnreadable => (None, None),
-                crate::state::persistence::StateLoadResult::IncompatibleFuture { version } => {
-                    (None, Some(version))
-                }
-            };
+        let (loaded_state, persistence_error) =
+            initial_persistence_state(crate::state::persistence::load_state_result());
         let mut app = Self::build(
             &cc.egui_ctx,
             brand_texture,
             loaded_state,
             pending_join_invite,
             true,
-            incompatible_version.is_none(),
+            persistence_error.is_none(),
         );
-        if let Some(version) = incompatible_version {
-            app.toast_error(format!(
-                "El layout usa el schema {version}, más nuevo que esta app; se abrió sin escribir para preservarlo"
-            ));
+        if let Some(error) = persistence_error {
+            app.toast_error(error);
         }
         app
     }
@@ -1304,6 +1295,29 @@ impl TerminalApp {
                 );
             }
         }
+    }
+}
+
+fn initial_persistence_state(
+    result: crate::state::persistence::StateLoadResult,
+) -> (Option<crate::state::persistence::AppState>, Option<String>) {
+    use crate::state::persistence::StateLoadResult;
+    match result {
+        StateLoadResult::Loaded(state) => (Some(state), None),
+        StateLoadResult::MissingOrUnreadable => (None, None),
+        StateLoadResult::ReadError { path, error } => (
+            None,
+            Some(format!(
+                "No se pudo leer {}: {error}. Se abrió sin guardar layout ni historial para preservarlos; revisá el archivo y reabrí la app",
+                path.display()
+            )),
+        ),
+        StateLoadResult::IncompatibleFuture { version } => (
+            None,
+            Some(format!(
+                "El layout usa el schema {version}, más nuevo que esta app; se abrió sin escribir para preservarlo"
+            )),
+        ),
     }
 }
 
