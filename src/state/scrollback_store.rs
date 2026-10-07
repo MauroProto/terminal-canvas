@@ -329,7 +329,10 @@ fn read_optional_history_file(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
     }
 }
 
-fn decode_generation_sidecar(bytes: &[u8]) -> std::io::Result<u32> {
+/// Share the same generation boundary between UI capture and daemon recovery.
+/// Four bytes always mean the current binary format; other lengths must be a
+/// complete legacy decimal value rather than a valid binary prefix plus junk.
+pub(crate) fn decode_generation_sidecar(bytes: &[u8]) -> std::io::Result<u32> {
     // Current writers use four little-endian bytes. Older decimal sidecars
     // remain readable when their length differs from that binary format.
     if bytes.len() == 4 {

@@ -2586,6 +2586,114 @@ fn session_frames_ignored_on_generation_mismatch() {
 }
 
 #[test]
+fn legacy_and_binary_sidecars_keep_matching_history_tails_in_ui_and_daemon_readers() {
+    use crate::state::{scrollback_log, scrollback_store};
+
+    let cases = [
+        (12_345, b"12345\n".to_vec()),
+        (12, b"12\n".to_vec()),
+        (12, 12_u32.to_le_bytes().to_vec()),
+        // Even printable four-byte values are binary: parsing them as decimal
+        // would change the generation of a legitimate existing sidecar.
+        (u32::from_le_bytes(*b"1234"), b"1234".to_vec()),
+    ];
+    for (generation, sidecar) in cases {
+        for leaf in [None, Some(Uuid::new_v4())] {
+            let dir = unique_temp_dir("tc-shared-history-generation");
+            let panel = Uuid::new_v4();
+            scrollback_store::save_leaf_scrollback(&dir, panel, leaf, "CHECKPOINT\n").unwrap();
+            let sidecar_path =
+                dir.join(scrollback_store::scrollback_leaf_gen_file_name(panel, leaf));
+            fs::write(&sidecar_path, &sidecar).unwrap();
+            let log_path = dir.join(scrollback_store::scrollback_leaf_log_file_name(panel, leaf));
+            scrollback_log::reset_log(&log_path, generation).unwrap();
+            scrollback_log::append_frames(
+                &log_path,
+                &scrollback_log::encode_frame(
+                    7,
+                    scrollback_log::FrameKind::Output,
+                    b"OLD TAIL\r\n",
+                ),
+            )
+            .unwrap();
+            let log_before = fs::read(&log_path).unwrap();
+
+            assert_eq!(
+                super::read_leaf_generation(&dir, panel, leaf).unwrap(),
+                generation
+            );
+            let captured = super::collect_leaf_histories(&dir, panel).unwrap();
+            assert_eq!(captured.len(), 1);
+            assert_eq!(captured[0].0, leaf);
+            assert_eq!(captured[0].1, "CHECKPOINT\n");
+            assert_eq!(
+                captured[0].2.len(),
+                1,
+                "matching old output must not be discarded"
+            );
+            assert_eq!(captured[0].2[0].seq, 7);
+            assert_eq!(captured[0].2[0].payload, b"OLD TAIL\r\n");
+            let daemon = scrollback_store::try_load_leaf_session(&dir, panel, leaf).unwrap();
+            assert_eq!(daemon.generation, generation);
+            assert_eq!(daemon.checkpoint, b"CHECKPOINT\r\n");
+            assert_eq!(daemon.frames, captured[0].2);
+            assert_eq!(fs::read(&sidecar_path).unwrap(), sidecar);
+            assert_eq!(fs::read(&log_path).unwrap(), log_before);
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+}
+
+#[test]
+fn history_readers_reject_generation_prefixes_with_trailing_junk_without_changing_files() {
+    use crate::state::{scrollback_log, scrollback_store};
+
+    for invalid in [
+        [12_u32.to_le_bytes().as_slice(), b"junk"].concat(),
+        b"12345junk\n".to_vec(),
+    ] {
+        let dir = unique_temp_dir("tc-generation-trailing-junk");
+        let panel = Uuid::new_v4();
+        let leaf = Some(Uuid::new_v4());
+        scrollback_store::save_leaf_scrollback(&dir, panel, leaf, "CHECKPOINT\n").unwrap();
+        let checkpoint_path = dir.join(scrollback_store::scrollback_leaf_file_name(panel, leaf));
+        let sidecar_path = dir.join(scrollback_store::scrollback_leaf_gen_file_name(panel, leaf));
+        fs::write(&sidecar_path, &invalid).unwrap();
+        let log_path = dir.join(scrollback_store::scrollback_leaf_log_file_name(panel, leaf));
+        scrollback_log::reset_log(&log_path, 12).unwrap();
+        scrollback_log::append_frames(
+            &log_path,
+            &scrollback_log::encode_frame(1, scrollback_log::FrameKind::Output, b"KEEP TAIL"),
+        )
+        .unwrap();
+        let checkpoint_before = fs::read(&checkpoint_path).unwrap();
+        let log_before = fs::read(&log_path).unwrap();
+
+        assert_eq!(
+            super::read_leaf_generation(&dir, panel, leaf)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            super::collect_leaf_histories(&dir, panel)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        // LeafSessionHistory does not need Debug merely to verify this error.
+        let daemon_error = scrollback_store::try_load_leaf_session(&dir, panel, leaf)
+            .err()
+            .expect("invalid sidecar must reject daemon recovery");
+        assert_eq!(daemon_error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(fs::read(&checkpoint_path).unwrap(), checkpoint_before);
+        assert_eq!(fs::read(&sidecar_path).unwrap(), invalid);
+        assert_eq!(fs::read(&log_path).unwrap(), log_before);
+        let _ = fs::remove_dir_all(dir);
+    }
+}
+
+#[test]
 fn atomic_checkpoint_generation_ignores_an_old_log_left_by_a_crash() {
     use crate::state::scrollback_log::{encode_frame, FrameKind};
     use crate::state::scrollback_store::scrollback_log_file_name;

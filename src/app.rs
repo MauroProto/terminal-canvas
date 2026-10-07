@@ -2742,13 +2742,7 @@ fn read_optional_history_bytes(path: &std::path::Path) -> std::io::Result<Option
 }
 
 fn decode_history_generation(bytes: &[u8]) -> std::io::Result<u32> {
-    if bytes.len() < 4 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "history generation sidecar is truncated",
-        ));
-    }
-    Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    crate::state::scrollback_store::decode_generation_sidecar(bytes)
 }
 
 /// Capture one generation coherently. Only actual absence means no history;
