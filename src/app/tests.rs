@@ -128,6 +128,26 @@ fn final_save_crash_recovery_preserves_the_dirty_marker() {
 }
 
 #[test]
+fn workspace_close_applies_durable_ack_before_capturing_a_new_batch() {
+    run_final_save_fixture("ack-workspace-close");
+}
+
+#[test]
+fn replaced_session_rejects_an_incremental_ack_from_its_previous_pty() {
+    run_final_save_fixture("ack-replaced-session-incremental");
+}
+
+#[test]
+fn replaced_session_rejects_a_full_checkpoint_ack_from_its_previous_pty() {
+    run_final_save_fixture("ack-replaced-session-full");
+}
+
+#[test]
+fn workspace_close_preserves_rollover_consumed_by_the_idle_barrier() {
+    run_final_save_fixture("ack-rollover-workspace-close");
+}
+
+#[test]
 #[ignore = "only run in an isolated child process through run_final_save_fixture"]
 fn final_save_profile_fixture() {
     use eframe::App;
@@ -178,7 +198,43 @@ fn final_save_profile_fixture() {
     assert!(crate::state::run_marker::current_process_may_write());
     assert!(marker.exists());
     let ctx = egui::Context::default();
-    let mut app = super::TerminalApp::new_for_tests(&ctx);
+    let mut app = if phase.starts_with("ack-") {
+        // A saved layout creates detached sessions. Install an in-memory
+        // spawner before attaching them so these regressions start no shell.
+        let mut workspace = Workspace::new("ACK regression", None);
+        workspace.add_restored_terminal(TerminalPanel::new(
+            pos2(0.0, 0.0),
+            vec2(300.0, 200.0),
+            Color32::WHITE,
+            1,
+        ));
+        let state = crate::state::AppState {
+            schema_version: crate::state::persistence::APP_STATE_SCHEMA_VERSION,
+            workspaces: vec![workspace.to_saved()],
+            active_ws: 0,
+            sidebar_visible: true,
+            legacy_canvas_ui: Default::default(),
+            local_device_id: Uuid::new_v4().to_string(),
+            trusted_devices: Vec::new(),
+            orchestration: Default::default(),
+        };
+        let mut app = super::TerminalApp::build(&ctx, None, Some(state), None, false, false);
+        let manager = app.workspaces[0].pty_manager();
+        manager
+            .lock()
+            .unwrap()
+            .set_remote_spawner(Box::new(|_, _, _, _, _| {
+                Ok((
+                    Uuid::new_v4(),
+                    crate::terminal::pty::PtyHandle::for_persistence_tests(b""),
+                ))
+            }));
+        let CanvasPanel::Terminal(panel) = &mut app.workspaces[0].panels[0];
+        panel.attach_session_with_spec(manager, None, crate::runtime::SessionSpec::default());
+        app
+    } else {
+        super::TerminalApp::new_for_tests(&ctx)
+    };
     app.persistence_writes_enabled = true;
     app.run_marker_active = true;
     app.workspaces[0].name = "Final workspace".to_owned();
@@ -369,6 +425,170 @@ fn final_save_profile_fixture() {
                 serde_json::from_slice(&fs::read(&layout).unwrap()).unwrap();
             assert_eq!(saved.workspaces[0].name, "Final workspace");
             assert!(marker.exists(), "crash recovery must remain a dirty run");
+        }
+        "ack-workspace-close" | "ack-rollover-workspace-close" => {
+            let panel_id = app.workspaces[0].panels[0].id();
+            let leaf_id = app.workspaces[0].panels[0].root_leaf_id();
+            let runtime_id = app.workspaces[0].panels[0].runtime_session_id().unwrap();
+            let manager = app.workspaces[0].pty_manager();
+            let handle = manager.lock().unwrap().handle(runtime_id).unwrap();
+            handle
+                .lock()
+                .unwrap()
+                .feed_output_for_persistence_tests(b"captured once\r\n");
+            let log_path = history.join(
+                crate::state::scrollback_store::scrollback_leaf_log_file_name(
+                    panel_id,
+                    Some(leaf_id),
+                ),
+            );
+            if phase == "ack-rollover-workspace-close" {
+                fs::create_dir_all(&history).unwrap();
+                crate::state::scrollback_log::reset_log(&log_path, 0).unwrap();
+                crate::state::scrollback_log::append_frames(
+                    &log_path,
+                    &crate::state::scrollback_log::encode_frame(
+                        u64::MAX,
+                        crate::state::scrollback_log::FrameKind::Output,
+                        b"exhausted sequence",
+                    ),
+                )
+                .unwrap();
+            }
+            assert!(app.persist_scrollbacks(false));
+            // New output after capture is outside the old ACK's prefix.
+            handle
+                .lock()
+                .unwrap()
+                .feed_output_for_persistence_tests(b"after capture\r\n");
+            let closed = Workspace::new("Another workspace", None);
+            let closed_id = closed.id;
+            app.workspaces.push(closed);
+            app.close_workspace_confirmed(closed_id);
+            let _ = app.drain_persistence_worker();
+            assert!(handle.lock().unwrap().pending_log_snapshot().is_empty());
+            if phase == "ack-workspace-close" {
+                let (_, frames) =
+                    crate::state::scrollback_log::read_frames(&fs::read(log_path).unwrap())
+                        .unwrap();
+                assert_eq!(
+                    frames
+                        .iter()
+                        .map(|frame| frame.payload.as_slice())
+                        .collect::<Vec<_>>(),
+                    vec![
+                        b"captured once\r\n".as_slice(),
+                        b"after capture\r\n".as_slice()
+                    ],
+                    "the accepted first batch must not be appended twice"
+                );
+                let restored = super::collect_leaf_histories(&history, panel_id);
+                assert_eq!(restored.len(), 1);
+                assert_eq!(
+                    restored[0].2.len(),
+                    2,
+                    "restart replays each accepted output exactly once"
+                );
+            } else {
+                assert!(
+                    !log_path.exists(),
+                    "a barrier-consumed rollover still requires a full checkpoint"
+                );
+                let checkpoint = crate::state::scrollback_store::load_leaf_scrollback(
+                    &history,
+                    panel_id,
+                    Some(leaf_id),
+                )
+                .unwrap();
+                assert!(checkpoint.contains("captured once"));
+                assert!(checkpoint.contains("after capture"));
+            }
+            let saved = crate::state::persistence::load_state().unwrap();
+            assert_eq!(saved.workspaces.len(), 1);
+            assert!(marker.exists());
+        }
+        "ack-replaced-session-incremental" | "ack-replaced-session-full" => {
+            let panel_id = app.workspaces[0].panels[0].id();
+            let leaf_id = app.workspaces[0].panels[0].root_leaf_id();
+            let old_runtime = app.workspaces[0].panels[0].runtime_session_id().unwrap();
+            let manager = app.workspaces[0].pty_manager();
+            let old_handle = manager.lock().unwrap().handle(old_runtime).unwrap();
+            old_handle
+                .lock()
+                .unwrap()
+                .feed_output_for_persistence_tests(b"previous session\r\n");
+            if phase == "ack-replaced-session-full" {
+                let entries = app.full_scrollback_entries(&history, None);
+                assert_eq!(entries.len(), 1);
+                assert!(app.persistence_worker.submit_full(entries));
+            } else {
+                assert!(app.persist_scrollbacks(false));
+            }
+            let workspace_id = app.workspaces[0].id;
+            let CanvasPanel::Terminal(panel) = &mut app.workspaces[0].panels[0];
+            assert!(panel.replace_focused_session(
+                manager.clone(),
+                None,
+                workspace_id,
+                "in-memory-resume".to_owned(),
+                "test agent".to_owned()
+            ));
+            assert_eq!(panel.root_leaf_id(), leaf_id);
+            let new_runtime = panel.runtime_session_id().unwrap();
+            assert_ne!(old_runtime, new_runtime);
+            let new_handle = manager.lock().unwrap().handle(new_runtime).unwrap();
+            new_handle
+                .lock()
+                .unwrap()
+                .feed_output_for_persistence_tests(b"replacement session\r\n");
+            let pending = new_handle.lock().unwrap().pending_log_snapshot();
+            let _ = app.drain_persistence_worker();
+            assert_eq!(
+                new_handle.lock().unwrap().pending_log_snapshot(),
+                pending,
+                "the old session's ACK must not remove any new output"
+            );
+            assert!(app.persist_scrollbacks(false));
+            new_handle
+                .lock()
+                .unwrap()
+                .feed_output_for_persistence_tests(b"fresh output after capture\r\n");
+            let _ = app.drain_persistence_worker();
+            let remaining = new_handle.lock().unwrap().pending_log_snapshot();
+            let mut encoded = crate::state::scrollback_log::encode_header(0);
+            encoded.extend_from_slice(&remaining);
+            let (_, frames) = crate::state::scrollback_log::read_frames(&encoded).unwrap();
+            assert_eq!(frames.len(), 1);
+            assert_eq!(frames[0].payload, b"fresh output after capture\r\n");
+            assert!(app.persist_scrollbacks(false));
+            let _ = app.drain_persistence_worker();
+            assert!(new_handle.lock().unwrap().pending_log_snapshot().is_empty());
+            let restored = super::collect_leaf_histories(&history, panel_id);
+            assert_eq!(restored.len(), 1);
+            let expected = if phase == "ack-replaced-session-full" {
+                vec![
+                    b"replacement session\r\n".as_slice(),
+                    b"fresh output after capture\r\n".as_slice(),
+                ]
+            } else {
+                vec![
+                    b"previous session\r\n".as_slice(),
+                    b"replacement session\r\n".as_slice(),
+                    b"fresh output after capture\r\n".as_slice(),
+                ]
+            };
+            assert_eq!(
+                restored[0]
+                    .2
+                    .iter()
+                    .map(|frame| frame.payload.as_slice())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            if phase == "ack-replaced-session-full" {
+                assert!(restored[0].1.contains("previous session"));
+            }
+            assert!(marker.exists());
         }
         _ => panic!("unknown isolated fixture phase: {phase}"),
     }

@@ -207,6 +207,72 @@ pub struct TerminalScrollState {
 }
 
 impl PtyHandle {
+    /// In-memory terminal for persistence regressions. It starts no shell,
+    /// socket, process watcher or graphical surface.
+    #[cfg(test)]
+    pub(crate) fn for_persistence_tests(output: &[u8]) -> Self {
+        let (event_tx, _event_rx) = mpsc::channel();
+        let config = TermConfig::default();
+        let scrollback_limit = config.scrolling_history;
+        let handle = Self {
+            term: Arc::new(Mutex::new(Term::new(
+                config,
+                &TermSize::new(80, 24),
+                EventProxy::new(event_tx),
+            ))),
+            title: Arc::new(ArcSwap::from_pointee("Test terminal".to_owned())),
+            alive: Arc::new(AtomicBool::new(true)),
+            bell_fired: Arc::new(AtomicBool::new(false)),
+            writer: TerminalWriter::Local(InputWriter::new(Box::new(std::io::sink())).unwrap()),
+            last_output_at: Arc::new(AtomicI64::new(0)),
+            window_size: Arc::new(Mutex::new(WindowSize {
+                num_lines: 24,
+                num_cols: 80,
+                cell_width: 0,
+                cell_height: 0,
+            })),
+            render_revision: Arc::new(AtomicU64::new(0)),
+            agent_status: Arc::new(ArcSwap::from_pointee(None)),
+            cwd: Arc::new(ArcSwap::from_pointee(None)),
+            pending_log: Arc::new(Mutex::new(Vec::new())),
+            log_seq: Arc::new(AtomicU64::new(0)),
+            restoring_history: Arc::new(AtomicBool::new(false)),
+            scrollback_limit,
+            #[cfg(feature = "ghostty-vt")]
+            backend_kind: TerminalBackendKind::Alacritty,
+            #[cfg(feature = "ghostty-vt")]
+            ghostty_runtime: None,
+            master: None,
+            killer: None,
+            child: None,
+            #[cfg(all(unix, feature = "daemon"))]
+            remote: None,
+            #[cfg(all(unix, feature = "daemon"))]
+            remote_exited: Arc::new(AtomicBool::new(false)),
+            hot_reattached: false,
+            _reader_thread: thread::spawn(|| {}),
+        };
+        handle.feed_output_for_persistence_tests(output);
+        handle
+    }
+
+    #[cfg(test)]
+    pub(crate) fn feed_output_for_persistence_tests(&self, output: &[u8]) {
+        if output.is_empty() {
+            return;
+        }
+        let mut term = self.term.lock().unwrap();
+        let mut pending = self.pending_log.lock().unwrap();
+        let mut parser = Processor::<StdSyncHandler>::new();
+        parser.advance(&mut *term, output);
+        let sequence = next_log_sequence(&self.log_seq).unwrap();
+        pending.extend_from_slice(&crate::state::scrollback_log::encode_frame(
+            sequence,
+            crate::state::scrollback_log::FrameKind::Output,
+            output,
+        ));
+    }
+
     pub fn spawn(
         cwd: Option<&Path>,
         cols: u16,
