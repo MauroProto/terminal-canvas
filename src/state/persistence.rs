@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashSet};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -10,6 +11,10 @@ use crate::orchestration::OrchestrationState;
 use crate::state::panel_state::PanelState;
 
 pub const APP_STATE_SCHEMA_VERSION: u32 = 3;
+
+// Layout metadata has a separate symmetric serialized-size limit. Terminal
+// history and repository diff-note files are persisted separately.
+const MAX_LAYOUT_FILE_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AppState {
@@ -415,21 +420,29 @@ pub fn load_state_from_path(path: &Path) -> Option<AppState> {
 }
 
 pub fn load_state_result_from_path(path: &Path) -> StateLoadResult {
-    // Si el principal está corrupto (crash a mitad de escritura), se prueba el
-    // ring en orden. Un schema futuro no es corrupción: si aparece antes que
-    // un snapshot compatible, se bloquea el downgrade y toda escritura de la
-    // app durante esta ejecución.
+    load_state_result_from_path_with_limit(path, MAX_LAYOUT_FILE_BYTES)
+}
+
+fn load_state_result_from_path_with_limit(path: &Path, limit: usize) -> StateLoadResult {
+    load_state_result_with_reader(path, |candidate| read_state_bytes(candidate, limit))
+}
+
+fn load_state_result_with_reader(
+    path: &Path,
+    mut read: impl FnMut(&Path) -> std::io::Result<Option<Vec<u8>>>,
+) -> StateLoadResult {
+    // Readable-invalid snapshots may fall back in order. Missing files may be
+    // skipped, but an unknown earlier snapshot must never authorize replacing
+    // it from an older backup, including when its schema cannot be inspected.
     let candidates = std::iter::once(path.to_path_buf()).chain(
         (0..crate::state::durable_write::BACKUP_SLOTS)
             .map(|slot| crate::state::durable_write::backup_path(path, slot)),
     );
     for candidate in candidates {
-        let bytes = match std::fs::read(&candidate) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+        let bytes = match read(&candidate) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => continue,
             Err(error) => {
-                // A readable backup cannot authorize replacing a newer primary
-                // whose contents we never inspected (including future schemas).
                 return StateLoadResult::ReadError {
                     path: candidate,
                     error: error.to_string(),
@@ -447,6 +460,133 @@ pub fn load_state_result_from_path(path: &Path) -> StateLoadResult {
         }
     }
     StateLoadResult::MissingOrUnreadable
+}
+
+fn layout_size_error(limit: usize) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("El layout supera el límite de {limit} bytes"),
+    )
+}
+
+fn retry_layout_interrupted<T>(
+    mut operation: impl FnMut() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    loop {
+        match operation() {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            result => return result,
+        }
+    }
+}
+
+fn read_state_bytes(path: &Path, limit: usize) -> std::io::Result<Option<Vec<u8>>> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Inspect FIFO/device descriptor metadata without waiting for a peer.
+        // Regular-file links remain compatible with historical layouts.
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = match retry_layout_interrupted(|| options.open(path)) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // A dangling link exists even though open returns NotFound. Only
+            // an absent directory entry permits falling back to older files.
+            return match retry_layout_interrupted(|| std::fs::symlink_metadata(path)) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Ok(_) => Err(error),
+                Err(error) => Err(error),
+            };
+        }
+        Err(error) => return Err(error),
+    };
+    let metadata = retry_layout_interrupted(|| file.metadata())?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "El layout debe estar en un archivo regular",
+        ));
+    }
+    read_state_bytes_with_limit(file, metadata.len(), limit).map(Some)
+}
+
+fn read_state_bytes_with_limit(
+    reader: impl Read,
+    declared_len: u64,
+    limit: usize,
+) -> std::io::Result<Vec<u8>> {
+    if declared_len > limit as u64 {
+        return Err(layout_size_error(limit));
+    }
+    let sentinel_limit = limit.checked_add(1).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Límite de layout inválido",
+        )
+    })?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(declared_len as usize)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::OutOfMemory, error))?;
+    // Take limits growth to one sentinel byte. Read::read_to_end retries
+    // Interrupted; every other read/EOF error propagates without parsing.
+    reader.take(sentinel_limit as u64).read_to_end(&mut bytes)?;
+    if bytes.len() > limit {
+        return Err(layout_size_error(limit));
+    }
+    Ok(bytes)
+}
+
+struct LimitedLayoutBuffer {
+    bytes: Vec<u8>,
+    limit: usize,
+}
+
+impl Write for LimitedLayoutBuffer {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() > self.limit.saturating_sub(self.bytes.len()) {
+            return Err(layout_size_error(self.limit));
+        }
+        self.bytes
+            .try_reserve(bytes.len())
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::OutOfMemory, error))?;
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialize_state_with_limit(state: &AppState, limit: usize) -> anyhow::Result<Vec<u8>> {
+    use anyhow::Context;
+    let mut buffer = LimitedLayoutBuffer {
+        bytes: Vec::new(),
+        limit,
+    };
+    serde_json::to_writer_pretty(&mut buffer, state).with_context(|| {
+        format!("No se pudo serializar el layout: el límite es de {limit} bytes")
+    })?;
+    buffer.write_all(b"\n").with_context(|| {
+        format!("El layout con su salto final supera el límite de {limit} bytes")
+    })?;
+    Ok(buffer.bytes)
+}
+
+fn save_state_to_path_with_limit(
+    path: &Path,
+    state: &AppState,
+    limit: usize,
+) -> anyhow::Result<()> {
+    // Complete bounded serialization, including the historical final LF,
+    // before creating directories, temporaries or rotating any backup.
+    let bytes = serialize_state_with_limit(state, limit)?;
+    crate::state::durable_write::write_durable(path, &bytes)?;
+    Ok(())
 }
 
 fn serialized_schema_version(bytes: &[u8]) -> Option<u32> {
@@ -476,10 +616,7 @@ pub fn try_save_state(state: &AppState) -> anyhow::Result<()> {
 /// Serializa y escribe con el patrón durable (tmp → fsync → rename → fsync
 /// del directorio, ring de backups y no-op si nada cambió).
 pub fn save_state_to_path(path: &Path, state: &AppState) -> anyhow::Result<()> {
-    let mut bytes = serde_json::to_vec_pretty(state)?;
-    bytes.push(b'\n');
-    crate::state::durable_write::write_durable(path, &bytes)?;
-    Ok(())
+    save_state_to_path_with_limit(path, state, MAX_LAYOUT_FILE_BYTES)
 }
 
 /// Parsea un snapshot de estado (esquema actual o legado). Es la función de
