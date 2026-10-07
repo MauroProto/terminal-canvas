@@ -238,7 +238,8 @@ impl TerminalApp {
                             .raw
                             .dropped_files
                             .first()
-                            .and_then(|file| file.path.clone()),
+                            .map(|file| file.path().to_path_buf())
+                            .filter(|path| !path.as_os_str().is_empty()),
                         input.pointer.hover_pos(),
                     )
                 });
@@ -489,6 +490,8 @@ fn load_file_for_view(path: &Path) -> FileViewerState {
 
 #[cfg(test)]
 mod tests {
+    use egui::text::ByteRangeExt as _;
+
     use super::{load_file_for_view, FileViewerState, MAX_VIEW_BYTES, MAX_VIEW_LINES};
 
     fn temp_path(tag: &str) -> std::path::PathBuf {
@@ -581,7 +584,7 @@ mod tests {
     fn job_text(job: &egui::text::LayoutJob) -> String {
         job.sections
             .iter()
-            .map(|section| &job.text[section.byte_range.clone()])
+            .map(|section| section.byte_range.slice(&job.text))
             .collect()
     }
 
