@@ -29,7 +29,8 @@ Online e invitaciones no reciben cambios funcionales en este pase.
 - Rust/Cargo/Clippy 1.98.0, Windows x86_64, máximo dos jobs de compilación y
   dos threads de pruebas. El último pase usó un solo job con prioridad baja.
   No se usó WSL ni se inició un servidor persistente.
-- Formato y Clippy de todos los targets, con warnings como errores.
+- Formato y Clippy de todos los targets del checkpoint histórico, con warnings
+  como errores; el nuevo pase tiene además la validación de componente descrita abajo.
 - Suite completa de todos los targets: **889 pruebas aprobadas y tres ignoradas**,
   incluyendo **850 pruebas de librería aprobadas y tres ignoradas**, más los tres
   benchmarks en modo smoke. El código comprobado termina en el commit local
@@ -106,7 +107,7 @@ y el [ensayo manual de distribución](https://github.com/MauroProto/terminal-can
 apuntan exactamente a `d79f0fa`. La auditoría y las nueve pruebas de la extensión
 ya pasaron; el ensayo pasó sus 15 regresiones del validador de paquetes.
 La CI de ese checkpoint y la
-[CI de la revisión actual](https://github.com/MauroProto/terminal-canvas/actions/runs/37549072652)
+[CI de la revisión ZIP](https://github.com/MauroProto/terminal-canvas/actions/runs/37549072652)
 (`5107f41`, con Node 24 y el validador ZIP corregido) terminaron completamente
 en verde, con estos mismos resultados:
 
@@ -129,8 +130,8 @@ se canceló mientras esperaba, sin jobs ni artefactos, para reemplazarlo por
 la revisión ZIP. La [CI de la revisión ZIP](https://github.com/MauroProto/terminal-canvas/actions/runs/37549072652)
 y el [ensayo actualizado](https://github.com/MauroProto/terminal-canvas/actions/runs/37549143310)
 apuntan exactamente a `5107f4155d7899968753e2fa3b215f4f137d04d4`.
-CI y Release tienen grupos separados de concurrencia. Tanto la CI actual como
-el ensayo actualizado terminaron completamente en verde. El ensayo actual validó
+CI y Release tienen grupos separados de concurrencia. Tanto la CI ZIP como
+el ensayo ZIP terminaron completamente en verde. El ensayo ZIP validó
 el ZIP Windows con el nuevo verificador, construyó/instaló/desinstaló Inno,
 montó y comprobó ambos DMG y verificó el tarball Linux, incluidos sus helpers.
 `verify-set` comprobó los cinco paquetes y cinco checksums, sin extras; `publish`
@@ -145,7 +146,7 @@ El ensayo manual no crea tags ni releases. Sus artefactos `dry-run-*` se conserv
 autenticados. No hay una release firmada publicada.
 Los logs y herramientas dentro de `dist` son locales y no forman parte del bundle.
 
-Los últimos commits de este cierre sólo actualizan documentación, incluida
+Los cinco commits documentales entre `5107f41` y `b6ea26a` actualizaron documentación, incluida
 `PORTABLE.md`, que se copia dentro de los paquetes. Los artefactos del ensayo
 `5107f41` se verifican con ese mismo checkout: el validador compara también
 LICENSE y PORTABLE con su fuente. No usar una revisión documental posterior
