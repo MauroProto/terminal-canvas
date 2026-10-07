@@ -489,6 +489,47 @@ fn normal_completion_stops_the_immediate_grandchild_and_captures_both_streams() 
 }
 
 #[test]
+fn abandoning_a_suspended_launch_stops_it_without_executing_fixture_code() {
+    let directory = TestDirectory::new();
+    let marker = directory.marker();
+    let capture = CommandCapture::new().unwrap();
+    let capture_directory = capture.directory.clone();
+    let stdout = capture.create_file("stdout").unwrap();
+    let stderr = capture.create_file("stderr").unwrap();
+    let suspended = fixture_command("suspended", &marker)
+        .spawn_suspended_for_test(&stdout, &stderr)
+        .unwrap();
+    assert!(suspended.is_in_job_for_test().unwrap());
+    let child = ObservedProcess::open(suspended.id_for_test());
+    assert!(!child.stopped(0));
+    drop(suspended);
+    assert!(child.stopped(5_000));
+    assert!(!marker.with_extension("child").exists());
+    drop(stdout);
+    drop(stderr);
+    drop(capture);
+    assert!(!capture_directory.exists());
+}
+
+#[test]
+fn a_missing_working_directory_fails_without_executing_the_fixture() {
+    let directory = TestDirectory::new();
+    let marker = directory.marker();
+    let capture = CommandCapture::new().unwrap();
+    let capture_directory = capture.directory.clone();
+    let stdout = capture.create_file("stdout").unwrap();
+    let stderr = capture.create_file("stderr").unwrap();
+    let mut command = fixture_command("suspended", &marker);
+    command.current_dir(directory.0.join("absent directory Mauro ñ 東京"));
+    assert!(command.spawn_captured(&stdout, &stderr).is_err());
+    assert!(!marker.with_extension("child").exists());
+    drop(stdout);
+    drop(stderr);
+    drop(capture);
+    assert!(!capture_directory.exists());
+}
+
+#[test]
 fn deadline_stops_both_the_child_and_its_immediate_grandchild() {
     let directory = TestDirectory::new();
     let marker = directory.marker();

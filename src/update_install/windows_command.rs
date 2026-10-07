@@ -511,6 +511,14 @@ impl SuspendedProcess {
     pub(super) fn is_in_job_for_test(&self) -> io::Result<bool> {
         self.is_in_job()
     }
+
+    #[cfg(test)]
+    pub(super) fn id_for_test(&self) -> u32 {
+        self.process
+            .as_ref()
+            .expect("The suspended fixture has not resumed")
+            .id()
+    }
 }
 
 pub(super) struct Process {
