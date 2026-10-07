@@ -838,7 +838,7 @@ impl TerminalApp {
         if can_persist {
             // An accepted autosave still contains the workspace we removed.
             // Publish its replacement only after that older write finishes.
-            self.persistence_worker.wait_until_idle();
+            let rollover_panels = self.drain_persistence_worker();
             if !self.ensure_persistence_ownership() {
                 return;
             }
@@ -849,7 +849,10 @@ impl TerminalApp {
                     self.autosave.mark_saved(Instant::now());
                     // Pruning closed panels is safe only after their removal
                     // is durable in the layout that restart will restore.
-                    self.persist_scrollbacks(false);
+                    // The barrier also consumes any requested rollover. A
+                    // full checkpoint preserves it instead of leaving an
+                    // exhausted incremental log unable to make progress.
+                    self.persist_scrollbacks(!rollover_panels.is_empty());
                 }
                 Err(err) => {
                     log::warn!("no se pudo persistir el cierre del workspace: {err}");
@@ -1077,7 +1080,7 @@ impl TerminalApp {
             anyhow::bail!("This app does not own its saved profile");
         }
         let preferences_saved = self.preferences_worker.drain();
-        self.persistence_worker.wait_until_idle();
+        let _ = self.drain_persistence_worker();
         // Ownership may have changed while the worker was finishing its queue.
         if !self.ensure_persistence_ownership() {
             anyhow::bail!("Another app took ownership while saving was finishing");
@@ -1158,7 +1161,35 @@ impl TerminalApp {
     }
 
     fn poll_persistence_worker(&mut self, ctx: &egui::Context) {
-        for completion in self.persistence_worker.poll() {
+        let completions = self.persistence_worker.poll();
+        let rollover_panels = self.apply_persistence_completions(completions, Some(ctx));
+        if rollover_panels.is_empty() {
+            return;
+        }
+        let Some(dir) = crate::state::scrollback_store::scrollback_dir() else {
+            return;
+        };
+        let entries = self.full_scrollback_entries(&dir, Some(&rollover_panels));
+        if !entries.is_empty() && !self.persistence_worker.submit_full(entries) {
+            log::warn!("no se pudo encolar el rollover de scrollback");
+        }
+    }
+
+    /// Waiting is also an acknowledgement boundary. Discarding these results
+    /// leaves already durable bytes in the PTY queue and duplicates them in
+    /// the next incremental batch.
+    fn drain_persistence_worker(&mut self) -> HashSet<Uuid> {
+        let completions = self.persistence_worker.wait_until_idle();
+        self.apply_persistence_completions(completions, None)
+    }
+
+    fn apply_persistence_completions(
+        &mut self,
+        completions: Vec<persistence_worker::Completion>,
+        ctx: Option<&egui::Context>,
+    ) -> HashSet<Uuid> {
+        let mut rollover = HashSet::new();
+        for completion in completions {
             match completion {
                 persistence_worker::Completion::State { snapshot, result } => match result {
                     Ok(()) => {
@@ -1167,7 +1198,9 @@ impl TerminalApp {
                     }
                     Err(err) => {
                         log::warn!("Autosave failed: {err}");
-                        ctx.request_repaint_after(AUTOSAVE_INTERVAL);
+                        if let Some(ctx) = ctx {
+                            ctx.request_repaint_after(AUTOSAVE_INTERVAL);
+                        }
                     }
                 },
                 persistence_worker::Completion::Incremental {
@@ -1175,23 +1208,14 @@ impl TerminalApp {
                     acknowledgements,
                 } => {
                     self.acknowledge_persisted_logs(acknowledgements);
-                    if rollover_panels.is_empty() {
-                        continue;
-                    }
-                    let Some(dir) = crate::state::scrollback_store::scrollback_dir() else {
-                        continue;
-                    };
-                    let wanted = rollover_panels.into_iter().collect::<HashSet<_>>();
-                    let entries = self.full_scrollback_entries(&dir, Some(&wanted));
-                    if !entries.is_empty() && !self.persistence_worker.submit_full(entries) {
-                        log::warn!("no se pudo encolar el rollover de scrollback");
-                    }
+                    rollover.extend(rollover_panels);
                 }
                 persistence_worker::Completion::Full { acknowledgements } => {
                     self.acknowledge_persisted_logs(acknowledgements);
                 }
             }
         }
+        rollover
     }
 
     fn acknowledge_persisted_logs(
@@ -1553,7 +1577,7 @@ impl TerminalApp {
         };
         self.remember_scrollback_layout();
         if full {
-            self.persistence_worker.wait_until_idle();
+            let _ = self.drain_persistence_worker();
             // Hold the same lease used by queued history writes through the
             // checkpoint and pruning, so another app cannot take it midway.
             let Ok(Some(_guard)) = crate::state::run_marker::acquire_write_guard() else {

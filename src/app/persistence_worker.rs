@@ -205,16 +205,21 @@ impl PersistenceWorker {
 
     /// El cierre limpio espera los jobs ya aceptados antes del checkpoint
     /// final. No se pierde el último lote por abandonar el worker.
-    pub(super) fn wait_until_idle(&mut self) {
+    pub(super) fn wait_until_idle(&mut self) -> Vec<Completion> {
+        let mut completions = Vec::new();
         while self.state_in_flight || self.scrollback_in_flight {
             match self.completions.recv() {
-                Ok(completion) => self.mark_complete(&completion),
+                Ok(completion) => {
+                    self.mark_complete(&completion);
+                    completions.push(completion);
+                }
                 Err(_) => {
                     self.state_in_flight = false;
                     self.scrollback_in_flight = false;
                 }
             }
         }
+        completions
     }
 
     fn mark_complete(&mut self, completion: &Completion) {

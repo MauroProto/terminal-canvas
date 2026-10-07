@@ -204,7 +204,7 @@ fn final_save_profile_fixture() {
             let release = hold_stale_autosave(&mut app, stale, layout.clone());
             app.close_workspace_confirmed(removed_id);
             release.join().unwrap();
-            app.persistence_worker.wait_until_idle();
+            let _ = app.drain_persistence_worker();
             let saved: crate::state::AppState =
                 serde_json::from_slice(&fs::read(&layout).unwrap()).unwrap();
             assert_eq!(saved.workspaces.len(), 1);
@@ -286,7 +286,7 @@ fn final_save_profile_fixture() {
             app.workspaces[0].panels.clear();
             // The last acknowledged layout still references this closed panel.
             assert!(app.persist_scrollbacks(false));
-            app.persistence_worker.wait_until_idle();
+            let _ = app.drain_persistence_worker();
             assert!(app.scrollback_known_leaves.contains_key(&panel_id));
             assert_eq!(
                 crate::state::scrollback_store::load_leaf_scrollback(
@@ -306,7 +306,7 @@ fn final_save_profile_fixture() {
             assert!(app.persistence_worker.state_in_flight());
             assert!(app.persist_scrollbacks(false));
             release.join().unwrap();
-            app.persistence_worker.wait_until_idle();
+            let _ = app.drain_persistence_worker();
             assert!(app.scrollback_known_leaves.contains_key(&panel_id));
             assert!(crate::state::scrollback_store::load_leaf_scrollback(
                 &history,
@@ -319,7 +319,7 @@ fn final_save_profile_fixture() {
             crate::state::persistence::try_save_state(&current_layout).unwrap();
             app.persisted_state = Some(current_layout);
             assert!(app.persist_scrollbacks(false));
-            app.persistence_worker.wait_until_idle();
+            let _ = app.drain_persistence_worker();
             assert!(!app.scrollback_known_leaves.contains_key(&panel_id));
             assert!(crate::state::scrollback_store::load_leaf_scrollback(
                 &history,
