@@ -173,6 +173,11 @@ impl TerminalApp {
                 viewer.highlight_token = None;
             }
         }
+        if !self.highlighter.is_available() {
+            if let Some(viewer) = self.file_viewer.as_mut() {
+                viewer.highlight_token = None;
+            }
+        }
     }
 
     pub(super) fn show_file_viewer(&mut self, ctx: &egui::Context) {
@@ -340,7 +345,7 @@ fn draw_header(
         if viewer.truncated {
             status.push_str(" · truncado por límite seguro");
         }
-        if viewer.highlighted.is_empty() && !viewer.lines.is_empty() {
+        if viewer.highlight_token.is_some() {
             status.push_str(" · coloreando…");
         }
         ui.label(RichText::new(status).size(10.0).color(palette::DIM));
