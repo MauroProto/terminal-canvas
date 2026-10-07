@@ -62,7 +62,7 @@ enum Job {
 
 pub(super) enum Completion {
     Restore {
-        histories: Vec<(Uuid, super::LeafHistories)>,
+        histories: Vec<(Uuid, std::io::Result<super::LeafHistories>)>,
     },
     State {
         snapshot: AppState,
@@ -102,14 +102,18 @@ impl PersistenceWorker {
 
     #[cfg(test)]
     pub(super) fn with_restore_processor_for_tests(
-        process: impl FnMut(&std::path::Path, Uuid) -> super::LeafHistories + Send + 'static,
+        process: impl FnMut(&std::path::Path, Uuid) -> std::io::Result<super::LeafHistories>
+            + Send
+            + 'static,
     ) -> Self {
         Self::with_processors(crate::state::persistence::try_save_state, process)
     }
 
     fn with_processors(
         mut process_state: impl FnMut(&AppState) -> anyhow::Result<()> + Send + 'static,
-        mut process_restore: impl FnMut(&std::path::Path, Uuid) -> super::LeafHistories + Send + 'static,
+        mut process_restore: impl FnMut(&std::path::Path, Uuid) -> std::io::Result<super::LeafHistories>
+            + Send
+            + 'static,
     ) -> Self {
         // One startup capture, one layout and one history write at most.
         // Capture is queued before any output from the new PTYs is written.
@@ -120,6 +124,10 @@ impl PersistenceWorker {
             .spawn(move || {
                 let mut next_sequences = HashMap::new();
                 let mut legacy_roots = HashMap::new();
+                // A failed startup capture blocks this directory for the run.
+                // The FIFO installs this guard before already queued writes,
+                // even if the app has not consumed the failure completion yet.
+                let mut blocked_history_dirs = HashSet::new();
                 while let Ok(job) = jobs_rx.recv() {
                     let completion = match job {
                         Job::Restore { dir, panels } => {
@@ -135,12 +143,22 @@ impl PersistenceWorker {
                                     .into_iter()
                                     .map(|(panel, root_leaf)| {
                                         let histories = process_restore(&dir, panel);
-                                        if histories.iter().any(|(leaf, _, _)| leaf.is_none())
-                                            && !histories
-                                                .iter()
-                                                .any(|(leaf, _, _)| *leaf == Some(root_leaf))
-                                        {
-                                            legacy_roots.insert((dir.clone(), panel), root_leaf);
+                                        match &histories {
+                                            Ok(histories) => {
+                                                if histories
+                                                    .iter()
+                                                    .any(|(leaf, _, _)| leaf.is_none())
+                                                    && !histories.iter().any(|(leaf, _, _)| {
+                                                        *leaf == Some(root_leaf)
+                                                    })
+                                                {
+                                                    legacy_roots
+                                                        .insert((dir.clone(), panel), root_leaf);
+                                                }
+                                            }
+                                            Err(_) => {
+                                                blocked_history_dirs.insert(dir.clone());
+                                            }
                                         }
                                         (panel, histories)
                                     })
@@ -152,26 +170,30 @@ impl PersistenceWorker {
                             Completion::State { snapshot, result }
                         }
                         Job::Incremental(batch) => {
-                            let (rollover_panels, acknowledgements) = if let Ok(Some(_guard)) =
-                                crate::state::run_marker::acquire_write_guard()
-                            {
-                                persist_incremental_batch(
-                                    batch,
-                                    &mut next_sequences,
-                                    &mut legacy_roots,
-                                )
-                            } else {
-                                (Vec::new(), Vec::new())
-                            };
+                            let (rollover_panels, acknowledgements) =
+                                if blocked_history_dirs.contains(&batch.dir) {
+                                    (Vec::new(), Vec::new())
+                                } else if let Ok(Some(_guard)) =
+                                    crate::state::run_marker::acquire_write_guard()
+                                {
+                                    persist_incremental_batch(
+                                        batch,
+                                        &mut next_sequences,
+                                        &mut legacy_roots,
+                                    )
+                                } else {
+                                    (Vec::new(), Vec::new())
+                                };
                             Completion::Incremental {
                                 rollover_panels,
                                 acknowledgements,
                             }
                         }
-                        Job::Full(entries) => Completion::Full {
+                        Job::Full(mut entries) => Completion::Full {
                             acknowledgements: if let Ok(Some(_guard)) =
                                 crate::state::run_marker::acquire_write_guard()
                             {
+                                entries.retain(|entry| !blocked_history_dirs.contains(&entry.dir));
                                 persist_full_entries(
                                     entries,
                                     &mut next_sequences,

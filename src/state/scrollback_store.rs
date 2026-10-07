@@ -183,16 +183,37 @@ pub fn load_leaf_scrollback_checkpoint(
     panel_id: Uuid,
     leaf_id: Option<Uuid>,
 ) -> Option<(Option<u32>, String)> {
-    let bytes = std::fs::read(dir.join(scrollback_leaf_file_name(panel_id, leaf_id))).ok()?;
+    try_load_leaf_scrollback_checkpoint(dir, panel_id, leaf_id)
+        .ok()
+        .flatten()
+}
+
+/// Missing history is normal; inaccessible history must remain distinguishable
+/// so recovery cannot authorize replacing unread durable output.
+pub fn try_load_leaf_scrollback_checkpoint(
+    dir: &Path,
+    panel_id: Uuid,
+    leaf_id: Option<Uuid>,
+) -> std::io::Result<Option<(Option<u32>, String)>> {
+    let bytes = match std::fs::read(dir.join(scrollback_leaf_file_name(panel_id, leaf_id))) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
     if (bytes.starts_with(CHECKPOINT_MAGIC) || bytes.starts_with(SNAPSHOT_MAGIC))
         && bytes.len() >= CHECKPOINT_MAGIC.len() + 4
     {
         let offset = CHECKPOINT_MAGIC.len();
-        let generation = u32::from_le_bytes(bytes[offset..offset + 4].try_into().ok()?);
+        let generation = u32::from_le_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+        ]);
         let text = String::from_utf8_lossy(&bytes[offset + 4..]).into_owned();
-        Some((Some(generation), text))
+        Ok(Some((Some(generation), text)))
     } else {
-        Some((None, String::from_utf8_lossy(&bytes).into_owned()))
+        Ok(Some((None, String::from_utf8_lossy(&bytes).into_owned())))
     }
 }
 

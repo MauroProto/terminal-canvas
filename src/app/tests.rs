@@ -188,6 +188,16 @@ fn unavailable_attached_pty_cannot_disappear_from_the_final_save() {
 }
 
 #[test]
+fn failed_history_capture_blocks_queued_autosave_and_keeps_recovery_state() {
+    run_final_save_fixture("ack-capture-failed");
+}
+
+#[test]
+fn closing_a_panel_with_unread_history_cannot_authorize_clean_shutdown() {
+    run_final_save_fixture("ack-capture-failed-closed");
+}
+
+#[test]
 #[ignore = "only run in an isolated child process through run_final_save_fixture"]
 fn final_save_profile_fixture() {
     use eframe::App;
@@ -525,7 +535,7 @@ fn final_save_profile_fixture() {
                     ],
                     "the accepted first batch must not be appended twice"
                 );
-                let restored = super::collect_leaf_histories(&history, panel_id);
+                let restored = super::collect_leaf_histories(&history, panel_id).unwrap();
                 assert_eq!(restored.len(), 1);
                 assert_eq!(
                     restored[0].2.len(),
@@ -606,7 +616,7 @@ fn final_save_profile_fixture() {
             assert!(app.persist_scrollbacks(false));
             let _ = app.drain_persistence_worker();
             assert!(new_handle.lock().unwrap().pending_log_snapshot().is_empty());
-            let restored = super::collect_leaf_histories(&history, panel_id);
+            let restored = super::collect_leaf_histories(&history, panel_id).unwrap();
             assert_eq!(restored.len(), 1);
             let expected = if phase == "ack-replaced-session-full" {
                 vec![
@@ -854,7 +864,7 @@ fn final_save_profile_fixture() {
                 checkpoint_before,
                 "partial live grid must not replace the old checkpoint"
             );
-            let restored = super::collect_leaf_histories(&history, panel_id);
+            let restored = super::collect_leaf_histories(&history, panel_id).unwrap();
             assert_eq!(restored.len(), 1);
             assert_eq!(restored[0].1, "old durable history\n");
             assert_eq!(
@@ -925,6 +935,147 @@ fn final_save_profile_fixture() {
                         .is_none()
                 );
             }
+        }
+        "ack-capture-failed" | "ack-capture-failed-closed" => {
+            let panel_id = app.workspaces[0].panels[0].id();
+            let leaf_id = app.workspaces[0].panels[0].root_leaf_id();
+            let runtime_id = app.workspaces[0].panels[0].runtime_session_id().unwrap();
+            let manager = app.workspaces[0].pty_manager();
+            let handle = manager.lock().unwrap().handle(runtime_id).unwrap();
+            crate::state::scrollback_store::save_leaf_scrollback_versioned(
+                &history,
+                panel_id,
+                Some(leaf_id),
+                8,
+                "unread durable history\n",
+            )
+            .unwrap();
+            let checkpoint_path = history.join(
+                crate::state::scrollback_store::scrollback_leaf_file_name(panel_id, Some(leaf_id)),
+            );
+            let checkpoint_before = fs::read(&checkpoint_path).unwrap();
+            let log_path = history.join(
+                crate::state::scrollback_store::scrollback_leaf_log_file_name(
+                    panel_id,
+                    Some(leaf_id),
+                ),
+            );
+            crate::state::scrollback_log::reset_log(&log_path, 8).unwrap();
+            crate::state::scrollback_log::append_frames(
+                &log_path,
+                &crate::state::scrollback_log::encode_frame(
+                    1,
+                    crate::state::scrollback_log::FrameKind::Output,
+                    b"unread durable tail\r\n",
+                ),
+            )
+            .unwrap();
+            let log_before = fs::read(&log_path).unwrap();
+            let closed_panel = Uuid::new_v4();
+            crate::state::scrollback_store::save_scrollback(
+                &history,
+                closed_panel,
+                "retained closed recovery\n",
+            )
+            .unwrap();
+            app.scrollback_known_leaves.entry(closed_panel).or_default();
+            app.persisted_state = Some(app.snapshot_state());
+            app.toasts = Default::default();
+            #[cfg(windows)]
+            let blocker = {
+                use std::os::windows::fs::OpenOptionsExt;
+                // Deny reads but permit atomic replacement: the old bug could
+                // destroy unread history even though capture failed with 32.
+                fs::OpenOptions::new()
+                    .write(true)
+                    .share_mode(4)
+                    .open(&checkpoint_path)
+                    .unwrap()
+            };
+            let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+            let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+            app.persistence_worker =
+                super::persistence_worker::PersistenceWorker::with_restore_processor_for_tests(
+                    move |dir, panel| {
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                        #[cfg(windows)]
+                        {
+                            let result = super::collect_leaf_histories(dir, panel);
+                            assert_eq!(result.as_ref().unwrap_err().raw_os_error(), Some(32));
+                            result
+                        }
+                        #[cfg(not(windows))]
+                        {
+                            let _ = (dir, panel);
+                            Err(std::io::ErrorKind::PermissionDenied.into())
+                        }
+                    },
+                );
+            app.scrollback_restored.remove(&panel_id);
+            app.scrollback_restore_pending.insert(panel_id);
+            assert!(app
+                .persistence_worker
+                .submit_restore(history.clone(), vec![(panel_id, leaf_id)]));
+            entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            handle
+                .lock()
+                .unwrap()
+                .feed_output_for_persistence_tests(b"unsaved new output\r\n");
+            let pending_before = handle.lock().unwrap().pending_log_snapshot();
+            // Autosave, including its authorized closed-history pruning, is
+            // queued before the app learns that startup capture has failed.
+            assert!(app.persist_scrollbacks(false));
+            release_tx.send(()).unwrap();
+            let _ = app.drain_persistence_worker();
+            #[cfg(windows)]
+            drop(blocker);
+            assert!(app.scrollback_restore_failed.contains(&panel_id));
+            assert!(!app.scrollback_restored.contains(&panel_id));
+            assert!(!app.scrollback_restore_ready.contains_key(&panel_id));
+            assert!(
+                !app.toasts.is_empty(),
+                "the app must explain the blocked history save"
+            );
+            assert_eq!(
+                handle.lock().unwrap().pending_log_snapshot(),
+                pending_before
+            );
+            assert_eq!(fs::read(&checkpoint_path).unwrap(), checkpoint_before);
+            assert_eq!(fs::read(&log_path).unwrap(), log_before);
+            assert!(
+                crate::state::scrollback_store::load_scrollback(&history, closed_panel).is_some()
+            );
+            // Full writes are guarded by the writer too, independently of
+            // whether a caller has applied the Restore completion already.
+            let full_entries = app.full_scrollback_entries(&history, None);
+            assert!(app.persistence_worker.submit_full(full_entries));
+            let completions = app.persistence_worker.wait_until_idle();
+            assert!(
+                matches!(&completions[0], super::persistence_worker::Completion::Full { acknowledgements } if acknowledgements.is_empty())
+            );
+            assert_eq!(fs::read(&checkpoint_path).unwrap(), checkpoint_before);
+            if phase == "ack-capture-failed-closed" {
+                app.workspaces[0].panels.clear();
+                app.restore_pending_scrollbacks();
+                assert!(app.scrollback_restore_failed.contains(&panel_id));
+            }
+            assert!(!app.persist_scrollbacks(false));
+            assert!(!app.persist_scrollbacks(true));
+            app.on_exit(None);
+            assert!(
+                marker.exists(),
+                "closing a failed capture cannot authorize a clean marker"
+            );
+            assert_eq!(fs::read(&checkpoint_path).unwrap(), checkpoint_before);
+            assert_eq!(fs::read(&log_path).unwrap(), log_before);
+            assert_eq!(
+                handle.lock().unwrap().pending_log_snapshot(),
+                pending_before
+            );
+            assert!(
+                crate::state::scrollback_store::load_scrollback(&history, closed_panel).is_some()
+            );
         }
         "ack-capture-pending" | "ack-capture-ready" | "ack-capture-legacy" => {
             let panel_id = app.workspaces[0].panels[0].id();
@@ -1007,7 +1158,7 @@ fn final_save_profile_fixture() {
             assert_eq!(captured[0].1, "old captured history\n");
             assert_eq!(captured[0].2.len(), 1);
             assert_eq!(captured[0].2[0].payload, b"old captured tail\r\n");
-            let restored = super::collect_leaf_histories(&history, panel_id);
+            let restored = super::collect_leaf_histories(&history, panel_id).unwrap();
             assert_eq!(restored.len(), 1);
             assert_eq!(restored[0].0, stored_leaf);
             assert_eq!(restored[0].1, "old captured history\n");
@@ -1085,7 +1236,7 @@ fn final_save_profile_fixture() {
                 assert_eq!(frames.len(), 1);
                 assert_eq!(frames[0].seq, 1);
                 assert_eq!(frames[0].payload, b"after canonical checkpoint\r\n");
-                let restored = super::collect_leaf_histories(&history, panel_id);
+                let restored = super::collect_leaf_histories(&history, panel_id).unwrap();
                 let stable_root = restored
                     .iter()
                     .find(|(leaf, _, _)| *leaf == Some(leaf_id))
@@ -2024,7 +2175,7 @@ fn split_logs_restore_without_a_prior_checkpoint_and_never_mix_leaves() {
         Some(false)
     );
 
-    let histories = super::collect_leaf_histories(&dir, panel);
+    let histories = super::collect_leaf_histories(&dir, panel).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
     assert_eq!(histories.len(), 2);
     assert_eq!(histories[0].0, Some(first.min(second)));
@@ -2055,7 +2206,7 @@ fn empty_canonical_root_marker_suppresses_stale_legacy_history() {
     .unwrap();
     super::write_leaf_generation(&dir, panel, Some(root), 1).unwrap();
 
-    let histories = super::collect_leaf_histories(&dir, panel);
+    let histories = super::collect_leaf_histories(&dir, panel).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 
     assert!(histories.iter().any(|(leaf, text, frames)| {
@@ -2064,4 +2215,34 @@ fn empty_canonical_root_marker_suppresses_stale_legacy_history() {
     assert!(histories.iter().any(|(leaf, _, _)| leaf.is_none()));
     // `TerminalPanel::restore_leaf_histories` da precedencia a Some(root),
     // por lo que el alias legado se omite y no resucita contenido obsoleto.
+}
+
+#[test]
+fn history_capture_distinguishes_missing_history_from_an_unreadable_directory() {
+    let dir = std::env::temp_dir().join(format!("tc-capture-errors-{}", Uuid::new_v4()));
+    let panel = Uuid::new_v4();
+    assert!(super::collect_leaf_histories(&dir, panel)
+        .unwrap()
+        .is_empty());
+    std::fs::write(&dir, b"not a directory").unwrap();
+    assert!(super::collect_leaf_histories(&dir, panel).is_err());
+    std::fs::remove_file(dir).unwrap();
+}
+
+#[test]
+fn history_capture_reports_unreadable_checkpoint_log_and_generation_files() {
+    let dir = unique_temp_dir("tc-capture-artifact-errors");
+    let panel = Uuid::new_v4();
+    let leaf = Some(Uuid::new_v4());
+    for name in [
+        crate::state::scrollback_store::scrollback_leaf_file_name(panel, leaf),
+        crate::state::scrollback_store::scrollback_leaf_log_file_name(panel, leaf),
+        crate::state::scrollback_store::scrollback_leaf_gen_file_name(panel, leaf),
+    ] {
+        let path = dir.join(name);
+        std::fs::create_dir(&path).unwrap();
+        assert!(super::collect_leaf_histories(&dir, panel).is_err());
+        std::fs::remove_dir(path).unwrap();
+    }
+    std::fs::remove_dir(dir).unwrap();
 }

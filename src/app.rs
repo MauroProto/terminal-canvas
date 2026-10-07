@@ -120,6 +120,9 @@ pub struct TerminalApp {
     /// from the persistence worker yet. New panel UUIDs have no old history.
     scrollback_restore_pending: HashSet<Uuid>,
     scrollback_restore_ready: HashMap<Uuid, LeafHistories>,
+    /// Failed captures block history writes for this run, including after a
+    /// panel closes. A later launch may recover once the files are readable.
+    scrollback_restore_failed: HashSet<Uuid>,
     /// Identidades de panel/hoja observadas por esta instancia. La poda de
     /// scrollback queda limitada a este alcance para no borrar datos de otra
     /// ventana que use el mismo directorio durable.
@@ -324,6 +327,7 @@ impl TerminalApp {
                 scrollback_restored: HashSet::new(),
                 scrollback_restore_pending: HashSet::new(),
                 scrollback_restore_ready: HashMap::new(),
+                scrollback_restore_failed: HashSet::new(),
                 scrollback_known_leaves: HashMap::new(),
                 highlighter: code_highlight::Highlighter::new(),
                 toasts: Default::default(),
@@ -430,6 +434,7 @@ impl TerminalApp {
                 scrollback_restored: HashSet::new(),
                 scrollback_restore_pending: HashSet::new(),
                 scrollback_restore_ready: HashMap::new(),
+                scrollback_restore_failed: HashSet::new(),
                 scrollback_known_leaves: HashMap::new(),
                 highlighter: code_highlight::Highlighter::new(),
                 toasts: Default::default(),
@@ -532,6 +537,9 @@ impl TerminalApp {
                 // can enqueue autosave output from any newly attached PTY.
                 if !app.persistence_worker.submit_restore(dir, panels) {
                     log::error!("no se pudo encolar la captura inicial del historial");
+                    app.scrollback_restore_failed
+                        .extend(app.scrollback_restore_pending.iter().copied());
+                    app.toast_error("No se pudo recuperar el historial. Su guardado está pausado para conservar los archivos anteriores. Reiniciá la app cuando puedan leerse.".to_owned());
                 }
             }
         }
@@ -1216,6 +1224,18 @@ impl TerminalApp {
                         .collect::<HashSet<_>>();
                     for (panel_id, histories) in histories {
                         self.scrollback_restore_pending.remove(&panel_id);
+                        let histories = match histories {
+                            Ok(histories) => histories,
+                            Err(error) => {
+                                log::error!("no se pudo capturar el historial del panel {panel_id}: {error}");
+                                let first_failure = self.scrollback_restore_failed.is_empty();
+                                self.scrollback_restore_failed.insert(panel_id);
+                                if first_failure {
+                                    self.toast_error("No se pudo recuperar el historial. Su guardado está pausado para conservar los archivos anteriores. La salida nueva sigue en memoria; copiála antes de reiniciar cuando los archivos puedan leerse.".to_owned());
+                                }
+                                continue;
+                            }
+                        };
                         if !live.contains(&panel_id) {
                             continue;
                         }
@@ -1617,6 +1637,14 @@ impl TerminalApp {
         self.remember_scrollback_layout();
         if full {
             let _ = self.drain_persistence_worker();
+        }
+        // Keep this guard after the barrier: the worker may have discovered a
+        // read failure while an autosave was already queued behind capture.
+        // Closing the failed panel does not make its unread history disposable.
+        if !self.scrollback_restore_failed.is_empty() {
+            return false;
+        }
+        if full {
             {
                 let Ok(Some(_guard)) = crate::state::run_marker::acquire_write_guard() else {
                     return false;
@@ -2528,15 +2556,18 @@ type LeafHistories = Vec<(
     Vec<crate::state::scrollback_log::Frame>,
 )>;
 
-fn collect_leaf_histories(dir: &std::path::Path, panel_id: Uuid) -> LeafHistories {
+fn collect_leaf_histories(dir: &std::path::Path, panel_id: Uuid) -> std::io::Result<LeafHistories> {
     use std::collections::BTreeSet;
 
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
     };
     let prefix = format!("{}-", panel_id.simple());
     let mut leaves = BTreeSet::new();
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = entry?;
         let name = entry.file_name().to_string_lossy().to_string();
         let Some(rest) = name.strip_prefix(&prefix).and_then(|rest| {
             rest.strip_suffix(".txt")
@@ -2552,45 +2583,94 @@ fn collect_leaf_histories(dir: &std::path::Path, panel_id: Uuid) -> LeafHistorie
     }
     let mut out = Vec::new();
     for leaf in leaves {
-        let text = crate::state::scrollback_store::load_leaf_scrollback(dir, panel_id, Some(leaf))
-            .unwrap_or_default();
-        let frames = load_leaf_session_frames(dir, panel_id, Some(leaf));
-        let has_generation_marker = dir
-            .join(
-                crate::state::scrollback_store::scrollback_leaf_gen_file_name(panel_id, Some(leaf)),
-            )
-            .exists()
-            || dir
-                .join(crate::state::scrollback_store::scrollback_leaf_file_name(
-                    panel_id,
-                    Some(leaf),
-                ))
-                .exists();
         // Un marker sin contenido representa de forma durable una hoja vacía.
         // Es importante durante la migración: evita que un checkpoint legado
         // de raíz reaparezca después de que el usuario limpió la terminal.
-        if !text.is_empty() || !frames.is_empty() || has_generation_marker {
+        if let Some((text, frames)) = capture_leaf_history(dir, panel_id, Some(leaf))? {
             out.push((Some(leaf), text, frames));
         }
     }
     // Alias legado de la raíz. La clave estable `Some(root_leaf)` gana dentro
     // del panel si ambos formatos coexisten durante la migración.
-    let legacy_root = crate::state::scrollback_store::load_leaf_scrollback(dir, panel_id, None)
-        .unwrap_or_default();
-    let legacy_frames = load_leaf_session_frames(dir, panel_id, None);
-    let legacy_checkpoint_exists = dir
-        .join(crate::state::scrollback_store::scrollback_leaf_file_name(
-            panel_id, None,
-        ))
-        .exists();
-    if !legacy_root.is_empty() || !legacy_frames.is_empty() || legacy_checkpoint_exists {
-        out.insert(0, (None, legacy_root, legacy_frames));
+    if let Some((text, frames)) = capture_leaf_history(dir, panel_id, None)? {
+        out.insert(0, (None, text, frames));
     }
-    out
+    Ok(out)
 }
 
-/// Frames del log incremental que corresponden al checkpoint actual (P1.7).
-/// Devuelve vacío si no hay log o si la generation no matchea.
+fn read_optional_history_bytes(path: &std::path::Path) -> std::io::Result<Option<Vec<u8>>> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// Capture one generation coherently. Only actual absence means no history;
+/// unreadable checkpoint/log/sidecar data cannot become an empty replay.
+fn capture_leaf_history(
+    dir: &std::path::Path,
+    panel_id: Uuid,
+    leaf_id: Option<Uuid>,
+) -> std::io::Result<Option<(String, Vec<crate::state::scrollback_log::Frame>)>> {
+    use crate::state::{scrollback_log, scrollback_store};
+
+    let checkpoint = scrollback_store::try_load_leaf_scrollback_checkpoint(dir, panel_id, leaf_id)?;
+    let sidecar = if checkpoint
+        .as_ref()
+        .is_some_and(|(generation, _)| generation.is_some())
+    {
+        // An atomic versioned checkpoint supersedes an obsolete sidecar.
+        None
+    } else {
+        read_optional_history_bytes(&dir.join(scrollback_store::scrollback_leaf_gen_file_name(
+            panel_id, leaf_id,
+        )))?
+    };
+    let sidecar_generation = match sidecar.as_deref() {
+        Some(bytes) if bytes.len() >= 4 => {
+            Some(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+        }
+        Some(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "history generation sidecar is truncated",
+            ));
+        }
+        None => None,
+    };
+    let generation = checkpoint
+        .as_ref()
+        .and_then(|(generation, _)| *generation)
+        .or(sidecar_generation)
+        .unwrap_or(0);
+    let log = read_optional_history_bytes(&dir.join(
+        scrollback_store::scrollback_leaf_log_file_name(panel_id, leaf_id),
+    ))?;
+    let frames = match log {
+        Some(bytes) => {
+            let (log_generation, frames) =
+                scrollback_log::read_frames(&bytes).ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "history log header is invalid",
+                    )
+                })?;
+            if log_generation == generation {
+                frames
+            } else {
+                Vec::new()
+            }
+        }
+        None => Vec::new(),
+    };
+    if checkpoint.is_none() && sidecar.is_none() && frames.is_empty() {
+        return Ok(None);
+    }
+    let text = checkpoint.map(|(_, text)| text).unwrap_or_default();
+    Ok(Some((text, frames)))
+}
+
 #[cfg(test)]
 fn load_session_frames(
     dir: &std::path::Path,
@@ -2599,23 +2679,16 @@ fn load_session_frames(
     load_leaf_session_frames(dir, panel_id, None)
 }
 
+#[cfg(test)]
 fn load_leaf_session_frames(
     dir: &std::path::Path,
     panel_id: Uuid,
     leaf_id: Option<Uuid>,
 ) -> Vec<crate::state::scrollback_log::Frame> {
-    let log_path =
-        dir.join(crate::state::scrollback_store::scrollback_leaf_log_file_name(panel_id, leaf_id));
-    let Ok(bytes) = std::fs::read(log_path) else {
-        return Vec::new();
-    };
-    let Some((log_gen, frames)) = crate::state::scrollback_log::read_frames(&bytes) else {
-        return Vec::new();
-    };
-    if log_gen != read_leaf_generation(dir, panel_id, leaf_id) {
-        return Vec::new();
-    }
-    frames
+    capture_leaf_history(dir, panel_id, leaf_id)
+        .unwrap()
+        .map(|(_, frames)| frames)
+        .unwrap_or_default()
 }
 
 fn load_brand_texture(cc: &eframe::CreationContext<'_>) -> Option<egui::TextureHandle> {
