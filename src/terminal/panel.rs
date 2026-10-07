@@ -1158,6 +1158,7 @@ impl TerminalPanel {
     pub fn orchestration_observation(&self, workspace_id: Uuid) -> PanelRuntimeObservation {
         let mut visible_text = String::new();
         let mut agent_status = None;
+        let mut activity_revision = None;
         let attached = self.runtime_session_attached();
         let recent_output = self
             .with_pty(|pty| {
@@ -1165,6 +1166,7 @@ impl TerminalPanel {
                     visible_text = visible_text_snapshot(&term, 16, 180);
                 }
                 agent_status = pty.agent_status_snapshot();
+                activity_revision = Some(pty.activity_revision());
                 pty.output_elapsed() <= Duration::from_secs(4)
             })
             .unwrap_or(false);
@@ -1185,6 +1187,7 @@ impl TerminalPanel {
             } else {
                 recent_output
             },
+            activity_revision,
             attached,
             minimized: self.minimized,
             agent_status: if self.minimized || !attached {

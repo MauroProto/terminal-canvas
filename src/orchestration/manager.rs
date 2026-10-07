@@ -434,6 +434,8 @@ pub struct PanelRuntimeObservation {
     pub visible_text: String,
     pub alive: bool,
     pub recent_output: bool,
+    /// Runtime-local input/output token, independent of the recent-output TTL.
+    pub activity_revision: Option<u64>,
     pub attached: bool,
     pub minimized: bool,
     /// Último report del canal OSC 9999 (estado autoritativo del agente).
@@ -486,6 +488,7 @@ pub struct Orchestrator {
     /// Último estado reportado por un hook del agente, por panel (P2.12).
     /// Gana sobre OSC 9999 y sobre la heurística de texto mientras sea fresco.
     hook_status: HashMap<Uuid, HookStatus>,
+    last_activity_revision: HashMap<Uuid, (Option<Uuid>, u64)>,
 }
 
 /// Estado reportado por un hook, con su sello para la ventana de frescura.
@@ -535,6 +538,7 @@ impl Orchestrator {
             worktree_creator: WorktreeCreator::default(),
             pending_launches: HashMap::new(),
             hook_status: HashMap::new(),
+            last_activity_revision: HashMap::new(),
         }
     }
 
@@ -664,11 +668,25 @@ impl Orchestrator {
             .iter_mut()
             .find(|session| session.panel_id == Some(panel_id))
         {
+            let identity_changed = existing.runtime_session_id != runtime_session_id
+                || existing.workspace_id != workspace_id
+                || existing.label != title
+                || (existing.cwd.is_none() && cwd.is_some());
             existing.runtime_session_id = runtime_session_id;
             existing.workspace_id = workspace_id;
             existing.label = title.to_owned();
             if existing.cwd.is_none() {
                 existing.cwd = cwd;
+            }
+            if identity_changed {
+                let now = Utc::now();
+                existing.last_activity_at = now;
+                if let Some(task_id) = existing.task_id {
+                    if let Some(task) = self.state.tasks.iter_mut().find(|task| task.id == task_id)
+                    {
+                        task.updated_at = now;
+                    }
+                }
             }
             return existing.session_id;
         }
@@ -1111,6 +1129,21 @@ impl Orchestrator {
 
     pub fn apply_observations(&mut self, observations: Vec<PanelRuntimeObservation>) {
         let now = Utc::now();
+        let previous_tasks = self
+            .state
+            .tasks
+            .iter()
+            .map(|task| (task.id, (task.state, task.conflict_risk)))
+            .collect::<HashMap<_, _>>();
+        let mut active_tasks = HashSet::new();
+        let live_sessions = self
+            .state
+            .sessions
+            .iter()
+            .map(|session| session.session_id)
+            .collect::<HashSet<_>>();
+        self.last_activity_revision
+            .retain(|id, _| live_sessions.contains(id));
         self.merge_finished_git_inspections();
         let observations_by_panel = observations
             .into_iter()
@@ -1133,9 +1166,23 @@ impl Orchestrator {
             let Some(observation) = observations_by_panel.get(&panel_id) else {
                 continue;
             };
+            let previous_identity = (
+                session.workspace_id,
+                session.runtime_session_id,
+                session.provider,
+                session.status,
+            );
+            let previous_command = session.command_summary.clone();
+            let previous_review = session.review_summary.clone();
+            let new_activity = observation.activity_revision.is_some_and(|revision| {
+                let token = (observation.runtime_session_id, revision);
+                self.last_activity_revision
+                    .insert(session.session_id, token)
+                    .map(|previous| previous != token)
+                    .unwrap_or(revision != 0)
+            });
             session.workspace_id = observation.workspace_id;
             session.runtime_session_id = observation.runtime_session_id;
-            session.last_activity_at = now;
             if session.provider == AgentProvider::Unknown {
                 session.provider = AgentProvider::detect(&observation.title)
                     .or_else(|| AgentProvider::detect(&observation.visible_text))
@@ -1178,9 +1225,23 @@ impl Orchestrator {
                 }
             }
             apply_output_summaries(session, &observation.visible_text);
+            let observed_change = previous_identity
+                != (
+                    session.workspace_id,
+                    session.runtime_session_id,
+                    session.provider,
+                    session.status,
+                )
+                || previous_command != session.command_summary
+                || previous_review != session.review_summary;
+            if new_activity || observed_change {
+                session.last_activity_at = now;
+                if let Some(task_id) = session.task_id {
+                    active_tasks.insert(task_id);
+                }
+            }
             if let Some(task_id) = session.task_id {
                 if let Some(task) = self.state.tasks.iter_mut().find(|task| task.id == task_id) {
-                    task.updated_at = now;
                     task.state = match session.status {
                         AgentStatus::WaitingApproval | AgentStatus::NeedsInput => {
                             TaskState::Blocked
@@ -1198,6 +1259,15 @@ impl Orchestrator {
         self.refresh_inbox();
         self.refresh_conflict_risk();
         self.sync_task_states_from_dependencies();
+        // Dependencies may temporarily override a session-derived state. Only
+        // the final durable state, or actual activity, advances the task date.
+        for task in &mut self.state.tasks {
+            if active_tasks.contains(&task.id)
+                || previous_tasks.get(&task.id) != Some(&(task.state, task.conflict_risk))
+            {
+                task.updated_at = now;
+            }
+        }
     }
 
     fn merge_finished_git_inspections(&mut self) {
@@ -2278,6 +2348,7 @@ mod tests {
             visible_text: "error: something failed badly".to_owned(),
             alive: true,
             recent_output: true,
+            activity_revision: None,
             attached: true,
             minimized: false,
             agent_status: Some(AgentStatusReport {
@@ -2322,6 +2393,7 @@ mod tests {
             visible_text: "Tests passed. Ready for review.".to_owned(),
             alive: true,
             recent_output: true,
+            activity_revision: None,
             attached: true,
             minimized: false,
             agent_status: Some(AgentStatusReport {
@@ -2412,6 +2484,7 @@ mod tests {
             visible_text: "mauro % claude\nTests passed. Ready for review.".to_owned(),
             alive: true,
             recent_output: true,
+            activity_revision: None,
             attached: true,
             minimized: false,
             agent_status: None,
@@ -2457,6 +2530,7 @@ mod tests {
             visible_text: "mauro % claude".to_owned(),
             alive: true,
             recent_output: true,
+            activity_revision: None,
             attached: true,
             minimized: false,
             agent_status: None,
@@ -2513,6 +2587,7 @@ mod tests {
             visible_text: String::new(),
             alive: true,
             recent_output: false,
+            activity_revision: None,
             attached: true,
             minimized: false,
             agent_status: None,
@@ -2651,6 +2726,7 @@ mod tests {
             visible_text: "Running".to_owned(),
             alive: true,
             recent_output: true,
+            activity_revision: None,
             attached: true,
             minimized: false,
             agent_status: None,
@@ -2735,6 +2811,7 @@ mod tests {
             visible_text: "Waiting for approval to run command".to_owned(),
             alive: true,
             recent_output: true,
+            activity_revision: None,
             attached: true,
             minimized: false,
             agent_status: None,
@@ -2985,6 +3062,7 @@ mod tests {
             visible_text: text.to_owned(),
             alive: true,
             recent_output: true,
+            activity_revision: None,
             attached: true,
             minimized: false,
             agent_status: None,

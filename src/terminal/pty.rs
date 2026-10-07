@@ -171,6 +171,8 @@ pub struct PtyHandle {
     pub bell_fired: Arc<AtomicBool>,
     writer: TerminalWriter,
     last_output_at: Arc<AtomicI64>,
+    /// Live input/output only; redraws and history replay are not activity.
+    activity_revision: Arc<AtomicU64>,
     window_size: Arc<Mutex<WindowSize>>,
     render_revision: Arc<AtomicU64>,
     agent_status: Arc<ArcSwap<Option<AgentStatusReport>>>,
@@ -242,6 +244,7 @@ impl PtyHandle {
             bell_fired: Arc::new(AtomicBool::new(false)),
             writer: TerminalWriter::Local(InputWriter::new(Box::new(std::io::sink())).unwrap()),
             last_output_at: Arc::new(AtomicI64::new(0)),
+            activity_revision: Arc::new(AtomicU64::new(0)),
             window_size: Arc::new(Mutex::new(WindowSize {
                 num_lines: 24,
                 num_cols: 80,
@@ -290,6 +293,7 @@ impl PtyHandle {
             crate::state::scrollback_log::FrameKind::Output,
             output,
         ));
+        self.activity_revision.fetch_add(1, Ordering::Relaxed);
     }
 
     #[cfg(test)]
@@ -357,6 +361,7 @@ impl PtyHandle {
         let alive = Arc::new(AtomicBool::new(true));
         let bell_fired = Arc::new(AtomicBool::new(false));
         let last_output_at = Arc::new(AtomicI64::new(pty_clock_now_ms()));
+        let activity_revision = Arc::new(AtomicU64::new(0));
         let window_size = Arc::new(Mutex::new(WindowSize {
             num_lines: rows,
             num_cols: cols,
@@ -420,6 +425,7 @@ impl PtyHandle {
             TerminalWriter::Local(InputWriter::new(writer).context("start PTY input writer")?);
         let writer_for_thread = writer_for_reader.clone();
         let output_for_reader = Arc::clone(&last_output_at);
+        let activity_for_reader = Arc::clone(&activity_revision);
         let term_for_reader = Arc::clone(&term);
         #[cfg(feature = "ghostty-vt")]
         let ghostty_for_reader = ghostty_runtime.clone();
@@ -503,6 +509,7 @@ impl PtyHandle {
                             }
                             render_revision_for_reader.fetch_add(1, Ordering::Relaxed);
                             output_for_reader.store(now_ms, Ordering::Relaxed);
+                            activity_for_reader.fetch_add(1, Ordering::Relaxed);
                             if let Ok(mut scheduler) = scheduler_for_reader.lock() {
                                 scheduler.record_output(session_id);
                             }
@@ -588,6 +595,7 @@ impl PtyHandle {
             bell_fired,
             writer: writer_for_reader,
             last_output_at,
+            activity_revision,
             window_size,
             render_revision,
             agent_status,
@@ -646,6 +654,7 @@ impl PtyHandle {
         let remote_exited = Arc::new(AtomicBool::new(!session_alive));
         let bell_fired = Arc::new(AtomicBool::new(false));
         let last_output_at = Arc::new(AtomicI64::new(pty_clock_now_ms()));
+        let activity_revision = Arc::new(AtomicU64::new(0));
         let window_size = Arc::new(Mutex::new(WindowSize {
             num_lines: rows,
             num_cols: cols,
@@ -693,6 +702,7 @@ impl PtyHandle {
         let alive_for_reader = Arc::clone(&alive);
         let bell_for_reader = Arc::clone(&bell_fired);
         let output_for_reader = Arc::clone(&last_output_at);
+        let activity_for_reader = Arc::clone(&activity_revision);
         let term_for_reader = Arc::clone(&term);
         let window_size_for_reader = Arc::clone(&window_size);
         let render_revision_for_reader = Arc::clone(&render_revision);
@@ -742,6 +752,9 @@ impl PtyHandle {
                     }
                     render_revision_for_reader.fetch_add(1, Ordering::Relaxed);
                     output_for_reader.store(now_ms, Ordering::Relaxed);
+                    if !bytes.is_empty() {
+                        activity_for_reader.fetch_add(1, Ordering::Relaxed);
+                    }
                     if let Ok(mut scheduler) = scheduler_for_reader.lock() {
                         scheduler.record_output(session_id);
                     }
@@ -773,6 +786,7 @@ impl PtyHandle {
             bell_fired,
             writer: writer_for_reader,
             last_output_at,
+            activity_revision,
             window_size,
             render_revision,
             agent_status,
@@ -893,7 +907,15 @@ impl PtyHandle {
     }
 
     pub fn try_write_all(&self, bytes: &[u8]) -> std::io::Result<()> {
-        self.writer.enqueue(bytes)
+        self.writer.enqueue(bytes)?;
+        if !bytes.is_empty() {
+            self.activity_revision.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    pub fn activity_revision(&self) -> u64 {
+        self.activity_revision.load(Ordering::Relaxed)
     }
 
     pub fn record_input_error(&self, message: String) {
