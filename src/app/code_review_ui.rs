@@ -423,8 +423,29 @@ impl TerminalApp {
                 {
                     self.retry_review_notes();
                 }
+                let recovery = self
+                    .code_review
+                    .as_ref()
+                    .filter(|state| {
+                        !state.notes_ready && !state.notes_loading && state.notes_error.is_some()
+                    })
+                    .filter(|state| {
+                        self.preferences_worker
+                            .retained_notes_for_repository(&state.repo_root)
+                            .is_some()
+                    })
+                    .map(|state| (state.key, state.repo_root.clone()));
+                if let Some((key, root)) = recovery {
+                    if ui
+                        .button("Editar notas pendientes")
+                        .on_hover_text("Recupera desde memoria las notas pendientes de guardar de esta sesión. Podés editarlas o reducirlas; siguen sin estar guardadas en disco.")
+                        .clicked()
+                    {
+                        self.recover_retained_review_notes(key, &root);
+                    }
+                }
             });
-            ui.label("El diff sigue disponible. Las notas sólo se pueden editar después de cargarlas correctamente.");
+            ui.label("El diff sigue disponible. Podés editar las notas después de cargarlas correctamente o recuperar explícitamente las notas pendientes de esta sesión.");
         }
     }
 
@@ -1278,6 +1299,40 @@ impl TerminalApp {
         state.notes_request = self
             .preferences_worker
             .load_notes(state.key, state.repo_root.clone());
+    }
+
+    /// Explicitly recover an accepted in-memory save, never an older disk
+    /// snapshot. The writer still owns its payload, warning and ACK barrier.
+    pub(super) fn recover_retained_review_notes(&mut self, key: Uuid, root: &Path) -> bool {
+        let eligible = |state: &CodeReviewState| {
+            state.key == key
+                && state.repo_root.as_path() == root
+                && state.notes_error.is_some()
+                && !state.notes_ready
+                && !state.notes_loading
+        };
+        if !self.code_review.as_ref().is_some_and(eligible) {
+            return false;
+        }
+        let Some(notes) = self
+            .preferences_worker
+            .retained_notes_for_repository(root)
+            .cloned()
+        else {
+            return false;
+        };
+        let Some(state) = self.code_review.as_mut().filter(|state| eligible(state)) else {
+            return false;
+        };
+        state.notes = notes;
+        state.notes_request = Uuid::new_v4();
+        state.import_request = None;
+        state.notes_loading = false;
+        state.importing_notes = false;
+        state.notes_error = None;
+        state.notes_ready = true;
+        state.show_all_notes = true;
+        true
     }
 
     /// Fila del editor de notas: un TextEdit de una línea + Guardar/Cancelar.
