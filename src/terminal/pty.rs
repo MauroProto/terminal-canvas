@@ -1714,6 +1714,54 @@ mod tests {
     }
 
     #[test]
+    fn activity_counts_live_io_but_not_redraw_resize_empty_or_rejected_input() {
+        use super::*;
+        let mut handle = PtyHandle::for_persistence_tests(b"");
+        assert_eq!(handle.activity_revision(), 0);
+        handle.mark_render_dirty();
+        handle.resize(60, 20);
+        handle.try_write_all(b"").unwrap();
+        handle.feed_output_for_persistence_tests(b"");
+        assert_eq!(handle.activity_revision(), 0);
+        handle.try_write_all(b"accepted input").unwrap();
+        assert_eq!(handle.activity_revision(), 1);
+        handle.feed_output_for_persistence_tests(b"\r");
+        handle.feed_output_for_persistence_tests(b"\r");
+        assert_eq!(
+            handle.activity_revision(),
+            3,
+            "identical output still is activity"
+        );
+        assert!(handle
+            .try_write_all(&vec![b'x'; MAX_INPUT_BYTES + 1])
+            .is_err());
+        assert_eq!(handle.activity_revision(), 3);
+        handle.writer.close();
+        assert!(handle.try_write_all(b"closed input").is_err());
+        assert_eq!(handle.activity_revision(), 3);
+    }
+
+    #[test]
+    fn replay_and_log_acknowledgements_never_change_live_activity() {
+        use super::*;
+        let mut handle = PtyHandle::for_persistence_tests(b"LIVE\r\n");
+        let live_revision = handle.activity_revision();
+        let pending = handle.pending_log_snapshot().len();
+        handle.set_replay_spawner_for_persistence_tests(|replay| {
+            replay();
+            Ok(())
+        });
+        assert!(handle.replay_session_preserving_live(b"OLD\r\n", &[], |_| b"LIVE\r\n".to_vec()));
+        assert!(handle
+            .with_term(|term| replay_history_text(term))
+            .unwrap()
+            .contains("OLD"));
+        assert_eq!(handle.activity_revision(), live_revision);
+        handle.acknowledge_pending_log(pending);
+        assert_eq!(handle.activity_revision(), live_revision);
+    }
+
+    #[test]
     fn busy_replay_rejects_a_second_worker_without_releasing_the_first_guard() {
         use super::*;
         let mut handle = PtyHandle::for_persistence_tests(b"LIVE\r\n");

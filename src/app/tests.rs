@@ -424,6 +424,11 @@ fn hidden_logic_flushes_pending_input_and_persists_pty_output_without_a_ui_pass(
 }
 
 #[test]
+fn idle_observations_skip_layout_writes_but_activity_and_layout_changes_are_saved() {
+    run_final_save_fixture("ack-idle-layout");
+}
+
+#[test]
 fn workspace_close_applies_durable_ack_before_capturing_a_new_batch() {
     run_final_save_fixture("ack-workspace-close");
 }
@@ -790,6 +795,198 @@ fn final_save_profile_fixture() {
                 serde_json::from_slice(&fs::read(&layout).unwrap()).unwrap();
             assert_eq!(saved.workspaces[0].name, "Final workspace");
             assert!(marker.exists(), "crash recovery must remain a dirty run");
+        }
+        "ack-idle-layout" => {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            use std::sync::Arc;
+
+            let panel_id = app.workspaces[0].panels[0].id();
+            let runtime_id = app.workspaces[0].panels[0].runtime_session_id().unwrap();
+            app.reconcile_orchestration();
+            let task_id = app.orchestrator.create_task(
+                app.workspaces[0].id,
+                "Idle autosave regression",
+                "",
+                None,
+            );
+            let mut orchestration = app.orchestrator.snapshot();
+            let session = orchestration
+                .sessions
+                .iter_mut()
+                .find(|session| {
+                    session.panel_id == Some(panel_id)
+                        && session.runtime_session_id == Some(runtime_id)
+                })
+                .expect("the in-memory fixture has an observed session");
+            session.task_id = Some(task_id);
+            let session_id = session.session_id;
+            let task = orchestration
+                .tasks
+                .iter_mut()
+                .find(|task| task.id == task_id)
+                .unwrap();
+            task.session_ids = vec![session_id];
+            task.state = crate::orchestration::TaskState::Running;
+            app.orchestrator = crate::orchestration::Orchestrator::from_saved(Some(orchestration));
+
+            let _ = app.drain_persistence_worker();
+            let writes = Arc::new(AtomicUsize::new(0));
+            let worker_writes = Arc::clone(&writes);
+            app.persistence_worker =
+                super::persistence_worker::PersistenceWorker::with_state_processor_for_tests(
+                    move |snapshot| {
+                        worker_writes.fetch_add(1, Ordering::SeqCst);
+                        crate::state::persistence::try_save_state(snapshot)
+                    },
+                );
+            app.autosave = crate::state::persistence::AutosaveController::new(Duration::ZERO);
+            // This fixture counts layout publications. The independent
+            // hidden-logic fixture still exercises periodic scrollback ACKs.
+            app.scrollback_flush = crate::state::persistence::PeriodicFlushController::new(
+                Duration::from_secs(60 * 60),
+            );
+            let hidden = RawInput {
+                focused: false,
+                ..Default::default()
+            };
+            let mut observation = app
+                .collect_observations()
+                .into_iter()
+                .find(|observation| observation.panel_id == panel_id)
+                .unwrap();
+            assert_eq!(observation.runtime_session_id, Some(runtime_id));
+            assert!(observation.attached);
+            // The test PTY's monotonic clock starts at zero: an empty handle
+            // may appear recent for four seconds. Inject idle observations
+            // explicitly instead of waiting or depending on runner speed.
+            observation.recent_output = false;
+            observation.activity_revision = Some(0);
+            observation.visible_text = "Stable fixture output".to_owned();
+            let drive =
+                |app: &mut super::TerminalApp,
+                 observation: &crate::orchestration::PanelRuntimeObservation| {
+                    let _ = ctx.run_logic(&hidden, |ctx| {
+                        app.orchestrator
+                            .apply_observations(vec![observation.clone()]);
+                        app.maybe_persist_state(ctx);
+                    });
+                    let _ = app.drain_persistence_worker();
+                    let snapshot = app.snapshot_state();
+                    assert_eq!(app.persisted_state.as_ref(), Some(&snapshot));
+                    assert_eq!(
+                        crate::state::persistence::load_state(),
+                        Some(snapshot.clone())
+                    );
+                    snapshot
+                };
+
+            // Normalize the observation once, publish through the real
+            // worker, and consume its ACK before measuring idle behavior.
+            let baseline = drive(&mut app, &observation);
+            assert_eq!(writes.load(Ordering::SeqCst), 1);
+            let baseline_bytes = fs::read(&layout).unwrap();
+            writes.store(0, Ordering::SeqCst);
+            for _ in 0..8 {
+                assert_eq!(drive(&mut app, &observation), baseline);
+                assert_eq!(writes.load(Ordering::SeqCst), 0);
+                assert_eq!(fs::read(&layout).unwrap(), baseline_bytes);
+            }
+
+            // A new activity token must persist even when the text, status
+            // and every other observation field stay exactly the same.
+            observation.activity_revision = Some(1);
+            let active = drive(&mut app, &observation);
+            assert_ne!(active, baseline);
+            assert_eq!(writes.load(Ordering::SeqCst), 1);
+            let baseline_session = baseline
+                .orchestration
+                .sessions
+                .iter()
+                .find(|session| session.session_id == session_id)
+                .unwrap();
+            let active_session = active
+                .orchestration
+                .sessions
+                .iter()
+                .find(|session| session.session_id == session_id)
+                .unwrap();
+            assert_eq!(
+                active_session.command_summary,
+                baseline_session.command_summary
+            );
+            assert_eq!(active_session.status, baseline_session.status);
+            assert!(active_session.last_activity_at > baseline_session.last_activity_at);
+            assert!(
+                active
+                    .orchestration
+                    .tasks
+                    .iter()
+                    .find(|task| task.id == task_id)
+                    .unwrap()
+                    .updated_at
+                    > baseline
+                        .orchestration
+                        .tasks
+                        .iter()
+                        .find(|task| task.id == task_id)
+                        .unwrap()
+                        .updated_at
+            );
+            let active_bytes = fs::read(&layout).unwrap();
+            for _ in 0..8 {
+                assert_eq!(drive(&mut app, &observation), active);
+                assert_eq!(writes.load(Ordering::SeqCst), 1);
+                assert_eq!(fs::read(&layout).unwrap(), active_bytes);
+            }
+
+            // A semantic transition remains durable without requiring a
+            // second activity token, and repeated observations stay idle.
+            observation.visible_text = "Tests passed. Ready for review.".to_owned();
+            let reviewing = drive(&mut app, &observation);
+            assert_ne!(reviewing, active);
+            assert_eq!(writes.load(Ordering::SeqCst), 2);
+            assert_eq!(
+                reviewing
+                    .orchestration
+                    .sessions
+                    .iter()
+                    .find(|session| session.session_id == session_id)
+                    .unwrap()
+                    .status,
+                crate::orchestration::AgentStatus::Reviewing
+            );
+            assert_eq!(
+                reviewing
+                    .orchestration
+                    .tasks
+                    .iter()
+                    .find(|task| task.id == task_id)
+                    .unwrap()
+                    .state,
+                crate::orchestration::TaskState::ReviewReady
+            );
+            for _ in 0..8 {
+                assert_eq!(drive(&mut app, &observation), reviewing);
+                assert_eq!(writes.load(Ordering::SeqCst), 2);
+            }
+
+            app.workspaces[0].name = "Renamed while terminal idle".to_owned();
+            let renamed = drive(&mut app, &observation);
+            assert_ne!(renamed, reviewing);
+            assert_eq!(renamed.workspaces[0].name, "Renamed while terminal idle");
+            assert_eq!(writes.load(Ordering::SeqCst), 3);
+            for _ in 0..8 {
+                assert_eq!(drive(&mut app, &observation), renamed);
+                assert_eq!(writes.load(Ordering::SeqCst), 3);
+            }
+            assert_eq!(
+                ctx.cumulative_pass_nr(),
+                0,
+                "the fixture must stay headless"
+            );
+            assert!(marker.exists(), "autosave never declares a clean shutdown");
+            app.on_exit(None);
+            assert!(!marker.exists());
         }
         "ack-hidden-logic" => {
             let panel_id = app.workspaces[0].panels[0].id();

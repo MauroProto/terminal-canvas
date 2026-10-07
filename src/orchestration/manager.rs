@@ -2523,6 +2523,200 @@ mod tests {
         );
     }
 
+    fn activity_fixture(
+        recent_output: bool,
+    ) -> (Orchestrator, PanelRuntimeObservation, uuid::Uuid) {
+        let mut orchestrator = Orchestrator::new();
+        let workspace_id = uuid::Uuid::new_v4();
+        let panel_id = uuid::Uuid::new_v4();
+        let runtime_session_id = Some(uuid::Uuid::new_v4());
+        let session_id = orchestrator.ensure_panel_session(
+            workspace_id,
+            None,
+            panel_id,
+            runtime_session_id,
+            "zsh",
+        );
+        let task_id = orchestrator.create_task(workspace_id, "Stable task", "", None);
+        orchestrator.state.sessions[0].task_id = Some(task_id);
+        orchestrator.state.tasks[0].session_ids.push(session_id);
+        let observation = PanelRuntimeObservation {
+            panel_id,
+            runtime_session_id,
+            workspace_id,
+            title: "zsh".into(),
+            visible_text: "user %".into(),
+            alive: true,
+            recent_output,
+            activity_revision: Some(0),
+            attached: true,
+            minimized: false,
+            agent_status: None,
+        };
+        orchestrator.apply_observations(vec![observation.clone()]);
+        let epoch = chrono::DateTime::from_timestamp(0, 0).unwrap();
+        orchestrator.state.sessions[0].last_activity_at = epoch;
+        orchestrator.state.tasks[0].updated_at = epoch;
+        (orchestrator, observation, task_id)
+    }
+
+    #[test]
+    fn identical_observations_preserve_the_entire_durable_state_even_with_recent_output() {
+        for recent_output in [false, true] {
+            let (mut orchestrator, observation, _) = activity_fixture(recent_output);
+            let baseline = orchestrator.snapshot();
+            let bytes = serde_json::to_vec(&baseline).unwrap();
+            for _ in 0..8 {
+                orchestrator.apply_observations(vec![observation.clone()]);
+                assert_eq!(orchestrator.snapshot(), baseline);
+                assert_eq!(serde_json::to_vec(&orchestrator.snapshot()).unwrap(), bytes);
+            }
+        }
+    }
+
+    #[test]
+    fn input_or_identical_output_activity_advances_dates_once_and_handles_replacement() {
+        let (mut orchestrator, mut observation, _) = activity_fixture(false);
+        let epoch = orchestrator.state.sessions[0].last_activity_at;
+        observation.activity_revision = Some(1);
+        orchestrator.apply_observations(vec![observation.clone()]);
+        assert!(orchestrator.state.sessions[0].last_activity_at > epoch);
+        assert!(orchestrator.state.tasks[0].updated_at > epoch);
+        let changed = orchestrator.snapshot();
+        for _ in 0..8 {
+            orchestrator.apply_observations(vec![observation.clone()]);
+            assert_eq!(orchestrator.snapshot(), changed);
+        }
+        // A replacement can start at zero; its runtime id scopes the counter.
+        orchestrator.state.sessions[0].last_activity_at = epoch;
+        orchestrator.state.tasks[0].updated_at = epoch;
+        observation.runtime_session_id = Some(uuid::Uuid::new_v4());
+        observation.activity_revision = Some(0);
+        orchestrator.apply_observations(vec![observation.clone()]);
+        assert!(orchestrator.state.sessions[0].last_activity_at > epoch);
+        assert!(orchestrator.state.tasks[0].updated_at > epoch);
+        let replaced = orchestrator.snapshot();
+        orchestrator.apply_observations(vec![observation]);
+        assert_eq!(orchestrator.snapshot(), replaced);
+    }
+
+    #[test]
+    fn reconciliation_timestamps_only_real_session_identity_changes() {
+        let (mut orchestrator, observation, _) = activity_fixture(false);
+        let baseline = orchestrator.snapshot();
+        let original_session = baseline.sessions[0].session_id;
+        orchestrator.ensure_panel_session(
+            observation.workspace_id,
+            None,
+            observation.panel_id,
+            observation.runtime_session_id,
+            "zsh",
+        );
+        assert_eq!(orchestrator.snapshot(), baseline);
+        let epoch = baseline.sessions[0].last_activity_at;
+        let workspace_id = uuid::Uuid::new_v4();
+        let runtime_id = Some(uuid::Uuid::new_v4());
+        let cwd = Some(PathBuf::from("observed-directory"));
+        orchestrator.ensure_panel_session(
+            workspace_id,
+            cwd.clone(),
+            observation.panel_id,
+            runtime_id,
+            "Renamed terminal",
+        );
+        let changed = orchestrator.snapshot();
+        assert_eq!(changed.sessions[0].session_id, original_session);
+        assert_eq!(changed.sessions[0].workspace_id, workspace_id);
+        assert_eq!(changed.sessions[0].runtime_session_id, runtime_id);
+        assert_eq!(changed.sessions[0].cwd, cwd);
+        assert!(changed.sessions[0].last_activity_at > epoch);
+        assert!(changed.tasks[0].updated_at > epoch);
+        orchestrator.ensure_panel_session(
+            workspace_id,
+            cwd,
+            observation.panel_id,
+            runtime_id,
+            "Renamed terminal",
+        );
+        assert_eq!(orchestrator.snapshot(), changed);
+    }
+
+    #[test]
+    fn dependency_blocked_tasks_do_not_advance_dates_on_transient_running_states() {
+        let (mut orchestrator, observation, task_id) = activity_fixture(true);
+        let dependency = orchestrator.create_task(observation.workspace_id, "Dependency", "", None);
+        orchestrator.state.dependencies.push(super::DependencyEdge {
+            from_task: task_id,
+            to_task: dependency,
+            kind: DependencyKind::DependsOn,
+        });
+        orchestrator.apply_observations(vec![observation.clone()]);
+        assert_eq!(orchestrator.state.tasks[0].state, TaskState::Blocked);
+        orchestrator.state.tasks[0].updated_at = chrono::DateTime::from_timestamp(0, 0).unwrap();
+        let blocked = orchestrator.snapshot();
+        for _ in 0..8 {
+            orchestrator.apply_observations(vec![observation.clone()]);
+            assert_eq!(orchestrator.snapshot(), blocked);
+        }
+        orchestrator.mark_task_state(dependency, TaskState::Done);
+        assert_eq!(orchestrator.state.tasks[0].state, TaskState::Running);
+        orchestrator.state.tasks[0].updated_at = chrono::DateTime::from_timestamp(0, 0).unwrap();
+        let unblocked = orchestrator.snapshot();
+        orchestrator.apply_observations(vec![observation]);
+        assert_eq!(orchestrator.snapshot(), unblocked);
+    }
+
+    #[test]
+    fn conflict_alert_episode_keeps_its_date_acknowledgement_and_archive_until_resolved() {
+        let (mut orchestrator, observation, _) = activity_fixture(false);
+        orchestrator.ensure_panel_session(
+            observation.workspace_id,
+            None,
+            uuid::Uuid::new_v4(),
+            None,
+            "Second terminal",
+        );
+        for session in &mut orchestrator.state.sessions {
+            session.review_summary.changed_files = vec![PathBuf::from("shared.rs")];
+        }
+        orchestrator.apply_observations(Vec::new());
+        let epoch = chrono::DateTime::from_timestamp(0, 0).unwrap();
+        for event in &mut orchestrator.state.inbox {
+            assert_eq!(event.kind, super::InboxEventKind::ConflictRisk);
+            event.created_at = epoch;
+            event.resolved = true;
+            event.archived = true;
+        }
+        let acknowledged = orchestrator.snapshot();
+        assert_eq!(acknowledged.inbox.len(), 2);
+        for _ in 0..8 {
+            orchestrator.apply_observations(Vec::new());
+            assert_eq!(orchestrator.snapshot(), acknowledged);
+        }
+        orchestrator.state.sessions[1]
+            .review_summary
+            .changed_files
+            .clear();
+        orchestrator.apply_observations(Vec::new());
+        assert!(orchestrator.state.inbox.is_empty());
+        assert!(orchestrator
+            .state
+            .sessions
+            .iter()
+            .all(|session| !session.conflict_risk));
+        orchestrator.state.sessions[1]
+            .review_summary
+            .changed_files
+            .push(PathBuf::from("shared.rs"));
+        orchestrator.apply_observations(Vec::new());
+        assert_eq!(orchestrator.state.inbox.len(), 2);
+        assert!(orchestrator
+            .state
+            .inbox
+            .iter()
+            .all(|event| event.created_at > epoch && !event.resolved && !event.archived));
+    }
+
     #[test]
     fn git_inspection_of_plain_terminals_uses_the_slow_cadence() {
         let mut orchestrator = Orchestrator::new();
