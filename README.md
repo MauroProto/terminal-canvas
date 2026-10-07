@@ -115,7 +115,13 @@ In the terminal, double-click selects a word and triple-click selects a line.
 
 Use Rust through `rustup`; the repository pins its compiler and tools in
 `rust-toolchain.toml`, matching CI. Windows source builds require the MSVC C++
-build tools. Build commands use the committed dependency lockfile.
+build tools. Build commands use the committed dependency lockfile. The graphics
+stack requires Rust 1.95 or newer; CI and `rust-toolchain.toml` use 1.98.0.
+On Ubuntu/Debian, install the font dependencies used by Wayland window decorations:
+
+```bash
+sudo apt-get install pkg-config libfontconfig1-dev libfreetype6-dev
+```
 
 ```bash
 cargo run --locked --bin mi-terminal

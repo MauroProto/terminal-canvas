@@ -38,6 +38,8 @@ tar y ejecutá `./mi-terminal` dentro de la carpeta. Conservá los helpers
 `mi-terminal-daemon`, `tc-memory` y `tc-memory-mcp` junto al ejecutable.
 El paquete se compila en Ubuntu 24.04: requiere un sistema compatible con sus
 bibliotecas nativas, una sesión gráfica y un driver gráfico compatible.
+Las decoraciones de ventanas Wayland usan Fontconfig y FreeType. En Ubuntu/Debian
+esas bibliotecas se instalan con `sudo apt-get install libfontconfig1 libfreetype6`.
 No es un binario estático ni promete compatibilidad con distribuciones más antiguas.
 
 ## macOS
