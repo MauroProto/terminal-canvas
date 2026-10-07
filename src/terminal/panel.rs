@@ -1739,7 +1739,8 @@ impl TerminalPanel {
     }
 
     /// Restaura el historial de cada hoja (P2.11, T4). Devuelve `false` si el
-    /// panel todavía no tiene terminal.
+    /// panel todavía no tiene terminal o el replay no fue aceptado; quien
+    /// llama debe conservar el historial pendiente para reintentarlo.
     pub fn restore_leaf_histories(
         &mut self,
         histories: &[(
@@ -1781,7 +1782,7 @@ impl TerminalPanel {
                         crate::terminal::export::scrollback_to_ansi(term).into_bytes()
                     })
                 })
-                .is_some();
+                .unwrap_or(false);
             if restored {
                 self.restored_history_leaves.insert(leaf);
             } else {
@@ -1853,7 +1854,8 @@ impl TerminalPanel {
     }
 
     /// Restaura checkpoint + frames del log incremental (P1.7). Devuelve
-    /// `false` si el panel aún no tiene terminal (reintentar después).
+    /// `false` si el panel aún no tiene terminal o el worker rechazó el replay
+    /// (conservar el historial pendiente y reintentar después).
     pub fn restore_session(
         &mut self,
         checkpoint: &str,
@@ -1869,9 +1871,9 @@ impl TerminalPanel {
         self.with_pty(|pty| {
             pty.replay_session_preserving_live(&bytes, frames, |term| {
                 crate::terminal::export::scrollback_to_ansi(term).into_bytes()
-            });
+            })
         })
-        .is_some()
+        .unwrap_or(false)
     }
 
     pub fn shared_snapshot(&self) -> SharedPanelSnapshot {

@@ -150,6 +150,10 @@ fn wait_for_history_restore(restoring: &AtomicBool) {
     }
 }
 
+#[cfg(test)]
+type HistoryReplaySpawner =
+    Box<dyn FnMut(Box<dyn FnOnce() + Send + 'static>) -> std::io::Result<()> + Send>;
+
 fn yield_for_reader_priority(scheduler: &SharedRuntimeScheduler, session_id: Uuid) {
     let delay = scheduler
         .lock()
@@ -178,6 +182,11 @@ pub struct PtyHandle {
     pending_log: Arc<Mutex<Vec<u8>>>,
     log_seq: Arc<AtomicU64>,
     restoring_history: Arc<AtomicBool>,
+    /// A failed replay may already have changed a healthy grid. Keep it from
+    /// replacing the durable checkpoint until a fresh session is created.
+    history_restore_failed: Arc<AtomicBool>,
+    #[cfg(test)]
+    history_replay_spawner: Mutex<Option<HistoryReplaySpawner>>,
     scrollback_limit: usize,
     #[cfg(feature = "ghostty-vt")]
     backend_kind: TerminalBackendKind,
@@ -245,6 +254,8 @@ impl PtyHandle {
             pending_log: Arc::new(Mutex::new(Vec::new())),
             log_seq: Arc::new(AtomicU64::new(0)),
             restoring_history: Arc::new(AtomicBool::new(false)),
+            history_restore_failed: Arc::new(AtomicBool::new(false)),
+            history_replay_spawner: Mutex::new(None),
             scrollback_limit,
             #[cfg(feature = "ghostty-vt")]
             backend_kind: TerminalBackendKind::Alacritty,
@@ -288,6 +299,16 @@ impl PtyHandle {
             panic!("injected pending log poison");
         }));
         assert!(result.is_err());
+    }
+
+    /// Per-handle replay scheduling injection; tests can reject or hold a
+    /// worker without exhausting threads or changing another test's behavior.
+    #[cfg(test)]
+    pub(crate) fn set_replay_spawner_for_persistence_tests(
+        &mut self,
+        spawner: impl FnMut(Box<dyn FnOnce() + Send + 'static>) -> std::io::Result<()> + Send + 'static,
+    ) {
+        *self.history_replay_spawner.get_mut().unwrap() = Some(Box::new(spawner));
     }
 
     pub fn spawn(
@@ -574,6 +595,9 @@ impl PtyHandle {
             pending_log,
             log_seq,
             restoring_history,
+            history_restore_failed: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            history_replay_spawner: Mutex::new(None),
             scrollback_limit,
             #[cfg(feature = "ghostty-vt")]
             backend_kind,
@@ -756,6 +780,9 @@ impl PtyHandle {
             pending_log,
             log_seq,
             restoring_history,
+            history_restore_failed: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            history_replay_spawner: Mutex::new(None),
             scrollback_limit,
             #[cfg(feature = "ghostty-vt")]
             backend_kind: TerminalBackendKind::Alacritty,
@@ -1044,7 +1071,9 @@ impl PtyHandle {
         &self,
         export: impl FnOnce(&Term<EventProxy>) -> R,
     ) -> Option<(R, usize)> {
-        if self.restoring_history.load(Ordering::Acquire) {
+        if self.restoring_history.load(Ordering::Acquire)
+            || self.history_restore_failed.load(Ordering::Acquire)
+        {
             return None;
         }
         let term = self.term.lock().ok()?;
@@ -1135,28 +1164,54 @@ impl PtyHandle {
         &self,
         checkpoint: &[u8],
         frames: &[crate::state::scrollback_log::Frame],
-    ) {
-        self.replay_session_preserving_live(checkpoint, frames, |_| Vec::new());
+    ) -> bool {
+        self.replay_session_preserving_live(checkpoint, frames, |_| Vec::new())
+    }
+
+    fn spawn_history_replay(&self, replay: impl FnOnce() + Send + 'static) -> std::io::Result<()> {
+        #[cfg(test)]
+        {
+            let mut injected = self
+                .history_replay_spawner
+                .lock()
+                .map_err(|_| std::io::Error::other("replay test spawner lock poisoned"))?;
+            if let Some(spawn) = injected.as_mut() {
+                return spawn(Box::new(replay));
+            }
+        }
+        thread::Builder::new()
+            .name("scrollback-replay".to_owned())
+            .spawn(replay)
+            .map(|_| ())
     }
 
     /// Variante usada por la app real: recibe el exportador semántico desde
     /// el módulo host para que los harness que montan `pty.rs` por `#[path]`
     /// no tengan que incluir todo `terminal::export`.
+    /// Returns whether the request was accepted, not whether replay finished.
+    /// A busy or rejected worker leaves the caller's durable history pending.
     pub fn replay_session_preserving_live(
         &self,
         checkpoint: &[u8],
         frames: &[crate::state::scrollback_log::Frame],
         export_live: impl FnOnce(&Term<EventProxy>) -> Vec<u8> + Send + 'static,
-    ) {
+    ) -> bool {
         if checkpoint.is_empty() && frames.is_empty() {
-            return;
+            return true;
         }
         if self
             .restoring_history
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
-            return;
+            return false;
+        }
+        if self.history_restore_failed.load(Ordering::Acquire) {
+            // Check after acquiring the guard: an earlier worker can fail
+            // while this request is entering. Its partial grid cannot become
+            // the live output of a retry; restoring needs a fresh PTY.
+            self.restoring_history.store(false, Ordering::Release);
+            return false;
         }
         let checkpoint = checkpoint.to_vec();
         let frames = frames.to_vec();
@@ -1164,104 +1219,111 @@ impl PtyHandle {
         let window_size = Arc::clone(&self.window_size);
         let restoring = Arc::clone(&self.restoring_history);
         let restoring_for_thread = Arc::clone(&restoring);
+        let failed = Arc::clone(&self.history_restore_failed);
         let render_revision = Arc::clone(&self.render_revision);
-        let spawn_result = thread::Builder::new()
-            .name("scrollback-replay".to_owned())
-            .spawn(move || {
-                let replay_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    const CHUNK_BYTES: usize = 16 * 1024;
-                    let mut processor = Processor::<StdSyncHandler>::new();
-                    // El shell puede haber emitido prompt/salida mientras el
-                    // checkpoint se leía en el worker. Capturamos ese grid,
-                    // limpiamos y lo reinyectamos al final: historial viejo
-                    // primero, salida viva después, sin perder ninguna de las
-                    // dos ni congelar el frame durante I/O de disco.
-                    let live_output = {
-                        let Ok(mut term) = term.lock() else {
-                            return;
-                        };
-                        let exported = export_live(&term);
-                        let mut live = Vec::with_capacity(exported.len());
-                        for (index, byte) in exported.iter().copied().enumerate() {
-                            if byte == b'\n' && (index == 0 || exported[index - 1] != b'\r') {
-                                live.push(b'\r');
-                            }
-                            live.push(byte);
-                        }
-                        processor.advance(&mut *term, b"\x1b[2J\x1b[3J\x1b[H");
-                        live
+        let spawn_result = self.spawn_history_replay(move || {
+            let replay_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                const CHUNK_BYTES: usize = 16 * 1024;
+                let mut processor = Processor::<StdSyncHandler>::new();
+                // El shell puede haber emitido prompt/salida mientras el
+                // checkpoint se leía en el worker. Capturamos ese grid,
+                // limpiamos y lo reinyectamos al final: historial viejo
+                // primero, salida viva después, sin perder ninguna de las
+                // dos ni congelar el frame durante I/O de disco.
+                let live_output = {
+                    let Ok(mut term) = term.lock() else {
+                        return false;
                     };
-                    for chunk in checkpoint.chunks(CHUNK_BYTES) {
-                        let Ok(mut term) = term.lock() else {
-                            return;
-                        };
-                        processor.advance(&mut *term, chunk);
-                        drop(term);
-                        thread::yield_now();
+                    let exported = export_live(&term);
+                    let mut live = Vec::with_capacity(exported.len());
+                    for (index, byte) in exported.iter().copied().enumerate() {
+                        if byte == b'\n' && (index == 0 || exported[index - 1] != b'\r') {
+                            live.push(b'\r');
+                        }
+                        live.push(byte);
                     }
-                    for frame in frames {
-                        match frame.kind {
-                            crate::state::scrollback_log::FrameKind::Output => {
-                                for chunk in frame.payload.chunks(CHUNK_BYTES) {
-                                    let Ok(mut term) = term.lock() else {
-                                        return;
-                                    };
-                                    processor.advance(&mut *term, chunk);
-                                    drop(term);
-                                    thread::yield_now();
-                                }
-                            }
-                            crate::state::scrollback_log::FrameKind::Resize => {
-                                if let Some((cols, rows)) =
-                                    crate::state::scrollback_log::parse_resize(&frame.payload)
-                                {
-                                    let Ok(mut term) = term.lock() else {
-                                        return;
-                                    };
-                                    term.resize(TermSize::new(cols as usize, rows as usize));
-                                }
-                            }
-                            crate::state::scrollback_log::FrameKind::Clear => {
+                    processor.advance(&mut *term, b"\x1b[2J\x1b[3J\x1b[H");
+                    live
+                };
+                for chunk in checkpoint.chunks(CHUNK_BYTES) {
+                    let Ok(mut term) = term.lock() else {
+                        return false;
+                    };
+                    processor.advance(&mut *term, chunk);
+                    drop(term);
+                    thread::yield_now();
+                }
+                for frame in frames {
+                    match frame.kind {
+                        crate::state::scrollback_log::FrameKind::Output => {
+                            for chunk in frame.payload.chunks(CHUNK_BYTES) {
                                 let Ok(mut term) = term.lock() else {
-                                    return;
+                                    return false;
                                 };
-                                processor.advance(&mut *term, b"\x1b[2J\x1b[3J\x1b[H");
+                                processor.advance(&mut *term, chunk);
+                                drop(term);
+                                thread::yield_now();
                             }
                         }
-                    }
-                    let size = window_size
-                        .lock()
-                        .ok()
-                        .map(|size| (size.num_cols, size.num_lines));
-                    if let Ok(mut term) = term.lock() {
-                        // A replayed resize belongs to the old process. Restore
-                        // current physical dimensions before injecting the live prompt.
-                        if let Some((cols, rows)) = size {
-                            term.resize(TermSize::new(cols.max(1) as usize, rows.max(1) as usize));
+                        crate::state::scrollback_log::FrameKind::Resize => {
+                            if let Some((cols, rows)) =
+                                crate::state::scrollback_log::parse_resize(&frame.payload)
+                            {
+                                let Ok(mut term) = term.lock() else {
+                                    return false;
+                                };
+                                term.resize(TermSize::new(cols as usize, rows as usize));
+                            }
                         }
-                        processor.advance(&mut *term, b"\x1b[?1049l\x1b[0m");
-                        processor
-                            .advance(&mut *term, &crate::state::scrollback_store::replay_marker());
+                        crate::state::scrollback_log::FrameKind::Clear => {
+                            let Ok(mut term) = term.lock() else {
+                                return false;
+                            };
+                            processor.advance(&mut *term, b"\x1b[2J\x1b[3J\x1b[H");
+                        }
                     }
-                    for chunk in live_output.chunks(CHUNK_BYTES) {
-                        let Ok(mut term) = term.lock() else {
-                            return;
-                        };
-                        processor.advance(&mut *term, chunk);
-                        drop(term);
-                        thread::yield_now();
-                    }
-                }));
+                }
+                let (cols, rows) = match window_size.lock() {
+                    Ok(size) => (size.num_cols, size.num_lines),
+                    Err(_) => return false,
+                };
+                {
+                    let Ok(mut term) = term.lock() else {
+                        return false;
+                    };
+                    // A replayed resize belongs to the old process. Restore
+                    // current physical dimensions before injecting the live prompt.
+                    term.resize(TermSize::new(cols.max(1) as usize, rows.max(1) as usize));
+                    processor.advance(&mut *term, b"\x1b[?1049l\x1b[0m");
+                    processor.advance(&mut *term, &crate::state::scrollback_store::replay_marker());
+                }
+                for chunk in live_output.chunks(CHUNK_BYTES) {
+                    let Ok(mut term) = term.lock() else {
+                        return false;
+                    };
+                    processor.advance(&mut *term, chunk);
+                    drop(term);
+                    thread::yield_now();
+                }
+                true
+            }));
+            if !matches!(replay_result, Ok(true)) {
+                failed.store(true, Ordering::Release);
                 if replay_result.is_err() {
                     log::error!("el replay de scrollback paniqueó");
+                } else {
+                    log::error!("el replay de scrollback no pudo leer el estado del terminal");
                 }
-                render_revision.fetch_add(1, Ordering::Release);
-                restoring_for_thread.store(false, Ordering::Release);
-            });
+            }
+            render_revision.fetch_add(1, Ordering::Release);
+            restoring_for_thread.store(false, Ordering::Release);
+        });
         if let Err(err) = spawn_result {
             restoring.store(false, Ordering::Release);
             log::warn!("no se pudo iniciar el replay de scrollback: {err}");
+            return false;
         }
+        true
     }
 
     pub fn title_snapshot(&self) -> Option<String> {
@@ -1572,6 +1634,155 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::shell_command;
+
+    fn replay_history_text(term: &super::Term<super::EventProxy>) -> String {
+        use alacritty_terminal::grid::Dimensions;
+        (-(term.grid().history_size() as i32)..term.screen_lines() as i32)
+            .flat_map(|line| {
+                term.grid()[alacritty_terminal::index::Line(line)]
+                    .into_iter()
+                    .map(|cell| cell.c)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn rejected_replay_preserves_live_output_and_accepts_one_retry() {
+        use super::*;
+        let mut handle = PtyHandle::for_persistence_tests(b"LIVE\r\n");
+        let pending_before = handle.pending_log_snapshot();
+        let attempts = Arc::new(AtomicU64::new(0));
+        let attempts_for_spawn = Arc::clone(&attempts);
+        handle.set_replay_spawner_for_persistence_tests(move |replay| {
+            if attempts_for_spawn.fetch_add(1, Ordering::Relaxed) == 0 {
+                return Err(std::io::Error::other("injected replay spawn rejection"));
+            }
+            replay();
+            Ok(())
+        });
+        let frames = vec![crate::state::scrollback_log::Frame {
+            seq: 1,
+            kind: crate::state::scrollback_log::FrameKind::Output,
+            payload: b"TAIL\r\n".to_vec(),
+        }];
+
+        assert!(!handle
+            .replay_session_preserving_live(b"OLD\r\n", &frames, |_| { b"LIVE\r\n".to_vec() }));
+        assert!(!handle.history_restore_in_progress());
+        let before = handle.with_term(|term| replay_history_text(term)).unwrap();
+        assert!(before.contains("LIVE"));
+        assert!(!before.contains("OLD"));
+        assert_eq!(handle.pending_log_snapshot(), pending_before);
+        assert!(matches!(
+            handle.recovery_snapshot::<String>(true, |_| panic!("OLD is still pending")),
+            RecoverySnapshot::PendingLog(bytes) if bytes == pending_before
+        ));
+
+        assert!(handle
+            .replay_session_preserving_live(b"OLD\r\n", &frames, |_| { b"LIVE\r\n".to_vec() }));
+        assert!(!handle.history_restore_in_progress());
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+        let (restored, _) = handle.checkpoint_snapshot(replay_history_text).unwrap();
+        assert_eq!(restored.matches("OLD").count(), 1);
+        assert_eq!(restored.matches("TAIL").count(), 1);
+        assert_eq!(restored.matches("LIVE").count(), 1);
+        assert!(restored.find("OLD") < restored.find("TAIL"));
+        assert!(restored.find("TAIL") < restored.find("LIVE"));
+        assert_eq!(handle.pending_log_snapshot(), pending_before);
+    }
+
+    #[test]
+    fn busy_replay_rejects_a_second_worker_without_releasing_the_first_guard() {
+        use super::*;
+        let mut handle = PtyHandle::for_persistence_tests(b"LIVE\r\n");
+        let (task_tx, task_rx) = mpsc::sync_channel(1);
+        handle.set_replay_spawner_for_persistence_tests(move |replay| {
+            task_tx.send(replay).unwrap();
+            Ok(())
+        });
+        assert!(
+            handle.replay_session_preserving_live(b"OLD\r\n", &[], |_| { b"LIVE\r\n".to_vec() })
+        );
+        let replay = task_rx.try_recv().unwrap();
+        assert!(handle.history_restore_in_progress());
+
+        assert!(!handle.replay_session_preserving_live(b"OTHER\r\n", &[], |_| Vec::new()));
+        assert!(handle.history_restore_in_progress());
+        assert!(task_rx.try_recv().is_err());
+        assert!(handle.checkpoint_snapshot(replay_history_text).is_none());
+        replay();
+        assert!(!handle.history_restore_in_progress());
+        let (restored, _) = handle.checkpoint_snapshot(replay_history_text).unwrap();
+        assert_eq!(restored.matches("OLD").count(), 1);
+        assert_eq!(restored.matches("LIVE").count(), 1);
+        assert!(!restored.contains("OTHER"));
+    }
+
+    #[test]
+    fn empty_replay_needs_no_worker_and_does_not_clear_live_output() {
+        use super::*;
+        let mut handle = PtyHandle::for_persistence_tests(b"LIVE\r\n");
+        handle.set_replay_spawner_for_persistence_tests(|_| {
+            panic!("empty replay must not schedule a worker")
+        });
+        assert!(handle.replay_session(b"", &[]));
+        assert!(!handle.history_restore_in_progress());
+        let (live, _) = handle.checkpoint_snapshot(replay_history_text).unwrap();
+        assert_eq!(live.matches("LIVE").count(), 1);
+    }
+
+    #[test]
+    fn failed_replay_after_grid_clear_cannot_checkpoint_a_healthy_partial_grid() {
+        use super::*;
+        let mut handle = PtyHandle::for_persistence_tests(b"LIVE\r\n");
+        let pending_before = handle.pending_log_snapshot();
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _size = handle.window_size.lock().unwrap();
+            panic!("injected replay window-size poison");
+        }));
+        assert!(poisoned.is_err());
+        handle.set_replay_spawner_for_persistence_tests(|replay| {
+            replay();
+            Ok(())
+        });
+
+        // The worker was accepted but failed after clearing the live grid.
+        assert!(
+            handle.replay_session_preserving_live(b"OLD\r\n", &[], |_| { b"LIVE\r\n".to_vec() })
+        );
+        assert!(!handle.history_restore_in_progress());
+        assert!(
+            handle.term.lock().is_ok(),
+            "the grid itself is not poisoned"
+        );
+        assert!(handle.checkpoint_snapshot(replay_history_text).is_none());
+        assert!(matches!(
+            handle.recovery_snapshot::<String>(false, |_| panic!("partial grid is not complete")),
+            RecoverySnapshot::PendingLog(bytes) if bytes == pending_before
+        ));
+        assert!(!handle.replay_session(b"OLD\r\n", &[]));
+    }
+
+    #[test]
+    fn replay_exporter_panic_releases_busy_state_without_authorizing_a_checkpoint() {
+        use super::*;
+        let mut handle = PtyHandle::for_persistence_tests(b"LIVE\r\n");
+        let pending_before = handle.pending_log_snapshot();
+        handle.set_replay_spawner_for_persistence_tests(|replay| {
+            replay();
+            Ok(())
+        });
+        assert!(handle.replay_session_preserving_live(b"OLD\r\n", &[], |_| {
+            panic!("injected replay exporter panic")
+        }));
+        assert!(!handle.history_restore_in_progress());
+        assert!(handle.term.lock().is_err());
+        assert!(handle.checkpoint_snapshot(replay_history_text).is_none());
+        assert!(matches!(
+            handle.recovery_snapshot::<String>(false, |_| panic!("poisoned grid is not complete")),
+            RecoverySnapshot::PendingLog(bytes) if bytes == pending_before
+        ));
+    }
 
     #[test]
     fn cold_history_restores_checkpoint_tail_and_current_dimensions() {

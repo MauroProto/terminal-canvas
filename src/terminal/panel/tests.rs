@@ -18,6 +18,155 @@ use super::{
     title_drag_hit_rect, PanelHitArea, PanelLod, ResizeHandle, TerminalPanel, BORDER_RADIUS,
     MIN_HEIGHT, MIN_WIDTH, TITLE_BAR_HEIGHT,
 };
+
+fn panel_with_in_memory_history() -> (TerminalPanel, crate::runtime::SharedPtyHandle) {
+    let manager = std::sync::Arc::new(std::sync::Mutex::new(
+        crate::runtime::PtyManager::new_for_tests(),
+    ));
+    manager
+        .lock()
+        .unwrap()
+        .set_remote_spawner(Box::new(|_, _, _, _, _| {
+            Ok((
+                uuid::Uuid::new_v4(),
+                crate::terminal::pty::PtyHandle::for_persistence_tests(b"LIVE\r\n"),
+            ))
+        }));
+    let mut panel = TerminalPanel::new(pos2(0.0, 0.0), vec2(400.0, 300.0), Color32::WHITE, 0);
+    panel.attach_session_with_spec(manager, None, crate::runtime::SessionSpec::default());
+    let handle = panel.leaf_session_handle(panel.root_leaf_id()).unwrap();
+    (panel, handle)
+}
+
+fn reject_first_history_replay(
+    handle: &crate::runtime::SharedPtyHandle,
+) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let attempts = std::sync::Arc::new(AtomicU64::new(0));
+    let attempts_for_spawn = std::sync::Arc::clone(&attempts);
+    handle
+        .lock()
+        .unwrap()
+        .set_replay_spawner_for_persistence_tests(move |replay| {
+            if attempts_for_spawn.fetch_add(1, Ordering::Relaxed) == 0 {
+                return Err(std::io::Error::other("injected replay spawn rejection"));
+            }
+            replay();
+            Ok(())
+        });
+    attempts
+}
+
+#[test]
+fn rejected_leaf_history_stays_pending_and_retry_applies_old_history_only_once() {
+    use crate::terminal::pty::RecoverySnapshot;
+    use std::sync::atomic::Ordering;
+    let (mut panel, handle) = panel_with_in_memory_history();
+    let leaf = panel.root_leaf_id();
+    let attempts = reject_first_history_replay(&handle);
+    let pending_before = handle.lock().unwrap().pending_log_snapshot();
+    let histories = vec![(
+        Some(leaf),
+        "OLD\n".to_owned(),
+        vec![crate::state::scrollback_log::Frame {
+            seq: 1,
+            kind: crate::state::scrollback_log::FrameKind::Output,
+            payload: b"TAIL\r\n".to_vec(),
+        }],
+    )];
+
+    assert!(!panel.restore_leaf_histories(&histories));
+    assert!(!panel.restored_history_leaves.contains(&leaf));
+    assert!(!handle.lock().unwrap().history_restore_in_progress());
+    let snapshots = panel.leaf_scrollbacks(&[leaf]);
+    assert_eq!(snapshots.len(), 1);
+    assert!(matches!(
+        &snapshots[0].2,
+        RecoverySnapshot::PendingLog(bytes) if bytes == &pending_before
+    ));
+    let live = panel.scrollback_text().unwrap();
+    assert!(live.contains("LIVE"));
+    assert!(!live.contains("OLD"));
+    assert_eq!(histories[0].1, "OLD\n");
+
+    assert!(panel.restore_leaf_histories(&histories));
+    assert!(panel.restored_history_leaves.contains(&leaf));
+    assert!(panel.restore_leaf_histories(&histories));
+    assert_eq!(attempts.load(Ordering::Relaxed), 2);
+    let restored = panel.scrollback_text().unwrap();
+    assert_eq!(restored.matches("OLD").count(), 1);
+    assert_eq!(restored.matches("TAIL").count(), 1);
+    assert_eq!(restored.matches("LIVE").count(), 1);
+    assert!(restored.find("OLD") < restored.find("TAIL"));
+    assert!(restored.find("TAIL") < restored.find("LIVE"));
+    assert!(matches!(
+        &panel.leaf_scrollbacks(&[leaf])[0].2,
+        RecoverySnapshot::Checkpoint { .. }
+    ));
+}
+
+#[test]
+fn busy_leaf_history_is_not_marked_restored_until_a_retry_is_accepted() {
+    use crate::terminal::pty::RecoverySnapshot;
+    let (mut panel, handle) = panel_with_in_memory_history();
+    let leaf = panel.root_leaf_id();
+    let (task_tx, task_rx) = std::sync::mpsc::sync_channel(1);
+    handle
+        .lock()
+        .unwrap()
+        .set_replay_spawner_for_persistence_tests(move |replay| {
+            task_tx.send(replay).unwrap();
+            Ok(())
+        });
+    assert!(handle
+        .lock()
+        .unwrap()
+        .replay_session_preserving_live(b"HELD\r\n", &[], |term| {
+            crate::terminal::export::scrollback_to_ansi(term).into_bytes()
+        }));
+    let replay = task_rx.try_recv().unwrap();
+    let histories = vec![(Some(leaf), "OLD\n".to_owned(), Vec::new())];
+
+    assert!(!panel.restore_leaf_histories(&histories));
+    assert!(!panel.restored_history_leaves.contains(&leaf));
+    assert!(handle.lock().unwrap().history_restore_in_progress());
+    assert!(task_rx.try_recv().is_err());
+    assert!(matches!(
+        &panel.leaf_scrollbacks(&[leaf])[0].2,
+        RecoverySnapshot::PendingLog(_)
+    ));
+    replay();
+    handle
+        .lock()
+        .unwrap()
+        .set_replay_spawner_for_persistence_tests(|replay| {
+            replay();
+            Ok(())
+        });
+    assert!(panel.restore_leaf_histories(&histories));
+    assert!(panel.restored_history_leaves.contains(&leaf));
+    let restored = panel.scrollback_text().unwrap();
+    assert_eq!(restored.matches("OLD").count(), 1);
+    assert_eq!(restored.matches("HELD").count(), 1);
+    assert_eq!(restored.matches("LIVE").count(), 1);
+}
+
+#[test]
+fn focused_session_restore_reports_worker_rejection_and_allows_retry() {
+    use std::sync::atomic::Ordering;
+    let (mut panel, handle) = panel_with_in_memory_history();
+    let attempts = reject_first_history_replay(&handle);
+    assert!(!panel.restore_session("OLD\n", &[]));
+    let live = panel.scrollback_text().unwrap();
+    assert!(live.contains("LIVE"));
+    assert!(!live.contains("OLD"));
+    assert!(panel.restore_session("OLD\n", &[]));
+    assert_eq!(attempts.load(Ordering::Relaxed), 2);
+    let restored = panel.scrollback_text().unwrap();
+    assert_eq!(restored.matches("OLD").count(), 1);
+    assert_eq!(restored.matches("LIVE").count(), 1);
+}
+
 #[test]
 fn custom_title_survives_shell_title_updates() {
     let mut panel = TerminalPanel::new(pos2(0.0, 0.0), vec2(400.0, 300.0), Color32::WHITE, 0);
