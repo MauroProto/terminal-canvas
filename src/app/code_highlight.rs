@@ -12,7 +12,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use egui::Color32;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::Theme;
-use syntect::parsing::SyntaxSet;
+use syntect::parsing::{SyntaxReference, SyntaxSet};
 use two_face::theme::EmbeddedThemeName;
 
 /// Tope de líneas a resaltar. Más que esto no aporta (nadie lee 40k líneas
@@ -78,20 +78,27 @@ pub fn syntect_color(color: syntect::highlighting::Color) -> Color32 {
 /// Elige la gramática por extensión y, si no hay, por la primera línea
 /// (shebangs tipo `#!/bin/bash`). Devuelve el nombre del lenguaje detectado.
 pub fn detect_language(file_name: &str, first_line: &str) -> Option<String> {
-    let set = syntax_set();
+    select_syntax(syntax_set(), file_name, first_line).map(|syntax| syntax.name.clone())
+}
+
+/// Keep the viewer's language indicator and its parser on the same grammar.
+pub(crate) fn select_syntax<'a>(
+    set: &'a SyntaxSet,
+    file_name: &str,
+    first_line: &str,
+) -> Option<&'a SyntaxReference> {
     let extension = file_name.rsplit('.').next().unwrap_or_default();
     // Un archivo sin punto (`Makefile`) no tiene extensión real: `rsplit` en ese
     // caso devuelve el nombre entero, que igual sirve para buscar por token.
     if !extension.is_empty() {
         if let Some(syntax) = set.find_syntax_by_extension(extension) {
-            return Some(syntax.name.clone());
+            return Some(syntax);
         }
     }
     if let Some(syntax) = set.find_syntax_by_token(file_name) {
-        return Some(syntax.name.clone());
+        return Some(syntax);
     }
     set.find_syntax_by_first_line(first_line)
-        .map(|syntax| syntax.name.clone())
 }
 
 /// Resalta el texto completo. Pensado para correr fuera del hilo de UI.
@@ -111,11 +118,7 @@ fn highlight_text_cancelable(
     }
     let set = syntax_set();
     let first_line = text.lines().next().unwrap_or_default();
-    let extension = file_name.rsplit('.').next().unwrap_or_default();
-    let syntax = set
-        .find_syntax_by_extension(extension)
-        .or_else(|| set.find_syntax_by_token(file_name))
-        .or_else(|| set.find_syntax_by_first_line(first_line))
+    let syntax = select_syntax(set, file_name, first_line)
         .unwrap_or_else(|| set.find_syntax_plain_text());
 
     let mut highlighter = HighlightLines::new(syntax, theme());
