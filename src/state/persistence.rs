@@ -1090,3 +1090,578 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod bounded_layout_tests {
+    use std::io::{self, Read};
+    use std::path::{Path, PathBuf};
+    use std::time::SystemTime;
+
+    use super::{
+        load_state_result_from_path_with_limit, load_state_result_with_reader,
+        read_state_bytes_with_limit, retry_layout_interrupted, save_state_to_path_with_limit,
+        serialize_state_with_limit, AppState, LegacyCanvasState, LegacyCanvasUiState,
+        StateLoadResult, WorkspaceDesktopState, WorkspaceState, APP_STATE_SCHEMA_VERSION,
+        MAX_LAYOUT_FILE_BYTES,
+    };
+    use crate::orchestration::{OrchestrationState, TaskCard, TaskState};
+    use crate::state::durable_write::{backup_path, BACKUP_SLOTS};
+
+    struct TempDirectory(PathBuf);
+
+    impl TempDirectory {
+        fn new() -> Self {
+            let path =
+                std::env::temp_dir().join(format!("tc-layout-bounded-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct ReadonlyGuard {
+        path: PathBuf,
+        original: std::fs::Permissions,
+    }
+
+    impl ReadonlyGuard {
+        fn new(path: &Path) -> Self {
+            let original = std::fs::metadata(path).unwrap().permissions();
+            let mut readonly = original.clone();
+            readonly.set_readonly(true);
+            std::fs::set_permissions(path, readonly).unwrap();
+            Self {
+                path: path.to_path_buf(),
+                original,
+            }
+        }
+    }
+
+    impl Drop for ReadonlyGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.path, self.original.clone());
+        }
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct Entry {
+        kind: &'static str,
+        bytes: Option<Vec<u8>>,
+        link: Option<PathBuf>,
+        modified: SystemTime,
+        readonly: bool,
+        #[cfg(unix)]
+        mode: u32,
+        #[cfg(unix)]
+        inode: u64,
+    }
+
+    fn snapshot(root: &Path) -> Vec<(PathBuf, Entry)> {
+        fn visit(root: &Path, path: &Path, entries: &mut Vec<(PathBuf, Entry)>) {
+            let metadata = std::fs::symlink_metadata(path).unwrap();
+            let is_link = metadata.file_type().is_symlink();
+            let kind = if is_link {
+                "link"
+            } else if metadata.is_file() {
+                "file"
+            } else if metadata.is_dir() {
+                "directory"
+            } else {
+                "special"
+            };
+            #[cfg(unix)]
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            entries.push((
+                path.strip_prefix(root).unwrap().to_path_buf(),
+                Entry {
+                    kind,
+                    bytes: (kind == "file").then(|| std::fs::read(path).unwrap()),
+                    link: is_link.then(|| std::fs::read_link(path).unwrap()),
+                    modified: metadata.modified().unwrap(),
+                    readonly: metadata.permissions().readonly(),
+                    #[cfg(unix)]
+                    mode: metadata.permissions().mode(),
+                    #[cfg(unix)]
+                    inode: metadata.ino(),
+                },
+            ));
+            if kind == "directory" {
+                for child in std::fs::read_dir(path).unwrap() {
+                    visit(root, &child.unwrap().path(), entries);
+                }
+            }
+        }
+        let mut entries = Vec::new();
+        visit(root, root, &mut entries);
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+        entries
+    }
+
+    fn sample_state(label: &str) -> AppState {
+        let workspace_id = uuid::Uuid::new_v4();
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-07T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        AppState {
+            schema_version: APP_STATE_SCHEMA_VERSION,
+            workspaces: vec![WorkspaceState {
+                id: workspace_id.to_string(),
+                name: format!("{label} café 🦀 \"quoted\"\r\nline\\path"),
+                cwd: Some(PathBuf::from("/synthetic/Unicode café")),
+                panels: Vec::new(),
+                desktop: WorkspaceDesktopState::default(),
+                legacy_canvas: LegacyCanvasState::default(),
+            }],
+            active_ws: 0,
+            sidebar_visible: true,
+            legacy_canvas_ui: LegacyCanvasUiState::default(),
+            local_device_id: "synthetic-layout-device".to_owned(),
+            trusted_devices: Vec::new(),
+            orchestration: OrchestrationState {
+                tasks: vec![TaskCard {
+                    id: uuid::Uuid::new_v4(),
+                    workspace_id,
+                    title: "Synthetic task 🦀".to_owned(),
+                    brief: "metadata \"quote\"\\path\r\nsecond line".to_owned(),
+                    state: TaskState::ReviewReady,
+                    provider_hint: None,
+                    session_ids: Vec::new(),
+                    conflict_risk: false,
+                    created_at: now,
+                    updated_at: now,
+                }],
+                ..OrchestrationState::default()
+            },
+        }
+    }
+
+    fn pretty_bytes(state: &AppState) -> Vec<u8> {
+        let mut bytes = serde_json::to_vec_pretty(state).unwrap();
+        bytes.push(b'\n');
+        assert!(bytes.len() < 32 * 1024, "fixtures must remain small");
+        bytes
+    }
+
+    struct ProbeReader<'a> {
+        bytes: &'a [u8],
+        offset: usize,
+        calls: usize,
+        interruptions: usize,
+        fail_at: Option<usize>,
+        failure_kind: io::ErrorKind,
+        max_read: usize,
+    }
+
+    impl<'a> ProbeReader<'a> {
+        fn new(bytes: &'a [u8]) -> Self {
+            Self {
+                bytes,
+                offset: 0,
+                calls: 0,
+                interruptions: 0,
+                fail_at: None,
+                failure_kind: io::ErrorKind::Other,
+                max_read: usize::MAX,
+            }
+        }
+    }
+
+    impl Read for ProbeReader<'_> {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if buffer.is_empty() {
+                return Ok(0);
+            }
+            self.calls += 1;
+            if self.interruptions > 0 {
+                self.interruptions -= 1;
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            if self.fail_at.is_some_and(|at| self.offset >= at) {
+                return Err(io::Error::new(
+                    self.failure_kind,
+                    "synthetic layout read failure",
+                ));
+            }
+            let before_failure = self
+                .fail_at
+                .map_or(usize::MAX, |at| at.saturating_sub(self.offset));
+            let count = buffer
+                .len()
+                .min(self.bytes.len() - self.offset)
+                .min(self.max_read)
+                .min(before_failure);
+            buffer[..count].copy_from_slice(&self.bytes[self.offset..self.offset + count]);
+            self.offset += count;
+            Ok(count)
+        }
+    }
+
+    fn expect_read_error(result: StateLoadResult, expected_path: &Path) -> String {
+        match result {
+            StateLoadResult::ReadError { path, error } => {
+                assert_eq!(path, expected_path);
+                error
+            }
+            other => panic!("unknown earlier snapshot must block fallback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bounded_layout_round_trip_counts_pretty_json_and_the_final_newline_exactly() {
+        assert_eq!(MAX_LAYOUT_FILE_BYTES, 16 * 1024 * 1024);
+        let directory = TempDirectory::new();
+        let path = directory.path().join("layout.json");
+        let state = sample_state("exact boundary");
+        let bytes = pretty_bytes(&state);
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(text.contains("café 🦀"));
+        assert!(text.contains("\\\"quoted\\\"\\r\\nline\\\\path"));
+        assert_eq!(bytes.last(), Some(&b'\n'));
+        assert_eq!(
+            serialize_state_with_limit(&state, bytes.len()).unwrap(),
+            bytes
+        );
+        save_state_to_path_with_limit(&path, &state, bytes.len()).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(
+            load_state_result_from_path_with_limit(&path, bytes.len()),
+            StateLoadResult::Loaded(state)
+        );
+    }
+
+    #[test]
+    fn bounded_layout_save_rejects_body_or_final_newline_overflow_before_any_io() {
+        let directory = TempDirectory::new();
+        let path = directory.path().join("layout.json");
+        let older = sample_state("older");
+        let older_bytes = pretty_bytes(&older);
+        std::fs::write(&path, &older_bytes).unwrap();
+        for slot in 0..BACKUP_SLOTS {
+            std::fs::write(backup_path(&path, slot), format!("backup {slot}")).unwrap();
+        }
+        let mut newer = sample_state("newer");
+        newer.orchestration.tasks[0].brief = "🦀\\\"\r\nmetadata".repeat(40);
+        let newer_bytes = pretty_bytes(&newer);
+        let before = snapshot(directory.path());
+        for limit in [newer_bytes.len() - 2, newer_bytes.len() - 1] {
+            let error = save_state_to_path_with_limit(&path, &newer, limit).unwrap_err();
+            assert!(format!("{error:#}").contains(&limit.to_string()));
+            assert_eq!(snapshot(directory.path()), before);
+            let absent = directory.path().join("not-created").join("layout.json");
+            assert!(save_state_to_path_with_limit(&absent, &newer, limit).is_err());
+            assert!(!absent.parent().unwrap().exists());
+            assert_eq!(snapshot(directory.path()), before);
+        }
+    }
+
+    #[test]
+    fn bounded_layout_missing_and_readable_invalid_snapshots_keep_ordered_fallback() {
+        let directory = TempDirectory::new();
+        let path = directory.path().join("layout.json");
+        let state = sample_state("compatible backup");
+        let bytes = pretty_bytes(&state);
+        assert_eq!(
+            load_state_result_from_path_with_limit(&path, bytes.len()),
+            StateLoadResult::MissingOrUnreadable
+        );
+        std::fs::write(&path, b"{invalid primary").unwrap();
+        std::fs::write(backup_path(&path, 1), b"[]").unwrap();
+        std::fs::write(backup_path(&path, 2), &bytes).unwrap();
+        let before = snapshot(directory.path());
+        assert_eq!(
+            load_state_result_from_path_with_limit(&path, bytes.len()),
+            StateLoadResult::Loaded(state)
+        );
+        assert_eq!(snapshot(directory.path()), before);
+    }
+
+    #[test]
+    fn bounded_layout_oversized_primary_blocks_readable_older_backups() {
+        let directory = TempDirectory::new();
+        let path = directory.path().join("layout.json");
+        let older = sample_state("older backup");
+        let older_bytes = pretty_bytes(&older);
+        let mut primary = sample_state("unknown larger primary");
+        primary.schema_version = APP_STATE_SCHEMA_VERSION + 10;
+        primary.orchestration.tasks[0].brief = "metadata café 🦀".repeat(100);
+        std::fs::write(&path, pretty_bytes(&primary)).unwrap();
+        std::fs::write(backup_path(&path, 0), &older_bytes).unwrap();
+        let before = snapshot(directory.path());
+        let error = expect_read_error(
+            load_state_result_from_path_with_limit(&path, older_bytes.len()),
+            &path,
+        );
+        assert!(error.contains(&older_bytes.len().to_string()));
+        assert_eq!(snapshot(directory.path()), before);
+    }
+
+    #[test]
+    fn bounded_layout_first_oversized_backup_blocks_later_compatible_snapshots() {
+        let directory = TempDirectory::new();
+        let path = directory.path().join("layout.json");
+        let older = sample_state("older later backup");
+        let older_bytes = pretty_bytes(&older);
+        let mut unread = sample_state("unknown earlier backup");
+        unread.orchestration.tasks[0].brief = "metadata".repeat(200);
+        let first = backup_path(&path, 0);
+        std::fs::write(&path, b"{invalid primary").unwrap();
+        std::fs::write(&first, pretty_bytes(&unread)).unwrap();
+        std::fs::write(backup_path(&path, 1), &older_bytes).unwrap();
+        let before = snapshot(directory.path());
+        expect_read_error(
+            load_state_result_from_path_with_limit(&path, older_bytes.len()),
+            &first,
+        );
+        assert_eq!(snapshot(directory.path()), before);
+    }
+
+    #[test]
+    fn bounded_layout_future_primary_or_backup_still_blocks_schema_downgrade() {
+        for future_in_backup in [false, true] {
+            let directory = TempDirectory::new();
+            let path = directory.path().join("layout.json");
+            let older = sample_state("compatible but older");
+            let older_bytes = pretty_bytes(&older);
+            let mut future = sample_state("future");
+            future.schema_version = APP_STATE_SCHEMA_VERSION + 2;
+            let future_bytes = pretty_bytes(&future);
+            let limit = older_bytes.len().max(future_bytes.len());
+            if future_in_backup {
+                std::fs::write(&path, b"{invalid primary").unwrap();
+                std::fs::write(backup_path(&path, 0), &future_bytes).unwrap();
+                std::fs::write(backup_path(&path, 1), &older_bytes).unwrap();
+            } else {
+                std::fs::write(&path, &future_bytes).unwrap();
+                std::fs::write(backup_path(&path, 0), &older_bytes).unwrap();
+            }
+            let before = snapshot(directory.path());
+            assert_eq!(
+                load_state_result_from_path_with_limit(&path, limit),
+                StateLoadResult::IncompatibleFuture {
+                    version: APP_STATE_SCHEMA_VERSION + 2
+                }
+            );
+            assert_eq!(snapshot(directory.path()), before);
+        }
+    }
+
+    #[test]
+    fn bounded_layout_legacy_migration_and_clamps_remain_available_within_limit() {
+        let directory = TempDirectory::new();
+        let path = directory.path().join("layout.json");
+        let legacy = serde_json::json!({
+            "workspaces": [{"id": "legacy-invalid-id", "name": "Legacy café 🦀",
+                "cwd": null, "panels": [], "viewport_pan": [2.0, 3.0],
+                "viewport_zoom": 1.5, "next_z": 7, "next_color": 2}],
+            "active_ws": 99,
+            "sidebar_visible": true,
+            "local_device_id": "legacy-device"
+        });
+        let bytes = serde_json::to_vec_pretty(&legacy).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        let before = snapshot(directory.path());
+        let loaded = match load_state_result_from_path_with_limit(&path, bytes.len()) {
+            StateLoadResult::Loaded(state) => state,
+            result => panic!("compatible bounded legacy layout must migrate: {result:?}"),
+        };
+        assert_eq!(loaded.schema_version, APP_STATE_SCHEMA_VERSION);
+        assert_eq!(loaded.active_ws, 0);
+        assert_eq!(loaded.workspaces[0].name, "Legacy café 🦀");
+        assert_eq!(loaded.workspaces[0].legacy_canvas.viewport_zoom, 1.5);
+        assert_eq!(loaded.workspaces[0].desktop.next_z, 7);
+        assert!(loaded.legacy_canvas_ui.show_grid);
+        assert!(!loaded.legacy_canvas_ui.show_minimap);
+        assert!(uuid::Uuid::parse_str(&loaded.workspaces[0].id).is_ok_and(|id| !id.is_nil()));
+        assert_eq!(snapshot(directory.path()), before);
+    }
+
+    #[test]
+    fn bounded_layout_huge_advertised_length_is_rejected_without_any_read() {
+        let mut reader = ProbeReader::new(b"{}");
+        let error = read_state_bytes_with_limit(&mut reader, u64::MAX, 32).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("32"));
+        assert_eq!(reader.calls, 0);
+        assert_eq!(reader.offset, 0);
+    }
+
+    #[test]
+    fn bounded_layout_growth_consumes_only_cap_plus_one_and_never_accepts_a_json_prefix() {
+        let directory = TempDirectory::new();
+        let path = directory.path().join("layout.json");
+        let state = sample_state("complete JSON prefix");
+        let bytes = pretty_bytes(&state);
+        let limit = bytes.len();
+        std::fs::write(&path, &bytes).unwrap();
+        std::fs::write(backup_path(&path, 0), &bytes).unwrap();
+        let before = snapshot(directory.path());
+        let mut grown = bytes.clone();
+        grown.extend_from_slice(&[b' '; 128]);
+        let mut reader = ProbeReader::new(&grown);
+        reader.max_read = 7;
+        let mut requested = Vec::new();
+        let result = load_state_result_with_reader(&path, |candidate| {
+            requested.push(candidate.to_path_buf());
+            assert_eq!(candidate, path);
+            read_state_bytes_with_limit(&mut reader, limit as u64, limit).map(Some)
+        });
+        expect_read_error(result, &path);
+        assert_eq!(requested, vec![path.clone()]);
+        assert_eq!(reader.offset, limit + 1);
+        assert!(reader.offset < grown.len());
+        assert_eq!(snapshot(directory.path()), before);
+    }
+
+    #[test]
+    fn bounded_layout_reader_retries_interrupted_calls_and_preserves_other_io_errors() {
+        let bytes = b"synthetic JSON bytes";
+        let mut interrupted = ProbeReader::new(bytes);
+        interrupted.interruptions = 2;
+        interrupted.max_read = 3;
+        assert_eq!(
+            read_state_bytes_with_limit(&mut interrupted, bytes.len() as u64, bytes.len()).unwrap(),
+            bytes
+        );
+        assert_eq!(interrupted.interruptions, 0);
+        let mut calls = 0;
+        assert_eq!(
+            retry_layout_interrupted(|| {
+                calls += 1;
+                if calls < 3 {
+                    Err(io::ErrorKind::Interrupted.into())
+                } else {
+                    Ok(42)
+                }
+            })
+            .unwrap(),
+            42
+        );
+        assert_eq!(calls, 3);
+        for kind in [
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::NotFound,
+            io::ErrorKind::Other,
+        ] {
+            for fail_at in [0, 5, bytes.len()] {
+                let mut failed = ProbeReader::new(bytes);
+                failed.fail_at = Some(fail_at);
+                failed.failure_kind = kind;
+                failed.max_read = 3;
+                let error =
+                    read_state_bytes_with_limit(&mut failed, bytes.len() as u64, bytes.len())
+                        .unwrap_err();
+                assert_eq!(error.kind(), kind);
+                assert!(error.to_string().contains("synthetic layout read failure"));
+            }
+        }
+    }
+
+    #[test]
+    fn bounded_layout_error_after_complete_json_does_not_become_missing_or_backup_fallback() {
+        let directory = TempDirectory::new();
+        let path = directory.path().join("layout.json");
+        let state = sample_state("newer complete but unverified");
+        let bytes = pretty_bytes(&state);
+        std::fs::write(&path, &bytes).unwrap();
+        std::fs::write(backup_path(&path, 0), pretty_bytes(&sample_state("older"))).unwrap();
+        let before = snapshot(directory.path());
+        for kind in [io::ErrorKind::NotFound, io::ErrorKind::PermissionDenied] {
+            let mut failed = ProbeReader::new(&bytes);
+            failed.fail_at = Some(bytes.len());
+            failed.failure_kind = kind;
+            let mut requested = Vec::new();
+            let result = load_state_result_with_reader(&path, |candidate| {
+                requested.push(candidate.to_path_buf());
+                assert_eq!(candidate, path);
+                read_state_bytes_with_limit(&mut failed, bytes.len() as u64, bytes.len()).map(Some)
+            });
+            let error = expect_read_error(result, &path);
+            assert!(error.contains("synthetic layout read failure"));
+            assert_eq!(failed.offset, bytes.len());
+            assert_eq!(requested, vec![path.clone()]);
+            assert_eq!(snapshot(directory.path()), before);
+        }
+    }
+
+    #[test]
+    fn bounded_layout_zero_and_overflowing_sentinel_limits_do_not_read_unbounded_data() {
+        let mut empty = ProbeReader::new(b"");
+        assert!(read_state_bytes_with_limit(&mut empty, 0, 0)
+            .unwrap()
+            .is_empty());
+        let mut nonempty = ProbeReader::new(b"xx");
+        assert_eq!(
+            read_state_bytes_with_limit(&mut nonempty, 0, 0)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(nonempty.offset, 1);
+        let mut invalid = ProbeReader::new(b"xx");
+        assert_eq!(
+            read_state_bytes_with_limit(&mut invalid, 0, usize::MAX)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(invalid.calls, 0);
+    }
+
+    #[test]
+    fn bounded_layout_non_regular_primary_or_backup_is_an_unknown_earlier_snapshot() {
+        for invalid_in_backup in [false, true] {
+            let directory = TempDirectory::new();
+            let path = directory.path().join("layout.json");
+            let state = sample_state("older readable");
+            let bytes = pretty_bytes(&state);
+            let invalid = if invalid_in_backup {
+                std::fs::write(&path, b"{invalid primary").unwrap();
+                std::fs::write(backup_path(&path, 1), &bytes).unwrap();
+                backup_path(&path, 0)
+            } else {
+                std::fs::write(backup_path(&path, 0), &bytes).unwrap();
+                path.clone()
+            };
+            std::fs::create_dir(&invalid).unwrap();
+            std::fs::write(invalid.join("keep"), b"metadata").unwrap();
+            let before = snapshot(directory.path());
+            expect_read_error(
+                load_state_result_from_path_with_limit(&path, bytes.len()),
+                &invalid,
+            );
+            assert_eq!(snapshot(directory.path()), before);
+        }
+    }
+
+    #[test]
+    fn bounded_layout_rejections_preserve_readonly_primary_and_backup_metadata() {
+        let directory = TempDirectory::new();
+        let path = directory.path().join("layout.json");
+        let backup = backup_path(&path, 0);
+        let older = sample_state("readonly backup");
+        let older_bytes = pretty_bytes(&older);
+        let mut larger = sample_state("readonly primary");
+        larger.orchestration.tasks[0].brief = "larger metadata".repeat(100);
+        let larger_bytes = pretty_bytes(&larger);
+        std::fs::write(&path, &larger_bytes).unwrap();
+        std::fs::write(&backup, &older_bytes).unwrap();
+        let _main_readonly = ReadonlyGuard::new(&path);
+        let _backup_readonly = ReadonlyGuard::new(&backup);
+        let before = snapshot(directory.path());
+        expect_read_error(
+            load_state_result_from_path_with_limit(&path, older_bytes.len()),
+            &path,
+        );
+        assert!(save_state_to_path_with_limit(&path, &larger, larger_bytes.len() - 1).is_err());
+        assert_eq!(snapshot(directory.path()), before);
+    }
+}
