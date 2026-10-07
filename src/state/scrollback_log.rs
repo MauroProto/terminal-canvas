@@ -167,17 +167,48 @@ pub fn reset_log(path: &Path, generation: u32) -> std::io::Result<()> {
 /// Appendea bytes de frames al log. Si el archivo no existe, lo crea con
 /// header de generation 0 primero.
 pub fn append_frames(path: &Path, frames_bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::{Seek, SeekFrom, Write};
+    use std::io::Write;
+    append_frames_with(path, frames_bytes, |file, bytes| {
+        file.write_all(bytes)?;
+        // Only acknowledge bytes after the entire batch has been flushed.
+        file.sync_data()
+    })
+}
+
+fn append_frames_with(
+    path: &Path,
+    frames_bytes: &[u8],
+    append: impl FnOnce(&mut std::fs::File, &[u8]) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    use std::io::{Seek, SeekFrom};
+    let mut incoming = encode_header(0);
+    incoming.extend_from_slice(frames_bytes);
+    let (_, incoming_frames, incoming_len) = read_frames_with_valid_len(&incoming)
+        .filter(|(_, _, valid_len)| *valid_len == incoming.len())
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "incomplete log batch")
+        })?;
+    debug_assert_eq!(incoming_len, incoming.len());
     if !path.exists() {
         crate::state::durable_write::write_atomic(path, &encode_header(0))?;
     }
     let bytes = std::fs::read(path)?;
-    let Some((_, _, valid_len)) = read_frames_with_valid_len(&bytes) else {
+    let Some((_, existing_frames, valid_len)) = read_frames_with_valid_len(&bytes) else {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "log incremental inválido",
         ));
     };
+    if let (Some(last), Some(first)) = (existing_frames.last(), incoming_frames.first()) {
+        if last.seq.checked_add(1) != Some(first.seq) {
+            // A failed rollback must never let a retry corrupt the previously
+            // accepted prefix by appending an already written sequence again.
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "log batch does not continue the durable sequence",
+            ));
+        }
+    }
     // Windows append-only access cannot truncate a torn frame. The single
     // durable writer repairs it with write access, then seeks to the new EOF.
     let mut file = std::fs::OpenOptions::new().write(true).open(path)?;
@@ -185,10 +216,23 @@ pub fn append_frames(path: &Path, frames_bytes: &[u8]) -> std::io::Result<()> {
         file.set_len(valid_len as u64)?;
     }
     file.seek(SeekFrom::End(0))?;
-    file.write_all(frames_bytes)?;
-    // El autosave afirma durabilidad frente a crash/power loss, no sólo que
-    // los bytes llegaron al page cache del proceso.
-    file.sync_data()
+    if let Err(error) = append(&mut file, frames_bytes) {
+        // RAM retains the whole unacknowledged batch. Remove even complete
+        // frames from a failed attempt so retrying it cannot duplicate output.
+        // If rollback also fails, report both errors and retain a valid old
+        // prefix; the sequence check above refuses an unsafe later append.
+        if let Err(rollback) = file
+            .set_len(valid_len as u64)
+            .and_then(|()| file.sync_data())
+        {
+            return Err(std::io::Error::new(
+                error.kind(),
+                format!("{error}; rolling back the log append also failed: {rollback}"),
+            ));
+        }
+        return Err(error);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -331,6 +375,88 @@ mod tests {
         bytes.extend_from_slice(&encode_frame(10, FrameKind::Output, b"uno"));
         bytes.extend_from_slice(&encode_frame(12, FrameKind::Output, b"tres"));
         assert!(read_frames(&bytes).is_none());
+    }
+
+    #[test]
+    fn a_failed_partial_append_can_be_retried_without_losing_or_duplicating_frames() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("mtlg-partial-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("panel.mtlg");
+        append_frames(
+            &path,
+            &encode_frame(1, FrameKind::Output, b"already durable"),
+        )
+        .unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let first = encode_frame(2, FrameKind::Output, b"new complete frame");
+        let mut batch = first.clone();
+        batch.extend_from_slice(&encode_frame(3, FrameKind::Output, b"second new frame"));
+        let error = super::append_frames_with(&path, &batch, |file, bytes| {
+            file.write_all(&bytes[..first.len() + 5])?;
+            Err(std::io::Error::other("injected partial write failure"))
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+
+        append_frames(&path, &batch).unwrap();
+        let (_, frames) = read_frames(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            frames
+                .iter()
+                .map(|frame| (frame.seq, frame.payload.as_slice()))
+                .collect::<Vec<_>>(),
+            vec![
+                (1, b"already durable".as_slice()),
+                (2, b"new complete frame".as_slice()),
+                (3, b"second new frame".as_slice())
+            ]
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_failed_flush_removes_the_unacknowledged_batch_before_retry() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("mtlg-flush-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("panel.mtlg");
+        append_frames(&path, &encode_frame(10, FrameKind::Output, b"previous")).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let batch = encode_frame(11, FrameKind::Output, b"new output");
+        assert!(super::append_frames_with(&path, &batch, |file, bytes| {
+            file.write_all(bytes)?;
+            Err(std::io::Error::other("injected sync failure"))
+        })
+        .is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        append_frames(&path, &batch).unwrap();
+        let (_, frames) = read_frames(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[1].payload, b"new output");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn rejected_batches_never_mutate_a_valid_log() {
+        let dir = std::env::temp_dir().join(format!("mtlg-invalid-batch-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("panel.mtlg");
+        append_frames(&path, &encode_frame(41, FrameKind::Output, b"keep")).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        for batch in [
+            encode_frame(41, FrameKind::Output, b"duplicate"),
+            encode_frame(43, FrameKind::Output, b"gap"),
+            encode_frame(42, FrameKind::Output, b"torn")[..14].to_vec(),
+        ] {
+            assert_eq!(
+                append_frames(&path, &batch).unwrap_err().kind(),
+                std::io::ErrorKind::InvalidData
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
