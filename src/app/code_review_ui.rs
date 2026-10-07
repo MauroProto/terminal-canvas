@@ -381,7 +381,8 @@ impl TerminalApp {
                         "Enviar {pending_count} nota{}",
                         if pending_count == 1 { "" } else { "s" }
                     );
-                    if ui.small_button(&send_label).clicked() {
+                    let notes_ready = self.code_review.as_ref().is_some_and(|state| state.notes_ready);
+                    if ui.add_enabled(notes_ready, egui::Button::new(&send_label).small()).clicked() {
                         self.begin_note_send();
                     }
                 }
@@ -440,13 +441,7 @@ impl TerminalApp {
         let (loading, failed, file_count) = self
             .code_review
             .as_ref()
-            .map(|state| {
-                (
-                    state.loading || state.notes_loading,
-                    state.failed,
-                    state.files.len(),
-                )
-            })
+            .map(|state| (state.loading, state.failed, state.files.len()))
             .unwrap_or_default();
 
         if loading {
@@ -483,6 +478,7 @@ impl TerminalApp {
             return;
         };
         let notes = state.notes.notes.clone();
+        let notes_ready = state.notes_ready;
         let mut actions = Vec::new();
         ScrollArea::vertical()
             .id_salt("review-all-notes")
@@ -491,7 +487,11 @@ impl TerminalApp {
             .show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
                 if notes.is_empty() {
-                    ui.label("No hay notas guardadas para este repositorio.");
+                    ui.label(if notes_ready {
+                        "No hay notas guardadas para este repositorio."
+                    } else {
+                        "Las notas todavía no se pudieron cargar."
+                    });
                 }
                 for note in &notes {
                     let stale = self.code_review.as_ref().is_some_and(|state| {
@@ -517,13 +517,17 @@ impl TerminalApp {
                             .and_then(|state| state.editing_note.as_mut())
                             .filter(|edit| edit.note_id == Some(note.id));
                         if let Some(edit) = editing {
-                            ui.add(
+                            ui.add_enabled(
+                                notes_ready,
                                 egui::TextEdit::multiline(&mut edit.body)
                                     .desired_width(f32::INFINITY)
                                     .desired_rows(3),
                             );
                             ui.horizontal(|ui| {
-                                if ui.button("Guardar nota").clicked() {
+                                if ui
+                                    .add_enabled(notes_ready, egui::Button::new("Guardar nota"))
+                                    .clicked()
+                                {
                                     actions.push(NoteAction::SaveEditor);
                                 }
                                 if ui.button("Cancelar edición").clicked() {
@@ -533,10 +537,22 @@ impl TerminalApp {
                         } else {
                             ui.label(&note.body);
                             ui.horizontal(|ui| {
-                                if ui.small_button("Editar nota").clicked() {
+                                if ui
+                                    .add_enabled(
+                                        notes_ready,
+                                        egui::Button::new("Editar nota").small(),
+                                    )
+                                    .clicked()
+                                {
                                     actions.push(NoteAction::Edit(note.id));
                                 }
-                                if ui.small_button("Eliminar nota").clicked() {
+                                if ui
+                                    .add_enabled(
+                                        notes_ready,
+                                        egui::Button::new("Eliminar nota").small(),
+                                    )
+                                    .clicked()
+                                {
                                     actions.push(NoteAction::Delete(note.id));
                                 }
                                 if note.sent_at.is_some() {
@@ -641,6 +657,10 @@ impl TerminalApp {
     }
 
     fn code_review_diff_view(&mut self, ui: &mut egui::Ui, height: f32) {
+        let notes_ready = self
+            .code_review
+            .as_ref()
+            .is_some_and(|state| state.notes_ready);
         let (file, notes, editing): (
             Option<FileDiff>,
             Vec<crate::orchestration::DiffNote>,
@@ -655,7 +675,7 @@ impl TerminalApp {
                         .get(state.selected.min(state.files.len().saturating_sub(1)))
                         .cloned(),
                     state.notes.notes.clone(),
-                    state.editing_note.clone(),
+                    state.editing_note.clone().filter(|_| state.notes_ready),
                 )
             })
             .unwrap_or_default();
@@ -741,8 +761,16 @@ impl TerminalApp {
                                             ),
                                             vec2(14.0, 14.0),
                                         );
-                                        let response = ui.allocate_rect(plus_rect, Sense::click());
-                                        if response.hovered() || response.clicked() {
+                                        let response = ui.allocate_rect(
+                                            plus_rect,
+                                            if notes_ready {
+                                                Sense::click()
+                                            } else {
+                                                Sense::hover()
+                                            },
+                                        );
+                                        if notes_ready && (response.hovered() || response.clicked())
+                                        {
                                             ui.painter().circle_filled(
                                                 plus_rect.center(),
                                                 6.5,
@@ -771,6 +799,7 @@ impl TerminalApp {
                                         row_rect,
                                         note,
                                         note_is_stale(note, Some(&file)),
+                                        notes_ready,
                                         &mut actions,
                                     );
                                 }
@@ -1619,6 +1648,7 @@ fn draw_note_row(
     rect: egui::Rect,
     note: &crate::orchestration::DiffNote,
     stale: bool,
+    editable: bool,
     actions: &mut Vec<NoteAction>,
 ) {
     let response = ui.allocate_rect(rect, Sense::hover());
@@ -1666,7 +1696,7 @@ fn draw_note_row(
         font,
         palette::TEXT,
     );
-    if response.hovered() {
+    if editable && response.hovered() {
         let edit_rect = egui::Rect::from_center_size(
             pos2(rect.right() - 76.0, rect.center().y),
             vec2(56.0, 18.0),
