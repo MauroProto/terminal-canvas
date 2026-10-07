@@ -228,19 +228,23 @@ impl TerminalApp {
                 ui.style_mut().interaction.selectable_labels = false;
                 // Borde izquierdo que separa el código del canvas.
                 let panel_rect = ui.max_rect();
-                if let Some(pointer) = ctx.input(|input| {
-                    input
-                        .pointer
-                        .primary_pressed()
+                let already_focused = file_viewer_selection::viewer_has_keyboard_focus(&ctx);
+                let focus_requested = ctx.input(|input| {
+                    (input.pointer.primary_pressed()
+                        || (input.pointer.primary_released() && already_focused))
                         .then(|| input.pointer.interact_pos())
                         .flatten()
-                }) {
-                    if can_focus && panel_rect.contains(pointer) {
-                        file_viewer_selection::request_keyboard_focus(&ctx);
-                    } else {
+                });
+                let focus_requested = if let Some(pointer) = focus_requested {
+                    if !panel_rect.contains(pointer)
+                        && ctx.input(|input| input.pointer.primary_pressed())
+                    {
                         file_viewer_selection::release_keyboard_focus(&ctx);
                     }
-                }
+                    can_focus && panel_rect.contains(pointer)
+                } else {
+                    false
+                };
 
                 // Soltar un archivo sobre el visor lo abre (si el puntero
                 // está dentro de la región del panel).
@@ -279,7 +283,11 @@ impl TerminalApp {
                             ui.disable();
                         }
                         let rect = ui.available_rect_before_wrap();
-                        file_viewer_selection::register_placeholder_keyboard_owner(ui, rect);
+                        file_viewer_selection::register_placeholder_keyboard_owner(
+                            ui,
+                            rect,
+                            focus_requested,
+                        );
                     });
                 }
 
@@ -312,7 +320,7 @@ impl TerminalApp {
                 if !can_focus {
                     ui.disable();
                 }
-                draw_code(ui, viewer);
+                draw_code(ui, viewer, focus_requested);
             });
 
         if close {
@@ -407,7 +415,7 @@ fn draw_header(
     ui.add_space(6.0);
 }
 
-fn draw_code(ui: &mut egui::Ui, viewer: &mut FileViewerState) {
+fn draw_code(ui: &mut egui::Ui, viewer: &mut FileViewerState, focus_requested: bool) {
     let Some(document) = &viewer.document else {
         return;
     };
@@ -424,6 +432,7 @@ fn draw_code(ui: &mut egui::Ui, viewer: &mut FileViewerState) {
         &mut viewer.selection,
         &viewer.highlighted,
         style,
+        focus_requested,
     );
 }
 
@@ -654,7 +663,10 @@ mod tests {
     #[test]
     fn loading_binary_and_error_headers_keep_focus_until_escape() {
         use egui::{Event, Modifiers, PointerButton, RawInput};
-        for kind in ["loading", "binary", "error"] {
+        for (kind, idle_frames) in ["loading", "binary", "error"]
+            .into_iter()
+            .flat_map(|kind| [0, 2].map(|idle_frames| (kind, idle_frames)))
+        {
             let ctx = egui::Context::default();
             let mut app = detached_app(&ctx);
             let mut viewer = super::loading_file_state("placeholder.txt".into());
@@ -693,21 +705,43 @@ mod tests {
                     _ => None,
                 })
                 .expect("viewer header");
+            let terminal_point = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::epaint::Shape::Text(text) if text.galley.text() == "Terminal area" => {
+                        Some(text.pos + text.galley.size() * 0.5)
+                    }
+                    _ => None,
+                })
+                .expect("terminal area");
             output.drop_without_applying_deltas();
-            for pressed in [true, false] {
-                frame(vec![
-                    Event::PointerMoved(point),
-                    Event::PointerButton {
-                        pos: point,
-                        button: PointerButton::Primary,
-                        pressed,
-                        modifiers: Modifiers::NONE,
-                    },
-                ])
-                .drop_without_applying_deltas();
+            for (interaction, start, end, expected_focus) in [
+                ("header click", point, point, true),
+                ("drag from terminal", terminal_point, point, false),
+                ("header reactivation", point, point, true),
+            ] {
+                for (point, pressed) in [(start, true), (end, false)] {
+                    frame(vec![
+                        Event::PointerMoved(point),
+                        Event::PointerButton {
+                            pos: point,
+                            button: PointerButton::Primary,
+                            pressed,
+                            modifiers: Modifiers::NONE,
+                        },
+                    ])
+                    .drop_without_applying_deltas();
+                    assert_eq!(
+                        super::file_viewer_selection::viewer_has_keyboard_focus(&ctx),
+                        expected_focus,
+                        "{kind}: {interaction} (pressed={pressed})"
+                    );
+                }
             }
-            frame(Vec::new()).drop_without_applying_deltas();
-            frame(Vec::new()).drop_without_applying_deltas();
+            for _ in 0..idle_frames {
+                frame(Vec::new()).drop_without_applying_deltas();
+            }
             assert!(
                 super::file_viewer_selection::viewer_has_keyboard_focus(&ctx),
                 "{kind}"
@@ -753,7 +787,7 @@ mod tests {
                     focused: true,
                     ..Default::default()
                 },
-                |ui| super::draw_code(ui, &mut viewer),
+                |ui| super::draw_code(ui, &mut viewer, false),
             );
             // This headless test inspects UI output rather than uploading fonts.
             output.textures_delta.clear();

@@ -32,15 +32,26 @@ pub(super) fn release_keyboard_focus(ctx: &egui::Context) {
 
 pub(super) fn request_keyboard_focus(ctx: &egui::Context) {
     if ctx.input(|input| input.raw.focused) {
-        ctx.memory_mut(|memory| memory.request_focus(owner_id()));
+        ctx.memory_mut(|memory| {
+            if !memory.has_focus(owner_id()) {
+                memory.request_focus(owner_id());
+            }
+        });
     }
 }
 
-pub(super) fn register_placeholder_keyboard_owner(ui: &mut egui::Ui, rect: Rect) -> egui::Response {
+pub(super) fn register_placeholder_keyboard_owner(
+    ui: &mut egui::Ui,
+    rect: Rect,
+    focus_requested: bool,
+) -> egui::Response {
     if !ui.is_enabled() || !ui.input(|input| input.raw.focused) {
         release_keyboard_focus(ui.ctx());
     }
     let response = ui.interact(rect, owner_id(), Sense::click());
+    if ui.is_enabled() && focus_requested {
+        request_keyboard_focus(ui.ctx());
+    }
     response.widget_info(|| {
         egui::WidgetInfo::labeled(
             egui::WidgetType::TextEdit,
@@ -582,6 +593,7 @@ pub(super) fn draw_widget(
     state: &mut SelectionState,
     highlighted: &[HighlightedLine],
     style: ViewerStyle,
+    focus_requested: bool,
 ) -> WidgetOutput {
     let ctx = ui.ctx().clone();
     let allow_input = ui.is_enabled() && ctx.input(|input| input.raw.focused);
@@ -637,6 +649,12 @@ pub(super) fn draw_widget(
             owner_id(),
             Sense::click_and_drag(),
         );
+        // egui can surrender this Id while registering its smaller body rect
+        // after a header click. Restore the panel's explicit focus request
+        // after registration, before keyboard ownership is evaluated.
+        if allow_input && focus_requested {
+            request_keyboard_focus(&ctx);
+        }
         owner.widget_info(|| {
             egui::WidgetInfo::labeled(
                 egui::WidgetType::TextEdit,
@@ -1014,6 +1032,7 @@ mod tests {
                                 &mut self.state,
                                 &[],
                                 ViewerStyle::default(),
+                                false,
                             )
                         })
                         .inner,
@@ -1274,6 +1293,15 @@ mod tests {
             let copied = harness.click(button);
             assert_eq!(copied.copied(), vec![expected]);
             copied.discard();
+            // egui hit-tests the previous pass's widgets. Let the closed
+            // popup disappear before issuing another right-click at its
+            // former anchor, otherwise that synthetic press hits the menu.
+            let closed = harness.settled();
+            assert!(
+                closed.report.menu_buttons.is_empty(),
+                "copy closes the menu"
+            );
+            closed.discard();
         }
     }
 
