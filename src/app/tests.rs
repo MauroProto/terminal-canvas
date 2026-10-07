@@ -1506,6 +1506,86 @@ fn taskbar_reveals_a_focused_terminal_beyond_the_window_width() {
 }
 
 #[test]
+fn docked_panels_share_the_root_ui_and_overlays_keep_the_remaining_canvas_bounds() {
+    let ctx = egui::Context::default();
+    let mut app = super::TerminalApp::new_for_tests(&ctx);
+    app.sidebar_visible = true;
+    app.onboarding_dismissed = true;
+    assert!(app.ws().panels[0].runtime_session_id().is_none());
+    let panel_id = app.ws().panels[0].id();
+    app.file_viewer = Some(super::file_viewer_ui::FileViewerState {
+        path: "layout.rs".into(),
+        lines: vec!["fn main() {}".into()],
+        truncated: false,
+        binary: false,
+        highlighted: Vec::new(),
+        highlight_token: None,
+        language: None,
+        loading: false,
+    });
+    app.command_palette.toggle();
+    let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(1400.0, 900.0));
+    let sidebar = Rect::from_min_max(screen.min, pos2(228.0, 900.0));
+    let taskbar = Rect::from_min_max(pos2(228.0, 856.0), screen.max);
+    let viewer = Rect::from_min_max(pos2(780.0, 0.0), pos2(1400.0, 856.0));
+    let canvas = Rect::from_min_max(pos2(228.0, 0.0), pos2(780.0, 856.0));
+
+    for _ in 0..2 {
+        let mut output = ctx.run_ui(
+            RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ui| app.ui_impl(ui),
+        );
+        // Clear before assertions too: a bounds regression should report
+        // its assertion, rather than panic again while dropping font deltas.
+        output.textures_delta.clear();
+        let regions = [
+            ("sidebar", sidebar, crate::theme::colors::INK),
+            ("taskbar", taskbar, crate::theme::colors::INK),
+            ("viewer", viewer, super::code_highlight::theme_background()),
+            ("canvas", canvas, crate::canvas::config::CANVAS_BG),
+        ]
+        .map(|(label, expected, fill)| {
+            let index = last_rect_shape_index(&output.shapes, expected, fill)
+                .unwrap_or_else(|| panic!("{label} must occupy {expected:?}"));
+            let egui::epaint::Shape::Rect(shape) = &output.shapes[index].shape else {
+                unreachable!();
+            };
+            assert!(
+                screen.contains_rect(shape.rect),
+                "{label} escaped the window"
+            );
+            (label, shape.rect)
+        });
+        for (index, (label, region)) in regions.iter().enumerate() {
+            for (other_label, other) in &regions[index + 1..] {
+                let overlap = region.intersect(*other);
+                assert!(
+                    overlap.width() <= 0.0 || overlap.height() <= 0.0,
+                    "{label} overlaps {other_label}: {overlap:?}"
+                );
+            }
+        }
+        let taskbar_button = app.taskbar_button_rects.get(&panel_id).unwrap();
+        assert!(taskbar.contains_rect(*taskbar_button));
+        // This overlay uses the canvas rect saved before CentralPanel takes
+        // the root cursor. Capturing it afterwards collapses the backdrop.
+        assert!(
+            last_rect_shape_index(
+                &output.shapes,
+                canvas,
+                Color32::from_rgba_premultiplied(0, 0, 0, 150),
+            )
+            .is_some(),
+            "the palette backdrop must cover only the usable canvas"
+        );
+        output.drop_without_applying_deltas();
+    }
+}
+
+#[test]
 fn docked_viewer_switches_keyboard_ownership_by_pointer_and_escape() {
     use egui_kittest::{kittest::Queryable, Harness};
     let ctx = egui::Context::default();
