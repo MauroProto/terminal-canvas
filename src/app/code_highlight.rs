@@ -107,17 +107,36 @@ pub fn highlight_text(file_name: &str, text: &str) -> Vec<HighlightedLine> {
 
     let mut highlighter = HighlightLines::new(syntax, theme());
     let mut out = Vec::new();
-    for line in text.lines().take(MAX_HIGHLIGHT_LINES) {
+    // Las gramáticas de extra_newlines consumen los terminadores para cerrar
+    // comentarios y strings de una sola línea. El parser recibe el texto real;
+    // sólo la representación visible omite LF/CRLF, igual que str::lines().
+    for line in text.split_inclusive('\n').take(MAX_HIGHLIGHT_LINES) {
+        let visible_line = line
+            .strip_suffix('\n')
+            .map(|without_lf| without_lf.strip_suffix('\r').unwrap_or(without_lf))
+            .unwrap_or(line);
         match highlighter.highlight_line(line, set) {
-            Ok(ranges) => out.push(
-                ranges
-                    .into_iter()
-                    .map(|(style, piece)| (syntect_color(style.foreground), piece.to_owned()))
-                    .collect(),
-            ),
+            Ok(ranges) => {
+                let mut spans = Vec::new();
+                let mut offset = 0;
+                for (style, piece) in ranges {
+                    // El terminador puede estar en otro tramo, o compartirlo
+                    // con código. Recortar por posición evita quitar caracteres
+                    // de contenido, como un CR sin LF al final del archivo.
+                    let visible_len = visible_line.len().saturating_sub(offset).min(piece.len());
+                    if visible_len > 0 {
+                        spans.push((
+                            syntect_color(style.foreground),
+                            piece[..visible_len].to_owned(),
+                        ));
+                    }
+                    offset += piece.len();
+                }
+                out.push(spans);
+            }
             // Si una línea falla (regex patológica), sigue en texto plano en
             // vez de tirar abajo el resaltado del archivo entero.
-            Err(_) => out.push(vec![(theme_foreground(), line.to_owned())]),
+            Err(_) => out.push(vec![(theme_foreground(), visible_line.to_owned())]),
         }
     }
     out
@@ -239,6 +258,74 @@ mod tests {
         let lines = highlight_text("main.rs", source);
         let rebuilt: Vec<String> = lines.iter().map(|line| joined(line)).collect();
         assert_eq!(rebuilt, vec!["fn main() {", "    let x = 42; // nota", "}"]);
+    }
+
+    #[test]
+    fn highlighting_preserves_visible_lines_for_lf_crlf_unicode_and_eof() {
+        for source in [
+            "",
+            "\n",
+            "\r\n",
+            "\n\n",
+            "const título = \"café 🐈\";\r\n\r\nconst final = 3;",
+            "const título = \"café 🐈\";\n\nconst final = 3;\n",
+            "sin terminador",
+            "un CR de contenido al final\r",
+            "un CR\ren medio\n",
+        ] {
+            let highlighted = highlight_text("example.js", source);
+            let rebuilt: Vec<String> = highlighted.iter().map(|line| joined(line)).collect();
+            let expected: Vec<String> = source.lines().map(str::to_owned).collect();
+            assert_eq!(rebuilt, expected, "source: {source:?}");
+        }
+    }
+
+    #[test]
+    fn a_javascript_line_comment_does_not_colour_the_next_line() {
+        let code = "const value = 42;";
+        for ending in ["\n", "\r\n"] {
+            let source = format!("// comentario{ending}{code}{ending}");
+            let lines = highlight_text("example.js", &source);
+            let independent = highlight_text("example.js", &format!("{code}{ending}"));
+            assert_eq!(
+                lines[1], independent[0],
+                "comment state leaked past {ending:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unclosed_javascript_string_ends_at_the_line_ending() {
+        let code = "const value = 42;";
+        for quote in ["'", "\""] {
+            for ending in ["\n", "\r\n"] {
+                let source = format!("{quote}sin cerrar{ending}{code}");
+                let lines = highlight_text("example.js", &source);
+                let independent = highlight_text("example.js", code);
+                assert_eq!(
+                    lines[1], independent[0],
+                    "string state leaked past {ending:?} with quote {quote:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_javascript_template_string_keeps_its_multiline_context() {
+        let code = "const value = 42;";
+        for ending in ["\n", "\r\n"] {
+            let source = format!("const message = `uno{ending}{code}{ending}`;{ending}{code}");
+            let lines = highlight_text("example.js", &source);
+            let independent = highlight_text("example.js", code);
+            assert_ne!(
+                lines[1], independent[0],
+                "a real multiline string lost its context at {ending:?}"
+            );
+            assert_eq!(
+                lines[3], independent[0],
+                "template string state leaked past the closing backtick"
+            );
+        }
     }
 
     #[test]
