@@ -6,8 +6,8 @@
 //! congelaría el frame al abrir un archivo. El visor muestra el texto plano al
 //! instante y cambia a la versión coloreada cuando el worker la entrega.
 
-use std::sync::mpsc::{Receiver, Sender};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use egui::Color32;
 use syntect::easy::HighlightLines;
@@ -96,6 +96,19 @@ pub fn detect_language(file_name: &str, first_line: &str) -> Option<String> {
 
 /// Resalta el texto completo. Pensado para correr fuera del hilo de UI.
 pub fn highlight_text(file_name: &str, text: &str) -> Vec<HighlightedLine> {
+    highlight_text_cancelable(file_name, text, &|| false).unwrap_or_default()
+}
+
+/// Cancelar entre líneas conserva el estado multilínea de la gramática. No
+/// interrumpe una regex que ya está ejecutándose sobre la línea actual.
+fn highlight_text_cancelable(
+    file_name: &str,
+    text: &str,
+    cancelled: &dyn Fn() -> bool,
+) -> Option<Vec<HighlightedLine>> {
+    if cancelled() {
+        return None;
+    }
     let set = syntax_set();
     let first_line = text.lines().next().unwrap_or_default();
     let extension = file_name.rsplit('.').next().unwrap_or_default();
@@ -111,6 +124,9 @@ pub fn highlight_text(file_name: &str, text: &str) -> Vec<HighlightedLine> {
     // comentarios y strings de una sola línea. El parser recibe el texto real;
     // sólo la representación visible omite LF/CRLF, igual que str::lines().
     for line in text.split_inclusive('\n').take(MAX_HIGHLIGHT_LINES) {
+        if cancelled() {
+            return None;
+        }
         let visible_line = line
             .strip_suffix('\n')
             .map(|without_lf| without_lf.strip_suffix('\r').unwrap_or(without_lf))
@@ -139,7 +155,7 @@ pub fn highlight_text(file_name: &str, text: &str) -> Vec<HighlightedLine> {
             Err(_) => out.push(vec![(theme_foreground(), visible_line.to_owned())]),
         }
     }
-    out
+    (!cancelled()).then_some(out)
 }
 
 pub struct HighlightRequest {
@@ -155,11 +171,55 @@ pub struct HighlightResult {
     pub lines: Vec<HighlightedLine>,
 }
 
-/// Worker de resaltado. Un único hilo con cola: alcanza porque sólo hay un
-/// visor abierto a la vez.
+struct HighlightJob {
+    request: HighlightRequest,
+    notify: Box<dyn FnOnce() + Send>,
+}
+
+#[derive(Default)]
+struct HighlightState {
+    /// Como máximo un pedido pendiente además del trabajo en curso.
+    pending: Option<HighlightJob>,
+    /// Como máximo un resultado, siempre del último token solicitado.
+    completed: Option<HighlightResult>,
+}
+
+struct HighlightShared {
+    state: Mutex<HighlightState>,
+    ready: Condvar,
+    latest_token: AtomicU64,
+    closed: AtomicBool,
+}
+
+impl HighlightShared {
+    fn cancelled(&self, token: u64) -> bool {
+        self.closed.load(Ordering::Acquire) || self.latest_token.load(Ordering::Acquire) != token
+    }
+}
+
+/// También marca el worker como no disponible si una operación entra en
+/// pánico: los siguientes pedidos pueden seguir mostrando texto plano.
+struct WorkerExitGuard(Arc<HighlightShared>);
+
+impl Drop for WorkerExitGuard {
+    fn drop(&mut self) {
+        let mut state = self
+            .0
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        self.0.closed.store(true, Ordering::Release);
+        let pending = state.pending.take();
+        drop(state);
+        self.0.ready.notify_all();
+        drop(pending);
+    }
+}
+
+/// Un único worker y dos slots reemplazables evitan acumular archivos o
+/// resultados obsoletos cuando el usuario cambia de archivo rápidamente.
 pub struct Highlighter {
-    tx: Sender<HighlightRequest>,
-    rx: Receiver<HighlightResult>,
+    shared: Arc<HighlightShared>,
     next_token: u64,
 }
 
@@ -171,57 +231,186 @@ impl Default for Highlighter {
 
 impl Highlighter {
     pub fn new() -> Self {
-        let (tx, job_rx) = std::sync::mpsc::channel::<HighlightRequest>();
-        let (result_tx, rx) = std::sync::mpsc::channel::<HighlightResult>();
-        std::thread::Builder::new()
+        Self::with_processor(|request, cancelled| {
+            highlight_text_cancelable(&request.file_name, &request.text, cancelled)
+        })
+    }
+
+    fn with_processor<F>(process: F) -> Self
+    where
+        F: Fn(&HighlightRequest, &dyn Fn() -> bool) -> Option<Vec<HighlightedLine>>
+            + Send
+            + 'static,
+    {
+        let shared = Arc::new(HighlightShared {
+            state: Mutex::new(HighlightState::default()),
+            ready: Condvar::new(),
+            latest_token: AtomicU64::new(0),
+            closed: AtomicBool::new(false),
+        });
+        let worker = Arc::clone(&shared);
+        let spawned = std::thread::Builder::new()
             .name("code-highlighter".to_owned())
             .spawn(move || {
-                while let Ok(mut job) = job_rx.recv() {
-                    // Only the latest file can be displayed. Skip obsolete
-                    // queued requests before starting expensive regex work.
-                    while let Ok(newer) = job_rx.try_recv() {
-                        job = newer;
+                let _exit = WorkerExitGuard(Arc::clone(&worker));
+                loop {
+                    let mut state = worker
+                        .state
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    while state.pending.is_none() && !worker.closed.load(Ordering::Acquire) {
+                        state = worker
+                            .ready
+                            .wait(state)
+                            .unwrap_or_else(|error| error.into_inner());
                     }
-                    let lines = highlight_text(&job.file_name, &job.text);
-                    if result_tx
-                        .send(HighlightResult {
-                            token: job.token,
-                            lines,
-                        })
-                        .is_err()
-                    {
-                        break;
+                    if worker.closed.load(Ordering::Acquire) {
+                        return;
                     }
+                    let job = state.pending.take().expect("pending highlight");
+                    drop(state);
+
+                    let cancelled = || worker.cancelled(job.request.token);
+                    if cancelled() {
+                        continue;
+                    }
+                    let Some(lines) = process(&job.request, &cancelled) else {
+                        continue;
+                    };
+                    let mut state = worker
+                        .state
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    if cancelled() {
+                        continue;
+                    }
+                    let replaced = state.completed.replace(HighlightResult {
+                        token: job.request.token,
+                        lines,
+                    });
+                    drop(state);
+                    drop(replaced);
+                    // El resultado se publica antes de despertar a la UI.
+                    // Una apertura nueva puede reemplazarlo sin bloquearse.
+                    (job.notify)();
                 }
             })
-            .ok();
+            .is_ok();
+        if !spawned {
+            shared.closed.store(true, Ordering::Release);
+        }
         Self {
-            tx,
-            rx,
+            shared,
             next_token: 0,
         }
     }
 
     /// Encola un archivo y devuelve el token con el que reconocer su resultado.
     pub fn request(&mut self, file_name: String, text: String) -> u64 {
+        self.request_with_notify(file_name, text, || {})
+    }
+
+    /// El callback despierta al consumidor cuando el resultado actual está
+    /// listo. No hay una cola de callbacks ni un envío que pueda bloquearse.
+    pub fn request_with_notify(
+        &mut self,
+        file_name: String,
+        text: String,
+        notify: impl FnOnce() + Send + 'static,
+    ) -> u64 {
         self.next_token = self.next_token.wrapping_add(1);
         let token = self.next_token;
-        let _ = self.tx.send(HighlightRequest {
-            token,
-            file_name,
-            text,
-        });
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        self.shared.latest_token.store(token, Ordering::Release);
+        let completed = state.completed.take();
+        let pending = state.pending.take();
+        if !self.shared.closed.load(Ordering::Acquire) {
+            state.pending = Some(HighlightJob {
+                request: HighlightRequest {
+                    token,
+                    file_name,
+                    text,
+                },
+                notify: Box::new(notify),
+            });
+        }
+        drop(state);
+        self.shared.ready.notify_one();
+        // Desalocar archivos grandes fuera del mutex mantiene breve el acceso
+        // al slot compartido desde el hilo de UI.
+        drop(pending);
+        drop(completed);
         token
     }
 
+    pub fn is_available(&self) -> bool {
+        !self.shared.closed.load(Ordering::Acquire)
+    }
+
+    /// Una apertura nueva o cerrar el visor invalida también el trabajo que
+    /// ya estaba en curso, además de liberar el pedido y resultado pendientes.
+    pub fn cancel(&mut self) {
+        self.next_token = self.next_token.wrapping_add(1);
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        self.shared
+            .latest_token
+            .store(self.next_token, Ordering::Release);
+        let pending = state.pending.take();
+        let completed = state.completed.take();
+        drop(state);
+        drop(pending);
+        drop(completed);
+    }
+
     pub fn poll(&mut self) -> Option<HighlightResult> {
-        self.rx.try_recv().ok()
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state
+            .completed
+            .take()
+            .filter(|result| result.token == self.shared.latest_token.load(Ordering::Acquire))
+    }
+}
+
+impl Drop for Highlighter {
+    fn drop(&mut self) {
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        self.shared.closed.store(true, Ordering::Release);
+        let pending = state.pending.take();
+        let completed = state.completed.take();
+        drop(state);
+        self.shared.ready.notify_all();
+        // No esperar una regex activa en el hilo de UI. El único worker sale
+        // cooperativamente al terminar la línea que estaba procesando.
+        drop(pending);
+        drop(completed);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{detect_language, highlight_text, Highlighter, MAX_HIGHLIGHT_LINES};
+
+    const WORKER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
+    fn plain_result(text: &str) -> Vec<super::HighlightedLine> {
+        vec![vec![(egui::Color32::WHITE, text.to_owned())]]
+    }
 
     fn joined(line: &[(egui::Color32, String)]) -> String {
         line.iter().map(|(_, text)| text.as_str()).collect()
@@ -386,16 +575,18 @@ mod tests {
     #[test]
     fn worker_returns_the_highlighted_file_with_its_token() {
         let mut highlighter = Highlighter::new();
-        let token = highlighter.request("main.rs".to_owned(), "fn main() {}\n".to_owned());
-
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let result = loop {
-            if let Some(result) = highlighter.poll() {
-                break result;
-            }
-            assert!(std::time::Instant::now() < deadline, "worker timed out");
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        };
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let token = highlighter.request_with_notify(
+            "main.rs".to_owned(),
+            "fn main() {}\n".to_owned(),
+            move || {
+                let _ = ready_tx.send(());
+            },
+        );
+        ready_rx
+            .recv_timeout(WORKER_DEADLINE)
+            .expect("worker ready");
+        let result = highlighter.poll().expect("published before notification");
 
         assert_eq!(result.token, token);
         assert_eq!(joined(&result.lines[0]), "fn main() {}");
@@ -407,6 +598,206 @@ mod tests {
         let first = highlighter.request("a.rs".to_owned(), "fn a() {}\n".to_owned());
         let second = highlighter.request("b.rs".to_owned(), "fn b() {}\n".to_owned());
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn the_latest_pending_request_replaces_older_jobs_without_notifying_them() {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let processed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let processed_worker = std::sync::Arc::clone(&processed);
+        let obsolete_notifications = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut highlighter = Highlighter::with_processor(move |request, cancelled| {
+            processed_worker.lock().unwrap().push(request.token);
+            if request.file_name == "blocked" {
+                let _ = entered_tx.send(());
+                release_rx.recv().expect("release first job");
+                assert!(
+                    cancelled(),
+                    "the superseded active job must see cancellation"
+                );
+                return None;
+            }
+            Some(plain_result(&request.text))
+        });
+        let first_notifications = std::sync::Arc::clone(&obsolete_notifications);
+        let first =
+            highlighter.request_with_notify("blocked".to_owned(), "first".to_owned(), move || {
+                first_notifications.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            });
+        entered_rx
+            .recv_timeout(WORKER_DEADLINE)
+            .expect("active job");
+        for index in 0..128 {
+            let notifications = std::sync::Arc::clone(&obsolete_notifications);
+            highlighter.request_with_notify("old".to_owned(), index.to_string(), move || {
+                notifications.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            });
+        }
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let latest =
+            highlighter.request_with_notify("latest".to_owned(), "final".to_owned(), move || {
+                let _ = ready_tx.send(());
+            });
+        {
+            let state = highlighter.shared.state.lock().unwrap();
+            assert_eq!(state.pending.as_ref().unwrap().request.token, latest);
+            assert!(state.completed.is_none());
+        }
+        assert_eq!(*processed.lock().unwrap(), vec![first]);
+        release_tx.send(()).expect("release active job");
+        ready_rx
+            .recv_timeout(WORKER_DEADLINE)
+            .expect("latest ready");
+        let result = highlighter.poll().expect("latest result");
+        assert_eq!(result.token, latest);
+        assert_eq!(joined(&result.lines[0]), "final");
+        assert_eq!(*processed.lock().unwrap(), vec![first, latest]);
+        assert_eq!(
+            obsolete_notifications.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        assert!(highlighter.poll().is_none());
+    }
+
+    #[test]
+    fn a_new_request_discards_an_unpolled_result_before_starting() {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let mut highlighter = Highlighter::with_processor(move |request, _| {
+            if request.file_name == "blocked" {
+                let _ = entered_tx.send(());
+                release_rx.recv().expect("release new job");
+            }
+            Some(plain_result(&request.text))
+        });
+        let (old_tx, old_rx) = std::sync::mpsc::channel();
+        let old = highlighter.request_with_notify("old".to_owned(), "old".to_owned(), move || {
+            let _ = old_tx.send(());
+        });
+        old_rx
+            .recv_timeout(WORKER_DEADLINE)
+            .expect("old result ready");
+        assert_eq!(
+            highlighter
+                .shared
+                .state
+                .lock()
+                .unwrap()
+                .completed
+                .as_ref()
+                .unwrap()
+                .token,
+            old
+        );
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let latest =
+            highlighter.request_with_notify("blocked".to_owned(), "latest".to_owned(), move || {
+                let _ = ready_tx.send(());
+            });
+        entered_rx
+            .recv_timeout(WORKER_DEADLINE)
+            .expect("new job active");
+        assert!(
+            highlighter.poll().is_none(),
+            "the old result must already be gone"
+        );
+        release_tx.send(()).expect("release new job");
+        ready_rx
+            .recv_timeout(WORKER_DEADLINE)
+            .expect("latest result ready");
+        assert_eq!(highlighter.poll().unwrap().token, latest);
+        assert!(highlighter.poll().is_none());
+    }
+
+    #[test]
+    fn cancelling_clears_queued_work_and_allows_a_later_request() {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (cancelled_tx, cancelled_rx) = std::sync::mpsc::channel();
+        let mut highlighter = Highlighter::with_processor(move |request, cancelled| {
+            if request.file_name == "blocked" {
+                let _ = entered_tx.send(());
+                release_rx.recv().expect("release cancelled job");
+                let _ = cancelled_tx.send(cancelled());
+                return None;
+            }
+            Some(plain_result(&request.text))
+        });
+        highlighter.request("blocked".to_owned(), "first".to_owned());
+        entered_rx
+            .recv_timeout(WORKER_DEADLINE)
+            .expect("first active");
+        highlighter.request("queued".to_owned(), "obsolete".to_owned());
+        highlighter.cancel();
+        {
+            let state = highlighter.shared.state.lock().unwrap();
+            assert!(state.pending.is_none());
+            assert!(state.completed.is_none());
+        }
+        release_tx.send(()).expect("release cancelled job");
+        assert!(cancelled_rx
+            .recv_timeout(WORKER_DEADLINE)
+            .expect("observed cancellation"));
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let latest =
+            highlighter.request_with_notify("new".to_owned(), "usable".to_owned(), move || {
+                let _ = ready_tx.send(());
+            });
+        ready_rx
+            .recv_timeout(WORKER_DEADLINE)
+            .expect("new result ready");
+        let result = highlighter.poll().expect("new result");
+        assert_eq!(result.token, latest);
+        assert_eq!(joined(&result.lines[0]), "usable");
+    }
+
+    #[test]
+    fn dropping_the_highlighter_cancels_without_joining_an_active_operation() {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (cancelled_tx, cancelled_rx) = std::sync::mpsc::channel();
+        let mut highlighter = Highlighter::with_processor(move |_, cancelled| {
+            let _ = entered_tx.send(());
+            release_rx.recv().expect("release active operation");
+            let _ = cancelled_tx.send(cancelled());
+            None
+        });
+        highlighter.request("blocked".to_owned(), "text".to_owned());
+        entered_rx
+            .recv_timeout(WORKER_DEADLINE)
+            .expect("active operation");
+        let (dropped_tx, dropped_rx) = std::sync::mpsc::channel();
+        let dropper = std::thread::spawn(move || {
+            drop(highlighter);
+            let _ = dropped_tx.send(());
+        });
+        let dropped_without_release = dropped_rx.recv_timeout(WORKER_DEADLINE);
+        // Liberar aun si falla la comprobación evita dejar el fixture trabado.
+        let _ = release_tx.send(());
+        dropper.join().expect("drop thread");
+        dropped_without_release.expect("Drop must return before the operation is released");
+        assert!(cancelled_rx
+            .recv_timeout(WORKER_DEADLINE)
+            .expect("Drop cancellation"));
+    }
+
+    #[test]
+    fn syntax_work_checks_for_cancellation_between_lines() {
+        let checks = std::cell::Cell::new(0);
+        let cancelled = || {
+            let count = checks.get();
+            checks.set(count + 1);
+            count >= 2
+        };
+        let result = super::highlight_text_cancelable(
+            "example.js",
+            "// first\nconst second = 42;\nconst third = 3;\n",
+            &cancelled,
+        );
+        assert!(result.is_none());
+        assert_eq!(checks.get(), 3, "cancelled before parsing the second line");
     }
     #[test]
     fn the_languages_this_app_is_used_with_are_all_covered() {
