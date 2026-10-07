@@ -4,6 +4,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
 use crate::orchestration::DiffNotes;
@@ -31,10 +32,11 @@ pub(super) enum Completion {
 }
 
 pub(super) struct PreferencesWorker {
-    jobs: Option<SyncSender<Job>>,
+    jobs: Option<SyncSender<Arc<Job>>>,
     results: Receiver<(Option<PathBuf>, Completion)>,
     thread: Option<JoinHandle<()>>,
-    pending: VecDeque<Job>,
+    pending: VecDeque<Arc<Job>>,
+    active: Option<Arc<Job>>,
     busy: bool,
     notes_write_errors: BTreeMap<PathBuf, String>,
     settings_write_error: Option<String>,
@@ -46,37 +48,37 @@ impl Default for PreferencesWorker {
     }
 }
 
-fn run_job(job: Job) -> Completion {
+fn run_job(job: &Job) -> Completion {
     match job {
         Job::SaveNotes(root, notes) => {
-            Completion::NotesSaved(crate::orchestration::save_notes(&root, &notes))
+            Completion::NotesSaved(crate::orchestration::save_notes(root, notes))
         }
         Job::LoadNotes(key, root) => Completion::NotesLoaded {
-            key,
-            notes: crate::orchestration::load_notes(&root),
-            legacy_available: crate::orchestration::legacy_notes_available(&root),
+            key: *key,
+            notes: crate::orchestration::load_notes(root),
+            legacy_available: crate::orchestration::legacy_notes_available(root),
         },
         Job::ImportNotes(key, root) => Completion::NotesImported {
-            key,
-            result: crate::orchestration::load_legacy_notes(&root),
+            key: *key,
+            result: crate::orchestration::load_legacy_notes(root),
         },
-        Job::SaveSettings(config) => Completion::SettingsSaved(crate::config::save(&config)),
+        Job::SaveSettings(config) => Completion::SettingsSaved(crate::config::save(config)),
     }
 }
 
 impl PreferencesWorker {
-    fn with_processor(mut process: impl FnMut(Job) -> Completion + Send + 'static) -> Self {
-        let (tx, rx) = mpsc::sync_channel::<Job>(1);
+    fn with_processor(mut process: impl FnMut(&Job) -> Completion + Send + 'static) -> Self {
+        let (tx, rx) = mpsc::sync_channel::<Arc<Job>>(1);
         let (result_tx, results) = mpsc::channel();
         let worker = thread::Builder::new()
             .name("preferences-writer".to_owned())
             .spawn(move || {
                 while let Ok(job) = rx.recv() {
-                    let notes_root = match &job {
+                    let notes_root = match job.as_ref() {
                         Job::SaveNotes(root, _) => Some(root.clone()),
                         _ => None,
                     };
-                    let completion = process(job);
+                    let completion = process(job.as_ref());
                     if let Completion::NotesSaved(Err(error))
                     | Completion::SettingsSaved(Err(error)) = &completion
                     {
@@ -92,6 +94,7 @@ impl PreferencesWorker {
             results,
             thread: Some(worker),
             pending: VecDeque::new(),
+            active: None,
             busy: false,
             notes_write_errors: BTreeMap::new(),
             settings_write_error: None,
@@ -101,21 +104,22 @@ impl PreferencesWorker {
 
 impl PreferencesWorker {
     fn submit(&mut self, job: Job) {
-        let existing = self
-            .pending
-            .iter_mut()
-            .find(|pending| match (&job, pending) {
-                (Job::SaveNotes(root, _), Job::SaveNotes(other, _)) => root == other,
-                (Job::SaveSettings(_), Job::SaveSettings(_)) => true,
-                _ => false,
-            });
+        let job = Arc::new(job);
+        let existing =
+            self.pending
+                .iter_mut()
+                .find(|pending| match (job.as_ref(), pending.as_ref()) {
+                    (Job::SaveNotes(root, _), Job::SaveNotes(other, _)) => root == other,
+                    (Job::SaveSettings(_), Job::SaveSettings(_)) => true,
+                    _ => false,
+                });
         if let Some(existing) = existing {
             *existing = job;
         } else {
             // Only the most recent review can receive a load completion.
-            if matches!(job, Job::LoadNotes(..)) {
+            if matches!(job.as_ref(), Job::LoadNotes(..)) {
                 self.pending
-                    .retain(|pending| !matches!(pending, Job::LoadNotes(..)));
+                    .retain(|pending| !matches!(pending.as_ref(), Job::LoadNotes(..)));
             }
             self.pending.push_back(job);
         }
@@ -130,7 +134,10 @@ impl PreferencesWorker {
             self.busy = self
                 .jobs
                 .as_ref()
-                .is_some_and(|jobs| jobs.send(job).is_ok());
+                .is_some_and(|jobs| jobs.send(Arc::clone(&job)).is_ok());
+            if self.busy {
+                self.active = Some(job);
+            }
         }
     }
 
@@ -147,7 +154,7 @@ impl PreferencesWorker {
         self.submit(Job::SaveSettings(config));
     }
     pub(super) fn busy(&self) -> bool {
-        self.busy || !self.pending.is_empty()
+        self.busy || self.active.is_some() || !self.pending.is_empty()
     }
 
     pub(super) fn poll(&mut self) -> Vec<Completion> {
@@ -157,6 +164,7 @@ impl PreferencesWorker {
         }
         if !results.is_empty() {
             self.busy = false;
+            self.active = None;
         }
         self.schedule();
         results
@@ -194,6 +202,7 @@ impl PreferencesWorker {
                 })?;
                 self.note_write_result(notes_root.as_ref(), &completion);
                 self.busy = false;
+                self.active = None;
             }
         }
         if let Some((root, error)) = self.notes_write_errors.iter().next() {
@@ -262,7 +271,7 @@ mod tests {
         let failed_root = repo_a.clone();
         let mut failed_once = false;
         let mut worker = PreferencesWorker::with_processor(move |job| match job {
-            Job::SaveNotes(root, _) if root == failed_root && !failed_once => {
+            Job::SaveNotes(root, _) if root == &failed_root && !failed_once => {
                 failed_once = true;
                 Completion::NotesSaved(Err(anyhow::anyhow!("repository A is read-only")))
             }
@@ -295,10 +304,10 @@ mod tests {
         let worker_config = config_path.clone();
         let mut worker = PreferencesWorker::with_processor(move |job| match job {
             Job::SaveNotes(_, notes) => Completion::NotesSaved(
-                crate::orchestration::save_notes_to_path(&worker_notes, &notes),
+                crate::orchestration::save_notes_to_path(&worker_notes, notes),
             ),
             Job::SaveSettings(config) => {
-                Completion::SettingsSaved(crate::config::save_to_path(&config, &worker_config))
+                Completion::SettingsSaved(crate::config::save_to_path(config, &worker_config))
             }
             _ => panic!("fixture only accepts writes"),
         });
@@ -340,9 +349,9 @@ mod tests {
         let pending = std::mem::take(&mut worker.pending);
         assert_eq!(pending.len(), 2);
         assert!(
-            matches!(&pending[0], Job::SaveNotes(_, notes) if notes.notes[0].body == "edit 99")
+            matches!(pending[0].as_ref(), Job::SaveNotes(_, notes) if notes.notes[0].body == "edit 99")
         );
-        assert!(matches!(&pending[1], Job::LoadNotes(actual, _) if *actual == key));
+        assert!(matches!(pending[1].as_ref(), Job::LoadNotes(actual, _) if *actual == key));
     }
 
     #[test]
@@ -357,6 +366,6 @@ mod tests {
         worker.load_notes(last, PathBuf::from("current"));
         let pending = std::mem::take(&mut worker.pending);
         assert_eq!(pending.len(), 1);
-        assert!(matches!(&pending[0], Job::LoadNotes(key, _) if *key == last));
+        assert!(matches!(pending[0].as_ref(), Job::LoadNotes(key, _) if *key == last));
     }
 }
