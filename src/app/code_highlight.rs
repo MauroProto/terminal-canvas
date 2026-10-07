@@ -105,11 +105,18 @@ pub(crate) fn select_syntax<'a>(
             return Some(syntax);
         }
     }
-    // two-face's fancy-regex set excludes Babel's JSX grammar. The embedded
-    // React grammar also parses JavaScript JSX; use it only after native
-    // extension lookup, keeping future asset definitions authoritative.
-    if file_name.contains('.') && extension.eq_ignore_ascii_case("jsx") {
-        if let Some(syntax) = set.find_syntax_by_name("TypeScriptReact") {
+    // The fancy-regex assets exclude Babel's extra extensions. JSX uses the
+    // embedded React grammar; module extensions use the same grammar as .js.
+    // Native extension definitions remain authoritative when assets change.
+    if file_name.contains('.') {
+        let alias = if extension.eq_ignore_ascii_case("jsx") {
+            Some("TypeScriptReact")
+        } else if extension.eq_ignore_ascii_case("mjs") || extension.eq_ignore_ascii_case("cjs") {
+            Some("JavaScript")
+        } else {
+            None
+        };
+        if let Some(syntax) = alias.and_then(|name| set.find_syntax_by_name(name)) {
             return Some(syntax);
         }
     }
@@ -907,6 +914,24 @@ mod tests {
                     source.lines().collect::<Vec<_>>(),
                     "{file}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn javascript_modules_keep_javascript_colours_and_text() {
+        for (file, source) in [
+            ("app.mjs", "import { answer } from \"./dep.mjs\";\nexport const message = `primera\ncafé 🐈 界 e\u{301} ${answer + 42}`;\n"),
+            ("app.cjs", "const { answer } = require(\"./dep.cjs\");\n/* café 🐈 界 e\u{301}\n   comentario */\nmodule.exports = { answer: answer + 42 };"),
+        ] {
+            for source in [source.to_owned(), source.replace('\n', "\r\n"), source.replacen('\n', "\r\n", 1)] {
+                let reference = highlight_text("app.js", &source);
+                for file in [file.to_owned(), file.to_uppercase()] {
+                    assert_eq!(detect_language(&file, "").as_deref(), Some("JavaScript"));
+                    let actual = highlight_text(&file, &source);
+                    assert_eq!(coloured_characters(&actual), coloured_characters(&reference), "{file}");
+                    assert_eq!(actual.iter().map(|line| joined(line)).collect::<Vec<_>>(), source.lines().collect::<Vec<_>>(), "{file}");
+                }
             }
         }
     }
