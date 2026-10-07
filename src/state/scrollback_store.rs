@@ -503,6 +503,8 @@ pub fn replay_marker() -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use uuid::Uuid;
 
     use super::{
