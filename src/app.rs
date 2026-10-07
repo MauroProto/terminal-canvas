@@ -45,7 +45,6 @@ mod persistence_worker;
 mod preferences_worker;
 mod quick_open_ui;
 mod resume_ui;
-mod scrollback_restore_worker;
 mod settings_ui;
 mod taskbar;
 #[cfg(test)]
@@ -117,7 +116,9 @@ pub struct TerminalApp {
     file_tree: crate::sidebar::file_tree::FileTreeState,
     /// Paneles cuyo scrollback persistido ya se reinyectó en esta corrida.
     scrollback_restored: HashSet<Uuid>,
-    scrollback_restore_worker: scrollback_restore_worker::ScrollbackRestoreWorker,
+    /// Loaded panels whose immutable old histories have not been consumed
+    /// from the persistence worker yet. New panel UUIDs have no old history.
+    scrollback_restore_pending: HashSet<Uuid>,
     scrollback_restore_ready: HashMap<Uuid, LeafHistories>,
     /// Identidades de panel/hoja observadas por esta instancia. La poda de
     /// scrollback queda limitada a este alcance para no borrar datos de otra
@@ -321,8 +322,7 @@ impl TerminalApp {
                 resume_picker: None,
                 file_tree: Default::default(),
                 scrollback_restored: HashSet::new(),
-                scrollback_restore_worker: scrollback_restore_worker::ScrollbackRestoreWorker::new(
-                ),
+                scrollback_restore_pending: HashSet::new(),
                 scrollback_restore_ready: HashMap::new(),
                 scrollback_known_leaves: HashMap::new(),
                 highlighter: code_highlight::Highlighter::new(),
@@ -428,8 +428,7 @@ impl TerminalApp {
                 resume_picker: None,
                 file_tree: Default::default(),
                 scrollback_restored: HashSet::new(),
-                scrollback_restore_worker: scrollback_restore_worker::ScrollbackRestoreWorker::new(
-                ),
+                scrollback_restore_pending: HashSet::new(),
                 scrollback_restore_ready: HashMap::new(),
                 scrollback_known_leaves: HashMap::new(),
                 highlighter: code_highlight::Highlighter::new(),
@@ -507,17 +506,33 @@ impl TerminalApp {
         app.reconcile_orchestration();
         app.refresh_orchestration();
         app.share_workspace_draft.broker_url = app.collab.broker_url().to_owned();
-        // Marcador de corrida: si la anterior murió sin cierre limpio (kill,
-        // crash nativo, OOM), avisamos que el estado igual se restauró. Sin
-        // esto, una muerte súbita y un cierre normal eran indistinguibles.
+        // A run marker may survive a crash or a normal close while history
+        // replay prevented a complete checkpoint. Explain the save boundary.
         if side_effects && crate::state::run_marker::begin_run().is_some() {
             app.toast_error(
-                "La sesión anterior terminó de golpe; se restauró el último estado guardado",
+                "La sesión anterior no completó el guardado final; se usará el último estado disponible",
             );
         }
         if side_effects {
             if let Some(error) = crate::state::run_marker::persistence_claim_error() {
                 app.toast_error(error);
+            }
+        }
+        if has_saved_state {
+            let panels = app
+                .workspaces
+                .iter()
+                .flat_map(|workspace| workspace.panels.iter())
+                .map(|panel| (panel.id(), panel.root_leaf_id()))
+                .collect::<Vec<_>>();
+            app.scrollback_restore_pending
+                .extend(panels.iter().map(|(panel, _)| *panel));
+            if let Some(dir) = crate::state::scrollback_store::scrollback_dir() {
+                // Queue the entire startup boundary before the first frame
+                // can enqueue autosave output from any newly attached PTY.
+                if !app.persistence_worker.submit_restore(dir, panels) {
+                    log::error!("no se pudo encolar la captura inicial del historial");
+                }
             }
         }
         if let Some(invite_code) = pending_join_invite {
@@ -1192,6 +1207,25 @@ impl TerminalApp {
         let mut rollover = HashSet::new();
         for completion in completions {
             match completion {
+                persistence_worker::Completion::Restore { histories } => {
+                    let live = self
+                        .workspaces
+                        .iter()
+                        .flat_map(|workspace| workspace.panels.iter())
+                        .map(crate::panel::CanvasPanel::id)
+                        .collect::<HashSet<_>>();
+                    for (panel_id, histories) in histories {
+                        self.scrollback_restore_pending.remove(&panel_id);
+                        if !live.contains(&panel_id) {
+                            continue;
+                        }
+                        if histories.is_empty() {
+                            self.scrollback_restored.insert(panel_id);
+                        } else {
+                            self.scrollback_restore_ready.insert(panel_id, histories);
+                        }
+                    }
+                }
                 persistence_worker::Completion::State { snapshot, result } => match result {
                     Ok(()) => {
                         self.persisted_state = Some(snapshot);
@@ -1583,22 +1617,46 @@ impl TerminalApp {
         self.remember_scrollback_layout();
         if full {
             let _ = self.drain_persistence_worker();
-            // Hold the same lease used by queued history writes through the
-            // checkpoint and pruning, so another app cannot take it midway.
-            let Ok(Some(_guard)) = crate::state::run_marker::acquire_write_guard() else {
-                return false;
-            };
-            if std::fs::create_dir_all(&dir).is_err() {
-                return false;
+            {
+                let Ok(Some(_guard)) = crate::state::run_marker::acquire_write_guard() else {
+                    return false;
+                };
+                if std::fs::create_dir_all(&dir).is_err() {
+                    return false;
+                }
             }
             let entries = self.full_scrollback_entries(&dir, None);
             let expected = entries.len();
-            let acknowledgements = persistence_worker::persist_full_entries(entries);
-            let complete = acknowledgements.len() == expected;
-            self.acknowledge_persisted_logs(acknowledgements);
-            if !complete {
+            let checkpoints_complete = entries.iter().all(|entry| {
+                matches!(
+                    &entry.content,
+                    persistence_worker::FullContent::Checkpoint { .. }
+                )
+            });
+            // A temporarily restoring PTY needs its raw pending prefix saved
+            // against the old checkpoint, not a partial export. Keep this in
+            // the same writer as incremental autosave so its sequence cache
+            // remains coherent if the app continues after this save.
+            if !self.persistence_worker.submit_full(entries) {
                 return false;
             }
+            let completions = self.persistence_worker.wait_until_idle();
+            let saved = completions.iter().find_map(|completion| match completion {
+                persistence_worker::Completion::Full { acknowledgements } => {
+                    Some(acknowledgements.len())
+                }
+                _ => None,
+            }) == Some(expected);
+            let _ = self.apply_persistence_completions(completions, None);
+            if !saved || !checkpoints_complete {
+                // Pending frames may have been rescued successfully, but an
+                // unfinished replay cannot justify pruning or a clean marker.
+                return false;
+            }
+            // Recheck the lease after the writer finishes before pruning.
+            let Ok(Some(_guard)) = crate::state::run_marker::acquire_write_guard() else {
+                return false;
+            };
             // A failed layout save still refers to panels closed in memory.
             // Rescue live histories without destroying that older recovery
             // state; pruning requires both the new layout and its checkpoints.
@@ -1723,16 +1781,37 @@ impl TerminalApp {
                 if only_panels.is_some_and(|wanted| !wanted.contains(&panel_id)) {
                     continue;
                 }
-                entries.extend(panel.leaf_scrollbacks().into_iter().map(
-                    |(leaf, runtime_session_id, text, pending_bytes)| {
-                        persistence_worker::FullEntry {
-                            dir: dir.to_path_buf(),
-                            panel_id,
-                            leaf_id: leaf,
-                            runtime_session_id,
-                            text,
-                            pending_bytes,
-                        }
+                let pending_leaves = if self.scrollback_restore_pending.contains(&panel_id) {
+                    panel.leaf_ids()
+                } else {
+                    self.scrollback_restore_ready
+                        .get(&panel_id)
+                        .map(|histories| {
+                            histories
+                                .iter()
+                                .map(|(leaf, _, _)| leaf.unwrap_or_else(|| panel.root_leaf_id()))
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                };
+                entries.extend(panel.leaf_scrollbacks(&pending_leaves).into_iter().map(
+                    |(leaf, runtime_session_id, snapshot)| persistence_worker::FullEntry {
+                        dir: dir.to_path_buf(),
+                        panel_id,
+                        leaf_id: leaf,
+                        runtime_session_id,
+                        content: match snapshot {
+                            crate::terminal::pty::RecoverySnapshot::Checkpoint {
+                                value: text,
+                                pending_bytes,
+                            } => persistence_worker::FullContent::Checkpoint {
+                                text,
+                                pending_bytes,
+                            },
+                            crate::terminal::pty::RecoverySnapshot::PendingLog(frames) => {
+                                persistence_worker::FullContent::PendingLog(frames)
+                            }
+                        },
                     },
                 ));
             }
@@ -1751,13 +1830,10 @@ impl TerminalApp {
             .collect::<HashSet<_>>();
         self.scrollback_restored
             .retain(|panel_id| live_panels.contains(panel_id));
-
-        for completion in self.scrollback_restore_worker.poll() {
-            if live_panels.contains(&completion.panel_id) {
-                self.scrollback_restore_ready
-                    .insert(completion.panel_id, completion.histories);
-            }
-        }
+        self.scrollback_restore_pending
+            .retain(|panel_id| live_panels.contains(panel_id));
+        self.scrollback_restore_ready
+            .retain(|panel_id, _| live_panels.contains(panel_id));
 
         let ready_panels = self
             .scrollback_restore_ready
@@ -1803,22 +1879,7 @@ impl TerminalApp {
             }
         }
 
-        if self.scrollback_restored.len() == live_panels.len() {
-            return;
-        }
-        let Some(dir) = crate::state::scrollback_store::scrollback_dir() else {
-            return;
-        };
-        if !self.scrollback_restore_worker.in_flight() {
-            let next = live_panels.iter().copied().find(|panel_id| {
-                !self.scrollback_restored.contains(panel_id)
-                    && !self.scrollback_restore_ready.contains_key(panel_id)
-            });
-            if let Some(panel_id) = next {
-                self.scrollback_restore_worker.submit(dir, panel_id);
-            }
-        }
-        if self.scrollback_restore_worker.in_flight() {
+        if self.persistence_worker.restore_in_flight() {
             if let Some(ctx) = &self.ctx {
                 ctx.request_repaint_after(Duration::from_millis(16));
             }

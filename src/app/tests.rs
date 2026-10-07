@@ -148,6 +148,31 @@ fn workspace_close_preserves_rollover_consumed_by_the_idle_barrier() {
 }
 
 #[test]
+fn shutdown_during_history_replay_rescues_pending_output_and_retains_recovery() {
+    run_final_save_fixture("ack-restoring-shutdown");
+}
+
+#[test]
+fn completed_history_replay_can_publish_a_full_checkpoint_and_clean_marker() {
+    run_final_save_fixture("ack-restoring-completed");
+}
+
+#[test]
+fn full_save_waits_for_initial_capture_before_any_new_output_is_written() {
+    run_final_save_fixture("ack-capture-pending");
+}
+
+#[test]
+fn ready_unapplied_history_cannot_be_replaced_by_a_fresh_live_grid() {
+    run_final_save_fixture("ack-capture-ready");
+}
+
+#[test]
+fn legacy_root_rescue_preserves_the_alias_until_a_complete_canonical_checkpoint() {
+    run_final_save_fixture("ack-capture-legacy");
+}
+
+#[test]
 #[ignore = "only run in an isolated child process through run_final_save_fixture"]
 fn final_save_profile_fixture() {
     use eframe::App;
@@ -219,6 +244,9 @@ fn final_save_profile_fixture() {
             orchestration: Default::default(),
         };
         let mut app = super::TerminalApp::build(&ctx, None, Some(state), None, false, false);
+        // This artificial initial layout has no history yet. Later phases
+        // explicitly install their old artifacts and controlled capture job.
+        let _ = app.drain_persistence_worker();
         let manager = app.workspaces[0].pty_manager();
         manager
             .lock()
@@ -589,6 +617,332 @@ fn final_save_profile_fixture() {
                 assert!(restored[0].1.contains("previous session"));
             }
             assert!(marker.exists());
+        }
+        "ack-restoring-shutdown" | "ack-restoring-completed" => {
+            let panel_id = app.workspaces[0].panels[0].id();
+            let leaf_id = app.workspaces[0].panels[0].root_leaf_id();
+            let runtime_id = app.workspaces[0].panels[0].runtime_session_id().unwrap();
+            let manager = app.workspaces[0].pty_manager();
+            let handle = manager.lock().unwrap().handle(runtime_id).unwrap();
+            // A detached panel owns no new output and must not make the
+            // eventual complete save fail just because it has no live PTY.
+            app.workspaces[0]
+                .panels
+                .push(CanvasPanel::Terminal(TerminalPanel::new(
+                    pos2(310.0, 0.0),
+                    vec2(300.0, 200.0),
+                    Color32::WHITE,
+                    2,
+                )));
+            crate::state::scrollback_store::save_leaf_scrollback_versioned(
+                &history,
+                panel_id,
+                Some(leaf_id),
+                3,
+                "old durable history\n",
+            )
+            .unwrap();
+            let checkpoint_path = history.join(
+                crate::state::scrollback_store::scrollback_leaf_file_name(panel_id, Some(leaf_id)),
+            );
+            let checkpoint_before = fs::read(&checkpoint_path).unwrap();
+            let log_path = history.join(
+                crate::state::scrollback_store::scrollback_leaf_log_file_name(
+                    panel_id,
+                    Some(leaf_id),
+                ),
+            );
+            crate::state::scrollback_log::reset_log(&log_path, 3).unwrap();
+            crate::state::scrollback_log::append_frames(
+                &log_path,
+                &crate::state::scrollback_log::encode_frame(
+                    1,
+                    crate::state::scrollback_log::FrameKind::Output,
+                    b"old incremental tail\r\n",
+                ),
+            )
+            .unwrap();
+            let old_frames = super::load_leaf_session_frames(&history, panel_id, Some(leaf_id));
+            let closed_panel = Uuid::new_v4();
+            crate::state::scrollback_store::save_scrollback(
+                &history,
+                closed_panel,
+                "retained recovery for closed panel\n",
+            )
+            .unwrap();
+            app.scrollback_known_leaves.entry(closed_panel).or_default();
+            handle
+                .lock()
+                .unwrap()
+                .feed_output_for_persistence_tests(b"new output during restore\r\n");
+            let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+            let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+            handle.lock().unwrap().replay_session_preserving_live(
+                b"old durable history\r\n",
+                &old_frames,
+                move |term| {
+                    let output = crate::terminal::export::scrollback_to_ansi(term).into_bytes();
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    output
+                },
+            );
+            entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            assert!(handle.lock().unwrap().history_restore_in_progress());
+            // The real replay worker is blocked while holding `term`. Saving
+            // must use the pending frame prefix without waiting for that grid.
+            app.on_exit(None);
+            assert!(
+                marker.exists(),
+                "unfinished replay cannot justify clean shutdown"
+            );
+            assert_eq!(
+                fs::read(&checkpoint_path).unwrap(),
+                checkpoint_before,
+                "partial live grid must not replace the old checkpoint"
+            );
+            let restored = super::collect_leaf_histories(&history, panel_id);
+            assert_eq!(restored.len(), 1);
+            assert_eq!(restored[0].1, "old durable history\n");
+            assert_eq!(
+                restored[0]
+                    .2
+                    .iter()
+                    .map(|frame| frame.payload.as_slice())
+                    .collect::<Vec<_>>(),
+                vec![
+                    b"old incremental tail\r\n".as_slice(),
+                    b"new output during restore\r\n".as_slice()
+                ]
+            );
+            assert!(
+                handle.lock().unwrap().pending_log_snapshot().is_empty(),
+                "only the rescued prefix is acknowledged"
+            );
+            assert!(
+                crate::state::scrollback_store::load_scrollback(&history, closed_panel).is_some(),
+                "incomplete checkpoints cannot authorize pruning"
+            );
+            release_tx.send(()).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while handle.lock().unwrap().history_restore_in_progress() {
+                assert!(Instant::now() < deadline, "released replay did not finish");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            if phase == "ack-restoring-completed" {
+                // The app may continue after a refused installation/save. A
+                // later autosave must use the sequence AFTER the rescued tail.
+                handle
+                    .lock()
+                    .unwrap()
+                    .feed_output_for_persistence_tests(b"output after rescue\r\n");
+                assert!(app.persist_scrollbacks(false));
+                let _ = app.drain_persistence_worker();
+                let (_, frames) =
+                    crate::state::scrollback_log::read_frames(&fs::read(&log_path).unwrap())
+                        .unwrap();
+                assert_eq!(
+                    frames.iter().map(|frame| frame.seq).collect::<Vec<_>>(),
+                    vec![1, 2, 3]
+                );
+                assert_eq!(frames[2].payload, b"output after rescue\r\n");
+                app.on_exit(None);
+                assert!(!marker.exists());
+                assert!(!log_path.exists());
+                let checkpoint = crate::state::scrollback_store::load_leaf_scrollback(
+                    &history,
+                    panel_id,
+                    Some(leaf_id),
+                )
+                .unwrap();
+                for output in [
+                    "old durable history",
+                    "old incremental tail",
+                    "new output during restore",
+                    "output after rescue",
+                ] {
+                    assert_eq!(
+                        checkpoint.matches(output).count(),
+                        1,
+                        "missing or duplicated output: {output}"
+                    );
+                }
+                assert!(
+                    crate::state::scrollback_store::load_scrollback(&history, closed_panel)
+                        .is_none()
+                );
+            }
+        }
+        "ack-capture-pending" | "ack-capture-ready" | "ack-capture-legacy" => {
+            let panel_id = app.workspaces[0].panels[0].id();
+            let leaf_id = app.workspaces[0].panels[0].root_leaf_id();
+            let runtime_id = app.workspaces[0].panels[0].runtime_session_id().unwrap();
+            let manager = app.workspaces[0].pty_manager();
+            let handle = manager.lock().unwrap().handle(runtime_id).unwrap();
+            let legacy = phase == "ack-capture-legacy";
+            let stored_leaf = if legacy { None } else { Some(leaf_id) };
+            crate::state::scrollback_store::save_leaf_scrollback_versioned(
+                &history,
+                panel_id,
+                stored_leaf,
+                3,
+                "old captured history\n",
+            )
+            .unwrap();
+            let checkpoint_path = history.join(
+                crate::state::scrollback_store::scrollback_leaf_file_name(panel_id, stored_leaf),
+            );
+            let checkpoint_before = fs::read(&checkpoint_path).unwrap();
+            let log_path = history.join(
+                crate::state::scrollback_store::scrollback_leaf_log_file_name(
+                    panel_id,
+                    stored_leaf,
+                ),
+            );
+            crate::state::scrollback_log::reset_log(&log_path, 3).unwrap();
+            crate::state::scrollback_log::append_frames(
+                &log_path,
+                &crate::state::scrollback_log::encode_frame(
+                    1,
+                    crate::state::scrollback_log::FrameKind::Output,
+                    b"old captured tail\r\n",
+                ),
+            )
+            .unwrap();
+            let log_before = fs::read(&log_path).unwrap();
+            let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+            let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+            app.persistence_worker =
+                super::persistence_worker::PersistenceWorker::with_restore_processor_for_tests(
+                    move |dir, panel| {
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                        super::collect_leaf_histories(dir, panel)
+                    },
+                );
+            app.scrollback_restored.remove(&panel_id);
+            app.scrollback_restore_pending.insert(panel_id);
+            assert!(app
+                .persistence_worker
+                .submit_restore(history.clone(), vec![(panel_id, leaf_id)]));
+            entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            handle
+                .lock()
+                .unwrap()
+                .feed_output_for_persistence_tests(b"new output before apply\r\n");
+            // This batch is captured before Completion::Restore installs the
+            // legacy alias in the app. The writer must route it only after
+            // capturing the immutable old history on its FIFO.
+            assert!(app.persist_scrollbacks(false));
+            assert_eq!(fs::read(&log_path).unwrap(), log_before);
+            release_tx.send(()).unwrap();
+            if phase != "ack-capture-pending" {
+                let _ = app.drain_persistence_worker();
+                assert!(!app.scrollback_restore_pending.contains(&panel_id));
+                assert!(app.scrollback_restore_ready.contains_key(&panel_id));
+            } else {
+                assert!(app.persistence_worker.restore_in_flight());
+                assert!(app.scrollback_restore_pending.contains(&panel_id));
+            }
+            // Both a capture completion not yet consumed and a ready capture
+            // not yet replayed must preserve the old checkpoint on shutdown.
+            app.on_exit(None);
+            assert!(marker.exists());
+            assert_eq!(fs::read(&checkpoint_path).unwrap(), checkpoint_before);
+            let captured = &app.scrollback_restore_ready[&panel_id];
+            assert_eq!(captured.len(), 1);
+            assert_eq!(captured[0].1, "old captured history\n");
+            assert_eq!(captured[0].2.len(), 1);
+            assert_eq!(captured[0].2[0].payload, b"old captured tail\r\n");
+            let restored = super::collect_leaf_histories(&history, panel_id);
+            assert_eq!(restored.len(), 1);
+            assert_eq!(restored[0].0, stored_leaf);
+            assert_eq!(restored[0].1, "old captured history\n");
+            assert_eq!(
+                restored[0]
+                    .2
+                    .iter()
+                    .map(|frame| frame.payload.as_slice())
+                    .collect::<Vec<_>>(),
+                vec![
+                    b"old captured tail\r\n".as_slice(),
+                    b"new output before apply\r\n".as_slice(),
+                ]
+            );
+            let canonical_checkpoint_path = history.join(
+                crate::state::scrollback_store::scrollback_leaf_file_name(panel_id, Some(leaf_id)),
+            );
+            let canonical_log_path = history.join(
+                crate::state::scrollback_store::scrollback_leaf_log_file_name(
+                    panel_id,
+                    Some(leaf_id),
+                ),
+            );
+            if legacy {
+                assert!(!canonical_checkpoint_path.exists());
+                assert!(!canonical_log_path.exists());
+            }
+            app.restore_pending_scrollbacks();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while handle.lock().unwrap().history_restore_in_progress() {
+                assert!(Instant::now() < deadline, "captured replay did not finish");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            if legacy {
+                // A complete save can also occur before update installation.
+                // Keep the run claim so subsequent output exercises the
+                // writer's transition from legacy to canonical storage.
+                app.persist_final_state().unwrap();
+                assert!(marker.exists());
+            } else {
+                app.on_exit(None);
+                assert!(!marker.exists());
+            }
+            let checkpoint = crate::state::scrollback_store::load_leaf_scrollback(
+                &history,
+                panel_id,
+                Some(leaf_id),
+            )
+            .unwrap();
+            for output in [
+                "old captured history",
+                "old captured tail",
+                "new output before apply",
+            ] {
+                assert_eq!(
+                    checkpoint.matches(output).count(),
+                    1,
+                    "missing or duplicated output: {output}"
+                );
+            }
+            if legacy {
+                assert_eq!(fs::read(&checkpoint_path).unwrap(), checkpoint_before);
+                let legacy_log_before = fs::read(&log_path).unwrap();
+                handle
+                    .lock()
+                    .unwrap()
+                    .feed_output_for_persistence_tests(b"after canonical checkpoint\r\n");
+                assert!(app.persist_scrollbacks(false));
+                let _ = app.drain_persistence_worker();
+                assert_eq!(fs::read(&log_path).unwrap(), legacy_log_before);
+                let (_, frames) = crate::state::scrollback_log::read_frames(
+                    &fs::read(&canonical_log_path).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(frames.len(), 1);
+                assert_eq!(frames[0].seq, 1);
+                assert_eq!(frames[0].payload, b"after canonical checkpoint\r\n");
+                let restored = super::collect_leaf_histories(&history, panel_id);
+                let stable_root = restored
+                    .iter()
+                    .find(|(leaf, _, _)| *leaf == Some(leaf_id))
+                    .unwrap();
+                assert_eq!(stable_root.1, checkpoint);
+                assert_eq!(stable_root.2.len(), 1);
+                assert_eq!(stable_root.2[0].payload, b"after canonical checkpoint\r\n");
+                app.on_exit(None);
+                assert!(!marker.exists());
+            }
         }
         _ => panic!("unknown isolated fixture phase: {phase}"),
     }

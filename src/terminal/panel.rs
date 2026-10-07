@@ -1701,11 +1701,11 @@ impl TerminalPanel {
     /// acepta `None` como alias legado de la raíz.
     pub fn leaf_scrollbacks(
         &self,
+        pending_restore_leaves: &[crate::terminal::split_tree::LeafId],
     ) -> Vec<(
         Option<crate::terminal::split_tree::LeafId>,
         Uuid,
-        String,
-        usize,
+        crate::terminal::pty::RecoverySnapshot<String>,
     )> {
         let mut out = Vec::new();
         for leaf in self.active_leaf_ids() {
@@ -1714,14 +1714,19 @@ impl TerminalPanel {
                     return None;
                 }
                 let runtime_session_id = session.runtime_session_id()?;
+                let restore_pending = pending_restore_leaves.contains(&leaf)
+                    && !self.restored_history_leaves.contains(&leaf);
                 session.with_pty(|pty| {
-                    pty.checkpoint_snapshot(crate::terminal::export::scrollback_to_ansi)
-                        .map(|(text, pending_bytes)| (runtime_session_id, text, pending_bytes))
+                    pty.recovery_snapshot(
+                        restore_pending,
+                        crate::terminal::export::scrollback_to_ansi,
+                    )
+                    .map(|snapshot| (runtime_session_id, snapshot))
                 })
             });
             let ansi = ansi.flatten();
-            if let Some((runtime_session_id, text, pending_bytes)) = ansi {
-                out.push((Some(leaf), runtime_session_id, text, pending_bytes));
+            if let Some((runtime_session_id, snapshot)) = ansi {
+                out.push((Some(leaf), runtime_session_id, snapshot));
             }
         }
         out

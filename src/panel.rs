@@ -424,9 +424,16 @@ impl WorkspacePanel {
         }
     }
 
-    pub fn leaf_scrollbacks(&self) -> Vec<(Option<uuid::Uuid>, uuid::Uuid, String, usize)> {
+    pub fn leaf_scrollbacks(
+        &self,
+        pending_restore_leaves: &[uuid::Uuid],
+    ) -> Vec<(
+        Option<uuid::Uuid>,
+        uuid::Uuid,
+        crate::terminal::pty::RecoverySnapshot<String>,
+    )> {
         match self {
-            Self::Terminal(panel) => panel.leaf_scrollbacks(),
+            Self::Terminal(panel) => panel.leaf_scrollbacks(pending_restore_leaves),
         }
     }
 

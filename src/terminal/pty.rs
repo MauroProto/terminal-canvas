@@ -206,6 +206,13 @@ pub struct TerminalScrollState {
     pub history_size: usize,
 }
 
+/// A restoring grid is incomplete. Its unacknowledged output can still be
+/// made durable on top of the previous checkpoint without exporting that grid.
+pub enum RecoverySnapshot<R> {
+    Checkpoint { value: R, pending_bytes: usize },
+    PendingLog(Vec<u8>),
+}
+
 impl PtyHandle {
     /// In-memory terminal for persistence regressions. It starts no shell,
     /// socket, process watcher or graphical surface.
@@ -1034,6 +1041,30 @@ impl PtyHandle {
         let pending_bytes = self.pending_log.lock().ok()?.len();
         let text = export(&term);
         Some((text, pending_bytes))
+    }
+
+    pub fn recovery_snapshot<R>(
+        &self,
+        restore_pending: bool,
+        export: impl FnOnce(&Term<EventProxy>) -> R,
+    ) -> Option<RecoverySnapshot<R>> {
+        if restore_pending || self.restoring_history.load(Ordering::Acquire) {
+            // The replay thread may hold `term` while it works. Pending output
+            // is a separate complete-frame prefix and needs no grid lock.
+            return Some(RecoverySnapshot::PendingLog(
+                self.pending_log.lock().ok()?.clone(),
+            ));
+        }
+        self.checkpoint_snapshot(export)
+            .map(|(value, pending_bytes)| RecoverySnapshot::Checkpoint {
+                value,
+                pending_bytes,
+            })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn history_restore_in_progress(&self) -> bool {
+        self.restoring_history.load(Ordering::Acquire)
     }
 
     /// Crea la frontera atómica de un hot attach. El snapshot del grid y los

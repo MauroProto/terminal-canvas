@@ -41,17 +41,28 @@ pub(super) struct FullEntry {
     pub(super) panel_id: Uuid,
     pub(super) leaf_id: Option<Uuid>,
     pub(super) runtime_session_id: Uuid,
-    pub(super) text: String,
-    pub(super) pending_bytes: usize,
+    pub(super) content: FullContent,
+}
+
+pub(super) enum FullContent {
+    Checkpoint { text: String, pending_bytes: usize },
+    PendingLog(Vec<u8>),
 }
 
 enum Job {
+    Restore {
+        dir: PathBuf,
+        panels: Vec<(Uuid, Uuid)>,
+    },
     State(AppState),
     Incremental(IncrementalBatch),
     Full(Vec<FullEntry>),
 }
 
 pub(super) enum Completion {
+    Restore {
+        histories: Vec<(Uuid, super::LeafHistories)>,
+    },
     State {
         snapshot: AppState,
         result: anyhow::Result<()>,
@@ -70,33 +81,71 @@ pub(super) struct PersistenceWorker {
     completions: Receiver<Completion>,
     state_in_flight: bool,
     scrollback_in_flight: bool,
+    restore_in_flight: bool,
 }
 
 impl PersistenceWorker {
     pub(super) fn new() -> Self {
-        Self::with_state_processor(crate::state::persistence::try_save_state)
+        Self::with_processors(
+            crate::state::persistence::try_save_state,
+            super::collect_leaf_histories,
+        )
     }
 
     #[cfg(test)]
     pub(super) fn with_state_processor_for_tests(
         process: impl FnMut(&AppState) -> anyhow::Result<()> + Send + 'static,
     ) -> Self {
-        Self::with_state_processor(process)
+        Self::with_processors(process, super::collect_leaf_histories)
     }
 
-    fn with_state_processor(
-        mut process_state: impl FnMut(&AppState) -> anyhow::Result<()> + Send + 'static,
+    #[cfg(test)]
+    pub(super) fn with_restore_processor_for_tests(
+        process: impl FnMut(&std::path::Path, Uuid) -> super::LeafHistories + Send + 'static,
     ) -> Self {
-        // Capacidad dos: uno de layout y uno de scrollback. Nunca se acumula
-        // una cola de snapshots stale si el disco está lento.
-        let (jobs_tx, jobs_rx) = mpsc::sync_channel::<Job>(2);
+        Self::with_processors(crate::state::persistence::try_save_state, process)
+    }
+
+    fn with_processors(
+        mut process_state: impl FnMut(&AppState) -> anyhow::Result<()> + Send + 'static,
+        mut process_restore: impl FnMut(&std::path::Path, Uuid) -> super::LeafHistories + Send + 'static,
+    ) -> Self {
+        // One startup capture, one layout and one history write at most.
+        // Capture is queued before any output from the new PTYs is written.
+        let (jobs_tx, jobs_rx) = mpsc::sync_channel::<Job>(3);
         let (completion_tx, completion_rx) = mpsc::channel::<Completion>();
         thread::Builder::new()
             .name("persistence-writer".to_owned())
             .spawn(move || {
                 let mut next_sequences = HashMap::new();
+                let mut legacy_roots = HashMap::new();
                 while let Ok(job) = jobs_rx.recv() {
                     let completion = match job {
+                        Job::Restore { dir, panels } => {
+                            // The same FIFO as writes establishes an immutable
+                            // old-history boundary before new live output can
+                            // reach these logs. Read-only apps may still load
+                            // history after another instance takes ownership.
+                            let _guard = crate::state::run_marker::acquire_write_guard()
+                                .ok()
+                                .flatten();
+                            Completion::Restore {
+                                histories: panels
+                                    .into_iter()
+                                    .map(|(panel, root_leaf)| {
+                                        let histories = process_restore(&dir, panel);
+                                        if histories.iter().any(|(leaf, _, _)| leaf.is_none())
+                                            && !histories
+                                                .iter()
+                                                .any(|(leaf, _, _)| *leaf == Some(root_leaf))
+                                        {
+                                            legacy_roots.insert((dir.clone(), panel), root_leaf);
+                                        }
+                                        (panel, histories)
+                                    })
+                                    .collect(),
+                            }
+                        }
                         Job::State(snapshot) => {
                             let result = process_state(&snapshot);
                             Completion::State { snapshot, result }
@@ -105,7 +154,11 @@ impl PersistenceWorker {
                             let (rollover_panels, acknowledgements) = if let Ok(Some(_guard)) =
                                 crate::state::run_marker::acquire_write_guard()
                             {
-                                persist_incremental_batch(batch, &mut next_sequences)
+                                persist_incremental_batch(
+                                    batch,
+                                    &mut next_sequences,
+                                    &mut legacy_roots,
+                                )
                             } else {
                                 (Vec::new(), Vec::new())
                             };
@@ -118,7 +171,11 @@ impl PersistenceWorker {
                             acknowledgements: if let Ok(Some(_guard)) =
                                 crate::state::run_marker::acquire_write_guard()
                             {
-                                persist_full_entries(entries)
+                                persist_full_entries(
+                                    entries,
+                                    &mut next_sequences,
+                                    &mut legacy_roots,
+                                )
                             } else {
                                 Vec::new()
                             },
@@ -135,6 +192,7 @@ impl PersistenceWorker {
             completions: completion_rx,
             state_in_flight: false,
             scrollback_in_flight: false,
+            restore_in_flight: false,
         }
     }
 
@@ -144,6 +202,27 @@ impl PersistenceWorker {
 
     pub(super) fn scrollback_in_flight(&self) -> bool {
         self.scrollback_in_flight
+    }
+
+    pub(super) fn restore_in_flight(&self) -> bool {
+        self.restore_in_flight
+    }
+
+    pub(super) fn submit_restore(&mut self, dir: PathBuf, panels: Vec<(Uuid, Uuid)>) -> bool {
+        if self.restore_in_flight {
+            return false;
+        }
+        match self.jobs.try_send(Job::Restore { dir, panels }) {
+            Ok(()) => {
+                self.restore_in_flight = true;
+                true
+            }
+            Err(TrySendError::Full(_)) => false,
+            Err(TrySendError::Disconnected(_)) => {
+                log::error!("el worker de persistencia se cerró");
+                false
+            }
+        }
     }
 
     pub(super) fn submit_state(&mut self, snapshot: AppState) -> bool {
@@ -210,7 +289,7 @@ impl PersistenceWorker {
     /// final. No se pierde el último lote por abandonar el worker.
     pub(super) fn wait_until_idle(&mut self) -> Vec<Completion> {
         let mut completions = Vec::new();
-        while self.state_in_flight || self.scrollback_in_flight {
+        while self.state_in_flight || self.scrollback_in_flight || self.restore_in_flight {
             match self.completions.recv() {
                 Ok(completion) => {
                     self.mark_complete(&completion);
@@ -219,6 +298,7 @@ impl PersistenceWorker {
                 Err(_) => {
                     self.state_in_flight = false;
                     self.scrollback_in_flight = false;
+                    self.restore_in_flight = false;
                 }
             }
         }
@@ -227,6 +307,7 @@ impl PersistenceWorker {
 
     fn mark_complete(&mut self, completion: &Completion) {
         match completion {
+            Completion::Restore { .. } => self.restore_in_flight = false,
             Completion::State { .. } => self.state_in_flight = false,
             Completion::Incremental { .. } | Completion::Full { .. } => {
                 self.scrollback_in_flight = false
@@ -235,31 +316,80 @@ impl PersistenceWorker {
     }
 }
 
-pub(super) fn persist_full_entries(entries: Vec<FullEntry>) -> Vec<IncrementalAck> {
+pub(super) fn persist_full_entries(
+    entries: Vec<FullEntry>,
+    next_sequences: &mut HashMap<(PathBuf, Uuid, Option<Uuid>), u64>,
+    legacy_roots: &mut HashMap<(PathBuf, Uuid), Uuid>,
+) -> Vec<IncrementalAck> {
+    persist_full_entries_with_remove(entries, next_sequences, legacy_roots, |path| {
+        std::fs::remove_file(path)
+    })
+}
+
+fn persist_full_entries_with_remove(
+    entries: Vec<FullEntry>,
+    next_sequences: &mut HashMap<(PathBuf, Uuid, Option<Uuid>), u64>,
+    legacy_roots: &mut HashMap<(PathBuf, Uuid), Uuid>,
+    mut remove_file: impl FnMut(&std::path::Path) -> std::io::Result<()>,
+) -> Vec<IncrementalAck> {
     let mut acknowledgements = Vec::new();
     for entry in entries {
-        let generation = super::read_leaf_generation(&entry.dir, entry.panel_id, entry.leaf_id)
-            .saturating_add(1);
+        let (text, pending_bytes) = match entry.content {
+            FullContent::Checkpoint {
+                text,
+                pending_bytes,
+            } => (text, pending_bytes),
+            FullContent::PendingLog(frames) => {
+                // Preserve the old checkpoint while replay is still building
+                // the grid. Use the same sequence cache as ordinary autosave,
+                // including when this rescue happens without app shutdown.
+                let (_, mut rescued) = persist_incremental_entries(
+                    vec![IncrementalEntry {
+                        dir: entry.dir,
+                        panel_id: entry.panel_id,
+                        leaf_id: entry.leaf_id,
+                        runtime_session_id: entry.runtime_session_id,
+                        frames,
+                    }],
+                    next_sequences,
+                    legacy_roots,
+                );
+                acknowledgements.append(&mut rescued);
+                continue;
+            }
+        };
+        let generation =
+            super::read_leaf_generation(&entry.dir, entry.panel_id, entry.leaf_id).wrapping_add(1);
         if let Err(err) = crate::state::scrollback_store::save_leaf_scrollback_versioned(
             &entry.dir,
             entry.panel_id,
             entry.leaf_id,
             generation,
-            &entry.text,
+            &text,
         ) {
             log::warn!("no se pudo guardar el scrollback de una hoja: {err}");
             continue;
         }
+        next_sequences.remove(&(entry.dir.clone(), entry.panel_id, entry.leaf_id));
+        if entry.leaf_id.is_some_and(|leaf| {
+            legacy_roots.get(&(entry.dir.clone(), entry.panel_id)) == Some(&leaf)
+        }) {
+            // Canonical publication is complete before any later raw output
+            // switches away from the legacy root. The old alias remains as
+            // compatibility/recovery data, never as a partial stable log.
+            legacy_roots.remove(&(entry.dir.clone(), entry.panel_id));
+            next_sequences.remove(&(entry.dir.clone(), entry.panel_id, None));
+        }
         // Checkpoint y generation se publican en el mismo rename atómico. Si
         // el proceso cae antes de este remove, el log viejo queda presente
         // pero su generation ya no coincide y el restore no lo reaplica.
-        let _ = std::fs::remove_file(entry.dir.join(
+        let _ = remove_file(&entry.dir.join(
             crate::state::scrollback_store::scrollback_leaf_log_file_name(
                 entry.panel_id,
                 entry.leaf_id,
             ),
         ));
-        let _ = std::fs::remove_file(entry.dir.join(
+        let _ = remove_file(&entry.dir.join(
             crate::state::scrollback_store::scrollback_leaf_gen_file_name(
                 entry.panel_id,
                 entry.leaf_id,
@@ -269,31 +399,56 @@ pub(super) fn persist_full_entries(entries: Vec<FullEntry>) -> Vec<IncrementalAc
             panel_id: entry.panel_id,
             leaf_id: entry.leaf_id,
             runtime_session_id: entry.runtime_session_id,
-            written_bytes: entry.pending_bytes,
+            written_bytes: pending_bytes,
         });
     }
     acknowledgements
 }
 
-fn persist_incremental_batch(
-    batch: IncrementalBatch,
+fn persist_incremental_entries(
+    entries: Vec<IncrementalEntry>,
     next_sequences: &mut HashMap<(PathBuf, Uuid, Option<Uuid>), u64>,
+    legacy_roots: &HashMap<(PathBuf, Uuid), Uuid>,
 ) -> (Vec<Uuid>, Vec<IncrementalAck>) {
     let mut rollover = HashSet::new();
     let mut acknowledgements = Vec::new();
-    for entry in batch.entries {
+    for entry in entries {
+        if entry.frames.is_empty() {
+            acknowledgements.push(IncrementalAck {
+                panel_id: entry.panel_id,
+                leaf_id: entry.leaf_id,
+                runtime_session_id: entry.runtime_session_id,
+                written_bytes: 0,
+            });
+            continue;
+        }
+        let storage_leaf_id = if entry.leaf_id.is_some_and(|leaf| {
+            legacy_roots.get(&(entry.dir.clone(), entry.panel_id)) == Some(&leaf)
+        }) {
+            None
+        } else {
+            entry.leaf_id
+        };
         let log_path = entry.dir.join(
             crate::state::scrollback_store::scrollback_leaf_log_file_name(
                 entry.panel_id,
-                entry.leaf_id,
+                storage_leaf_id,
             ),
         );
-        let key = (entry.dir.clone(), entry.panel_id, entry.leaf_id);
+        let key = (entry.dir.clone(), entry.panel_id, storage_leaf_id);
         let first_seq = if log_path.exists() {
             *next_sequences.entry(key.clone()).or_insert_with(|| {
                 std::fs::read(&log_path)
                     .ok()
                     .and_then(|bytes| crate::state::scrollback_log::read_frames(&bytes))
+                    .filter(|(generation, _)| {
+                        *generation
+                            == super::read_leaf_generation(
+                                &entry.dir,
+                                entry.panel_id,
+                                storage_leaf_id,
+                            )
+                    })
                     .and_then(|(_, frames)| frames.last().map(|frame| frame.seq.saturating_add(1)))
                     .unwrap_or(1)
             })
@@ -316,7 +471,7 @@ fn persist_incremental_batch(
         if let Some(needs_rollover) = super::persist_incremental_frames(
             &entry.dir,
             entry.panel_id,
-            entry.leaf_id,
+            storage_leaf_id,
             &durable_frames,
         ) {
             if needs_rollover {
@@ -331,6 +486,16 @@ fn persist_incremental_batch(
             next_sequences.insert(key, next_seq);
         }
     }
+    (rollover.into_iter().collect(), acknowledgements)
+}
+
+fn persist_incremental_batch(
+    batch: IncrementalBatch,
+    next_sequences: &mut HashMap<(PathBuf, Uuid, Option<Uuid>), u64>,
+    legacy_roots: &mut HashMap<(PathBuf, Uuid), Uuid>,
+) -> (Vec<Uuid>, Vec<IncrementalAck>) {
+    let (rollover, acknowledgements) =
+        persist_incremental_entries(batch.entries, next_sequences, legacy_roots);
     let live_ids = batch
         .live_panels
         .iter()
@@ -368,13 +533,19 @@ fn persist_incremental_batch(
             .get(panel)
             .is_some_and(|leaves| leaf.is_none_or(|leaf| leaves.contains(&leaf)))
     });
-    (rollover.into_iter().collect(), acknowledgements)
+    legacy_roots.retain(|(dir, panel), root_leaf| {
+        dir != &batch.dir
+            || live_leaves
+                .get(panel)
+                .is_some_and(|leaves| leaves.contains(root_leaf))
+    });
+    (rollover, acknowledgements)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        persist_full_entries, persist_incremental_batch, FullEntry, IncrementalBatch,
+        persist_full_entries, persist_incremental_batch, FullContent, FullEntry, IncrementalBatch,
         IncrementalEntry,
     };
     use crate::state::scrollback_log::{encode_frame, FrameKind};
@@ -402,6 +573,7 @@ mod tests {
                 live_panels: Vec::new(),
                 known_panels: vec![(panel_id, vec![leaf_id])],
             },
+            &mut std::collections::HashMap::new(),
             &mut std::collections::HashMap::new(),
         );
 
@@ -442,6 +614,7 @@ mod tests {
                 known_panels: vec![(panel_id, Vec::new())],
             },
             &mut std::collections::HashMap::new(),
+            &mut std::collections::HashMap::new(),
         );
 
         assert_eq!(rollover, vec![panel_id]);
@@ -468,6 +641,7 @@ mod tests {
                 live_panels: vec![(local_panel, Vec::new())],
                 known_panels: vec![(local_panel, Vec::new())],
             },
+            &mut std::collections::HashMap::new(),
             &mut std::collections::HashMap::new(),
         );
 
@@ -504,6 +678,7 @@ mod tests {
                 ],
             },
             &mut sequences,
+            &mut std::collections::HashMap::new(),
         );
 
         assert_eq!(sequences.len(), 1);
@@ -520,14 +695,20 @@ mod tests {
         let root = std::env::temp_dir().join(format!("tc-full-ack-{}", uuid::Uuid::new_v4()));
         let panel_id = uuid::Uuid::new_v4();
         let leaf_id = uuid::Uuid::new_v4();
-        let acknowledgements = persist_full_entries(vec![FullEntry {
-            dir: root.clone(),
-            panel_id,
-            leaf_id: Some(leaf_id),
-            runtime_session_id: uuid::Uuid::new_v4(),
-            text: "snapshot durable".to_owned(),
-            pending_bytes: 123,
-        }]);
+        let acknowledgements = persist_full_entries(
+            vec![FullEntry {
+                dir: root.clone(),
+                panel_id,
+                leaf_id: Some(leaf_id),
+                runtime_session_id: uuid::Uuid::new_v4(),
+                content: FullContent::Checkpoint {
+                    text: "snapshot durable".to_owned(),
+                    pending_bytes: 123,
+                },
+            }],
+            &mut std::collections::HashMap::new(),
+            &mut std::collections::HashMap::new(),
+        );
 
         assert_eq!(acknowledgements.len(), 1);
         assert_eq!(acknowledgements[0].written_bytes, 123);
@@ -540,7 +721,7 @@ mod tests {
     }
 
     #[test]
-    fn full_checkpoint_tolerates_a_max_generation_without_overflow() {
+    fn full_checkpoint_wraps_generation_to_a_distinct_value() {
         let root = std::env::temp_dir().join(format!("tc-max-generation-{}", uuid::Uuid::new_v4()));
         let panel_id = uuid::Uuid::new_v4();
         crate::state::scrollback_store::save_leaf_scrollback_versioned(
@@ -552,20 +733,26 @@ mod tests {
         )
         .unwrap();
 
-        let acknowledgements = persist_full_entries(vec![FullEntry {
-            dir: root.clone(),
-            panel_id,
-            leaf_id: None,
-            runtime_session_id: uuid::Uuid::new_v4(),
-            text: "nuevo".to_owned(),
-            pending_bytes: 5,
-        }]);
+        let acknowledgements = persist_full_entries(
+            vec![FullEntry {
+                dir: root.clone(),
+                panel_id,
+                leaf_id: None,
+                runtime_session_id: uuid::Uuid::new_v4(),
+                content: FullContent::Checkpoint {
+                    text: "nuevo".to_owned(),
+                    pending_bytes: 5,
+                },
+            }],
+            &mut std::collections::HashMap::new(),
+            &mut std::collections::HashMap::new(),
+        );
 
         assert_eq!(acknowledgements.len(), 1);
         let (generation, text) =
             crate::state::scrollback_store::load_leaf_scrollback_checkpoint(&root, panel_id, None)
                 .unwrap();
-        assert_eq!(generation, Some(u32::MAX));
+        assert_eq!(generation, Some(0));
         assert_eq!(text, "nuevo");
         let _ = std::fs::remove_dir_all(root);
     }
@@ -611,8 +798,10 @@ mod tests {
             panel_id,
             leaf_id: Some(leaf_id),
             runtime_session_id,
-            text: "checkpoint\n".to_owned(),
-            pending_bytes: written_bytes,
+            content: FullContent::Checkpoint {
+                text: "checkpoint\n".to_owned(),
+                pending_bytes: written_bytes
+            },
         }]));
         let completions = worker.wait_until_idle();
         assert_eq!(completions.len(), 1);
@@ -624,6 +813,100 @@ mod tests {
         assert_eq!(acknowledgements[0].written_bytes, written_bytes);
         assert!(worker.poll().is_empty());
         assert!(worker.wait_until_idle().is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn full_checkpoint_survives_retained_max_generation_log_and_restarts_sequences() {
+        let root =
+            std::env::temp_dir().join(format!("tc-full-retained-log-{}", uuid::Uuid::new_v4()));
+        let panel_id = uuid::Uuid::new_v4();
+        let leaf_id = uuid::Uuid::new_v4();
+        let runtime_session_id = uuid::Uuid::new_v4();
+        crate::state::scrollback_store::save_leaf_scrollback_versioned(
+            &root,
+            panel_id,
+            Some(leaf_id),
+            u32::MAX,
+            "previous checkpoint\n",
+        )
+        .unwrap();
+        let log_path = root.join(
+            crate::state::scrollback_store::scrollback_leaf_log_file_name(panel_id, Some(leaf_id)),
+        );
+        crate::state::scrollback_log::reset_log(&log_path, u32::MAX).unwrap();
+        crate::state::scrollback_log::append_frames(
+            &log_path,
+            &encode_frame(
+                u64::MAX,
+                FrameKind::Output,
+                b"already included in the full checkpoint",
+            ),
+        )
+        .unwrap();
+        let old_log = std::fs::read(&log_path).unwrap();
+        let key = (root.clone(), panel_id, Some(leaf_id));
+        let mut sequences = std::collections::HashMap::from([(key.clone(), u64::MAX)]);
+        let mut legacy_roots = std::collections::HashMap::new();
+        let acknowledgements = super::persist_full_entries_with_remove(
+            vec![FullEntry {
+                dir: root.clone(),
+                panel_id,
+                leaf_id: Some(leaf_id),
+                runtime_session_id,
+                content: FullContent::Checkpoint {
+                    text: "fully saved prior output\n".to_owned(),
+                    pending_bytes: 42,
+                },
+            }],
+            &mut sequences,
+            &mut legacy_roots,
+            |_| Err(std::io::ErrorKind::PermissionDenied.into()),
+        );
+        assert_eq!(acknowledgements.len(), 1);
+        assert!(
+            !sequences.contains_key(&key),
+            "a full checkpoint invalidates the old counter"
+        );
+        assert_eq!(
+            std::fs::read(&log_path).unwrap(),
+            old_log,
+            "failed deletion leaves the old artifact intact"
+        );
+        let (checkpoint, frames) =
+            crate::state::scrollback_store::load_leaf_session(&root, panel_id, Some(leaf_id));
+        assert_eq!(checkpoint, b"fully saved prior output\r\n");
+        assert!(
+            frames.is_empty(),
+            "the retained previous generation must never be reapplied"
+        );
+        let (rollover, acknowledgements) = persist_incremental_batch(
+            IncrementalBatch {
+                dir: root.clone(),
+                entries: vec![IncrementalEntry {
+                    dir: root.clone(),
+                    panel_id,
+                    leaf_id: Some(leaf_id),
+                    runtime_session_id,
+                    frames: encode_frame(1, FrameKind::Output, b"new output"),
+                }],
+                live_panels: vec![(panel_id, vec![leaf_id])],
+                known_panels: vec![(panel_id, vec![leaf_id])],
+            },
+            &mut sequences,
+            &mut legacy_roots,
+        );
+        assert!(
+            rollover.is_empty(),
+            "the saturated old cache must not force another full save"
+        );
+        assert_eq!(acknowledgements.len(), 1);
+        let (generation, frames) =
+            crate::state::scrollback_log::read_frames(&std::fs::read(&log_path).unwrap()).unwrap();
+        assert_eq!(generation, 0);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].seq, 1);
+        assert_eq!(frames[0].payload, b"new output");
         let _ = std::fs::remove_dir_all(root);
     }
 }
