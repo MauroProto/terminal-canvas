@@ -169,7 +169,6 @@ impl SourceDocument {
     /// Highlight only a visible fragment's intersection with the selection.
     /// A selected newline may have no visible fragment bytes; it still remains
     /// in `selection_text`, including the final terminator in Ctrl+A.
-    #[cfg(test)]
     pub fn fragment_selection_text(
         &self,
         index: usize,
