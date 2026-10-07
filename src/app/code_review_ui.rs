@@ -1265,7 +1265,7 @@ impl TerminalApp {
                             self.toast_success("Notas anteriores importadas. Revisá sus archivos antes de enviarlas.");
                         }
                         Err(err) => {
-                            self.toast_error(format!("No se pudieron importar las notas: {err}"))
+                            self.toast_error(format!("No se pudieron importar las notas: {err:#}"))
                         }
                     }
                 }
