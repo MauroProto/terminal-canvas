@@ -135,6 +135,33 @@ fn startup_read_error_blocks_layout_writes_and_reports_the_failed_path() {
 }
 
 #[test]
+fn disabled_profile_writes_keep_a_visible_warning_after_transient_toasts_expire() {
+    let ctx = egui::Context::default();
+    let mut app = detached_test_app_with_panel(&ctx);
+    app.persistence_warning = Some("controlled profile read error".to_owned());
+    assert!(!app.persistence_writes_enabled);
+    for time in [0.0, 600.0] {
+        let mut output = ctx.run_ui(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(700.0, 300.0))),
+                time: Some(time),
+                ..Default::default()
+            },
+            |ui| app.show_persistence_warning(ui),
+        );
+        assert!(output.shapes.iter().any(|shape| match &shape.shape {
+            egui::epaint::Shape::Text(text) => text
+                .galley
+                .text()
+                .contains("Guardado de layout e historial desactivado"),
+            _ => false,
+        }));
+        output.textures_delta.clear();
+        output.drop_without_applying_deltas();
+    }
+}
+
+#[test]
 fn test_app_never_owns_the_users_run_marker() {
     let ctx = egui::Context::default();
     let app = super::TerminalApp::new_for_tests(&ctx);

@@ -188,6 +188,7 @@ pub struct TerminalApp {
     run_marker_active: bool,
     /// A future or unreadable layout blocks profile writes and history pruning.
     persistence_writes_enabled: bool,
+    persistence_warning: Option<String>,
 }
 
 impl TerminalApp {
@@ -205,6 +206,7 @@ impl TerminalApp {
             persistence_error.is_none(),
         );
         if let Some(error) = persistence_error {
+            app.persistence_warning = Some(error.clone());
             app.toast_error(error);
         }
         app
@@ -381,6 +383,7 @@ impl TerminalApp {
                 consecutive_ui_panics: 0,
                 run_marker_active: side_effects,
                 persistence_writes_enabled,
+                persistence_warning: None,
             }
         } else {
             let collab = CollabManager::new();
@@ -490,6 +493,7 @@ impl TerminalApp {
                 consecutive_ui_panics: 0,
                 run_marker_active: side_effects,
                 persistence_writes_enabled,
+                persistence_warning: None,
             }
         };
 
@@ -1179,9 +1183,9 @@ impl TerminalApp {
             return true;
         }
         self.persistence_writes_enabled = false;
-        self.toast_error(
-            "Otra instancia de TerminalCanvas tomó el guardado; esta ventana dejó de escribir para proteger tus proyectos",
-        );
+        let warning = "Otra instancia de TerminalCanvas tomó el guardado; esta ventana dejó de escribir para proteger tus proyectos".to_owned();
+        self.persistence_warning = Some(warning.clone());
+        self.toast_error(warning);
         false
     }
 
@@ -1392,6 +1396,7 @@ impl TerminalApp {
             self.execute_command(command, &ctx, ui.available_rect_before_wrap());
         }
         self.forward_input_to_focused_panel(&ctx);
+        self.show_persistence_warning(ui);
         self.show_sidebar(ui);
         self.show_taskbar(ui);
         // El visor de código es un SidePanel: tiene que declararse antes del
@@ -1418,6 +1423,24 @@ impl TerminalApp {
             });
 
         self.finish_ui(&ctx, canvas_rect, frame_started_at, perf_snapshot);
+    }
+
+    fn show_persistence_warning(&self, ui: &mut egui::Ui) {
+        let Some(reason) = self
+            .persistence_warning
+            .as_deref()
+            .filter(|_| !self.persistence_writes_enabled)
+        else {
+            return;
+        };
+        Panel::top("persistence-write-warning")
+            .resizable(false)
+            .show(ui, |ui| {
+                ui.label(egui::RichText::new("Guardado de layout e historial desactivado")
+                    .strong().color(Color32::from_rgb(235, 170, 95)))
+                    .on_hover_text(reason);
+                ui.label("Revisá el motivo antes de continuar con cambios; el detalle aparece al pasar el mouse.");
+            });
     }
 
     /// Poll workers without requiring layout, painting, or fresh UI input.
