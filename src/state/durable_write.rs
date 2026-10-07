@@ -29,11 +29,15 @@ pub const BACKUP_MIN_SPACING: Duration = Duration::from_secs(60 * 60);
 /// Escribe `bytes` en `path` de forma durable. Devuelve `true` si escribió;
 /// `false` si el archivo ya tenía exactamente ese contenido (no-op).
 pub fn write_durable(path: &Path, bytes: &[u8]) -> std::io::Result<bool> {
+    validate_write_target(path)?;
     // No-op por contenido: reescribir el mismo estado solo gasta disco y le
     // miente al ring de backups (copias idénticas).
     if content_matches(path, bytes) {
         return Ok(false);
     }
+    // A no-op never touches the ring. Changed writes validate every slot
+    // before rotation can move a special file or copy through a backup link.
+    validate_backup_ring(path)?;
     rotate_backup_ring(path, SystemTime::now(), BACKUP_MIN_SPACING);
     write_atomic_changed(path, bytes)?;
     Ok(true)
@@ -43,11 +47,62 @@ pub fn write_durable(path: &Path, bytes: &[u8]) -> std::io::Result<bool> {
 /// para checkpoints frecuentes y regenerables (scrollback): mantiene el
 /// patrón tmp/fsync/rename y el no-op por contenido, sin multiplicar archivos.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<bool> {
+    validate_write_target(path)?;
     if content_matches(path, bytes) {
         return Ok(false);
     }
     write_atomic_changed(path, bytes)?;
     Ok(true)
+}
+
+// Check types before opening contents, rotating backups or replacing entries.
+// This is a preflight for stable paths, not protection against concurrent
+// filesystem replacement. Generic writers keep following regular-file links.
+fn validate_write_target(path: &Path) -> std::io::Result<()> {
+    let metadata = match retry_interrupted(|| std::fs::symlink_metadata(path)) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let metadata = if metadata.file_type().is_symlink() {
+        // A dangling link is present: failure here must not become permission
+        // to create a new file over that link.
+        retry_interrupted(|| std::fs::metadata(path))?
+    } else {
+        metadata
+    };
+    if metadata.is_file() {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "state destination must be a regular file: {}",
+                path.display()
+            ),
+        ))
+    }
+}
+
+fn validate_backup_ring(path: &Path) -> std::io::Result<()> {
+    for slot in 0..BACKUP_SLOTS {
+        let backup = backup_path(path, slot);
+        match retry_interrupted(|| std::fs::symlink_metadata(&backup)) {
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+            Ok(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "state backup must be a regular file without a link: {}",
+                        backup.display()
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn write_atomic_changed(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
