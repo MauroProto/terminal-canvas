@@ -233,37 +233,51 @@ impl PreferencesWorker {
             self.mark_unavailable(format!("No se pudo iniciar el guardado: {error}"));
             return;
         }
-        let was_active = self.failed_active.is_some();
-        let Some(job) = self
-            .failed_active
-            .take()
-            .or_else(|| self.pending.pop_front())
-        else {
+        loop {
+            let was_active = self.failed_active.is_some();
+            let Some(job) = self
+                .failed_active
+                .take()
+                .or_else(|| self.pending.pop_front())
+            else {
+                return;
+            };
+            // A new review must never expose an older disk snapshot while
+            // edits for the same repository are still known to be unsaved.
+            if let Job::LoadNotes(_, _, root) = job.as_ref() {
+                if let Some(failure) = self.notes_write_errors.get(root) {
+                    self.completions.push_back(job.interrupted(&format!(
+                        "Hay notas pendientes de guardar: {}",
+                        failure.reason
+                    )));
+                    continue;
+                }
+            }
+            let sent = self
+                .worker
+                .as_ref()
+                .map(|w| w.jobs.try_send(Arc::clone(&job)));
+            match sent {
+                Some(Ok(())) => self.active = Some(job),
+                Some(Err(TrySendError::Full(returned))) => {
+                    if was_active {
+                        self.failed_active = Some(returned);
+                    } else {
+                        self.pending.push_front(returned);
+                    }
+                }
+                _ => {
+                    if was_active {
+                        self.failed_active = Some(job);
+                    } else {
+                        self.pending.push_front(job);
+                    }
+                    self.mark_unavailable(
+                        "El guardado se interrumpió antes de aceptar el trabajo".to_owned(),
+                    );
+                }
+            }
             return;
-        };
-        let sent = self
-            .worker
-            .as_ref()
-            .map(|w| w.jobs.try_send(Arc::clone(&job)));
-        match sent {
-            Some(Ok(())) => self.active = Some(job),
-            Some(Err(TrySendError::Full(returned))) => {
-                if was_active {
-                    self.failed_active = Some(returned);
-                } else {
-                    self.pending.push_front(returned);
-                }
-            }
-            _ => {
-                if was_active {
-                    self.failed_active = Some(job);
-                } else {
-                    self.pending.push_front(job);
-                }
-                self.mark_unavailable(
-                    "El guardado se interrumpió antes de aceptar el trabajo".to_owned(),
-                );
-            }
         }
     }
 
@@ -362,6 +376,11 @@ impl PreferencesWorker {
         self.submit(Job::SaveNotes(root, notes));
     }
     pub(super) fn load_notes(&mut self, key: Uuid, root: PathBuf) -> Uuid {
+        if let Some(failure) = self.notes_write_errors.get(&root) {
+            if !self.write_waiting(failure.job.as_ref()) {
+                self.queue(Arc::clone(&failure.job));
+            }
+        }
         let request = Uuid::new_v4();
         self.submit(Job::LoadNotes(key, request, root));
         request
