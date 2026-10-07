@@ -33,6 +33,105 @@ fn test_app_never_owns_the_users_run_marker() {
     assert!(!app.persistence_writes_enabled);
 }
 
+#[test]
+fn hidden_logic_ignores_stale_ui_input_and_keeps_ui_state_between_passes() {
+    let ctx = egui::Context::default();
+    let mut app = super::TerminalApp::new_for_tests(&ctx);
+    let panel_id = app.ws().panels[0].id();
+    app.ws_mut().bring_to_front(panel_id);
+    app.ws_mut().panels[0].set_unread(true);
+    let raw_input = RawInput {
+        time: Some(1.0),
+        focused: true,
+        events: vec![
+            egui::Event::Text("last visible key".to_owned()),
+            egui::Event::Key {
+                key: egui::Key::Comma,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::CTRL,
+            },
+        ],
+        ..Default::default()
+    };
+    ctx.run_ui(raw_input, |_| {}).drop_without_applying_deltas();
+    let passes = ctx.cumulative_pass_nr();
+    let focus_id = egui::Id::new("retained-hidden-focus");
+    ctx.memory_mut(|memory| memory.request_focus(focus_id));
+    let from_rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(300.0, 200.0));
+    app.window_transitions.insert(
+        panel_id,
+        WindowTransition {
+            kind: WindowTransitionKind::Minimizing,
+            from_rect,
+            to_rect: from_rect.translate(vec2(100.0, 200.0)),
+            started_at: 1.0,
+            duration: 0.14,
+        },
+    );
+    let mut hidden = RawInput {
+        time: Some(100.0),
+        focused: false,
+        ..Default::default()
+    };
+    hidden
+        .viewports
+        .entry(egui::ViewportId::ROOT)
+        .or_default()
+        .minimized = Some(true);
+    let repaint_delays = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed_delays = std::sync::Arc::clone(&repaint_delays);
+    ctx.set_request_repaint_callback(move |request| {
+        observed_delays.lock().unwrap().push(request.delay);
+    });
+    for _ in 0..3 {
+        let output = ctx.run_logic(&hidden, |ctx| app.logic_impl(ctx));
+        assert_eq!(output.platform_output.num_completed_passes, 0);
+        assert!(!app.settings_open, "a stale shortcut must not be executed");
+        assert!(
+            app.ws().panels[0].unread(),
+            "stale input must not clear unread"
+        );
+        assert!(
+            !app.window_focused,
+            "logic must use the fresh raw focus state"
+        );
+        assert!(app.window_transitions.contains_key(&panel_id));
+        assert_eq!(app.last_perf_snapshot.visible_panels, 0);
+        assert_eq!(ctx.cumulative_pass_nr(), passes);
+        assert_eq!(ctx.memory(|memory| memory.focused()), Some(focus_id));
+        assert_eq!(ctx.input(|input| input.time), 1.0);
+    }
+    assert!(
+        repaint_delays
+            .lock()
+            .unwrap()
+            .contains(&super::AUTOSAVE_INTERVAL),
+        "background polling remains scheduled even when persistence is disabled"
+    );
+}
+
+#[test]
+fn successful_logic_cannot_reset_a_repeated_ui_panic() {
+    use super::UpdatePhase;
+    let ctx = egui::Context::default();
+    let mut app = super::TerminalApp::new_for_tests(&ctx);
+    for expected in 1..=super::MAX_CONSECUTIVE_UPDATE_PANICS {
+        assert_eq!(app.record_update_outcome(UpdatePhase::Logic, false), 0);
+        assert_eq!(app.record_update_outcome(UpdatePhase::Ui, true), expected);
+    }
+    assert_eq!(app.record_update_outcome(UpdatePhase::Ui, false), 0);
+    for expected in 1..=super::MAX_CONSECUTIVE_UPDATE_PANICS {
+        assert_eq!(app.record_update_outcome(UpdatePhase::Ui, false), 0);
+        assert_eq!(
+            app.record_update_outcome(UpdatePhase::Logic, true),
+            expected
+        );
+    }
+    assert_eq!(app.record_update_outcome(UpdatePhase::Logic, false), 0);
+}
+
 /// Run real closing writes in a fresh process: cached paths and the writer
 /// claim must never be changed in the test runner's own user profile.
 fn run_final_save_fixture(phase: &str) {
@@ -125,6 +224,11 @@ fn final_save_does_not_write_or_remove_successor_marker_after_losing_lease() {
 #[test]
 fn final_save_crash_recovery_preserves_the_dirty_marker() {
     run_final_save_fixture("crash-recovery");
+}
+
+#[test]
+fn hidden_logic_flushes_pending_input_and_persists_pty_output_without_a_ui_pass() {
+    run_final_save_fixture("ack-hidden-logic");
 }
 
 #[test]
@@ -483,6 +587,90 @@ fn final_save_profile_fixture() {
                 serde_json::from_slice(&fs::read(&layout).unwrap()).unwrap();
             assert_eq!(saved.workspaces[0].name, "Final workspace");
             assert!(marker.exists(), "crash recovery must remain a dirty run");
+        }
+        "ack-hidden-logic" => {
+            let panel_id = app.workspaces[0].panels[0].id();
+            let leaf_id = app.workspaces[0].panels[0].root_leaf_id();
+            let runtime_id = app.workspaces[0].panels[0].runtime_session_id().unwrap();
+            let manager = app.workspaces[0].pty_manager();
+            let handle = manager.lock().unwrap().handle(runtime_id).unwrap();
+            app.autosave = crate::state::persistence::AutosaveController::new(Duration::ZERO);
+            app.scrollback_flush =
+                crate::state::persistence::PeriodicFlushController::new(Duration::ZERO);
+            manager
+                .lock()
+                .unwrap()
+                .queue_prompt(runtime_id, "deferred hidden prompt");
+            assert!(app.workspaces[0].has_pending_inputs());
+            handle
+                .lock()
+                .unwrap()
+                .feed_output_for_persistence_tests(b"hidden first batch\r\n");
+            let mut hidden = RawInput {
+                focused: false,
+                ..Default::default()
+            };
+            hidden
+                .viewports
+                .entry(egui::ViewportId::ROOT)
+                .or_default()
+                .minimized = Some(true);
+            let _ = ctx.run_logic(&hidden, |ctx| app.logic_impl(ctx));
+            assert!(app.persistence_worker.scrollback_in_flight());
+            assert!(
+                app.workspaces[0].has_pending_inputs(),
+                "prompt waits for fresh output"
+            );
+            handle.lock().unwrap().mark_render_dirty();
+            handle
+                .lock()
+                .unwrap()
+                .feed_output_for_persistence_tests(b"hidden next batch\r\n");
+            let snapshot = app.snapshot_state();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                let _ = ctx.run_logic(&hidden, |ctx| app.logic_impl(ctx));
+                if handle.lock().unwrap().pending_log_snapshot().is_empty()
+                    && app.persisted_state.as_ref() == Some(&snapshot)
+                {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "hidden autosave/ACK did not finish"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(!app.workspaces[0].has_pending_inputs());
+            assert_eq!(
+                ctx.cumulative_pass_nr(),
+                0,
+                "logic must not begin a UI pass"
+            );
+            assert_eq!(app.last_perf_snapshot.visible_panels, 0);
+            assert!(marker.exists(), "autosave never declares a clean shutdown");
+            let log_path = history.join(
+                crate::state::scrollback_store::scrollback_leaf_log_file_name(
+                    panel_id,
+                    Some(leaf_id),
+                ),
+            );
+            let (_, frames) =
+                crate::state::scrollback_log::read_frames(&fs::read(log_path).unwrap()).unwrap();
+            assert_eq!(
+                frames
+                    .iter()
+                    .map(|frame| (frame.seq, frame.payload.as_slice()))
+                    .collect::<Vec<_>>(),
+                vec![
+                    (1, b"hidden first batch\r\n".as_slice()),
+                    (2, b"hidden next batch\r\n".as_slice())
+                ]
+            );
+            let saved = crate::state::persistence::load_state().unwrap();
+            assert_eq!(saved, snapshot);
+            app.on_exit(None);
+            assert!(!marker.exists());
         }
         "ack-workspace-close" | "ack-rollover-workspace-close" => {
             let panel_id = app.workspaces[0].panels[0].id();
@@ -1298,10 +1486,10 @@ fn taskbar_reveals_a_focused_terminal_beyond_the_window_width() {
     }
     let mut harness = Harness::builder()
         .with_size(vec2(600.0, 400.0))
-        .build_state(
-            |ctx, app: &mut super::TerminalApp| {
-                app.show_taskbar(ctx);
-                CentralPanel::default().show(ctx, |_| {});
+        .build_ui_state(
+            |ui, app: &mut super::TerminalApp| {
+                app.show_taskbar(ui);
+                CentralPanel::default().show(ui, |_| {});
             },
             app,
         );
@@ -1335,10 +1523,10 @@ fn docked_viewer_switches_keyboard_ownership_by_pointer_and_escape() {
     });
     let mut harness = Harness::builder()
         .with_size(vec2(1100.0, 700.0))
-        .build_state(
-            |ctx, app: &mut super::TerminalApp| {
-                app.show_file_viewer(ctx);
-                CentralPanel::default().show(ctx, |ui| {
+        .build_ui_state(
+            |ui, app: &mut super::TerminalApp| {
+                app.show_file_viewer(ui);
+                CentralPanel::default().show(ui, |ui| {
                     ui.label("Terminal area");
                 });
             },
@@ -1437,6 +1625,7 @@ fn closing_a_project_requires_confirmation_and_captures_terminal_input() {
             workspace_id,
         )],
         &ctx,
+        ctx.content_rect(),
     );
 
     assert_eq!(app.closing_workspace, Some(workspace_id));
@@ -1870,8 +2059,8 @@ fn minimap_paints_above_overlapping_panels() {
     let panel_size = vec2(280.0, 220.0);
     let mut canvas_rect = Rect::NOTHING;
 
-    let output = ctx.run(raw_input, |ctx| {
-        CentralPanel::default().show(ctx, |ui| {
+    let output = ctx.run_ui(raw_input, |ui| {
+        CentralPanel::default().show(ui, |ui| {
             canvas_rect = ui.max_rect();
 
             let mut drawn_panel = TerminalPanel::new(panel_pos, panel_size, Color32::LIGHT_BLUE, 1);
@@ -1908,6 +2097,7 @@ fn minimap_paints_above_overlapping_panels() {
         minimap_bg_idx > panel_bg_idx,
         "minimap should paint after overlapping panels, got panel idx {panel_bg_idx} and minimap idx {minimap_bg_idx}"
     );
+    output.drop_without_applying_deltas();
 }
 
 #[test]
