@@ -639,6 +639,33 @@ fn completed_process_can_return_the_still_active_numeric_exit_code() {
 }
 
 #[test]
+fn real_powershell_verification_preserves_utf8_environment_and_system_directory() {
+    let value = "Mauro ñ 東京 🦀: \"comillas\", $() y barras\\";
+    let mut command = super::windows_system_command(
+        r#"[pscustomobject]@{
+            value = $env:TC_WINDOWS_VERIFY_POWERSHELL_VALUE
+            directory = [Environment]::CurrentDirectory
+        } | ConvertTo-Json -Compress"#,
+    )
+    .unwrap();
+    command.env("TC_WINDOWS_VERIFY_POWERSHELL_VALUE", value);
+    let output = super::bounded_output(&mut command, Duration::from_secs(15)).unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["value"], value);
+    let system_directory = PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32");
+    let actual_directory = Path::new(report["directory"].as_str().unwrap());
+    assert_eq!(
+        std::fs::canonicalize(actual_directory).unwrap(),
+        std::fs::canonicalize(system_directory).unwrap()
+    );
+}
+
+#[test]
 fn real_crt_preserves_arguments_unicode_directory_and_case_insensitive_environment_edits() {
     let directory = TestDirectory::new();
     let marker = directory.marker();
