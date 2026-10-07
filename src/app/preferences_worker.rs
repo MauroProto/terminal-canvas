@@ -670,3 +670,7 @@ mod tests {
         assert!(matches!(pending[0].as_ref(), Job::LoadNotes(key, _, _) if *key == last));
     }
 }
+
+#[cfg(test)]
+#[path = "preferences_worker/tests.rs"]
+mod recovery_tests;
