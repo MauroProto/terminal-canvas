@@ -491,3 +491,271 @@ mod private_security_tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 }
+
+#[cfg(test)]
+mod streaming_content_tests {
+    use std::io::{Error, ErrorKind, Read};
+    use std::path::{Path, PathBuf};
+    use std::time::SystemTime;
+
+    use super::{
+        backup_path, content_matches, content_matches_reader, write_atomic, write_durable,
+        BACKUP_SLOTS, CONTENT_COMPARE_CHUNK_BYTES,
+    };
+
+    struct ControlledReader<'a> {
+        remaining: &'a [u8],
+        calls: usize,
+        bytes_read: usize,
+        largest_request: usize,
+        max_chunk: usize,
+        interrupt_calls: &'a [usize],
+        fail_on_call: Option<usize>,
+    }
+
+    impl<'a> ControlledReader<'a> {
+        fn new(data: &'a [u8]) -> Self {
+            Self {
+                remaining: data,
+                calls: 0,
+                bytes_read: 0,
+                largest_request: 0,
+                max_chunk: usize::MAX,
+                interrupt_calls: &[],
+                fail_on_call: None,
+            }
+        }
+    }
+
+    impl Read for ControlledReader<'_> {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            self.calls += 1;
+            self.largest_request = self.largest_request.max(buffer.len());
+            if self.interrupt_calls.contains(&self.calls) {
+                return Err(ErrorKind::Interrupted.into());
+            }
+            if self.fail_on_call == Some(self.calls) {
+                return Err(Error::from(ErrorKind::PermissionDenied));
+            }
+            let read = self.remaining.len().min(buffer.len()).min(self.max_chunk);
+            buffer[..read].copy_from_slice(&self.remaining[..read]);
+            self.remaining = &self.remaining[read..];
+            self.bytes_read += read;
+            Ok(read)
+        }
+    }
+
+    struct TempDirectory(PathBuf);
+
+    impl TempDirectory {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("tc-streaming-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn fingerprint(path: &Path) -> (Vec<u8>, SystemTime) {
+        (
+            std::fs::read(path).unwrap(),
+            std::fs::metadata(path).unwrap().modified().unwrap(),
+        )
+    }
+
+    #[test]
+    fn streaming_content_matches_equal_bytes_across_fixed_chunks() {
+        let bytes = vec![b'x'; CONTENT_COMPARE_CHUNK_BYTES * 2 + 9];
+        let mut reader = ControlledReader::new(&bytes);
+        assert!(content_matches_reader(
+            &mut reader,
+            bytes.len() as u64,
+            &bytes
+        ));
+        assert_eq!(reader.largest_request, CONTENT_COMPARE_CHUNK_BYTES);
+        assert_eq!(reader.bytes_read, bytes.len());
+        assert_eq!(reader.calls, 4);
+    }
+
+    #[test]
+    fn streaming_content_matches_empty_bytes_only_after_eof() {
+        let mut reader = ControlledReader::new(b"");
+        assert!(content_matches_reader(&mut reader, 0, b""));
+        assert_eq!(reader.calls, 1);
+        assert_eq!(reader.largest_request, 1);
+    }
+
+    #[test]
+    fn streaming_content_rejects_a_difference_at_the_first_byte() {
+        let mut reader = ControlledReader::new(b"xbc");
+        assert!(!content_matches_reader(&mut reader, 3, b"abc"));
+        assert_eq!(reader.calls, 1);
+    }
+
+    #[test]
+    fn streaming_content_rejects_a_difference_at_the_last_byte() {
+        let bytes = vec![b'x'; CONTENT_COMPARE_CHUNK_BYTES + 9];
+        let mut changed = bytes.clone();
+        *changed.last_mut().unwrap() = b'y';
+        let mut reader = ControlledReader::new(&changed);
+        assert!(!content_matches_reader(
+            &mut reader,
+            bytes.len() as u64,
+            &bytes
+        ));
+        assert_eq!(reader.calls, 2);
+    }
+
+    #[test]
+    fn streaming_content_rejects_a_gibibyte_length_without_reading() {
+        let mut reader = ControlledReader::new(b"unused");
+        assert!(!content_matches_reader(&mut reader, 1_u64 << 30, b"x"));
+        assert_eq!(reader.calls, 0);
+        assert_eq!(reader.bytes_read, 0);
+        assert_eq!(reader.largest_request, 0);
+    }
+
+    #[test]
+    fn streaming_content_rejects_truncation_after_metadata() {
+        let mut reader = ControlledReader::new(b"ab");
+        assert!(!content_matches_reader(&mut reader, 3, b"abc"));
+        assert_eq!(reader.calls, 2);
+        assert_eq!(reader.bytes_read, 2);
+    }
+
+    #[test]
+    fn streaming_content_rejects_growth_with_only_one_sentinel_byte() {
+        for (data, expected) in [
+            (b"abc-trailer".as_slice(), b"abc".as_slice()),
+            (b"x".as_slice(), b"".as_slice()),
+        ] {
+            let mut reader = ControlledReader::new(data);
+            assert!(!content_matches_reader(
+                &mut reader,
+                expected.len() as u64,
+                expected
+            ));
+            assert_eq!(reader.bytes_read, expected.len() + 1);
+            assert_eq!(reader.remaining.len(), data.len() - expected.len() - 1);
+        }
+    }
+
+    #[test]
+    fn streaming_content_rejects_read_errors_before_or_during_comparison() {
+        for failing_call in [1, 2] {
+            let mut reader = ControlledReader::new(b"abc");
+            reader.max_chunk = 1;
+            reader.fail_on_call = Some(failing_call);
+            assert!(!content_matches_reader(&mut reader, 3, b"abc"));
+        }
+    }
+
+    #[test]
+    fn streaming_content_rejects_an_error_while_checking_eof() {
+        let mut reader = ControlledReader::new(b"abc");
+        reader.fail_on_call = Some(2);
+        assert!(!content_matches_reader(&mut reader, 3, b"abc"));
+        assert_eq!(reader.bytes_read, 3);
+    }
+
+    #[test]
+    fn streaming_content_retries_interrupted_data_reads_and_eof() {
+        for max_chunk in [usize::MAX, 1] {
+            let mut reader = ControlledReader::new(b"abc");
+            reader.max_chunk = max_chunk;
+            reader.interrupt_calls = &[1, 3, 5, 7];
+            assert!(content_matches_reader(&mut reader, 3, b"abc"));
+            assert_eq!(reader.bytes_read, 3);
+            assert_eq!(reader.calls, if max_chunk == 1 { 8 } else { 4 });
+        }
+    }
+
+    #[test]
+    fn streaming_content_accepts_short_reads_without_growing_the_buffer() {
+        let bytes = vec![b'x'; CONTENT_COMPARE_CHUNK_BYTES * 2 + 9];
+        let mut reader = ControlledReader::new(&bytes);
+        reader.max_chunk = 7;
+        assert!(content_matches_reader(
+            &mut reader,
+            bytes.len() as u64,
+            &bytes
+        ));
+        assert_eq!(reader.largest_request, CONTENT_COMPARE_CHUNK_BYTES);
+        assert_eq!(reader.bytes_read, bytes.len());
+        assert!(reader.calls > 4);
+    }
+
+    #[test]
+    fn streaming_content_noop_preserves_main_timestamp_and_entire_backup_ring() {
+        let directory = TempDirectory::new();
+        let path = directory.path().join("layout.json");
+        std::fs::write(&path, b"unchanged").unwrap();
+        for slot in 0..BACKUP_SLOTS {
+            std::fs::write(backup_path(&path, slot), format!("backup-{slot}")).unwrap();
+        }
+        let paths: Vec<_> = std::iter::once(path.clone())
+            .chain((0..BACKUP_SLOTS).map(|slot| backup_path(&path, slot)))
+            .collect();
+        let before: Vec<_> = paths.iter().map(|path| fingerprint(path)).collect();
+        assert!(!write_durable(&path, b"unchanged").unwrap());
+        assert!(!write_atomic(&path, b"unchanged").unwrap());
+        let after: Vec<_> = paths.iter().map(|path| fingerprint(path)).collect();
+        assert_eq!(before, after);
+        assert_eq!(
+            std::fs::read_dir(directory.path()).unwrap().count(),
+            BACKUP_SLOTS + 1
+        );
+    }
+
+    #[test]
+    fn streaming_content_rejects_a_missing_file_and_directory() {
+        let directory = TempDirectory::new();
+        assert!(!content_matches(&directory.path().join("missing"), b""));
+        assert!(!content_matches(directory.path(), b""));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn streaming_content_follows_a_symlink_to_a_regular_file() {
+        let directory = TempDirectory::new();
+        let target = directory.path().join("target");
+        let link = directory.path().join("link");
+        std::fs::write(&target, b"same").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(content_matches(&link, b"same"));
+        assert!(!content_matches(&link, b"different"));
+        assert_eq!(std::fs::read(&target).unwrap(), b"same");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn streaming_content_rejects_a_fifo_without_waiting_for_a_writer() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let directory = TempDirectory::new();
+        let fifo = directory.path().join("fifo");
+        let fifo_c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: fifo_c owns a NUL-terminated path valid for this call.
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+        let (sender, receiver) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _ = sender.send(content_matches(&fifo, b""));
+        });
+        // No scoped join on failure: a regression to blocking open must fail
+        // this test promptly rather than keep CI waiting for a FIFO writer.
+        assert!(!receiver.recv_timeout(Duration::from_secs(2)).unwrap());
+        worker.join().unwrap();
+    }
+}
