@@ -121,10 +121,8 @@ fn run_job(job: &Job) -> Completion {
             key: *key,
             request: *request,
             repo_root: root.clone(),
-            result: Ok((
-                crate::orchestration::load_notes(root),
-                crate::orchestration::legacy_notes_available(root),
-            )),
+            result: crate::orchestration::load_notes(root)
+                .map(|notes| (notes, crate::orchestration::legacy_notes_available(root))),
         },
         Job::ImportNotes(key, request, root) => Completion::NotesImported {
             key: *key,

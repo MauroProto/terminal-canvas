@@ -196,16 +196,36 @@ pub fn save_notes_to_path(path: &Path, notes: &DiffNotes) -> anyhow::Result<()> 
     Ok(())
 }
 
-/// Carga las notas del repo; archivo ausente o corrupto → lista vacía (nunca
-/// un panic: las notas son feedback, no estado crítico).
-pub fn load_notes(repo_root: &Path) -> DiffNotes {
-    let Some(path) = notes_file(repo_root) else {
-        return DiffNotes::default();
+/// An absent file is a new repository. Unreadable or malformed notes must
+/// remain an error: exposing an empty editable collection could overwrite them.
+pub fn load_notes(repo_root: &Path) -> anyhow::Result<DiffNotes> {
+    let path = notes_file(repo_root).ok_or_else(|| {
+        anyhow::anyhow!(
+            "No se pudo resolver el archivo de notas de {}",
+            repo_root.display()
+        )
+    })?;
+    load_notes_from_path(&path)
+}
+
+/// Read an explicit destination without changing either its bytes or profile.
+pub fn load_notes_from_path(path: &Path) -> anyhow::Result<DiffNotes> {
+    use anyhow::Context;
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(DiffNotes::default())
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("No se pudo leer {}", path.display()))
+        }
     };
-    let Ok(bytes) = std::fs::read(&path) else {
-        return DiffNotes::default();
-    };
-    serde_json::from_slice(&bytes).unwrap_or_default()
+    serde_json::from_slice(&bytes).with_context(|| {
+        format!(
+            "El archivo de notas {} no contiene JSON válido",
+            path.display()
+        )
+    })
 }
 
 #[cfg(test)]
@@ -303,13 +323,13 @@ mod tests {
         notes.add("src/b.rs", None, 1, "otra");
 
         save_notes(&dir, &notes).unwrap();
-        let loaded = load_notes(&dir);
+        let loaded = load_notes(&dir).unwrap();
         assert_eq!(loaded, notes);
         let _ = std::fs::remove_dir_all(dir_parent(&dir));
     }
 
     #[test]
-    fn a_corrupt_notes_file_yields_an_empty_list_without_panicking() {
+    fn a_corrupt_notes_file_returns_an_error_without_modifying_it() {
         let dir = unique_dir();
         save_notes(&dir, &{
             let mut notes = DiffNotes::default();
@@ -321,8 +341,47 @@ mod tests {
         let file = notes_file_for(&dir);
         std::fs::write(&file, "{no es json").unwrap();
 
-        assert_eq!(load_notes(&dir), DiffNotes::default());
+        let error = load_notes(&dir).unwrap_err();
+        assert!(format!("{error:#}").contains(&file.display().to_string()));
+        assert_eq!(std::fs::read(&file).unwrap(), b"{no es json");
         let _ = std::fs::remove_dir_all(dir_parent(&dir));
+    }
+
+    #[test]
+    fn absent_notes_file_is_an_empty_collection_without_creating_a_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("missing.json");
+        assert_eq!(
+            super::load_notes_from_path(&path).unwrap(),
+            DiffNotes::default()
+        );
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn unreadable_notes_path_is_an_error_without_removing_its_contents() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("notes.json");
+        std::fs::create_dir(&path).unwrap();
+        let preserved = path.join("preserved");
+        std::fs::write(&preserved, b"keep these bytes").unwrap();
+        let error = super::load_notes_from_path(&path).unwrap_err();
+        assert!(format!("{error:#}").contains(&path.display().to_string()));
+        assert_eq!(std::fs::read(preserved).unwrap(), b"keep these bytes");
+        assert!(path.is_dir());
+    }
+
+    #[test]
+    fn malformed_notes_stay_untouched_and_can_be_read_after_explicit_repair() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("notes.json");
+        std::fs::write(&path, b"{invalid JSON").unwrap();
+        assert!(super::load_notes_from_path(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"{invalid JSON");
+        let mut repaired = DiffNotes::default();
+        repaired.add("a.rs", None, 9, "Recovered note");
+        super::save_notes_to_path(&path, &repaired).unwrap();
+        assert_eq!(super::load_notes_from_path(&path).unwrap(), repaired);
     }
 
     #[test]
