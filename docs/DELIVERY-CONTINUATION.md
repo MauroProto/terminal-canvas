@@ -19,15 +19,25 @@ restauración, migración del historial antiguo, reintentos de append,
 coloreado, lectura del visor, fuentes y caché de render. Captura inicial y
 escrituras comparten una cola; un cierre con replay pendiente conserva el
 checkpoint anterior y rescata la salida nueva sin declarar un guardado completo.
+Una hoja con snapshot no disponible sigue contando como guardado incompleto;
+un grid que falló puede rescatar su log sano sin reemplazar el checkpoint.
+Los errores de lectura inicial se propagan y bloquean escrituras/poda del
+historial durante esa ejecución, incluso si se cierra el panel afectado. La app
+avisa que la salida nueva queda en memoria y debe copiarse antes de reiniciar.
 El visor mantiene un lector y un resaltador, cada uno con un pedido y resultado
 reemplazables; cancela trabajo obsoleto y conserva los saltos de línea originales.
 Online e invitaciones no reciben cambios funcionales.
 
 Las comprobaciones locales de componentes pasaron: resaltador 25 casos,
 lector de archivos 13, fallback de fuentes 4 y log/durable write 22, además de
-Clippy de cada harness. Se ejecutaron sin GUI, con un job y prioridad baja.
+Clippy de cada harness. El componente de captura estricta pasó 52 casos,
+incluyendo un bloqueo de lectura real de Windows que permitía reemplazar el
+archivo anterior. Ese harness incluye pruebas de store/log/durable write;
+sus casos se solapan con el componente de append y no deben sumarse como únicos.
+Se ejecutaron sin GUI, con un job y prioridad baja.
 Formato y revisión independiente del diff completo también pasaron. Los seis
-casos nuevos de integración de persistencia y los cambios de render requieren
+casos nuevos de cierre/restauración, los de snapshot no disponible, captura
+fallida y los cambios de render requieren
 la suite completa en GitHub. Los resultados anteriores corresponden al SHA
 indicado: no validan estos cambios nuevos. Comprobar la CI y el ensayo de
 distribución del nuevo HEAD antes de distribuirlo.

@@ -62,6 +62,12 @@ perfil habitual, quitála del entorno. Los overrides específicos
 `TC_MEMORY_DB`, `MI_TERMINAL_SCROLLBACK_DIR` y `MI_TERMINAL_DAEMON_DIR` conservan
 su precedencia; quitálos también para una prueba completamente aislada.
 
+Si aparece «No se pudo recuperar el historial», copiá primero la salida nueva
+que necesitás conservar antes de cerrar o reiniciar. En ese caso el guardado
+del historial queda pausado durante esta ejecución: la app conserva los archivos
+anteriores y el marcador de recuperación, pero la salida nueva sigue en memoria.
+Resolvé el bloqueo de lectura y reabrí la app para recuperar esos archivos.
+
 Para hacer una copia antes de investigar un problema de persistencia, cerrá
 las instancias de la app y los procesos que escriben sus datos. En Unix,
 cerrar la ventana no detiene el daemon: finalizá sus sesiones y detenelo
