@@ -974,7 +974,7 @@ mod tests {
             }
         }
 
-        fn frame(&mut self, events: Vec<Event>) -> Frame {
+        fn frame(&mut self, mut events: Vec<Event>) -> Frame {
             self.time += 0.1;
             let modifiers = events
                 .iter()
@@ -986,12 +986,12 @@ mod tests {
                     _ => None,
                 })
                 .unwrap_or(Modifiers::NONE);
+            events.insert(0, Event::ModifiersChanged(modifiers));
             let mut report = None;
             let mut output = self.ctx.run_ui(
                 RawInput {
                     screen_rect: Some(Rect::from_min_size(Pos2::ZERO, self.size)),
                     events,
-                    modifiers,
                     focused: self.focused,
                     time: Some(self.time),
                     ..Default::default()
@@ -1658,7 +1658,7 @@ mod tests {
         assert_eq!(
             job.sections
                 .iter()
-                .map(|section| &job.text[section.byte_range.clone()])
+                .map(|section| &job.text[section.byte_range.start.0..section.byte_range.end.0])
                 .collect::<Vec<_>>(),
             ["    let ", "café", " = 42;"]
         );
