@@ -349,8 +349,8 @@ mod tests {
 
     #[test]
     fn absent_notes_file_is_an_empty_collection_without_creating_a_file() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("missing.json");
+        let directory = TemporaryNotesDirectory::new();
+        let path = directory.0.join("missing.json");
         assert_eq!(
             super::load_notes_from_path(&path).unwrap(),
             DiffNotes::default()
@@ -360,8 +360,8 @@ mod tests {
 
     #[test]
     fn unreadable_notes_path_is_an_error_without_removing_its_contents() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("notes.json");
+        let directory = TemporaryNotesDirectory::new();
+        let path = directory.0.join("notes.json");
         std::fs::create_dir(&path).unwrap();
         let preserved = path.join("preserved");
         std::fs::write(&preserved, b"keep these bytes").unwrap();
@@ -373,8 +373,8 @@ mod tests {
 
     #[test]
     fn malformed_notes_stay_untouched_and_can_be_read_after_explicit_repair() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("notes.json");
+        let directory = TemporaryNotesDirectory::new();
+        let path = directory.0.join("notes.json");
         std::fs::write(&path, b"{invalid JSON").unwrap();
         assert!(super::load_notes_from_path(&path).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), b"{invalid JSON");
@@ -404,6 +404,22 @@ mod tests {
         notes.prune_missing_files(&["src/vivo.rs".to_owned()]);
         assert_eq!(notes.notes.len(), 1);
         assert_eq!(notes.notes[0].file_path, "src/vivo.rs");
+    }
+
+    struct TemporaryNotesDirectory(std::path::PathBuf);
+
+    impl TemporaryNotesDirectory {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("tc-notes-read-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TemporaryNotesDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 
     // Los helpers de abajo reproducen el slug interno para localizar el
