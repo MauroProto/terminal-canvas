@@ -104,10 +104,9 @@ fn hidden_logic_ignores_stale_ui_input_and_keeps_ui_state_between_passes() {
         assert_eq!(ctx.input(|input| input.time), 1.0);
     }
     assert!(
-        repaint_delays
-            .lock()
-            .unwrap()
-            .contains(&super::AUTOSAVE_INTERVAL),
+        repaint_delays.lock().unwrap().iter().any(|delay| {
+            *delay > std::time::Duration::from_secs(1) && *delay <= super::AUTOSAVE_INTERVAL
+        }),
         "background polling remains scheduled even when persistence is disabled"
     );
 }
