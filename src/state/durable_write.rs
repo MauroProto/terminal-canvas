@@ -1006,4 +1006,180 @@ mod special_file_write_tests {
         assert!(!backup_path(&path, 1).exists());
         assert_eq!(std::fs::read(&path).unwrap(), b"third");
     }
+
+    #[cfg(unix)]
+    fn make_fifo(path: &Path) {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let path_c = CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: path_c owns a NUL-terminated path valid for this call.
+        assert_eq!(unsafe { libc::mkfifo(path_c.as_ptr(), 0o600) }, 0);
+    }
+
+    #[cfg(unix)]
+    fn bounded_write(writer: Writer, path: &Path, bytes: &'static [u8]) -> io::Result<bool> {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let path = path.to_path_buf();
+        let (sender, receiver) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _ = sender.send(writer(&path, bytes));
+        });
+        // On timeout, dropping this JoinHandle detaches instead of waiting for
+        // a blocked FIFO open. Fixtures never supply a reader/writer peer.
+        let result = receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+        worker.join().unwrap();
+        result
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_rejects_fifo_destinations_without_opening_or_replacing_them() {
+        for has_backups in [false, true] {
+            for writer in writers() {
+                let directory = TempDirectory::new();
+                let path = directory.path().join("state");
+                make_fifo(&path);
+                if has_backups {
+                    seed_ring(&path);
+                }
+                let before = snapshot(directory.path());
+                let error = bounded_write(writer, &path, b"new").unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+                assert_eq!(snapshot(directory.path()), before);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn changed_durable_write_rejects_fifo_backups_but_noop_preserves_them() {
+        for slot in 0..BACKUP_SLOTS {
+            let directory = TempDirectory::new();
+            let path = directory.path().join("state");
+            std::fs::write(&path, b"same").unwrap();
+            seed_ring(&path);
+            let fifo = backup_path(&path, slot);
+            std::fs::remove_file(&fifo).unwrap();
+            make_fifo(&fifo);
+            let before = snapshot(directory.path());
+            assert!(!bounded_write(write_durable, &path, b"same").unwrap());
+            assert_eq!(snapshot(directory.path()), before);
+            let error = bounded_write(write_durable, &path, b"new").unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(snapshot(directory.path()), before);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn changed_durable_write_rejects_regular_and_dangling_backup_links() {
+        use std::os::unix::fs::symlink;
+        for target_exists in [false, true] {
+            for slot in 0..BACKUP_SLOTS {
+                let directory = TempDirectory::new();
+                let path = directory.path().join("state");
+                std::fs::write(&path, b"same").unwrap();
+                seed_ring(&path);
+                let target = directory.path().join("outside");
+                if target_exists {
+                    std::fs::write(&target, b"outside").unwrap();
+                }
+                let link = backup_path(&path, slot);
+                std::fs::remove_file(&link).unwrap();
+                symlink(&target, &link).unwrap();
+                let before = snapshot(directory.path());
+                assert!(!write_durable(&path, b"same").unwrap());
+                assert_eq!(snapshot(directory.path()), before);
+                let error = write_durable(&path, b"new").unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+                assert_eq!(snapshot(directory.path()), before);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generic_writes_keep_regular_main_link_noop_and_changed_write_behavior() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        for (writer, has_ring) in [
+            (write_durable as Writer, true),
+            (write_atomic as Writer, false),
+        ] {
+            let directory = TempDirectory::new();
+            let target = directory.path().join("outside");
+            let path = directory.path().join("state");
+            std::fs::write(&target, b"same").unwrap();
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+            symlink(&target, &path).unwrap();
+            let before = snapshot(directory.path());
+            assert!(!writer(&path, b"same").unwrap());
+            assert_eq!(snapshot(directory.path()), before);
+            let target_before = snapshot(&target);
+            assert!(writer(&path, b"new").unwrap());
+            assert!(std::fs::symlink_metadata(&path).unwrap().is_file());
+            assert_eq!(std::fs::read(&path).unwrap(), b"new");
+            assert_eq!(snapshot(&target), target_before);
+            // The durable writer retains the old target bytes; atomic never
+            // creates a ring. Both replace only the main link entry.
+            let backup = backup_path(&path, 0);
+            if has_ring {
+                assert_eq!(std::fs::read(&backup).unwrap(), b"same");
+            } else {
+                assert!(!backup.exists());
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_rejects_dangling_and_non_regular_main_links_before_mutation() {
+        use std::os::unix::fs::symlink;
+        for kind in ["missing", "directory", "fifo"] {
+            for writer in writers() {
+                let directory = TempDirectory::new();
+                let target = directory.path().join("outside");
+                match kind {
+                    "missing" => {}
+                    "directory" => std::fs::create_dir(&target).unwrap(),
+                    "fifo" => make_fifo(&target),
+                    _ => unreachable!(),
+                }
+                let path = directory.path().join("state");
+                symlink(&target, &path).unwrap();
+                seed_ring(&path);
+                let before = snapshot(directory.path());
+                let error = bounded_write(writer, &path, b"new").unwrap_err();
+                assert_eq!(
+                    error.kind(),
+                    if kind == "missing" {
+                        io::ErrorKind::NotFound
+                    } else {
+                        io::ErrorKind::InvalidInput
+                    }
+                );
+                assert_eq!(snapshot(directory.path()), before);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_noop_keeps_its_stricter_backup_link_protection() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let directory = TempDirectory::new();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.path().join("state");
+        let target = directory.path().join("outside");
+        for file in [&path, &target] {
+            std::fs::write(file, b"same").unwrap();
+            std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        symlink(&target, backup_path(&path, 0)).unwrap();
+        let before = snapshot(directory.path());
+        assert!(!write_durable(&path, b"same").unwrap());
+        assert_eq!(snapshot(directory.path()), before);
+        assert!(super::write_private_durable(&path, b"same").is_err());
+        assert_eq!(snapshot(directory.path()), before);
+    }
 }
