@@ -19,6 +19,10 @@ use two_face::theme::EmbeddedThemeName;
 /// coloreadas) y sí cuesta memoria: el resto queda en texto plano.
 pub const MAX_HIGHLIGHT_LINES: usize = 20_000;
 
+/// Máximo de bytes que recibe el parser por línea, incluidos LF/CRLF.
+/// Una línea más larga deja todo el prefijo visible en texto plano.
+pub const MAX_HIGHLIGHT_LINE_BYTES: usize = 1024;
+
 /// Un tramo coloreado dentro de una línea.
 pub type Span = (Color32, String);
 /// Línea ya resaltada, partida en tramos.
@@ -78,6 +82,9 @@ pub fn syntect_color(color: syntect::highlighting::Color) -> Color32 {
 /// Elige la gramática por extensión y, si no hay, por la primera línea
 /// (shebangs tipo `#!/bin/bash`). Devuelve el nombre del lenguaje detectado.
 pub fn detect_language(file_name: &str, first_line: &str) -> Option<String> {
+    if first_line.len() > MAX_HIGHLIGHT_LINE_BYTES {
+        return None;
+    }
     select_syntax(syntax_set(), file_name, first_line).map(|syntax| {
         if file_name
             .rsplit_once('.')
@@ -97,6 +104,9 @@ pub(crate) fn select_syntax<'a>(
     file_name: &str,
     first_line: &str,
 ) -> Option<&'a SyntaxReference> {
+    if first_line.len() > MAX_HIGHLIGHT_LINE_BYTES {
+        return None;
+    }
     let extension = file_name.rsplit('.').next().unwrap_or_default();
     // Un archivo sin punto (`Makefile`) no tiene extensión real: `rsplit` en ese
     // caso devuelve el nombre entero, que igual sirve para buscar por token.
@@ -138,6 +148,72 @@ fn highlight_text_cancelable(
     text: &str,
     cancelled: &dyn Fn() -> bool,
 ) -> Option<Vec<HighlightedLine>> {
+    highlight_guarded(text, cancelled, || {
+        highlight_text_prechecked(file_name, text, cancelled)
+    })
+}
+
+/// El escaneo ocurre antes de elegir una gramática o ejecutar su primera regex.
+/// Los chunks acotan el trabajo entre chequeos incluso si no hay terminadores.
+fn contains_oversized_line(text: &str, cancelled: &dyn Fn() -> bool) -> Option<bool> {
+    let mut line_bytes = 0;
+    for chunk in text.as_bytes().chunks(MAX_HIGHLIGHT_LINE_BYTES) {
+        if cancelled() {
+            return None;
+        }
+        for byte in chunk {
+            line_bytes += 1;
+            if line_bytes > MAX_HIGHLIGHT_LINE_BYTES {
+                return Some(true);
+            }
+            if *byte == b'\n' {
+                line_bytes = 0;
+            }
+        }
+    }
+    (!cancelled()).then_some(false)
+}
+
+fn visible_line(line: &str) -> &str {
+    line.strip_suffix('\n')
+        .map(|without_lf| without_lf.strip_suffix('\r').unwrap_or(without_lf))
+        .unwrap_or(line)
+}
+
+fn plain_lines_cancelable(
+    text: &str,
+    cancelled: &dyn Fn() -> bool,
+) -> Option<Vec<HighlightedLine>> {
+    let foreground = theme_foreground();
+    let mut out = Vec::new();
+    for line in text.split_inclusive('\n').take(MAX_HIGHLIGHT_LINES) {
+        if cancelled() {
+            return None;
+        }
+        out.push(vec![(foreground, visible_line(line).to_owned())]);
+    }
+    (!cancelled()).then_some(out)
+}
+
+fn highlight_guarded(
+    text: &str,
+    cancelled: &dyn Fn() -> bool,
+    process: impl FnOnce() -> Option<Vec<HighlightedLine>>,
+) -> Option<Vec<HighlightedLine>> {
+    if contains_oversized_line(text, cancelled)? {
+        // No reanudar un parser multilínea después de omitir una línea larga.
+        plain_lines_cancelable(text, cancelled)
+    } else {
+        process()
+    }
+}
+
+/// Sólo se llama después de la guardia del helper síncrono o del worker.
+fn highlight_text_prechecked(
+    file_name: &str,
+    text: &str,
+    cancelled: &dyn Fn() -> bool,
+) -> Option<Vec<HighlightedLine>> {
     if cancelled() {
         return None;
     }
@@ -155,10 +231,7 @@ fn highlight_text_cancelable(
         if cancelled() {
             return None;
         }
-        let visible_line = line
-            .strip_suffix('\n')
-            .map(|without_lf| without_lf.strip_suffix('\r').unwrap_or(without_lf))
-            .unwrap_or(line);
+        let visible_line = visible_line(line);
         match highlighter.highlight_line(line, set) {
             Ok(ranges) => {
                 let mut spans = Vec::new();
@@ -189,7 +262,7 @@ fn highlight_text_cancelable(
 pub struct HighlightRequest {
     pub token: u64,
     pub file_name: String,
-    pub text: String,
+    pub text: Arc<str>,
 }
 
 pub struct HighlightResult {
@@ -260,7 +333,7 @@ impl Default for Highlighter {
 impl Highlighter {
     pub fn new() -> Self {
         Self::with_processor(|request, cancelled| {
-            highlight_text_cancelable(&request.file_name, &request.text, cancelled)
+            highlight_text_prechecked(&request.file_name, &request.text, cancelled)
         })
     }
 
@@ -302,7 +375,9 @@ impl Highlighter {
                     if cancelled() {
                         continue;
                     }
-                    let Some(lines) = process(&job.request, &cancelled) else {
+                    let Some(lines) = highlight_guarded(&job.request.text, &cancelled, || {
+                        process(&job.request, &cancelled)
+                    }) else {
                         continue;
                     };
                     let mut state = worker
@@ -334,7 +409,7 @@ impl Highlighter {
     }
 
     /// Encola un archivo y devuelve el token con el que reconocer su resultado.
-    pub fn request(&mut self, file_name: String, text: String) -> u64 {
+    pub fn request(&mut self, file_name: String, text: Arc<str>) -> u64 {
         self.request_with_notify(file_name, text, || {})
     }
 
@@ -343,7 +418,7 @@ impl Highlighter {
     pub fn request_with_notify(
         &mut self,
         file_name: String,
-        text: String,
+        text: Arc<str>,
         notify: impl FnOnce() + Send + 'static,
     ) -> u64 {
         self.next_token = self.next_token.wrapping_add(1);
@@ -433,6 +508,8 @@ impl Drop for Highlighter {
 #[cfg(test)]
 mod tests {
     use super::{detect_language, highlight_text, Highlighter, MAX_HIGHLIGHT_LINES};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     const WORKER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -614,12 +691,207 @@ mod tests {
     }
 
     #[test]
+    fn parser_line_byte_limit_includes_terminators_and_unicode_bytes() {
+        let limit = super::MAX_HIGHLIGHT_LINE_BYTES;
+        for (source, expected) in [
+            (String::new(), false),
+            ("x".repeat(limit), false),
+            ("x".repeat(limit + 1), true),
+            (format!("{}\n", "x".repeat(limit - 1)), false),
+            (format!("{}\n", "x".repeat(limit)), true),
+            (format!("{}\r\n", "x".repeat(limit - 2)), false),
+            (format!("{}\r\n", "x".repeat(limit - 1)), true),
+            ("界".repeat(limit / 3), false),
+            ("界".repeat(limit / 3 + 1), true),
+        ] {
+            assert_eq!(
+                super::contains_oversized_line(&source, &|| false),
+                Some(expected),
+                "{} bytes",
+                source.len()
+            );
+        }
+    }
+
+    #[test]
+    fn a_long_first_line_is_rejected_before_language_detection() {
+        let first_line = format!("#!/bin/bash {}", "x".repeat(2 * 1024 * 1024));
+        for file_name in ["deploy", "main.rs", "Card.jsx", "Dockerfile"] {
+            assert_eq!(detect_language(file_name, &first_line), None, "{file_name}");
+        }
+        assert_eq!(
+            detect_language("main.rs", "fn main() {}"),
+            Some("Rust".into())
+        );
+    }
+
+    #[test]
+    fn fallback_preserves_visible_crlf_lf_unicode_and_bare_cr_at_eof() {
+        let oversized = "界".repeat(super::MAX_HIGHLIGHT_LINE_BYTES / 3 + 1);
+        for source in [
+            format!("const título = `café 🐈\n{oversized}\n`;\n\nfinal\r"),
+            format!("const título = `café 🐈\r\n{oversized}\r\n`;\r\n\r\nfinal\r"),
+            format!("{oversized}\r"),
+            format!("{oversized}\r\n"),
+        ] {
+            let lines = highlight_text("example.js", &source);
+            let expected: Vec<_> = source.lines().collect();
+            assert_eq!(lines.len(), expected.len());
+            for (line, visible) in lines.iter().zip(expected) {
+                assert_eq!(line.len(), 1);
+                assert_eq!(line[0].0, super::theme_foreground());
+                assert_eq!(line[0].1, visible);
+            }
+        }
+    }
+
+    #[test]
+    fn a_long_line_after_the_output_cap_makes_the_whole_visible_prefix_plain() {
+        let mut source = "let value = 42;\n".repeat(MAX_HIGHLIGHT_LINES);
+        source.push_str(&"x".repeat(super::MAX_HIGHLIGHT_LINE_BYTES + 1));
+        let lines = highlight_text("main.rs", &source);
+        assert_eq!(lines.len(), MAX_HIGHLIGHT_LINES);
+        assert!(lines.iter().all(|line| {
+            line.len() == 1
+                && line[0].0 == super::theme_foreground()
+                && line[0].1 == "let value = 42;"
+        }));
+    }
+
+    #[test]
+    fn guard_scan_cancels_before_calling_the_processor() {
+        let source = "short line\n".repeat(super::MAX_HIGHLIGHT_LINE_BYTES);
+        let checks = std::cell::Cell::new(0);
+        let processed = std::cell::Cell::new(false);
+        let result = super::highlight_guarded(
+            &source,
+            &|| {
+                let previous = checks.get();
+                checks.set(previous + 1);
+                previous >= 1
+            },
+            || {
+                processed.set(true);
+                Some(plain_result("unexpected processor"))
+            },
+        );
+        assert!(result.is_none());
+        assert!(!processed.get());
+        assert_eq!(checks.get(), 2, "the scan must stop between bounded chunks");
+    }
+
+    #[test]
+    fn fallback_discards_its_partial_output_when_the_generation_changes() {
+        let source = format!(
+            "first\n{}\nlast\r",
+            "x".repeat(super::MAX_HIGHLIGHT_LINE_BYTES + 1)
+        );
+        let generation = AtomicU64::new(1);
+        let checks = std::cell::Cell::new(0);
+        let processed = std::cell::Cell::new(false);
+        let result = super::highlight_guarded(
+            &source,
+            &|| {
+                let count = checks.get() + 1;
+                checks.set(count);
+                if count == 4 {
+                    generation.store(2, Ordering::Release);
+                }
+                generation.load(Ordering::Acquire) != 1
+            },
+            || {
+                processed.set(true);
+                Some(plain_result("unexpected processor"))
+            },
+        );
+        assert!(
+            result.is_none(),
+            "a cancelled prefix must never be published"
+        );
+        assert!(!processed.get());
+        assert_eq!(generation.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn requests_share_the_original_text_allocation_with_the_worker() {
+        let source: Arc<str> = Arc::from("fn main() {}\n");
+        let worker_source = Arc::clone(&source);
+        let shared_allocation = Arc::new(AtomicBool::new(false));
+        let worker_shared_allocation = Arc::clone(&shared_allocation);
+        let mut highlighter = Highlighter::with_processor(move |request, _| {
+            worker_shared_allocation.store(
+                Arc::ptr_eq(&request.text, &worker_source),
+                Ordering::Release,
+            );
+            Some(plain_result(&request.text))
+        });
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        highlighter.request_with_notify("main.rs".to_owned(), Arc::clone(&source), move || {
+            let _ = ready_tx.send(());
+        });
+        ready_rx
+            .recv_timeout(WORKER_DEADLINE)
+            .expect("shared text ready");
+        assert!(shared_allocation.load(Ordering::Acquire));
+        assert_eq!(
+            joined(&highlighter.poll().unwrap().lines[0]),
+            source.as_ref()
+        );
+    }
+
+    #[test]
+    fn a_two_megabyte_line_bypasses_the_worker_processor_without_losing_text() {
+        let source: Arc<str> = format!(
+            "fn main() {{\r\n{}\r\n}}\r\n\r\nun CR al EOF\r",
+            "x".repeat(2 * 1024 * 1024)
+        )
+        .into();
+        let processed = Arc::new(AtomicUsize::new(0));
+        let worker_processed = Arc::clone(&processed);
+        let mut highlighter = Highlighter::with_processor(move |request, _| {
+            worker_processed.fetch_add(1, Ordering::Relaxed);
+            Some(plain_result(&request.text))
+        });
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let token =
+            highlighter.request_with_notify("main.rs".to_owned(), Arc::clone(&source), move || {
+                let _ = ready_tx.send(());
+            });
+        ready_rx
+            .recv_timeout(WORKER_DEADLINE)
+            .expect("plain fallback ready");
+        let result = highlighter
+            .poll()
+            .expect("fallback published before notification");
+        assert_eq!(result.token, token);
+        assert_eq!(processed.load(Ordering::Relaxed), 0);
+        let expected: Vec<_> = source.lines().collect();
+        assert_eq!(result.lines.len(), expected.len());
+        for (line, visible) in result.lines.iter().zip(expected) {
+            assert_eq!(line.len(), 1);
+            assert_eq!(line[0].0, super::theme_foreground());
+            assert_eq!(line[0].1, visible);
+        }
+        assert!(highlighter.is_available());
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let next =
+            highlighter.request_with_notify("main.rs".to_owned(), "normal".into(), move || {
+                let _ = ready_tx.send(());
+            });
+        ready_rx
+            .recv_timeout(WORKER_DEADLINE)
+            .expect("next request ready");
+        assert_eq!(highlighter.poll().unwrap().token, next);
+        assert_eq!(processed.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
     fn worker_returns_the_highlighted_file_with_its_token() {
         let mut highlighter = Highlighter::new();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let token = highlighter.request_with_notify(
             "main.rs".to_owned(),
-            "fn main() {}\n".to_owned(),
+            "fn main() {}\n".into(),
             move || {
                 let _ = ready_tx.send(());
             },
@@ -636,8 +908,8 @@ mod tests {
     #[test]
     fn tokens_increase_so_a_stale_result_can_be_discarded() {
         let mut highlighter = Highlighter::new();
-        let first = highlighter.request("a.rs".to_owned(), "fn a() {}\n".to_owned());
-        let second = highlighter.request("b.rs".to_owned(), "fn b() {}\n".to_owned());
+        let first = highlighter.request("a.rs".to_owned(), "fn a() {}\n".into());
+        let second = highlighter.request("b.rs".to_owned(), "fn b() {}\n".into());
         assert_ne!(first, second);
     }
 
@@ -663,7 +935,7 @@ mod tests {
         });
         let first_notifications = std::sync::Arc::clone(&obsolete_notifications);
         let first =
-            highlighter.request_with_notify("blocked".to_owned(), "first".to_owned(), move || {
+            highlighter.request_with_notify("blocked".to_owned(), "first".into(), move || {
                 first_notifications.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             });
         entered_rx
@@ -671,13 +943,17 @@ mod tests {
             .expect("active job");
         for index in 0..128 {
             let notifications = std::sync::Arc::clone(&obsolete_notifications);
-            highlighter.request_with_notify("old".to_owned(), index.to_string(), move || {
-                notifications.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            });
+            highlighter.request_with_notify(
+                "old".to_owned(),
+                index.to_string().into(),
+                move || {
+                    notifications.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                },
+            );
         }
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let latest =
-            highlighter.request_with_notify("latest".to_owned(), "final".to_owned(), move || {
+            highlighter.request_with_notify("latest".to_owned(), "final".into(), move || {
                 let _ = ready_tx.send(());
             });
         {
@@ -713,7 +989,7 @@ mod tests {
             Some(plain_result(&request.text))
         });
         let (old_tx, old_rx) = std::sync::mpsc::channel();
-        let old = highlighter.request_with_notify("old".to_owned(), "old".to_owned(), move || {
+        let old = highlighter.request_with_notify("old".to_owned(), "old".into(), move || {
             let _ = old_tx.send(());
         });
         old_rx
@@ -734,7 +1010,7 @@ mod tests {
 
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let latest =
-            highlighter.request_with_notify("blocked".to_owned(), "latest".to_owned(), move || {
+            highlighter.request_with_notify("blocked".to_owned(), "latest".into(), move || {
                 let _ = ready_tx.send(());
             });
         entered_rx
@@ -766,11 +1042,11 @@ mod tests {
             }
             Some(plain_result(&request.text))
         });
-        highlighter.request("blocked".to_owned(), "first".to_owned());
+        highlighter.request("blocked".to_owned(), "first".into());
         entered_rx
             .recv_timeout(WORKER_DEADLINE)
             .expect("first active");
-        highlighter.request("queued".to_owned(), "obsolete".to_owned());
+        highlighter.request("queued".to_owned(), "obsolete".into());
         highlighter.cancel();
         {
             let state = highlighter.shared.state.lock().unwrap();
@@ -783,7 +1059,7 @@ mod tests {
             .expect("observed cancellation"));
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let latest =
-            highlighter.request_with_notify("new".to_owned(), "usable".to_owned(), move || {
+            highlighter.request_with_notify("new".to_owned(), "usable".into(), move || {
                 let _ = ready_tx.send(());
             });
         ready_rx
@@ -805,7 +1081,7 @@ mod tests {
             let _ = cancelled_tx.send(cancelled());
             None
         });
-        highlighter.request("blocked".to_owned(), "text".to_owned());
+        highlighter.request("blocked".to_owned(), "text".into());
         entered_rx
             .recv_timeout(WORKER_DEADLINE)
             .expect("active operation");
@@ -832,7 +1108,7 @@ mod tests {
             checks.set(count + 1);
             count >= 2
         };
-        let result = super::highlight_text_cancelable(
+        let result = super::highlight_text_prechecked(
             "example.js",
             "// first\nconst second = 42;\nconst third = 3;\n",
             &cancelled,
