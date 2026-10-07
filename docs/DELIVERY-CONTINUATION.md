@@ -1,4 +1,4 @@
-# Estado de entrega y continuación — 6 de octubre de 2026
+# Estado de entrega y continuación — 7 de octubre de 2026
 
 El último checkpoint completamente validado es
 `65d81a75eba0d5cb4f243d476f25fc580fc0b75a`: **45 microcommits** desde la base
@@ -14,9 +14,23 @@ El ensayo comprobó exactamente cinco paquetes y cinco checksums, incluyendo
 instalación/desinstalación de Inno y montaje de ambos DMG. No publicó una
 release y sus paquetes son de prueba, sin firma del proveedor.
 
-El pase siguiente corrige confirmaciones de persistencia, coloreado y fuentes.
-Los resultados anteriores corresponden al SHA indicado: no validan esos
-cambios nuevos. Comprobar la CI del nuevo HEAD antes de distribuirlo.
+El pase actual corrige confirmaciones de persistencia, cierre durante la
+restauración, migración del historial antiguo, reintentos de append,
+coloreado, lectura del visor, fuentes y caché de render. Captura inicial y
+escrituras comparten una cola; un cierre con replay pendiente conserva el
+checkpoint anterior y rescata la salida nueva sin declarar un guardado completo.
+El visor mantiene un lector y un resaltador, cada uno con un pedido y resultado
+reemplazables; cancela trabajo obsoleto y conserva los saltos de línea originales.
+Online e invitaciones no reciben cambios funcionales.
+
+Las comprobaciones locales de componentes pasaron: resaltador 25 casos,
+lector de archivos 13, fallback de fuentes 4 y log/durable write 22, además de
+Clippy de cada harness. Se ejecutaron sin GUI, con un job y prioridad baja.
+Formato y revisión independiente del diff completo también pasaron. Los seis
+casos nuevos de integración de persistencia y los cambios de render requieren
+la suite completa en GitHub. Los resultados anteriores corresponden al SHA
+indicado: no validan estos cambios nuevos. Comprobar la CI y el ensayo de
+distribución del nuevo HEAD antes de distribuirlo.
 
 ## Checkpoints anteriores
 
