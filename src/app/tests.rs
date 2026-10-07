@@ -665,6 +665,17 @@ fn final_save_profile_fixture() {
             .unwrap();
             app.on_exit(None);
             assert_eq!(fs::read(&backup).unwrap(), old_backup_bytes);
+            assert!(matches!(
+                crate::state::persistence::load_state_result(),
+                crate::state::persistence::StateLoadResult::ReadError { path, .. }
+                    if path == layout
+            ));
+            // The unreadable primary must first be unblocked. Its older backup
+            // is preserved but cannot authorize writes while its contents are
+            // unknown. Only this isolated fixture's deliberately created blocker
+            // is removed, then the normal backup recovery can run.
+            fs::remove_file(layout.join("publication-blocker")).unwrap();
+            fs::remove_dir(&layout).unwrap();
             let restored = crate::state::persistence::load_state().unwrap();
             assert_eq!(restored.workspaces[0].panels[0].id, panel_id.to_string());
             assert_eq!(
