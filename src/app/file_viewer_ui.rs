@@ -11,13 +11,16 @@
 #[cfg(test)]
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 
-use egui::{vec2, Color32, FontId, RichText, ScrollArea};
+use egui::{vec2, Color32, RichText};
 
 use crate::theme::colors as palette;
 
 use super::code_highlight::HighlightedLine;
+use super::file_viewer_document::SourceDocument;
 use super::file_viewer_reader::{FileContents, FileViewerReader};
+use super::file_viewer_selection::{self, SelectionState, ViewerStyle};
 use super::TerminalApp;
 
 #[cfg(test)]
@@ -25,10 +28,6 @@ use super::file_viewer_reader::{MAX_VIEW_BYTES, MAX_VIEW_LINES};
 const DEFAULT_WIDTH: f32 = 620.0;
 const MIN_WIDTH: f32 = 320.0;
 const MAX_WIDTH: f32 = 1200.0;
-const CODE_FONT_SIZE: f32 = 12.5;
-/// Interlineado extra: pegadas, las líneas de código se leen mal. Un editor
-/// decente deja aire entre renglones.
-const LINE_SPACING: f32 = 3.0;
 
 /// El fondo y el color base salen del tema de syntect, no de la paleta de la
 /// app: los colores de los tokens están elegidos para ese fondo.
@@ -56,7 +55,9 @@ fn gutter_fg() -> Color32 {
 
 pub(super) struct FileViewerState {
     pub(super) path: PathBuf,
-    pub(super) lines: Vec<String>,
+    pub(super) document: Option<Arc<SourceDocument>>,
+    pub(super) selection: SelectionState,
+    pub(super) read_error: Option<String>,
     pub(super) truncated: bool,
     pub(super) binary: bool,
     /// Líneas ya coloreadas; vacío mientras el worker trabaja.
@@ -74,18 +75,14 @@ impl FileViewerState {
             .map(|name| name.to_string_lossy().to_string())
             .unwrap_or_else(|| self.path.display().to_string())
     }
-
-    /// Ancho del gutter según la cantidad de dígitos del número más alto.
-    fn gutter_width(&self) -> f32 {
-        let digits = self.lines.len().max(1).to_string().len();
-        12.0 + digits as f32 * 7.5
-    }
 }
 
 impl TerminalApp {
     pub(super) fn open_file_viewer(&mut self, path: PathBuf) {
         self.highlighter.cancel();
-        self.file_viewer_keyboard_active = false;
+        if let Some(ctx) = &self.ctx {
+            file_viewer_selection::release_keyboard_focus(ctx);
+        }
         let reader = self
             .file_viewer_reader
             .get_or_insert_with(|| FileViewerReader::new(super::code_highlight::detect_language));
@@ -100,18 +97,21 @@ impl TerminalApp {
         if !available {
             if let Some(viewer) = self.file_viewer.as_mut() {
                 viewer.loading = false;
-                viewer.lines = vec!["(no se pudo iniciar la lectura del archivo)".to_owned()];
+                viewer.read_error = Some("(no se pudo iniciar la lectura del archivo)".to_owned());
             }
         }
     }
 
-    fn activate_loaded_file(&mut self, mut state: FileViewerState, source: Option<String>) {
-        if let Some(source) = source
-            .filter(|_| !state.binary && !state.lines.is_empty() && self.highlighter.is_available())
-        {
+    fn activate_loaded_file(&mut self, mut state: FileViewerState, source: Option<Arc<str>>) {
+        if let Some(source) = source.filter(|_| {
+            !state.binary
+                && state.document.as_ref().is_some_and(|document| {
+                    !document.logical_lines().is_empty() && !document.has_long_lines()
+                })
+                && self.highlighter.is_available()
+        }) {
             let name = state.file_name();
-            // Mover el texto original conserva los terminadores y evita
-            // reconstruir/copiar el archivo completo en el hilo de UI.
+            // Share the prepared source; no full-file clone or line scan on UI.
             let repaint = self.ctx.clone();
             state.highlight_token =
                 Some(self.highlighter.request_with_notify(name, source, move || {
@@ -154,7 +154,7 @@ impl TerminalApp {
                         ctx.request_repaint_after(std::time::Duration::from_millis(50));
                     } else {
                         viewer.loading = false;
-                        viewer.lines = vec!["(no se pudo leer el archivo)".to_owned()];
+                        viewer.read_error = Some("(no se pudo leer el archivo)".to_owned());
                     }
                 }
             }
@@ -187,17 +187,23 @@ impl TerminalApp {
 
     pub(super) fn show_file_viewer(&mut self, root_ui: &mut egui::Ui) {
         let ctx = root_ui.ctx().clone();
+        self.ctx = Some(ctx.clone());
         if self.file_viewer.is_none() {
             return;
         }
-        if self.file_viewer_keyboard_active
-            && ctx.input(|input| input.key_pressed(egui::Key::Escape))
+        let can_focus = !self.modal_input_is_active() && ctx.input(|input| input.raw.focused);
+        if !can_focus {
+            file_viewer_selection::release_keyboard_focus(&ctx);
+        }
+        if file_viewer_selection::viewer_has_keyboard_focus(&ctx)
+            && ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
         {
             self.highlighter.cancel();
             if let Some(reader) = self.file_viewer_reader.as_mut() {
                 reader.cancel();
             }
             self.file_viewer = None;
+            file_viewer_selection::release_keyboard_focus(&ctx);
             return;
         }
 
@@ -216,9 +222,10 @@ impl TerminalApp {
                     .inner_margin(egui::Margin::same(0)),
             )
             .show(root_ui, |ui| {
-                let Some(viewer) = self.file_viewer.as_ref() else {
+                let Some(viewer) = self.file_viewer.as_mut() else {
                     return;
                 };
+                ui.style_mut().interaction.selectable_labels = false;
                 // Borde izquierdo que separa el código del canvas.
                 let panel_rect = ui.max_rect();
                 if let Some(pointer) = ctx.input(|input| {
@@ -228,7 +235,11 @@ impl TerminalApp {
                         .then(|| input.pointer.interact_pos())
                         .flatten()
                 }) {
-                    self.file_viewer_keyboard_active = panel_rect.contains(pointer);
+                    if can_focus && panel_rect.contains(pointer) {
+                        file_viewer_selection::request_keyboard_focus(&ctx);
+                    } else {
+                        file_viewer_selection::release_keyboard_focus(&ctx);
+                    }
                 }
 
                 // Soltar un archivo sobre el visor lo abre (si el puntero
@@ -258,6 +269,20 @@ impl TerminalApp {
                 draw_header(ui, viewer, &mut close, &mut open_external);
                 ui.separator();
 
+                if viewer.binary
+                    || viewer.loading
+                    || viewer.read_error.is_some()
+                    || viewer.document.is_none()
+                {
+                    ui.scope(|ui| {
+                        if !can_focus {
+                            ui.disable();
+                        }
+                        let rect = ui.available_rect_before_wrap();
+                        file_viewer_selection::register_placeholder_keyboard_owner(ui, rect);
+                    });
+                }
+
                 if viewer.binary {
                     ui.add_space(16.0);
                     ui.label(
@@ -278,6 +303,15 @@ impl TerminalApp {
                     return;
                 }
 
+                if let Some(message) = &viewer.read_error {
+                    ui.add_space(16.0);
+                    ui.label(RichText::new(message).size(11.0).color(palette::DIM));
+                    return;
+                }
+
+                if !can_focus {
+                    ui.disable();
+                }
                 draw_code(ui, viewer);
             });
 
@@ -287,6 +321,7 @@ impl TerminalApp {
                 reader.cancel();
             }
             self.file_viewer = None;
+            file_viewer_selection::release_keyboard_focus(&ctx);
         }
         if let Some(path) = open_dropped {
             self.open_file_viewer(path);
@@ -302,7 +337,9 @@ impl TerminalApp {
 fn loading_file_state(path: PathBuf) -> FileViewerState {
     FileViewerState {
         path,
-        lines: Vec::new(),
+        document: None,
+        selection: SelectionState::default(),
+        read_error: None,
         truncated: false,
         binary: false,
         highlighted: Vec::new(),
@@ -347,124 +384,60 @@ fn draw_header(
     ui.add_space(4.0);
     ui.horizontal(|ui| {
         ui.add_space(10.0);
-        let mut status = format!("{} líneas", viewer.lines.len());
+        let line_count = viewer
+            .document
+            .as_ref()
+            .map_or(0, |document| document.logical_lines().len());
+        let mut status = format!("{line_count} líneas");
         if viewer.truncated {
             status.push_str(" · truncado por límite seguro");
         }
         if viewer.highlight_token.is_some() {
             status.push_str(" · coloreando…");
         }
+        if viewer
+            .document
+            .as_ref()
+            .is_some_and(|document| document.has_long_lines())
+        {
+            status.push_str(" · líneas extensas en texto plano");
+        }
         ui.label(RichText::new(status).size(10.0).color(palette::DIM));
     });
     ui.add_space(6.0);
 }
 
-fn draw_code(ui: &mut egui::Ui, viewer: &FileViewerState) {
-    let font = FontId::monospace(CODE_FONT_SIZE);
-    // La fila que reserva `show_rows` tiene que coincidir exactamente con la
-    // que ocupa cada renglón, si no el gutter se desalinea del código.
-    let row_height = ui.fonts_mut(|fonts| fonts.row_height(&font)) + LINE_SPACING;
-    let gutter_width = viewer.gutter_width();
-    let total_rows = viewer.lines.len();
-
-    ScrollArea::both()
-        .id_salt("code-viewer-scroll")
-        .auto_shrink([false, false])
-        .show_rows(ui, row_height, total_rows, |ui, range| {
-            ui.spacing_mut().item_spacing.y = LINE_SPACING;
-            // El gutter se pinta como una banda continua a lo alto de todo lo
-            // que se está dibujando, no por fila: si no, se ve rayado.
-            let area = ui.max_rect();
-            ui.painter().rect_filled(
-                egui::Rect::from_min_size(
-                    area.min,
-                    vec2(gutter_width, area.height().max(ui.available_height())),
-                ),
-                0.0,
-                gutter_bg(),
-            );
-
-            for index in range {
-                let Some(plain) = viewer.lines.get(index) else {
-                    continue;
-                };
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 0.0;
-                    // Número de línea alineado a la derecha del gutter.
-                    ui.allocate_ui_with_layout(
-                        vec2(gutter_width, row_height),
-                        egui::Layout::right_to_left(egui::Align::Center),
-                        |ui| {
-                            ui.add_space(8.0);
-                            ui.add(
-                                egui::Label::new(
-                                    RichText::new((index + 1).to_string())
-                                        .font(font.clone())
-                                        .color(gutter_fg()),
-                                )
-                                .selectable(false),
-                            );
-                        },
-                    );
-                    ui.add_space(10.0);
-                    let job = line_layout_job(viewer, index, plain, &font);
-                    // `selectable`: un visor de código del que no podés copiar
-                    // no sirve para nada.
-                    ui.add(
-                        egui::Label::new(job)
-                            .wrap_mode(egui::TextWrapMode::Extend)
-                            .selectable(true),
-                    );
-                });
-            }
-        });
-}
-
-/// Dibuja una línea: coloreada si el worker ya la entregó, plana si no.
-///
-/// Se arma un único `LayoutJob` por línea en vez de un label por tramo. Dos
-/// razones: un label por tramo serían ~400 widgets por frame (50 líneas × 8
-/// tramos), y además cada label se posiciona por separado, lo que rompe la
-/// alineación monoespaciada. Con un solo job el texto es una sola tirada.
-fn line_layout_job(
-    viewer: &FileViewerState,
-    index: usize,
-    plain: &str,
-    font: &FontId,
-) -> egui::text::LayoutJob {
-    let mut job = egui::text::LayoutJob::default();
-    // Sin wrap: una línea de código es una fila. Si envolviera, la fila
-    // ocuparía más alto del que `show_rows` reservó y todo se desalinearía.
-    job.wrap.max_width = f32::INFINITY;
-    job.break_on_newline = false;
-
-    let format_for = |color: Color32| egui::TextFormat {
-        font_id: font.clone(),
-        color,
-        ..Default::default()
+fn draw_code(ui: &mut egui::Ui, viewer: &mut FileViewerState) {
+    let Some(document) = &viewer.document else {
+        return;
     };
-
-    match viewer.highlighted.get(index) {
-        Some(spans) if !spans.is_empty() => {
-            for (color, piece) in spans {
-                job.append(piece, 0.0, format_for(*color));
-            }
-        }
-        _ => job.append(plain, 0.0, format_for(plain_fg())),
-    }
-    job
+    let style = ViewerStyle {
+        foreground: plain_fg(),
+        background: code_bg(),
+        gutter_background: gutter_bg(),
+        gutter_foreground: gutter_fg(),
+        selection: ui.visuals().selection.bg_fill,
+    };
+    file_viewer_selection::draw_widget(
+        ui,
+        document,
+        &mut viewer.selection,
+        &viewer.highlighted,
+        style,
+    );
 }
-fn loaded_file_state(path: PathBuf, contents: FileContents) -> (FileViewerState, Option<String>) {
+
+fn loaded_file_state(path: PathBuf, contents: FileContents) -> (FileViewerState, Option<Arc<str>>) {
     let mut state = loading_file_state(path);
     state.loading = false;
     let source = match contents {
         FileContents::Text {
-            lines,
-            source,
+            document,
             truncated,
             language,
         } => {
-            state.lines = lines;
+            let source = document.source_arc();
+            state.document = Some(document);
             state.truncated = truncated;
             state.language = language;
             Some(source)
@@ -474,7 +447,7 @@ fn loaded_file_state(path: PathBuf, contents: FileContents) -> (FileViewerState,
             None
         }
         FileContents::Unreadable => {
-            state.lines = vec!["(no se pudo leer el archivo)".to_owned()];
+            state.read_error = Some("(no se pudo leer el archivo)".to_owned());
             None
         }
     };
@@ -505,8 +478,12 @@ mod tests {
         let state = load_file_for_view(&temp_path("missing"));
         assert!(!state.binary);
         assert!(!state.truncated);
-        assert_eq!(state.lines.len(), 1);
-        assert!(state.lines[0].contains("no se pudo leer"));
+        assert!(state.document.is_none());
+        assert!(state
+            .read_error
+            .as_deref()
+            .unwrap()
+            .contains("no se pudo leer"));
     }
 
     #[test]
@@ -518,7 +495,15 @@ mod tests {
 
         assert!(!state.binary);
         assert!(!state.truncated);
-        assert_eq!(state.lines, vec!["alpha", "beta", "gamma"]);
+        let document = state.document.unwrap();
+        assert_eq!(document.logical_lines().len(), 3);
+        assert_eq!(
+            (0..3)
+                .map(|index| document.logical_line_text(index).unwrap())
+                .collect::<Vec<_>>(),
+            vec!["alpha", "beta", "gamma"]
+        );
+        assert_eq!(document.source(), "alpha\nbeta\ngamma\n");
     }
 
     #[test]
@@ -529,7 +514,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         assert!(state.binary);
-        assert!(state.lines.is_empty());
+        assert!(state.document.is_none());
     }
 
     #[test]
@@ -541,8 +526,15 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         assert!(!state.truncated, "cap-sized file must not be truncated");
-        assert_eq!(state.lines.len(), 1);
-        assert_eq!(state.lines[0].len(), MAX_VIEW_BYTES as usize);
+        let document = state.document.unwrap();
+        assert_eq!(document.logical_lines().len(), 1);
+        assert_eq!(document.source().len(), MAX_VIEW_BYTES as usize);
+        assert!(document.has_long_lines());
+        assert!(document
+            .fragments()
+            .iter()
+            .all(|fragment| fragment.source.len()
+                <= super::super::file_viewer_document::FRAGMENT_BYTE_CAP));
     }
 
     #[test]
@@ -554,8 +546,10 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         assert!(state.truncated, "oversized file must be flagged truncated");
-        let total: usize = state.lines.iter().map(String::len).sum();
-        assert_eq!(total, MAX_VIEW_BYTES as usize);
+        assert_eq!(
+            state.document.unwrap().source().len(),
+            MAX_VIEW_BYTES as usize
+        );
     }
 
     #[test]
@@ -567,13 +561,20 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         assert!(state.truncated);
-        assert_eq!(state.lines.len(), MAX_VIEW_LINES);
+        assert_eq!(
+            state.document.unwrap().logical_lines().len(),
+            MAX_VIEW_LINES
+        );
     }
 
     fn viewer_with(lines: &[&str], highlighted: Vec<super::HighlightedLine>) -> FileViewerState {
         FileViewerState {
             path: std::path::PathBuf::from("/tmp/demo.rs"),
-            lines: lines.iter().map(|line| (*line).to_owned()).collect(),
+            document: Some(std::sync::Arc::new(super::SourceDocument::prepare(
+                std::sync::Arc::from(lines.join("\n")),
+            ))),
+            selection: super::SelectionState::default(),
+            read_error: None,
             truncated: false,
             binary: false,
             highlighted,
@@ -583,76 +584,156 @@ mod tests {
         }
     }
 
-    fn job_text(job: &egui::text::LayoutJob) -> String {
-        job.sections
-            .iter()
-            .map(|section| &job.text[section.byte_range.start.0..section.byte_range.end.0])
-            .collect()
+    fn detached_app(ctx: &egui::Context) -> super::TerminalApp {
+        let workspace = crate::state::Workspace::new("Viewer regression", None);
+        let state = crate::state::AppState {
+            schema_version: crate::state::persistence::APP_STATE_SCHEMA_VERSION,
+            workspaces: vec![workspace.to_saved()],
+            active_ws: 0,
+            sidebar_visible: true,
+            legacy_canvas_ui: Default::default(),
+            local_device_id: uuid::Uuid::new_v4().to_string(),
+            trusted_devices: Vec::new(),
+            orchestration: Default::default(),
+        };
+        super::TerminalApp::build(ctx, None, Some(state), None, false, false)
     }
 
     #[test]
-    fn a_code_line_never_wraps() {
-        // Si envolviera, la fila ocuparía más alto del reservado por show_rows
-        // y el gutter dejaría de alinear con el código.
-        let viewer = viewer_with(&["x".repeat(4000).as_str()], Vec::new());
-        let font = egui::FontId::monospace(12.0);
-        let job = super::line_layout_job(&viewer, 0, &viewer.lines[0], &font);
-        assert_eq!(job.wrap.max_width, f32::INFINITY);
-        assert!(!job.break_on_newline);
-    }
-
-    #[test]
-    fn highlighted_line_keeps_the_exact_source_text() {
-        let spans = vec![vec![
-            (egui::Color32::RED, "fn ".to_owned()),
-            (egui::Color32::GREEN, "main".to_owned()),
-            (egui::Color32::WHITE, "() {}".to_owned()),
-        ]];
-        let viewer = viewer_with(&["fn main() {}"], spans);
-        let font = egui::FontId::monospace(12.0);
-        let job = super::line_layout_job(&viewer, 0, &viewer.lines[0], &font);
-        assert_eq!(job_text(&job), "fn main() {}");
-        assert_eq!(job.sections.len(), 3, "one section per span");
-    }
-
-    #[test]
-    fn indentation_is_preserved_verbatim() {
-        let viewer = viewer_with(&["        anidado()"], Vec::new());
-        let font = egui::FontId::monospace(12.0);
-        let job = super::line_layout_job(&viewer, 0, &viewer.lines[0], &font);
-        assert!(job_text(&job).starts_with("        "), "lost the indent");
-    }
-
-    #[test]
-    fn falls_back_to_plain_text_while_the_worker_is_still_running() {
-        let viewer = viewer_with(&["let x = 1;"], Vec::new());
-        let font = egui::FontId::monospace(12.0);
-        let job = super::line_layout_job(&viewer, 0, &viewer.lines[0], &font);
-        assert_eq!(job_text(&job), "let x = 1;");
-        assert_eq!(job.sections.len(), 1);
-    }
-
-    #[test]
-    fn a_line_past_the_highlight_cap_still_renders_plain() {
-        // El worker recorta a MAX_HIGHLIGHT_LINES; las siguientes no tienen
-        // spans y no deben quedar en blanco.
-        let viewer = viewer_with(
-            &["uno", "dos"],
-            vec![vec![(egui::Color32::RED, "uno".to_owned())]],
+    fn loading_shares_the_original_buffer_with_the_highlighter() {
+        let source: std::sync::Arc<str> = std::sync::Arc::from("fn main() {}\r\n");
+        let document = std::sync::Arc::new(super::SourceDocument::prepare(source.clone()));
+        let (state, highlight_source) = super::loaded_file_state(
+            "main.rs".into(),
+            super::FileContents::Text {
+                document: document.clone(),
+                truncated: false,
+                language: Some("Rust".to_owned()),
+            },
         );
-        let font = egui::FontId::monospace(12.0);
-        let job = super::line_layout_job(&viewer, 1, &viewer.lines[1], &font);
-        assert_eq!(job_text(&job), "dos");
+        assert!(std::sync::Arc::ptr_eq(&highlight_source.unwrap(), &source));
+        assert!(std::sync::Arc::ptr_eq(
+            state.document.as_ref().unwrap(),
+            &document
+        ));
+        assert_eq!(document.source(), "fn main() {}\r\n");
     }
 
     #[test]
-    fn gutter_widens_with_the_line_count() {
-        let narrow = viewer_with(&["a"], Vec::new());
-        let wide = viewer_with(&["a"; 10_000], Vec::new());
-        assert!(
-            wide.gutter_width() > narrow.gutter_width(),
-            "a 5-digit gutter must be wider than a 1-digit one"
+    fn huge_line_activation_keeps_all_source_and_skips_the_highlight_request() {
+        let ctx = egui::Context::default();
+        let mut app = detached_app(&ctx);
+        let mut state = viewer_with(&["x".repeat(MAX_VIEW_BYTES as usize).as_str()], Vec::new());
+        let source = state.document.as_ref().unwrap().source_arc();
+        state.truncated = false;
+        app.activate_loaded_file(state, Some(source.clone()));
+        let viewer = app.file_viewer.as_ref().unwrap();
+        assert!(viewer.highlight_token.is_none());
+        assert!(viewer.highlighted.is_empty());
+        assert!(!viewer.truncated);
+        assert!(std::sync::Arc::ptr_eq(
+            &viewer.document.as_ref().unwrap().source_arc(),
+            &source
+        ));
+        assert_eq!(
+            viewer.document.as_ref().unwrap().source().len(),
+            MAX_VIEW_BYTES as usize
         );
+    }
+
+    #[test]
+    fn short_file_activation_still_requests_async_syntax_highlighting() {
+        let ctx = egui::Context::default();
+        let mut app = detached_app(&ctx);
+        let state = viewer_with(&["fn main() {}"], Vec::new());
+        let source = state.document.as_ref().unwrap().source_arc();
+        app.activate_loaded_file(state, Some(source));
+        assert!(app.file_viewer.as_ref().unwrap().highlight_token.is_some());
+    }
+
+    #[test]
+    fn loading_binary_and_error_headers_keep_focus_until_escape() {
+        use egui::{Event, Modifiers, PointerButton, RawInput};
+        for kind in ["loading", "binary", "error"] {
+            let ctx = egui::Context::default();
+            let mut app = detached_app(&ctx);
+            let mut viewer = super::loading_file_state("placeholder.txt".into());
+            viewer.loading = kind == "loading";
+            viewer.binary = kind == "binary";
+            viewer.read_error = (kind == "error").then(|| "controlled read failure".to_owned());
+            app.file_viewer = Some(viewer);
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 600.0));
+            let mut frame = |events| {
+                let mut output = ctx.run_ui(
+                    RawInput {
+                        screen_rect: Some(screen),
+                        focused: true,
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| {
+                        app.show_file_viewer(ui);
+                        egui::CentralPanel::default().show(ui, |ui| {
+                            ui.label("Terminal area");
+                        });
+                    },
+                );
+                output.textures_delta.clear();
+                output
+            };
+            frame(Vec::new()).drop_without_applying_deltas();
+            let output = frame(Vec::new());
+            let point = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::epaint::Shape::Text(text) if text.galley.text() == "placeholder.txt" => {
+                        Some(text.pos + text.galley.size() * 0.5)
+                    }
+                    _ => None,
+                })
+                .expect("viewer header");
+            output.drop_without_applying_deltas();
+            for pressed in [true, false] {
+                frame(vec![
+                    Event::PointerMoved(point),
+                    Event::PointerButton {
+                        pos: point,
+                        button: PointerButton::Primary,
+                        pressed,
+                        modifiers: Modifiers::NONE,
+                    },
+                ])
+                .drop_without_applying_deltas();
+            }
+            frame(Vec::new()).drop_without_applying_deltas();
+            frame(Vec::new()).drop_without_applying_deltas();
+            assert!(
+                super::file_viewer_selection::viewer_has_keyboard_focus(&ctx),
+                "{kind}"
+            );
+            frame(vec![Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            }])
+            .drop_without_applying_deltas();
+            assert!(
+                app.file_viewer.is_none(),
+                "Escape closes the focused {kind} viewer"
+            );
+            assert!(app.terminal_input_is_routable());
+            assert!(!ctx.input(|input| input.events.iter().any(|event| matches!(
+                event,
+                Event::Key {
+                    key: egui::Key::Escape,
+                    pressed: true,
+                    ..
+                }
+            ))));
+        }
     }
 
     #[test]
@@ -661,17 +742,18 @@ mod tests {
 
         let ctx = egui::Context::default();
         let lines = ["let palabra = \"cafe\u{301}\";", "let 漢字 = 2;"];
-        let viewer = viewer_with(&lines, Vec::new());
+        let mut viewer = viewer_with(&lines, Vec::new());
         let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(620.0, 300.0));
-        let frame = |events: Vec<Event>, time: f64| {
+        let mut frame = |events: Vec<Event>, time: f64| {
             let mut output = ctx.run_ui(
                 RawInput {
                     screen_rect: Some(screen),
                     events,
                     time: Some(time),
+                    focused: true,
                     ..Default::default()
                 },
-                |ui| super::draw_code(ui, &viewer),
+                |ui| super::draw_code(ui, &mut viewer),
             );
             // This headless test inspects UI output rather than uploading fonts.
             output.textures_delta.clear();
@@ -728,15 +810,16 @@ mod tests {
         )
         .drop_without_applying_deltas();
         let output = frame(vec![Event::Copy], 0.5);
-        let copied = output
+        let copied: Vec<_> = output
             .platform_output
             .commands
             .iter()
-            .find_map(|command| match command {
+            .filter_map(|command| match command {
                 egui::OutputCommand::CopyText(text) => Some(text.as_str()),
                 _ => None,
-            });
-        assert_eq!(copied, Some(lines.join("\n").as_str()));
+            })
+            .collect();
+        assert_eq!(copied, vec![lines.join("\n").as_str()]);
         output.drop_without_applying_deltas();
     }
 }

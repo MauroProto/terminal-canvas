@@ -32,7 +32,9 @@ mod desktop;
 mod dialogs;
 mod export_action;
 mod export_worker;
+mod file_viewer_document;
 mod file_viewer_reader;
+mod file_viewer_selection;
 mod file_viewer_ui;
 mod memory_ui;
 mod notify_policy;
@@ -106,7 +108,6 @@ pub struct TerminalApp {
     screenshot_rx: Option<std::sync::mpsc::Receiver<anyhow::Result<PathBuf>>>,
     screenshot_target: Option<(Uuid, Uuid, Uuid)>,
     file_viewer: Option<file_viewer_ui::FileViewerState>,
-    file_viewer_keyboard_active: bool,
     file_viewer_reader: Option<file_viewer_reader::FileViewerReader>,
     settings_open: bool,
     settings_draft: Option<settings_ui::SettingsDraft>,
@@ -311,7 +312,6 @@ impl TerminalApp {
                 screenshot_rx: None,
                 screenshot_target: None,
                 file_viewer: None,
-                file_viewer_keyboard_active: false,
                 file_viewer_reader: None,
                 settings_open: false,
                 settings_draft: None,
@@ -421,7 +421,6 @@ impl TerminalApp {
                 screenshot_rx: None,
                 screenshot_target: None,
                 file_viewer: None,
-                file_viewer_keyboard_active: false,
                 file_viewer_reader: None,
                 settings_open: false,
                 settings_draft: None,
@@ -645,6 +644,7 @@ impl TerminalApp {
             {
                 if modifiers.ctrl && modifiers.shift && key == Key::P {
                     consume_key_event(ctx, modifiers, key);
+                    file_viewer_selection::release_keyboard_focus(ctx);
                     self.command_palette.toggle();
                     return None;
                 }
@@ -1395,13 +1395,15 @@ impl TerminalApp {
         if let Some(command) = self.handle_shortcuts(&ctx) {
             self.execute_command(command, &ctx, ui.available_rect_before_wrap());
         }
-        self.forward_input_to_focused_panel(&ctx);
         self.show_persistence_warning(ui);
         self.show_sidebar(ui);
         self.show_taskbar(ui);
         // El visor de código es un SidePanel: tiene que declararse antes del
         // CentralPanel para que el canvas se achique en vez de quedar tapado.
         self.show_file_viewer(ui);
+        // The viewer resolves pointer focus and consumes its copy/navigation
+        // events before the remaining keyboard stream can reach the PTY.
+        self.forward_input_to_focused_panel(&ctx);
         let canvas_rect = ui.available_rect_before_wrap();
 
         CentralPanel::default()
@@ -1448,6 +1450,9 @@ impl TerminalApp {
         self.ctx = Some(ctx.clone());
         self.command_palette.desktop_mode = !matches!(self.collab.mode(), CollabMode::Guest);
         self.window_focused = ctx.input(|input| input.raw.focused);
+        if !self.window_focused || self.modal_input_is_active() {
+            file_viewer_selection::release_keyboard_focus(ctx);
+        }
         self.poll_persistence_worker(ctx);
         self.handle_collab_events();
         self.maybe_refresh_orchestration();
@@ -1571,7 +1576,11 @@ impl TerminalApp {
     /// passphrases nunca se escriban también en el shell detrás del diálogo.
     fn terminal_input_is_routable(&self) -> bool {
         !(self.modal_input_is_active()
-            || (self.file_viewer.is_some() && self.file_viewer_keyboard_active)
+            || (self.file_viewer.is_some()
+                && self
+                    .ctx
+                    .as_ref()
+                    .is_some_and(file_viewer_selection::viewer_has_keyboard_focus))
             || matches!(self.collab.mode(), CollabMode::Guest))
     }
 

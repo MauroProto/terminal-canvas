@@ -7,15 +7,17 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
+use super::file_viewer_document::SourceDocument;
+
 pub(super) const MAX_VIEW_BYTES: u64 = 2 * 1024 * 1024;
 pub(super) const MAX_VIEW_LINES: usize = 100_000;
 const READ_CHUNK_BYTES: usize = 32 * 1024;
 
 pub(super) enum FileContents {
     Text {
-        lines: Vec<String>,
-        /// Conserva LF/CRLF y EOF para el parser, sin reensamblar en la UI.
-        source: String,
+        /// Fuente y rangos completos preparados en el reader, sin copiar cada
+        /// línea ni reconstruir el texto/los segmentos en el hilo de UI.
+        document: Arc<SourceDocument>,
         truncated: bool,
         language: Option<String>,
     },
@@ -326,18 +328,13 @@ pub(super) fn load_file_for_view(
         return Some(FileContents::Binary);
     }
     let mut source = String::from_utf8_lossy(&bytes).into_owned();
+    drop(bytes);
     let mut source_lines = source.split_inclusive('\n');
-    let mut lines = Vec::new();
     let mut source_end = 0;
     for line in source_lines.by_ref().take(MAX_VIEW_LINES) {
         if cancelled() {
             return None;
         }
-        let visible = line
-            .strip_suffix('\n')
-            .map(|without_lf| without_lf.strip_suffix('\r').unwrap_or(without_lf))
-            .unwrap_or(line);
-        lines.push(visible.to_owned());
         source_end += line.len();
     }
     let truncated_lines = source_lines.next().is_some();
@@ -347,16 +344,23 @@ pub(super) fn load_file_for_view(
     if cancelled() {
         return None;
     }
+    let document = Arc::new(SourceDocument::prepare_cancellable(
+        Arc::from(source),
+        cancelled,
+    )?);
     let language = path
         .file_name()
         .and_then(|name| name.to_str())
-        .and_then(|name| lines.first().and_then(|first| detect_language(name, first)));
+        .and_then(|name| {
+            document
+                .logical_line_text(0)
+                .and_then(|first| detect_language(name, first))
+        });
     if cancelled() {
         return None;
     }
     Some(FileContents::Text {
-        lines,
-        source,
+        document,
         truncated: truncated_bytes || truncated_lines,
         language,
     })
@@ -397,8 +401,7 @@ mod tests {
 
     fn text_contents(text: &str) -> FileContents {
         FileContents::Text {
-            lines: vec![text.to_owned()],
-            source: text.to_owned(),
+            document: Arc::new(SourceDocument::prepare(Arc::from(text))),
             truncated: false,
             language: None,
         }
@@ -406,18 +409,19 @@ mod tests {
 
     fn assert_source(contents: FileContents, expected: &str, expected_truncated: bool) {
         let FileContents::Text {
-            lines,
-            source,
+            document,
             truncated,
             ..
         } = contents
         else {
             panic!("expected text");
         };
-        assert_eq!(source, expected);
+        assert_eq!(document.source(), expected);
         assert_eq!(
-            lines,
-            expected.lines().map(str::to_owned).collect::<Vec<_>>()
+            (0..document.logical_lines().len())
+                .map(|index| document.logical_line_text(index).unwrap())
+                .collect::<Vec<_>>(),
+            expected.lines().collect::<Vec<_>>()
         );
         assert_eq!(truncated, expected_truncated);
     }
@@ -453,6 +457,34 @@ mod tests {
         let expected = "x\r\n".repeat(MAX_VIEW_LINES);
         std::fs::write(&fixture.path, format!("{expected}extra\n")).expect("write many lines");
         assert_source(load(&fixture.path), &expected, true);
+    }
+
+    #[test]
+    fn a_byte_cap_inside_utf8_keeps_the_existing_lossy_fallback_and_safe_fragments() {
+        use super::super::file_viewer_document::FRAGMENT_BYTE_CAP;
+
+        let fixture = Fixture::new("utf8-cap.txt");
+        let prefix = "x".repeat(MAX_VIEW_BYTES as usize - 1);
+        std::fs::write(&fixture.path, format!("{prefix}🙂")).expect("write split UTF-8");
+        let FileContents::Text {
+            document,
+            truncated,
+            ..
+        } = load(&fixture.path)
+        else {
+            panic!("expected text");
+        };
+        assert!(truncated);
+        assert_eq!(document.source(), format!("{prefix}�"));
+        assert!(document.has_long_lines());
+        assert!(document
+            .fragments()
+            .iter()
+            .all(|fragment| fragment.source.len() <= FRAGMENT_BYTE_CAP));
+        for fragment in document.fragments() {
+            assert!(document.source().is_char_boundary(fragment.source.start));
+            assert!(document.source().is_char_boundary(fragment.source.end));
+        }
     }
 
     #[test]
@@ -526,6 +558,65 @@ mod tests {
         assert_eq!(result.token, token);
         assert_eq!(result.path, fixture.path);
         assert_source(result.contents, source, false);
+    }
+
+    #[test]
+    fn the_worker_prepares_complete_unicode_fragments_before_notifying() {
+        use super::super::file_viewer_document::FRAGMENT_BYTE_CAP;
+
+        let fixture = Fixture::new("long.js");
+        let first_line = "é🙂e\u{301}".repeat(2400);
+        let source = format!("{first_line}\r\nfin\n");
+        std::fs::write(&fixture.path, &source).expect("write long source");
+        let mut reader = FileViewerReader::new(move |name, first| {
+            assert_eq!(name, "long.js");
+            assert_eq!(
+                first, first_line,
+                "detection receives original logical text"
+            );
+            assert_eq!(std::thread::current().name(), Some("file-viewer-reader"));
+            None
+        });
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let token = reader.request(fixture.path.clone(), move || {
+            let _ = ready_tx.send(());
+        });
+        ready_rx
+            .recv_timeout(DEADLINE)
+            .expect("fragmented document ready");
+        let result = reader
+            .poll()
+            .expect("document published before notification");
+        assert_eq!(result.token, token);
+        let FileContents::Text {
+            document,
+            truncated,
+            language,
+        } = result.contents
+        else {
+            panic!("expected text");
+        };
+        assert!(!truncated);
+        assert!(language.is_none());
+        assert_eq!(document.source(), source);
+        assert_eq!(document.logical_lines().len(), 2);
+        assert_eq!(document.logical_line_text(1), Some("fin"));
+        assert!(document.has_long_lines());
+        assert!(document.fragments().len() > document.logical_lines().len());
+        assert!(document
+            .fragments()
+            .iter()
+            .all(|fragment| fragment.source.len() <= FRAGMENT_BYTE_CAP));
+        assert!(Arc::ptr_eq(&document.source_arc(), &document.source_arc()));
+        assert_source(
+            FileContents::Text {
+                document,
+                truncated,
+                language,
+            },
+            &source,
+            false,
+        );
     }
 
     #[cfg(unix)]

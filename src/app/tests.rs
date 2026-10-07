@@ -1718,7 +1718,13 @@ fn docked_panels_share_the_root_ui_and_overlays_keep_the_remaining_canvas_bounds
     let panel_id = app.ws().panels[0].id();
     app.file_viewer = Some(super::file_viewer_ui::FileViewerState {
         path: "layout.rs".into(),
-        lines: vec!["fn main() {}".into()],
+        document: Some(std::sync::Arc::new(
+            super::file_viewer_document::SourceDocument::prepare(std::sync::Arc::from(
+                "fn main() {}",
+            )),
+        )),
+        selection: super::file_viewer_selection::SelectionState::default(),
+        read_error: None,
         truncated: false,
         binary: false,
         highlighted: Vec::new(),
@@ -1796,7 +1802,13 @@ fn docked_viewer_switches_keyboard_ownership_by_pointer_and_escape() {
     let mut app = super::TerminalApp::new_for_tests(&ctx);
     app.file_viewer = Some(super::file_viewer_ui::FileViewerState {
         path: "example.rs".into(),
-        lines: vec!["fn main() {}".into()],
+        document: Some(std::sync::Arc::new(
+            super::file_viewer_document::SourceDocument::prepare(std::sync::Arc::from(
+                "fn main() {}",
+            )),
+        )),
+        selection: super::file_viewer_selection::SelectionState::default(),
+        read_error: None,
         truncated: false,
         binary: false,
         highlighted: Vec::new(),
@@ -1840,7 +1852,13 @@ fn docked_viewer_only_captures_keyboard_when_its_content_is_active() {
     let mut app = super::TerminalApp::new_for_tests(&ctx);
     app.file_viewer = Some(super::file_viewer_ui::FileViewerState {
         path: "example.rs".into(),
-        lines: vec!["fn main() {}".into()],
+        document: Some(std::sync::Arc::new(
+            super::file_viewer_document::SourceDocument::prepare(std::sync::Arc::from(
+                "fn main() {}",
+            )),
+        )),
+        selection: super::file_viewer_selection::SelectionState::default(),
+        read_error: None,
         truncated: false,
         binary: false,
         highlighted: Vec::new(),
@@ -1850,14 +1868,113 @@ fn docked_viewer_only_captures_keyboard_when_its_content_is_active() {
     });
     assert!(!app.modal_input_is_active());
     assert!(app.terminal_input_is_routable());
-    app.file_viewer_keyboard_active = true;
+    super::file_viewer_selection::request_keyboard_focus(&ctx);
     assert!(!app.terminal_input_is_routable());
     assert!(
         !app.modal_input_is_active(),
         "global commands remain available"
     );
-    app.file_viewer_keyboard_active = false;
+    ctx.memory_mut(|memory| memory.request_focus(egui::Id::new("other-text-field")));
+    assert!(
+        app.terminal_input_is_routable(),
+        "selection alone does not own keyboard focus"
+    );
+    super::file_viewer_selection::request_keyboard_focus(&ctx);
+    super::file_viewer_selection::release_keyboard_focus(&ctx);
     assert!(app.terminal_input_is_routable());
+}
+
+#[test]
+fn opening_palette_releases_viewer_focus_before_the_same_frame_copy_event() {
+    let ctx = egui::Context::default();
+    let mut app = detached_test_app_with_panel(&ctx);
+    app.onboarding_dismissed = true;
+    let source = "fn main() { /* viewer selection */ }\r\n";
+    app.file_viewer = Some(super::file_viewer_ui::FileViewerState {
+        path: "focus.rs".into(),
+        document: Some(std::sync::Arc::new(
+            super::file_viewer_document::SourceDocument::prepare(std::sync::Arc::from(source)),
+        )),
+        selection: super::file_viewer_selection::SelectionState::default(),
+        read_error: None,
+        truncated: false,
+        binary: false,
+        highlighted: Vec::new(),
+        highlight_token: None,
+        language: None,
+        loading: false,
+    });
+    let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(1400.0, 900.0));
+    let mut frame = |events| {
+        let mut output = ctx.run_ui(
+            RawInput {
+                screen_rect: Some(screen),
+                focused: true,
+                events,
+                ..Default::default()
+            },
+            |ui| app.ui_impl(ui),
+        );
+        output.textures_delta.clear();
+        output
+    };
+    frame(Vec::new()).drop_without_applying_deltas();
+    frame(Vec::new()).drop_without_applying_deltas();
+    super::file_viewer_selection::request_keyboard_focus(&ctx);
+    frame(vec![egui::Event::Key {
+        key: egui::Key::A,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: Modifiers::CTRL,
+    }])
+    .drop_without_applying_deltas();
+    let copied = frame(vec![egui::Event::Copy]);
+    let commands: Vec<_> = copied
+        .platform_output
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            egui::OutputCommand::CopyText(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        commands,
+        vec![source],
+        "the viewer must own a real selection first"
+    );
+    copied.drop_without_applying_deltas();
+    let output = frame(vec![
+        egui::Event::Key {
+            key: egui::Key::P,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers {
+                ctrl: true,
+                shift: true,
+                ..Default::default()
+            },
+        },
+        egui::Event::Copy,
+    ]);
+    assert!(
+        !output.platform_output.commands.iter().any(|command| {
+            matches!(command, egui::OutputCommand::CopyText(text) if text == source)
+        }),
+        "opening the palette must not copy the previous viewer selection"
+    );
+    output.drop_without_applying_deltas();
+    assert!(app.command_palette.open);
+    assert!(app.file_viewer.is_some());
+    assert!(!super::file_viewer_selection::viewer_has_keyboard_focus(
+        &ctx
+    ));
+    assert!(
+        !app.terminal_input_is_routable(),
+        "the palette still blocks PTY input"
+    );
 }
 
 #[test]
