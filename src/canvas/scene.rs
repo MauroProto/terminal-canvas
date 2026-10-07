@@ -86,7 +86,7 @@ mod tests {
         let screen_rect = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0));
         let mut viewport = Viewport::default();
 
-        let _ = ctx.run(
+        let output = ctx.run_ui(
             RawInput {
                 screen_rect: Some(screen_rect),
                 events: vec![
@@ -94,18 +94,21 @@ mod tests {
                     Event::MouseWheel {
                         unit: MouseWheelUnit::Point,
                         delta: vec2(0.0, 120.0),
+                        phase: egui::TouchPhase::Move,
                         modifiers: egui::Modifiers::NONE,
                     },
                 ],
                 ..Default::default()
             },
-            |ctx| {
-                CentralPanel::default().show(ctx, |ui| {
+            |ui| {
+                CentralPanel::default().show(ui, |ui| {
                     let state = handle_canvas_input(ui, &mut viewport, screen_rect, false, true);
                     assert!(!state.viewport_changed);
                 });
             },
         );
+
+        output.drop_without_applying_deltas();
 
         assert_eq!(viewport.pan, egui::Vec2::ZERO);
     }
@@ -116,7 +119,7 @@ mod tests {
         let screen_rect = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0));
         let mut viewport = Viewport::default();
 
-        let _ = ctx.run(
+        let output = ctx.run_ui(
             RawInput {
                 screen_rect: Some(screen_rect),
                 events: vec![
@@ -124,18 +127,21 @@ mod tests {
                     Event::MouseWheel {
                         unit: MouseWheelUnit::Point,
                         delta: vec2(0.0, 120.0),
+                        phase: egui::TouchPhase::Move,
                         modifiers: egui::Modifiers::NONE,
                     },
                 ],
                 ..Default::default()
             },
-            |ctx| {
-                CentralPanel::default().show(ctx, |ui| {
+            |ui| {
+                CentralPanel::default().show(ui, |ui| {
                     let state = handle_canvas_input(ui, &mut viewport, screen_rect, false, false);
                     assert!(state.viewport_changed);
                 });
             },
         );
+
+        output.drop_without_applying_deltas();
 
         assert_eq!(viewport.pan.x, 0.0);
         assert!(viewport.pan.y > 0.0);
@@ -147,19 +153,21 @@ mod tests {
         let screen_rect = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0));
         let mut viewport = Viewport::default();
 
-        let _ = ctx.run(
+        let output = ctx.run_ui(
             RawInput {
                 screen_rect: Some(screen_rect),
                 events: vec![Event::PointerMoved(pos2(200.0, 200.0)), Event::Zoom(1.2)],
                 ..Default::default()
             },
-            |ctx| {
-                CentralPanel::default().show(ctx, |ui| {
+            |ui| {
+                CentralPanel::default().show(ui, |ui| {
                     let state = handle_canvas_input(ui, &mut viewport, screen_rect, false, true);
                     assert!(!state.viewport_changed);
                 });
             },
         );
+
+        output.drop_without_applying_deltas();
 
         assert_eq!(viewport.zoom, 1.0);
     }
