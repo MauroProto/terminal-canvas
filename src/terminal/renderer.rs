@@ -37,12 +37,15 @@ struct RenderMetrics {
 /// Clave del cache de shapes del grid. Depende solo del TAMAÑO del rect (no
 /// de su posición): los shapes se construyen en coordenadas locales al panel
 /// y se trasladan al pintar, así el cache sobrevive drags, transiciones y
-/// re-tiling sin reconstruir galleys.
+/// re-tiling sin reconstruir galleys. El tamaño de fuente efectivo también
+/// forma parte de la clave: los settings pueden cambiarlo sin cambiar el
+/// tamaño de la grilla, la revisión del terminal ni el atlas de fuentes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GridCacheKey {
     width_bits: u32,
     height_bits: u32,
     zoom_bits: u32,
+    font_size_bits: u32,
     revision: u64,
     row_stride: usize,
     atlas_generation: u64,
@@ -52,6 +55,7 @@ impl GridCacheKey {
     pub(crate) fn new(
         rect: Rect,
         zoom: f32,
+        font_size: f32,
         revision: u64,
         row_stride: usize,
         atlas_generation: u64,
@@ -60,6 +64,7 @@ impl GridCacheKey {
             width_bits: rect.width().to_bits(),
             height_bits: rect.height().to_bits(),
             zoom_bits: zoom.to_bits(),
+            font_size_bits: font_size.to_bits(),
             revision,
             row_stride,
             atlas_generation,
@@ -303,6 +308,7 @@ pub fn render_ghostty_text_snapshot(
     let cache_key = GridCacheKey::new(
         content_rect,
         zoom,
+        metrics.font_size,
         snapshot.revision,
         1,
         font_atlas_generation(painter.ctx()),
@@ -627,6 +633,7 @@ fn render_terminal_with_row_stride(
     let cache_key = GridCacheKey::new(
         content_rect,
         zoom,
+        metrics.font_size,
         revision,
         row_stride,
         font_atlas_generation(painter.ctx()),
@@ -1607,8 +1614,8 @@ mod tests {
     #[test]
     fn grid_cache_key_tracks_atlas_generation() {
         let rect = Rect::from_min_size(pos2(20.0, 20.0), vec2(220.0, 120.0));
-        let first = GridCacheKey::new(rect, 1.0, 7, 1, 0);
-        let after_atlas_recreation = GridCacheKey::new(rect, 1.0, 7, 1, 1);
+        let first = GridCacheKey::new(rect, 1.0, 15.0, 7, 1, 0);
+        let after_atlas_recreation = GridCacheKey::new(rect, 1.0, 15.0, 7, 1, 1);
 
         assert_ne!(first, after_atlas_recreation);
     }
@@ -1616,9 +1623,9 @@ mod tests {
     #[test]
     fn grid_cache_key_tracks_revision_and_display_offset() {
         let rect = Rect::from_min_size(pos2(20.0, 20.0), vec2(220.0, 120.0));
-        let first = GridCacheKey::new(rect, 1.0, 7, 1, 0);
-        let different_revision = GridCacheKey::new(rect, 1.0, 8, 1, 0);
-        let different_offset = GridCacheKey::new(rect, 1.0, 7, 1, 0);
+        let first = GridCacheKey::new(rect, 1.0, 15.0, 7, 1, 0);
+        let different_revision = GridCacheKey::new(rect, 1.0, 15.0, 8, 1, 0);
+        let different_offset = GridCacheKey::new(rect, 1.0, 15.0, 7, 1, 0);
 
         assert_ne!(first, different_revision);
         assert_eq!(first, different_offset);
@@ -1627,7 +1634,7 @@ mod tests {
     #[test]
     fn grid_cache_reuses_shapes_only_for_identical_keys() {
         let rect = Rect::from_min_size(pos2(20.0, 20.0), vec2(220.0, 120.0));
-        let key = GridCacheKey::new(rect, 1.0, 7, 1, 0);
+        let key = GridCacheKey::new(rect, 1.0, 15.0, 7, 1, 0);
         let mut cache = TerminalGridCache::default();
 
         assert!(!cache.matches(key));
@@ -1639,7 +1646,50 @@ mod tests {
             sample_term("hello").renderable_content().cursor,
         );
         assert!(cache.matches(key));
-        assert!(!cache.matches(GridCacheKey::new(rect, 1.0, 8, 1, 0)));
+        assert!(!cache.matches(GridCacheKey::new(rect, 1.0, 15.0, 8, 1, 0)));
+    }
+
+    #[test]
+    fn font_size_change_invalidates_cached_shapes_without_other_state_changes() {
+        let rect = Rect::from_min_size(pos2(20.0, 20.0), vec2(220.0, 120.0));
+        let term = sample_term("unchanged");
+        let content = term.renderable_content();
+        let background = terminal_background_color(content.colors);
+
+        // Settings can change the base font size even when rounding leaves
+        // the PTY dimensions unchanged. Do not mutate the global font size:
+        // concurrent renderer tests must retain their own stable metrics.
+        for zoom in [0.5, 1.0, 2.0] {
+            let first = GridCacheKey::new(rect, zoom, 15.0 * zoom, 7, 1, 0);
+            let resized_font = GridCacheKey::new(rect, zoom, 15.5 * zoom, 7, 1, 0);
+            let mut cache = TerminalGridCache::default();
+            cache.store(first, Vec::new(), background, 0, content.cursor);
+
+            assert!(cache.state_for(first).is_some());
+            assert!(
+                cache.state_for(resized_font).is_none(),
+                "old font shapes must not be reused at zoom {zoom}"
+            );
+            cache.store(resized_font, Vec::new(), background, 0, content.cursor);
+            assert!(cache.state_for(resized_font).is_some());
+            assert!(cache.state_for(first).is_none());
+        }
+    }
+
+    #[cfg(feature = "ghostty-vt")]
+    #[test]
+    fn ghostty_cache_also_invalidates_when_only_font_size_changes() {
+        let rect = Rect::from_min_size(pos2(20.0, 20.0), vec2(220.0, 120.0));
+        let first = GridCacheKey::new(rect, 1.0, 15.0, 7, 1, 0);
+        let resized_font = GridCacheKey::new(rect, 1.0, 15.5, 7, 1, 0);
+        let mut cache = GhosttyGridCache::default();
+        cache.store(first, Vec::new(), egui::Color32::BLACK);
+
+        assert!(cache.matches(first));
+        assert!(!cache.matches(resized_font));
+        cache.store(resized_font, Vec::new(), egui::Color32::BLACK);
+        assert!(cache.matches(resized_font));
+        assert!(!cache.matches(first));
     }
 
     #[test]
