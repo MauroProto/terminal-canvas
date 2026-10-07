@@ -491,8 +491,6 @@ fn load_file_for_view(path: &Path) -> FileViewerState {
 
 #[cfg(test)]
 mod tests {
-    use egui::text::ByteRangeExt as _;
-
     use super::{load_file_for_view, FileViewerState, MAX_VIEW_BYTES, MAX_VIEW_LINES};
 
     fn temp_path(tag: &str) -> std::path::PathBuf {
@@ -585,7 +583,7 @@ mod tests {
     fn job_text(job: &egui::text::LayoutJob) -> String {
         job.sections
             .iter()
-            .map(|section| section.byte_range.slice(&job.text))
+            .map(|section| &job.text[section.byte_range.start.0..section.byte_range.end.0])
             .collect()
     }
 
