@@ -1159,11 +1159,13 @@ impl TerminalPanel {
         let mut visible_text = String::new();
         let mut agent_status = None;
         let mut activity_revision = None;
+        let mut text_snapshot_available = false;
         let attached = self.runtime_session_attached();
         let recent_output = self
             .with_pty(|pty| {
                 if let Ok(term) = pty.term.try_lock() {
                     visible_text = visible_text_snapshot(&term, 16, 180);
+                    text_snapshot_available = true;
                 }
                 agent_status = pty.agent_status_snapshot();
                 activity_revision = Some(pty.activity_revision());
@@ -1188,6 +1190,7 @@ impl TerminalPanel {
                 recent_output
             },
             activity_revision,
+            text_snapshot_available: text_snapshot_available && attached && !self.minimized,
             attached,
             minimized: self.minimized,
             agent_status: if self.minimized || !attached {

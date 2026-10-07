@@ -436,6 +436,8 @@ pub struct PanelRuntimeObservation {
     pub recent_output: bool,
     /// Runtime-local input/output token, independent of the recent-output TTL.
     pub activity_revision: Option<u64>,
+    /// False when the grid is busy, detached or intentionally not sampled.
+    pub text_snapshot_available: bool,
     pub attached: bool,
     pub minimized: bool,
     /// Último report del canal OSC 9999 (estado autoritativo del agente).
@@ -1173,7 +1175,6 @@ impl Orchestrator {
                 session.status,
             );
             let previous_command = session.command_summary.clone();
-            let previous_review = session.review_summary.clone();
             let new_activity = observation.activity_revision.is_some_and(|revision| {
                 let token = (observation.runtime_session_id, revision);
                 self.last_activity_revision
@@ -1185,10 +1186,18 @@ impl Orchestrator {
             session.runtime_session_id = observation.runtime_session_id;
             if session.provider == AgentProvider::Unknown {
                 session.provider = AgentProvider::detect(&observation.title)
-                    .or_else(|| AgentProvider::detect(&observation.visible_text))
+                    .or_else(|| {
+                        if observation.text_snapshot_available {
+                            AgentProvider::detect(&observation.visible_text)
+                        } else {
+                            None
+                        }
+                    })
                     .unwrap_or(AgentProvider::Unknown);
             }
-            session.command_summary = summarize_command_output(&observation.visible_text);
+            if observation.text_snapshot_available {
+                session.command_summary = summarize_command_output(&observation.visible_text);
+            }
             if let Some(report) =
                 fresh_agent_status(observation.agent_status.as_ref(), pty_clock_now_ms())
             {
@@ -1205,12 +1214,18 @@ impl Orchestrator {
                     authoritative_agent_status(observation.agent_status.as_ref(), observation.alive)
                 })
                 .unwrap_or_else(|| {
-                    derive_status(
-                        observation.alive,
-                        observation.recent_output,
-                        &observation.visible_text,
-                        session.review_summary.last_error.as_deref(),
-                    )
+                    if observation.text_snapshot_available {
+                        derive_status(
+                            observation.alive,
+                            observation.recent_output,
+                            &observation.visible_text,
+                            session.review_summary.last_error.as_deref(),
+                        )
+                    } else if observation.alive {
+                        session.status
+                    } else {
+                        AgentStatus::Done
+                    }
                 });
             let should_inspect_git = should_inspect_git_for_session(
                 session,
@@ -1224,7 +1239,8 @@ impl Orchestrator {
                     self.git_inspector.request(session.session_id, cwd);
                 }
             }
-            apply_output_summaries(session, &observation.visible_text);
+            let review_changed = observation.text_snapshot_available
+                && apply_output_summaries(session, &observation.visible_text);
             let observed_change = previous_identity
                 != (
                     session.workspace_id,
@@ -1233,7 +1249,7 @@ impl Orchestrator {
                     session.status,
                 )
                 || previous_command != session.command_summary
-                || previous_review != session.review_summary;
+                || review_changed;
             if new_activity || observed_change {
                 session.last_activity_at = now;
                 if let Some(task_id) = session.task_id {
@@ -1938,16 +1954,24 @@ fn summarize_command_output(visible_text: &str) -> Option<CommandSummary> {
     })
 }
 
-fn apply_output_summaries(session: &mut AgentSessionMeta, visible_text: &str) {
+fn apply_output_summaries(session: &mut AgentSessionMeta, visible_text: &str) -> bool {
     use crate::utils::ascii_icontains;
+    let mut changed = false;
     if ascii_icontains(visible_text, "tests passed")
         || ascii_icontains(visible_text, "all checks passed")
     {
-        session.review_summary.last_success = Some("Tests passed".to_owned());
-        session.review_summary.tests = vec![TestStatus {
-            label: "Suite".to_owned(),
-            passed: true,
-        }];
+        if session.review_summary.last_success.as_deref() != Some("Tests passed") {
+            session.review_summary.last_success = Some("Tests passed".to_owned());
+            changed = true;
+        }
+        if !matches!(session.review_summary.tests.as_slice(), [test] if test.label == "Suite" && test.passed)
+        {
+            session.review_summary.tests = vec![TestStatus {
+                label: "Suite".to_owned(),
+                passed: true,
+            }];
+            changed = true;
+        }
     }
     if let Some(error_line) = visible_text
         .lines()
@@ -1956,8 +1980,12 @@ fn apply_output_summaries(session: &mut AgentSessionMeta, visible_text: &str) {
         .map(str::trim)
         .filter(|line| !line.is_empty())
     {
-        session.review_summary.last_error = Some(error_line.to_owned());
+        if session.review_summary.last_error.as_deref() != Some(error_line) {
+            session.review_summary.last_error = Some(error_line.to_owned());
+            changed = true;
+        }
     }
+    changed
 }
 
 fn should_inspect_git_for_session(
@@ -2368,6 +2396,7 @@ mod tests {
             alive: true,
             recent_output: true,
             activity_revision: None,
+            text_snapshot_available: true,
             attached: true,
             minimized: false,
             agent_status: Some(AgentStatusReport {
@@ -2413,6 +2442,7 @@ mod tests {
             alive: true,
             recent_output: true,
             activity_revision: None,
+            text_snapshot_available: true,
             attached: true,
             minimized: false,
             agent_status: Some(AgentStatusReport {
@@ -2504,6 +2534,7 @@ mod tests {
             alive: true,
             recent_output: true,
             activity_revision: None,
+            text_snapshot_available: true,
             attached: true,
             minimized: false,
             agent_status: None,
@@ -2549,6 +2580,7 @@ mod tests {
             alive: true,
             recent_output,
             activity_revision: Some(0),
+            text_snapshot_available: true,
             attached: true,
             minimized: false,
             agent_status: None,
@@ -2639,6 +2671,33 @@ mod tests {
             "Renamed terminal",
         );
         assert_eq!(orchestrator.snapshot(), changed);
+    }
+
+    #[test]
+    fn unavailable_text_preserves_summaries_but_still_observes_process_exit() {
+        let (mut orchestrator, mut observation, _) = activity_fixture(true);
+        observation.visible_text = "Tests passed. Ready for review.".into();
+        orchestrator.apply_observations(vec![observation.clone()]);
+        let baseline = orchestrator.snapshot();
+        observation.text_snapshot_available = false;
+        observation.visible_text.clear();
+        observation.recent_output = false;
+        for _ in 0..8 {
+            orchestrator.apply_observations(vec![observation.clone()]);
+            assert_eq!(orchestrator.snapshot(), baseline);
+        }
+        observation.alive = false;
+        orchestrator.apply_observations(vec![observation]);
+        assert_eq!(orchestrator.state.sessions[0].status, AgentStatus::Done);
+        assert_eq!(orchestrator.state.tasks[0].state, TaskState::Done);
+        assert_eq!(
+            orchestrator.state.sessions[0].command_summary,
+            baseline.sessions[0].command_summary
+        );
+        assert_eq!(
+            orchestrator.state.sessions[0].review_summary,
+            baseline.sessions[0].review_summary
+        );
     }
 
     #[test]
@@ -2744,6 +2803,7 @@ mod tests {
             alive: true,
             recent_output: true,
             activity_revision: None,
+            text_snapshot_available: true,
             attached: true,
             minimized: false,
             agent_status: None,
@@ -2801,6 +2861,7 @@ mod tests {
             alive: true,
             recent_output: false,
             activity_revision: None,
+            text_snapshot_available: true,
             attached: true,
             minimized: false,
             agent_status: None,
@@ -2940,6 +3001,7 @@ mod tests {
             alive: true,
             recent_output: true,
             activity_revision: None,
+            text_snapshot_available: true,
             attached: true,
             minimized: false,
             agent_status: None,
@@ -3025,6 +3087,7 @@ mod tests {
             alive: true,
             recent_output: true,
             activity_revision: None,
+            text_snapshot_available: true,
             attached: true,
             minimized: false,
             agent_status: None,
@@ -3276,6 +3339,7 @@ mod tests {
             alive: true,
             recent_output: true,
             activity_revision: None,
+            text_snapshot_available: true,
             attached: true,
             minimized: false,
             agent_status: None,

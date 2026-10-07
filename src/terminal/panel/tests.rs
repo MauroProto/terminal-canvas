@@ -38,6 +38,26 @@ fn panel_with_in_memory_history() -> (TerminalPanel, crate::runtime::SharedPtyHa
     (panel, handle)
 }
 
+#[test]
+fn a_busy_grid_is_unavailable_rather_than_empty_and_keeps_its_activity_token() {
+    let (panel, handle) = panel_with_in_memory_history();
+    let workspace = uuid::Uuid::new_v4();
+    let ready = panel.orchestration_observation(workspace);
+    assert!(ready.text_snapshot_available);
+    assert!(ready.visible_text.contains("LIVE"));
+    let term = std::sync::Arc::clone(&handle.lock().unwrap().term);
+    let guard = term.lock().unwrap();
+    let busy = panel.orchestration_observation(workspace);
+    assert!(!busy.text_snapshot_available);
+    assert_eq!(busy.activity_revision, ready.activity_revision);
+    assert_eq!(busy.runtime_session_id, ready.runtime_session_id);
+    drop(guard);
+    let ready_again = panel.orchestration_observation(workspace);
+    assert!(ready_again.text_snapshot_available);
+    assert_eq!(ready_again.visible_text, ready.visible_text);
+    assert_eq!(ready_again.activity_revision, ready.activity_revision);
+}
+
 fn reject_first_history_replay(
     handle: &crate::runtime::SharedPtyHandle,
 ) -> std::sync::Arc<std::sync::atomic::AtomicU64> {

@@ -861,6 +861,7 @@ fn final_save_profile_fixture() {
             // explicitly instead of waiting or depending on runner speed.
             observation.recent_output = false;
             observation.activity_revision = Some(0);
+            observation.text_snapshot_available = true;
             observation.visible_text = "Stable fixture output".to_owned();
             let drive =
                 |app: &mut super::TerminalApp,
