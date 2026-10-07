@@ -130,11 +130,63 @@ fn hidden_logic_ignores_stale_ui_input_and_keeps_ui_state_between_passes() {
         assert_eq!(ctx.input(|input| input.time), 1.0);
     }
     assert!(
-        repaint_delays.lock().unwrap().iter().any(|delay| {
-            *delay > std::time::Duration::from_secs(1) && *delay <= super::AUTOSAVE_INTERVAL
-        }),
-        "background polling remains scheduled even when persistence is disabled"
+        repaint_delays
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|delay| *delay <= super::AUTOSAVE_INTERVAL),
+        "hidden logic must schedule a finite deadline; busy workers may wake it sooner"
     );
+}
+
+#[test]
+fn background_repaint_fallback_remains_scheduled_when_persistence_is_disabled() {
+    let ctx = egui::Context::default();
+    let app = detached_test_app_with_panel(&ctx);
+    assert!(!app.persistence_writes_enabled);
+    assert!(app.ws().panels[0].runtime_session_id().is_none());
+    assert!(matches!(app.collab.mode(), CollabMode::Inactive));
+    assert!(!app.collab.join_in_flight());
+    assert!(!app.workspaces.iter().any(Workspace::has_pending_inputs));
+    assert!(app
+        .repaint_policy
+        .next_repaint_delay(std::time::Instant::now())
+        .is_none());
+    let hidden = RawInput {
+        focused: false,
+        ..Default::default()
+    };
+    // Consume egui's initial immediate repaint without polling app workers.
+    // A pending Restore can request 16 ms before the fallback, and egui only
+    // reports a new minimum delay, rather than every repaint_after call.
+    let _ = ctx.run_logic(&hidden, |_| {});
+    let repaint_delays = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed_delays = std::sync::Arc::clone(&repaint_delays);
+    ctx.set_request_repaint_callback(move |request| {
+        observed_delays.lock().unwrap().push(request.delay);
+    });
+    let _ = ctx.run_logic(&hidden, |_| {});
+    assert!(
+        repaint_delays.lock().unwrap().is_empty(),
+        "an idle logic tick must not manufacture the fallback deadline"
+    );
+    for _ in 0..3 {
+        repaint_delays.lock().unwrap().clear();
+        let output = ctx.run_logic(&hidden, |ctx| {
+            app.schedule_logic_repaint(ctx, &super::FramePerfSnapshot::default());
+        });
+        let delays = repaint_delays.lock().unwrap();
+        assert!(
+            !delays.is_empty(),
+            "the production fallback must wake logic"
+        );
+        assert!(delays
+            .iter()
+            .all(|delay| { !delay.is_zero() && *delay <= super::AUTOSAVE_INTERVAL }));
+        assert!(app.ws().panels[0].runtime_session_id().is_none());
+        assert_eq!(output.platform_output.num_completed_passes, 0);
+        assert_eq!(ctx.cumulative_pass_nr(), 0);
+    }
 }
 
 #[test]
