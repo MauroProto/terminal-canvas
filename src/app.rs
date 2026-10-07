@@ -2324,7 +2324,8 @@ impl TerminalApp {
         // no tienen nada que tipear.
         let paths: Vec<_> = dropped_files
             .iter()
-            .filter_map(|file| file.path.clone())
+            .map(|file| file.path().to_path_buf())
+            .filter(|path| !path.as_os_str().is_empty())
             .collect();
         if !paths.is_empty() {
             let mut text = String::new();
