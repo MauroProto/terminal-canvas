@@ -119,9 +119,10 @@ fn write_path(path: &Path, value: &Path) {
 
 fn read_path(path: &Path) -> PathBuf {
     let bytes = std::fs::read(path).unwrap();
-    assert_eq!(bytes.len() % 2, 0);
-    let wide: Vec<u16> = bytes
-        .chunks_exact(2)
+    let (pairs, remainder) = bytes.as_chunks::<2>();
+    assert!(remainder.is_empty());
+    let wide: Vec<u16> = pairs
+        .iter()
         .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
         .collect();
     PathBuf::from(OsString::from_wide(&wide))
@@ -387,6 +388,10 @@ fn subprocess_fixture() {
 fn tree_fixture(mode: &str, marker: &Path) {
     // Spawn the grandchild immediately, before publishing the child's PID or
     // any readiness signal. Its std::process launch inherits the private Job.
+    // This Windows-only fixture must leave the grandchild running when its
+    // parent exits. Waiting here would mask a missing production Job cleanup;
+    // the supervisor owns a process handle and a bounded failure cleanup.
+    #[allow(clippy::zombie_processes)]
     let grandchild = uncontained_fixture_command("grandchild", marker)
         .spawn()
         .unwrap();
