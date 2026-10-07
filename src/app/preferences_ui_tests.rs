@@ -613,7 +613,7 @@ fn closed_settings_keeps_a_persistent_warning_and_retries_the_latest_snapshot() 
     assert!(harness.state().toasts.is_empty());
     assert!(painted_contains(
         harness.output(),
-        "Hay preferencias sin guardar"
+        "El guardado de preferencias requiere atención"
     ));
     assert!(painted_contains(harness.output(), "controlled disk full"));
     assert!(!painted_contains(harness.output(), SAVED_MESSAGE));
@@ -639,7 +639,7 @@ fn closed_settings_keeps_a_persistent_warning_and_retries_the_latest_snapshot() 
     assert!(painted_contains(harness.output(), SAVED_MESSAGE));
     assert!(!painted_contains(
         harness.output(),
-        "Hay preferencias sin guardar"
+        "El guardado de preferencias requiere atención"
     ));
     assert!(!harness.state().settings_open && harness.state().settings_draft.is_none());
 }

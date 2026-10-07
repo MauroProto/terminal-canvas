@@ -463,7 +463,7 @@ fn profile_persistence_subprocess() {
                 assert_eq!(generation, Some(7));
                 assert_eq!(text, format!("hoja {index}: salida ñ\n"));
             }
-            let notes = orchestration::load_notes(&root);
+            let notes = orchestration::load_notes(&root).expect("restored notes must be readable");
             assert_eq!(notes.notes.len(), 1);
             assert_eq!(notes.notes[0].body, "Conservar esta decisión");
         }

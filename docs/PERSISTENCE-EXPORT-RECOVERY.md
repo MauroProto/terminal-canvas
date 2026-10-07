@@ -39,6 +39,31 @@ La tolerancia existente a un tail de log incompleto se mantiene: recupera el
 prefijo válido. No equivale a aceptar headers inválidos o saltos de secuencia.
 Ver [SUPPORT.md](SUPPORT.md) antes de investigar datos reales.
 
+## Preferencias y notas
+
+El worker de preferencias se crea con el primer pedido. Conserva los snapshots
+aceptados hasta recibir confirmación y mantiene separados los errores de cada
+repositorio y de configuración. Un fallo al iniciar o una desconexión no deja
+la app esperando indefinidamente; el aviso permanece visible aunque se cierre
+Settings o desaparezca el toast. **Reintentar guardado** usa el último snapshot
+retenido, incluyendo integraciones y onboarding.
+
+Un archivo de notas ausente permite empezar una colección. Un error de lectura
+o JSON inválido conserva sus bytes y bloquea crear, editar, borrar y enviar
+notas; el diff sigue disponible. **Reintentar lectura de notas** vuelve a leer
+el mismo repositorio. Las respuestas de pedidos anteriores o de otro
+repositorio no reemplazan la colección actual. Al reabrir un review, los
+snapshots sin guardar deben resolverse antes de ofrecer notas editables del
+disco.
+
+La barrera de cierre aplica las respuestas pendientes de lectura e importación
+y espera también el guardado de las notas fusionadas. Los fallos de
+preferencias no impiden rescatar layout e historial, pero impiden marcar el
+cierre como limpio o continuar una instalación. Los snapshots fallidos siguen
+en memoria para reintentar durante esa sesión: la marca de recuperación no
+convierte esos snapshots en archivos durables si el almacenamiento sigue
+fallando.
+
 ## Exportaciones y copia
 
 Los exports de texto usan fecha e identificador único. Un único worker lazy
