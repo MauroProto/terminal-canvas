@@ -32,6 +32,10 @@ pub use diff_notes::{
     format_note, legacy_notes_available, load_legacy_notes, load_notes, save_notes,
     save_notes_to_path, DiffNote, DiffNotes,
 };
+#[cfg(test)]
+pub(crate) use diff_notes::{
+    test_load_notes_from_path_with_limit, test_save_notes_to_path_with_limit,
+};
 #[allow(unused_imports)]
 pub use gh_client::{
     issue_branch_name, issue_prompt, GhAvailability, GhClient, GhResult, GhSnapshot, Issue,

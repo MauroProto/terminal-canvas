@@ -336,6 +336,30 @@ impl Write for LimitedNotesBuffer {
     }
 }
 
+// Explicit test paths and injected limits exercise the production I/O paths
+// without resolving or modifying the user's notes profile.
+#[cfg(test)]
+pub(crate) fn test_load_notes_from_path_with_limit(
+    path: &Path,
+    limit: usize,
+    require_existing: bool,
+) -> anyhow::Result<DiffNotes> {
+    if require_existing {
+        load_existing_notes_from_path(path, limit)
+    } else {
+        load_notes_from_path_with_limit(path, limit)
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_save_notes_to_path_with_limit(
+    path: &Path,
+    notes: &DiffNotes,
+    limit: usize,
+) -> anyhow::Result<()> {
+    save_notes_to_path_with_limit(path, notes, limit)
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
