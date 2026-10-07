@@ -16,7 +16,9 @@ publicación quedaron omitidas; sus paquetes son de prueba, sin firma del
 proveedor. No se acredita una release de producción publicada.
 
 Este cierre actualiza GRAPHICS-MIGRATION y este documento después del código
-validado. Son documentos que no se copian dentro de los paquetes. El recibo
+validado, además de una fixture TLS incluida sólo bajo `#[cfg(test)]`. Los
+documentos no se copian dentro de los paquetes y la fixture no se compila
+para sus binarios de producción. El recibo
 externo de continuación debe registrar el HEAD documental posterior, su CI
 exacta, mapas, bundles y SHA256 al cerrar la entrega. Las corridas anteriores
 sólo acreditan sus propios
@@ -94,6 +96,18 @@ entrada retenida, foco, unread, ausencia de passes UI y de PTY real; retirar
 el fallback de producción deja el nuevo test sin callback y lo hace fallar.
 El cambio afecta sólo pruebas, no la lógica de producción.
 
+La [CI del cierre documental previo, 37580301965](https://github.com/MauroProto/terminal-canvas/actions/runs/37580301965),
+de `efa33bb44bd10a8fca9903d24c69dd175368d8b3`, detectó otra carrera en una
+fixture TLS de Linux: la suite normal pasó 979 casos y el filtro de seguridad
+19, pero el cleanup de un socket ya desconectado falló después de que el
+cliente comprobara HTTP 307 y cuerpo vacío. La misma fixture había pasado
+normal/seguridad/daemon del checkpoint de código. Se acepta únicamente
+`NotConnected` al hacer shutdown después de completar request, respuesta y
+flush estrictos. Otros errores siguen fallando y los asserts de redirect,
+certificado, status y cuerpo se conservan. Sólo cambia el módulo de tests,
+sin cambios funcionales de Online ni invitaciones. El recibo externo debe
+acreditar por separado la CI exacta del HEAD corregido.
+
 El [ensayo anterior, 37575466330](https://github.com/MauroProto/terminal-canvas/actions/runs/37575466330),
 del mismo SHA, terminó CANCELLED tras confirmar la misma fixture fallida en
 el preflight daemon de macOS ARM. Dejó **cero artefactos** y no validó paquetes,
@@ -124,7 +138,8 @@ los dos avisos descritos arriba.
 Para cerrar el candidato actual, exigir éxito de los cuatro jobs de plataforma,
 Clippy, suites normales/seguridad/daemon, extensión y auditoría, además del
 ensayo completo con `verify-set`. Registrar cada SHA y recibo por separado.
-Si el HEAD final sólo añade documentación no empaquetada, distinguirlo del
+Si el HEAD final sólo añade documentación no empaquetada y fixtures bajo
+`#[cfg(test)]`, distinguirlo del
 SHA de código validado y del SHA de los paquetes. `LICENSE` y
 `docs/PORTABLE.md` se copian dentro de los paquetes: verificarlos con el mismo
 checkout del ensayo. Comparar inputs no demuestra que una recompilación
@@ -158,7 +173,8 @@ produzca binarios idénticos. Una publicación real reconstruye desde su tag.
 > Continuá Terminal Canvas (`MauroProto/terminal-canvas`) desde el HEAD publicado
 > de `master`; conservá los checkpoints anteriores. El código gráfico validado
 > es `a93286e77054bbfd803c4503860ab488585103b0`, de 97 microcommits, con CI 37576723374
-> y Release 37576793676 aprobadas. El cierre documental posterior debe registrarse
+> y Release 37576793676 aprobadas. El cierre posterior, con docs y fixture TLS,
+> debe registrarse
 > en el recibo externo con su SHA y CI exacta. Comprobá HEAD, rama, estado,
 > remoto y SHAs de las corridas antes de editar; no atribuyas éxito a otro SHA.
 > Leé este documento, GRAPHICS-MIGRATION, DEPENDENCY-MAINTENANCE, RELEASE,
@@ -199,7 +215,7 @@ gráfico debe adjuntar un manifiesto con los SHAs público/original, código
 validado, paquetes y HEAD documental, las corridas exactas y hashes de cada
 archivo. Sus bundles previstos son
 `terminal-canvas-graphics-final-published-20261007.bundle` (base `f0458dd1`) y
-`terminal-canvas-graphics-final-original-20261007.bundle` (base `c2b4aca`);
+`terminal-canvas-graphics-final-original-v2-20261007.bundle` (base `c2b4aca`);
 la creación y verificación de los bundles se registra por separado en el recibo
 externo, después de comprobar sus refs y hashes. Los bundles no
 contienen `dist/` ni datos del perfil; los recibos se entregan aparte.
