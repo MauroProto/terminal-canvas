@@ -1811,6 +1811,9 @@ impl TerminalApp {
                             crate::terminal::pty::RecoverySnapshot::PendingLog(frames) => {
                                 persistence_worker::FullContent::PendingLog(frames)
                             }
+                            crate::terminal::pty::RecoverySnapshot::Unavailable => {
+                                persistence_worker::FullContent::Unavailable
+                            }
                         },
                     },
                 ));

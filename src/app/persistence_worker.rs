@@ -47,6 +47,7 @@ pub(super) struct FullEntry {
 pub(super) enum FullContent {
     Checkpoint { text: String, pending_bytes: usize },
     PendingLog(Vec<u8>),
+    Unavailable,
 }
 
 enum Job {
@@ -335,6 +336,10 @@ fn persist_full_entries_with_remove(
     let mut acknowledgements = Vec::new();
     for entry in entries {
         let (text, pending_bytes) = match entry.content {
+            FullContent::Unavailable => {
+                log::warn!("terminal recovery snapshot unavailable; retaining its previous durable history");
+                continue;
+            }
             FullContent::Checkpoint {
                 text,
                 pending_bytes,

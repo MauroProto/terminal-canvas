@@ -211,6 +211,7 @@ pub struct TerminalScrollState {
 pub enum RecoverySnapshot<R> {
     Checkpoint { value: R, pending_bytes: usize },
     PendingLog(Vec<u8>),
+    Unavailable,
 }
 
 impl PtyHandle {
@@ -278,6 +279,15 @@ impl PtyHandle {
             crate::state::scrollback_log::FrameKind::Output,
             output,
         ));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn poison_pending_log_for_persistence_tests(&self) {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _pending = self.pending_log.lock().unwrap();
+            panic!("injected pending log poison");
+        }));
+        assert!(result.is_err());
     }
 
     pub fn spawn(
@@ -1047,19 +1057,25 @@ impl PtyHandle {
         &self,
         restore_pending: bool,
         export: impl FnOnce(&Term<EventProxy>) -> R,
-    ) -> Option<RecoverySnapshot<R>> {
-        if restore_pending || self.restoring_history.load(Ordering::Acquire) {
-            // The replay thread may hold `term` while it works. Pending output
-            // is a separate complete-frame prefix and needs no grid lock.
-            return Some(RecoverySnapshot::PendingLog(
-                self.pending_log.lock().ok()?.clone(),
-            ));
-        }
-        self.checkpoint_snapshot(export)
-            .map(|(value, pending_bytes)| RecoverySnapshot::Checkpoint {
+    ) -> RecoverySnapshot<R> {
+        let checkpoint = if restore_pending || self.restoring_history.load(Ordering::Acquire) {
+            None
+        } else {
+            self.checkpoint_snapshot(export)
+        };
+        if let Some((value, pending_bytes)) = checkpoint {
+            return RecoverySnapshot::Checkpoint {
                 value,
                 pending_bytes,
-            })
+            };
+        }
+        // A replay or a poisoned grid cannot yield a complete checkpoint.
+        // Its healthy log still has a durable rescue boundary without taking
+        // `term`; unavailable output must remain visible to the final save.
+        self.pending_log
+            .lock()
+            .map(|pending| RecoverySnapshot::PendingLog(pending.clone()))
+            .unwrap_or(RecoverySnapshot::Unavailable)
     }
 
     #[cfg(test)]

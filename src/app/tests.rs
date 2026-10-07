@@ -173,6 +173,21 @@ fn legacy_root_rescue_preserves_the_alias_until_a_complete_canonical_checkpoint(
 }
 
 #[test]
+fn poisoned_terminal_grid_rescues_pending_output_without_claiming_a_clean_save() {
+    run_final_save_fixture("ack-poisoned-grid");
+}
+
+#[test]
+fn unavailable_pending_log_preserves_the_previous_history_and_recovery_marker() {
+    run_final_save_fixture("ack-poisoned-pending");
+}
+
+#[test]
+fn unavailable_attached_pty_cannot_disappear_from_the_final_save() {
+    run_final_save_fixture("ack-poisoned-handle");
+}
+
+#[test]
 #[ignore = "only run in an isolated child process through run_final_save_fixture"]
 fn final_save_profile_fixture() {
     use eframe::App;
@@ -617,6 +632,144 @@ fn final_save_profile_fixture() {
                 assert!(restored[0].1.contains("previous session"));
             }
             assert!(marker.exists());
+        }
+        "ack-poisoned-grid" | "ack-poisoned-pending" | "ack-poisoned-handle" => {
+            let panel_id = app.workspaces[0].panels[0].id();
+            let leaf_id = app.workspaces[0].panels[0].root_leaf_id();
+            let runtime_id = app.workspaces[0].panels[0].runtime_session_id().unwrap();
+            let manager = app.workspaces[0].pty_manager();
+            let handle = manager.lock().unwrap().handle(runtime_id).unwrap();
+            // Detached leaves legitimately have no new PTY output to save.
+            app.workspaces[0]
+                .panels
+                .push(CanvasPanel::Terminal(TerminalPanel::new(
+                    pos2(310.0, 0.0),
+                    vec2(300.0, 200.0),
+                    Color32::WHITE,
+                    2,
+                )));
+            crate::state::scrollback_store::save_leaf_scrollback_versioned(
+                &history,
+                panel_id,
+                Some(leaf_id),
+                3,
+                "previous complete history\n",
+            )
+            .unwrap();
+            let checkpoint_path = history.join(
+                crate::state::scrollback_store::scrollback_leaf_file_name(panel_id, Some(leaf_id)),
+            );
+            let checkpoint_before = fs::read(&checkpoint_path).unwrap();
+            let log_path = history.join(
+                crate::state::scrollback_store::scrollback_leaf_log_file_name(
+                    panel_id,
+                    Some(leaf_id),
+                ),
+            );
+            crate::state::scrollback_log::reset_log(&log_path, 3).unwrap();
+            crate::state::scrollback_log::append_frames(
+                &log_path,
+                &crate::state::scrollback_log::encode_frame(
+                    1,
+                    crate::state::scrollback_log::FrameKind::Output,
+                    b"previous durable tail\r\n",
+                ),
+            )
+            .unwrap();
+            let log_before = fs::read(&log_path).unwrap();
+            let closed_panel = Uuid::new_v4();
+            crate::state::scrollback_store::save_scrollback(
+                &history,
+                closed_panel,
+                "retained closed recovery\n",
+            )
+            .unwrap();
+            app.scrollback_known_leaves.entry(closed_panel).or_default();
+            handle
+                .lock()
+                .unwrap()
+                .feed_output_for_persistence_tests(b"new unacknowledged output\r\n");
+
+            if phase == "ack-poisoned-grid" {
+                let term = handle.lock().unwrap().term.clone();
+                assert!(
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                        let _term = term.lock().unwrap();
+                        panic!("injected terminal grid poison");
+                    }))
+                    .is_err()
+                );
+            } else if phase == "ack-poisoned-pending" {
+                handle
+                    .lock()
+                    .unwrap()
+                    .poison_pending_log_for_persistence_tests();
+            } else {
+                let unavailable = handle.clone();
+                assert!(
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                        let _handle = unavailable.lock().unwrap();
+                        panic!("injected PTY handle poison");
+                    }))
+                    .is_err()
+                );
+            }
+
+            let entries = app.full_scrollback_entries(&history, None);
+            assert_eq!(entries.len(), 1, "an unavailable attached leaf must not be omitted; the detached leaf needs no entry");
+            if phase == "ack-poisoned-grid" {
+                assert!(matches!(
+                    &entries[0].content,
+                    super::persistence_worker::FullContent::PendingLog(_)
+                ));
+            } else {
+                assert!(matches!(
+                    &entries[0].content,
+                    super::persistence_worker::FullContent::Unavailable
+                ));
+            }
+            assert!(
+                !app.persist_scrollbacks(true),
+                "unavailable grids never justify a complete checkpoint set"
+            );
+            assert_eq!(fs::read(&checkpoint_path).unwrap(), checkpoint_before);
+            assert!(
+                crate::state::scrollback_store::load_scrollback(&history, closed_panel).is_some(),
+                "incomplete history cannot authorize pruning"
+            );
+            app.on_exit(None);
+            assert!(
+                marker.exists(),
+                "missing snapshots cannot authorize clean shutdown"
+            );
+            assert_eq!(fs::read(&checkpoint_path).unwrap(), checkpoint_before);
+            assert!(
+                crate::state::scrollback_store::load_scrollback(&history, closed_panel).is_some()
+            );
+            if phase == "ack-poisoned-grid" {
+                let (generation, frames) =
+                    crate::state::scrollback_log::read_frames(&fs::read(&log_path).unwrap())
+                        .unwrap();
+                assert_eq!(generation, 3);
+                assert_eq!(
+                    frames
+                        .iter()
+                        .map(|frame| frame.payload.as_slice())
+                        .collect::<Vec<_>>(),
+                    vec![
+                        b"previous durable tail\r\n".as_slice(),
+                        b"new unacknowledged output\r\n".as_slice()
+                    ],
+                    "repeated failed full saves must rescue the healthy prefix only once"
+                );
+                assert!(handle.lock().unwrap().pending_log_snapshot().is_empty());
+            } else {
+                assert_eq!(
+                    fs::read(&log_path).unwrap(),
+                    log_before,
+                    "unavailable output is not acknowledged or written"
+                );
+            }
         }
         "ack-restoring-shutdown" | "ack-restoring-completed" => {
             let panel_id = app.workspaces[0].panels[0].id();

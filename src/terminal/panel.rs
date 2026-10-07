@@ -1716,15 +1716,20 @@ impl TerminalPanel {
                 let runtime_session_id = session.runtime_session_id()?;
                 let restore_pending = pending_restore_leaves.contains(&leaf)
                     && !self.restored_history_leaves.contains(&leaf);
-                session.with_pty(|pty| {
-                    pty.recovery_snapshot(
-                        restore_pending,
-                        crate::terminal::export::scrollback_to_ansi,
-                    )
+                session
+                    .with_pty(|pty| {
+                        pty.recovery_snapshot(
+                            restore_pending,
+                            crate::terminal::export::scrollback_to_ansi,
+                        )
+                    })
+                    .or_else(|| {
+                        session
+                            .is_attached()
+                            .then_some(crate::terminal::pty::RecoverySnapshot::Unavailable)
+                    })
                     .map(|snapshot| (runtime_session_id, snapshot))
-                })
             });
-            let ansi = ansi.flatten();
             if let Some((runtime_session_id, snapshot)) = ansi {
                 out.push((Some(leaf), runtime_session_id, snapshot));
             }
