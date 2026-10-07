@@ -21,9 +21,25 @@ El workflow [release.yml](../.github/workflows/release.yml) tiene dos modos:
   plataformas y la verificación del conjunto completo hayan pasado.
 
 El código y sus controles están preparados; esto no acredita un release firmado
-ya ejecutado. Quedan pendientes la corrida completa en GitHub, el ensayo real
-de Inno Setup, las firmas/notarización con credenciales reales y la publicación
-con acceso de escritura. `packaging/terminalcanvas.rb` sigue siendo una plantilla
+ya ejecutado. El [ensayo base de GitHub](https://github.com/MauroProto/terminal-canvas/actions/runs/37545144493)
+sobre `d79f0fa` terminó en verde: extracción del ZIP Windows, construcción,
+instalación y desinstalación de Inno Setup en el runner, tarball Linux y ambos
+DMG macOS montados y comprobados. Los helpers pasaron sus smoke tests y el
+conjunto final contenía exactamente cinco paquetes y sus cinco checksums.
+El job de publicación se omitió y no se crearon tags ni releases.
+El [ensayo actualizado](https://github.com/MauroProto/terminal-canvas/actions/runs/37549143310)
+sobre `5107f41` incluye las acciones Node 24 y el preflight ZIP; sus 27
+regresiones Python y la corrida completa terminaron en verde: ZIP y setup Windows,
+tarball Linux, ambos DMG, helpers y exactamente cinco paquetes con sus checksums.
+También omitió publicación. La [continuación de entrega](DELIVERY-CONTINUATION.md)
+registra los commits, la CI y los pendientes. Los cambios documentales posteriores
+incluyen `PORTABLE.md`: para comprobar los archivos del ensayo contra sus fuentes,
+usar el checkout `5107f41`. Una release real reconstruye desde el tag exacto.
+Siguen pendientes las firmas/notarización
+con credenciales reales y la publicación de una release firmada.
+Los artefactos de Actions en este repositorio público son descargables por
+lectores autenticados; los paquetes de ensayo no tienen firma del proveedor.
+`packaging/terminalcanvas.rb` sigue siendo una plantilla
 con checksums pendientes y su tap todavía debe publicarse. Las pruebas locales
 de fixtures y sintaxis no sustituyen esas verificaciones externas.
 
@@ -89,6 +105,14 @@ metadatos de versión, icono, arquitectura y helpers. Los smoke tests ejecutan
 negociación MCP con listado de herramientas desde los archivos extraídos,
 usando `TERMINAL_CANVAS_HOME` y una base de memoria temporales.
 
+Antes de cargar el parser ZIP se limita el índice a 2 MiB y a las entradas
+del manifiesto, con una carpeta raíz opcional. Se comprueban los índices reales,
+los conteos declarados y los offsets, también en ZIP64; no alcanza con falsificar
+el footer. Los TAR se recorren sólo hasta exceder el manifiesto. Las 27
+regresiones pequeñas incluyen archivos válidos y metadatos falsificados. El
+índice y la lista de entradas se validan antes de extraer; el contenido esperado,
+la arquitectura y los smoke tests se comprueban después de extraer.
+
 ```sh
 # Fixtures pequeños: no compilan Rust ni ejecutan instaladores.
 python -B scripts/package-verify-tests.py
@@ -143,7 +167,9 @@ disponible mientras la plantilla conserve placeholders.
 El actualizador implementa descarga verificada y requiere una acción explícita
 para instalar. macOS instala sólo desde la app válida de `/Applications`, con
 el mismo Developer ID y respaldo de la versión anterior; Windows abre sólo un
-setup firmado por el mismo certificado que la app actual. Una app Windows sin
-firma utiliza la descarga ZIP manual para su primer cambio a una versión
-firmada. Linux conserva la extracción manual. El flujo real de actualización
+setup firmado por el mismo certificado que la app actual y exige que el registro
+de Inno identifique esa misma instalación. Las copias Windows portables, incluso
+firmadas, y las apps sin firma utilizan ZIP y actualización manual; el primer
+cambio a una versión firmada también es manual. Linux conserva la extracción
+manual. El flujo real de actualización
 con un release firmado también queda pendiente de validación externa.
