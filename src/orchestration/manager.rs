@@ -2816,6 +2816,15 @@ mod tests {
             event.resolved = true;
             event.archived = true;
         }
+        // Equal fixture dates use the id tie-breaker, unlike the original
+        // distinct arrival dates. Normalize that ordering before measuring
+        // identical polls, while separately checking episode preservation.
+        orchestrator.apply_observations(Vec::new());
+        assert!(orchestrator
+            .state
+            .inbox
+            .iter()
+            .all(|event| event.created_at == epoch && event.resolved && event.archived));
         let acknowledged = orchestrator.snapshot();
         assert_eq!(acknowledged.inbox.len(), 2);
         for _ in 0..8 {
