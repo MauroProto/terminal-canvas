@@ -83,6 +83,18 @@ instancia anterior y reabrí la que vas a usar. La propiedad de escritura proteg
 el layout y el historial guardado por la UI frente a una instancia anterior;
 la configuración, notas y SQLite tienen sus propios mecanismos de escritura.
 
+Si aparece la franja «Guardado de layout e historial desactivado», pasá el
+mouse sobre el motivo para ver el detalle. Puede indicar un archivo que no
+se pudo leer, un formato de una versión más nueva o pérdida de la propiedad
+de escritura. La franja permanece después de que desaparece el toast.
+Los cambios de layout y la salida nueva de esa ejecución no quedan guardados
+por la UI: exportá lo que necesites conservar y esperá la confirmación antes
+de cerrar. Cerrá las instancias, respaldá los datos y resolvé el bloqueo de
+lectura antes de reabrir; para un formato más nuevo, usá una versión compatible.
+No borres el original ni reemplaces `layout.json` por un backup mientras no
+se pueda leer. Un archivo ausente permite crear un perfil; un error de lectura
+en un archivo existente detiene la recuperación automática desde backups.
+
 ## Diagnósticos
 
 La exportación de diagnóstico recoge configuración, layout y logs con límites
@@ -91,6 +103,13 @@ que no se pueda interpretar con seguridad. Los mensajes de error y logs aún
 pueden contener texto privado: revisá el ZIP antes de adjuntarlo a un issue.
 No hace falta publicar la base de memoria ni el historial completo para
 reportar un problema de interfaz.
+
+Los diagnósticos y exports de texto se escriben en segundo plano. La app
+acepta una exportación por vez e informa el resultado y su ruta cuando termina;
+«Exportación en curso» sólo confirma que aceptó el trabajo. Cerrar normalmente
+la app espera el trabajo aceptado. Una terminación forzada no ofrece esa barrera.
+Los exports de texto incluyen un identificador único además de la fecha, para
+conservar dos capturas del mismo panel hechas dentro del mismo segundo.
 
 ## Instalación y actualización
 
@@ -139,3 +158,4 @@ La lectura tiene un único worker. Una llamada al sistema detenida en una unidad
 de red puede seguir esperando; cambiar de archivo no crea más hilos ni cancela
 instantáneamente esa llamada. La app conserva el texto original para el parser,
 incluidos CRLF y EOF, y pide repintado cuando termina de leer o colorear.
+Los números de línea no forman parte del texto seleccionado al copiar código.
