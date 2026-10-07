@@ -72,9 +72,11 @@ muestra progreso, permite cancelar/reintentar y exige el checksum antes de
 dejar listo el paquete. La instalación requiere una acción explícita y cerrar
 las sesiones activas.
 
-En Windows, una app actualmente firmada puede abrir el setup con una firma
-válida del mismo certificado. La app sin firma descarga el ZIP para instalación
-manual; el primer paso a una versión firmada se realiza manualmente. En macOS,
+En Windows, una copia firmada instalada por el setup puede abrir un nuevo
+instalador válido del mismo certificado sólo si el registro de Inno apunta a
+la copia que está ejecutándose. Las copias portables, incluso firmadas, y las
+apps sin firma usan ZIP e instalación manual; el primer paso a una versión
+firmada se realiza manualmente. En macOS,
 la app instalada en `/Applications` verifica notarización y el mismo Team ID,
 y conserva una copia de la versión anterior al reemplazarla. Hay que cerrar
 y volver a abrir la aplicación. En Linux, abrí la carpeta de descarga y

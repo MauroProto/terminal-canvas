@@ -34,6 +34,9 @@ helpers y las rutas exactas de esta instalación sin abrir la interfaz, una
 terminal ni la base de memoria. Si falta un helper, devuelve un error: extraé
 el paquete completo antes de volver a probar. El informe contiene rutas locales;
 revisalas antes de compartirlo.
+No comprueba permisos de escritura ni el contenido de tus datos. Tampoco
+informa las rutas efectivas de memoria o historial definidas por overrides;
+revisá esas variables antes de preparar un respaldo.
 
 ## Probar con un perfil aislado
 
@@ -65,6 +68,9 @@ cerrar la ventana no detiene el daemon: finalizá sus sesiones y detenelo
 también antes de copiar el historial. Guardá una copia completa de los
 directorios de datos y configuración. Si copiás SQLite, incluí sus archivos `-wal`
 y `-shm` cuando existan. Conservá la copia original para comparar resultados.
+Si definiste `TC_MEMORY_DB` o `MI_TERMINAL_SCROLLBACK_DIR`, incluí además la
+base de memoria y el directorio de historial de esas rutas: pueden quedar fuera
+de los directorios del perfil. Copiar sólo `config` y `data` no los conserva.
 
 Si aparece un aviso de que otra instancia tiene la persistencia, cerrá la
 instancia anterior y reabrí la que vas a usar. La propiedad de escritura protege
