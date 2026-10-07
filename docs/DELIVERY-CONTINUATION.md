@@ -1,6 +1,6 @@
 # Estado de entrega y continuación — 7 de octubre de 2026
 
-El último checkpoint publicado y validado es
+El checkpoint de recuperación publicado y validado es
 `d226a0ce1376bb615ac13bdcf85d4f94ddd1d9d0`, de **125 microcommits** desde
 `f0458dd1dae08b3aca080a914042deb5a9454cf3`.
 Su [CI candidata](https://github.com/MauroProto/terminal-canvas/actions/runs/37604909916)
