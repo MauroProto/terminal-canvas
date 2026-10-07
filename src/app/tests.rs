@@ -1763,7 +1763,7 @@ fn consumed_app_shortcut_is_removed_from_the_pty_event_stream() {
     super::consume_key_event(&ctx, modifiers, egui::Key::T);
 
     let remaining = ctx.input(|input| input.events.clone());
-    let _ = ctx.end_pass();
+    ctx.end_pass().drop_without_applying_deltas();
     assert_eq!(remaining, vec![egui::Event::Text("keep".to_owned())]);
 }
 
