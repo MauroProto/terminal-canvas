@@ -15,7 +15,13 @@ de la app, permisos de publicación ni controles de firma.
 El siguiente microcommit, `5107f41`, limita los metadatos ZIP antes de construir
 el parser del validador de paquetes. El checkpoint `5107f41` contiene
 **32 microcommits publicados** sobre la base revisada; el código Rust conserva
-el mismo árbol que la CI del checkpoint `d79f0fa`.
+el mismo árbol que la CI del checkpoint `d79f0fa` en ese checkpoint histórico.
+El cierre documental posterior llegó a **37 microcommits** en `b6ea26a` y su
+[CI completa](https://github.com/MauroProto/terminal-canvas/actions/runs/37553410152)
+también pasó. El nuevo pase agrega cinco microcommits de contención Windows,
+hasta `7097d3ae51d64b2ec384179f7c38704257e8962d`: **42 microcommits** desde la
+base revisada, antes de su documentación. Ahora cambia código Rust y necesita
+una CI nueva del HEAD publicado; los ensayos anteriores no validan ese cambio.
 Online e invitaciones no reciben cambios funcionales en este pase.
 
 ## Verificación realizada en esta PC
@@ -27,8 +33,9 @@ Online e invitaciones no reciben cambios funcionales en este pase.
 - Suite completa de todos los targets: **889 pruebas aprobadas y tres ignoradas**,
   incluyendo **850 pruebas de librería aprobadas y tres ignoradas**, más los tres
   benchmarks en modo smoke. El código comprobado termina en el commit local
-  `c2faf67`, publicado como `1588988`. Los cambios posteriores afectan
-  scripts de validación, infraestructura y documentación.
+  `c2faf67`, publicado como `1588988`. Hasta `5107f41`, los cambios posteriores
+  afectaban scripts, infraestructura y documentación. Estos recuentos locales
+  son históricos: no corresponden al nuevo lanzador Windows.
   Dos pruebas ignoradas son fixtures que las regresiones normales invocan
   explícitamente en procesos hijos; la tercera depende de sesiones Claude reales.
 - Pruebas de perfil mediante procesos independientes: layout, configuración,
@@ -56,10 +63,19 @@ Online e invitaciones no reciben cambios funcionales en este pase.
   que el registro de Inno nombre la copia que está ejecutándose y entrega esa
   carpeta mediante `/DIR`; una copia portable firmada usa actualización manual.
   Las regresiones incluyen Unicode, espacios y rutas UNC.
-- Windows configura el Job para terminar los helpers asociados cuando el SO
-  cierra su último handle, incluso si la app sale sin ejecutar `Drop`. Dos
-  pruebas reales comprueban cierre del handle y salida abrupta del padre.
-  La ventana entre lanzamiento y asociación al Job sigue pendiente.
+- Los helpers de verificación Windows se crean dentro de su Job privado con
+  `PROC_THREAD_ATTRIBUTE_JOB_LIST`, antes de ejecutar código del hijo. Se inicia
+  el proceso suspendido, se comprueba su asociación a ese Job exacto y luego se
+  reanuda; un fallo aborta el lanzamiento. El Job termina sus descendientes al
+  cerrar su último handle, incluso si la app sale sin ejecutar `Drop`.
+  La validación local del componente pasó sus **21 casos**: siete pruebas puras,
+  trece regresiones con procesos reales y un fixture inerte. Comprueba nietos
+  creados inmediatamente, timeout, límite de salida, abandono antes de reanudar,
+  cierre del guard y salida del padre; también argumentos, entorno Unicode y
+  PowerShell real. Clippy del componente pasó con warnings como errores.
+  Se usó un harness pequeño con el código de producción, un job y prioridad
+  Idle; no se recompiló ni abrió la app completa en esta PC. Exigir una CI nueva
+  del HEAD publicado antes de dar por validada su integración multiplataforma.
 - **27 pruebas del validador de paquetes**. Un TAR con 5.006 entradas se rechaza
   tras leer sólo ocho encabezados, sin extraer archivos. Un ZIP con 3.005
   entradas se rechaza antes de construir `ZipFile`; también se comprueban
@@ -78,6 +94,13 @@ Los logs del último cierre se guardan en `dist/validation-clippy-job-cleanup.lo
 la auditoría previa está en
 `dist/validation-audit.json`. No se deben confundir
 los resultados locales con una CI multiplataforma del candidato.
+Los resultados nuevos están en `dist/validation-contained-launch-tests.*.log`,
+`dist/validation-contained-launch-errors.*.log`,
+`dist/validation-contained-launch-powershell.*.log`,
+`dist/validation-contained-launch-clippy-fixed.*.log` y
+`dist/validation-contained-launch-owner-fixed.*.log`. Las corridas filtradas
+comprueban los casos agregados y la corrección del fixture; no son suites
+completas adicionales ni se deben sumar como casos distintos.
 La [CI del checkpoint publicado](https://github.com/MauroProto/terminal-canvas/actions/runs/37544616708)
 y el [ensayo manual de distribución](https://github.com/MauroProto/terminal-canvas/actions/runs/37545144493)
 apuntan exactamente a `d79f0fa`. La auditoría y las nueve pruebas de la extensión
@@ -131,7 +154,7 @@ release real reconstruye los paquetes y su documentación desde el tag exacto.
 
 ## Publicación y respaldo
 
-La publicación del checkpoint `5107f41` está realizada: se verificaron los
+La publicación del checkpoint histórico `5107f41` está realizada: se verificaron los
 32 árboles, mensajes y padres antes de avanzar `master`, sin force push.
 El conector autorizado de `MauroProto` pudo publicar también los workflows.
 Git Data API asignó nuevos IDs, fechas y metadatos de autor; los originales
@@ -140,28 +163,27 @@ Usar la rama publicada para continuar. Los originales de los siguientes pases
 quedan en `codex/ci-runtime-delivery-20261006` y
 `codex/zip-preflight-delivery-20261006`. El CLI de esta PC conserva su cuenta
 de sólo lectura. Revalidar la CI cuando se cambie código, sin bajar aserciones.
+Los originales del pase de contención Windows se conservan en
+`codex/windows-contained-launch-delivery-20261006`; los árboles, mensajes y
+padres publicados se comprueban antes de avanzar la rama sin force push.
 
 ## Pendientes concretos
 
 1. Probar interfaz, cierre/reapertura, recuperación tras crash y agentes reales
    en instalaciones nativas. Comprobar además que los datos previos se conservan.
-2. Cerrar la ventana entre lanzamiento del helper y asociación al Job Windows
-   de los comandos del actualizador (`src/update_install.rs`).
-   Las regresiones comprueban el helper asociado y el cierre abrupto del padre;
-   no demuestran contención de procesos que escaparon antes de asociar el Job.
-   Resolverlo con lanzamiento contenido antes de ejecutar código del hijo y
-   probar también nietos creados inmediatamente, timeout y cancelación.
-3. Antes de publicar, configurar las credenciales reales documentadas en `RELEASE.md`: Windows
+2. Antes de publicar, configurar las credenciales reales documentadas en `RELEASE.md`: Windows
    Authenticode con timestamp; macOS Developer ID, notarización y Team ID.
    Probar upgrade desde una versión firmada por el mismo editor/certificado.
-   Comprobar cancelación, error de disco, publisher distinto y sesiones vivas.
-4. Publicar sólo después de validar el dry-run y el candidato. Los tags deben
+   Comprobar cancelación de la descarga, error de disco, publisher distinto y
+   sesiones vivas. La instalación y los helpers no ofrecen cancelación mediante
+   un token del usuario; los helpers tienen timeout, límite de salida y cleanup.
+3. Publicar sólo después de validar el dry-run y el candidato. Los tags deben
    coincidir con Cargo; el workflow impide publicación sin firmas verificadas.
    Descargar y verificar los paquetes que se publicaron realmente.
-5. Reemplazar placeholders de versión/SHA256 del cask con los DMG finales y
+4. Reemplazar placeholders de versión/SHA256 del cask con los DMG finales y
    publicar el tap con acceso real. Revisar protección de rama y permisos de
    archivos en instalaciones reales. No afirmar que ya existe una release/tap.
-6. Ejecutar las migraciones de mantenimiento descritas en
+5. Ejecutar las migraciones de mantenimiento descritas en
    [DEPENDENCY-MAINTENANCE.md](DEPENDENCY-MAINTENANCE.md), respetando la exclusión
    de Online/invitaciones. Requieren validación multiplataforma, sin ignores.
 
@@ -178,8 +200,8 @@ versión y resultados sin adjuntar contenido privado del perfil.
 ## Prompt para continuar en otra máquina
 
 > Continuá Terminal Canvas (`MauroProto/terminal-canvas`) desde la rama publicada
-> `master`; el checkpoint Rust y de entrega es `d79f0fa`, seguido por acciones
-> Node 24 y validación ZIP acotada hasta `5107f41`. Usá el HEAD publicado actual.
+> `master`; usá el HEAD publicado actual. El código de contención Windows llega
+> a `7097d3a`, seguido por su documentación; conserva los checkpoints anteriores.
 > Leé `docs/DELIVERY-CONTINUATION.md`,
 > `docs/RELEASE.md`, `docs/PORTABLE.md`, `docs/SUPPORT.md` y
 > `docs/DEPENDENCY-MAINTENANCE.md`. Conservá todos los
@@ -189,7 +211,10 @@ versión y resultados sin adjuntar contenido privado del perfil.
 > Verificá también CI 37549072652 y Release 37549143310 sobre `5107f41`.
 > Las dos CI y los dos ensayos completos quedaron aprobados; los ensayos
 > omitieron publicación y generaron paquetes de prueba sin firma del proveedor.
-> Los últimos commits posteriores a `5107f41` sólo corrigen documentación.
+> El pase posterior a `b6ea26a` modifica el lanzador Windows: crea los helpers
+> asociados a su Job antes de ejecutar código. Sus 21 casos del componente y
+> Clippy pasaron localmente; comprobá también la CI y el ensayo Release del HEAD
+> nuevo en Actions. Los ensayos anteriores no cubren ese código.
 > Para verificar archivos empaquetados del ensayo, usá su mismo checkout.
 > No repitas builds completos sin cambios ni una falla que investigar.
 > Las corridas 9f se reemplazaron: CI 37546104540 se canceló con Windows/Linux,
@@ -200,8 +225,7 @@ versión y resultados sin adjuntar contenido privado del perfil.
 > No descartes cambios ni reescribas historial. No modifiques
 > Online/invitaciones. Cerrá los pendientes enumerados con evidencia real:
 > preservación de datos e interfaz en sistemas nativos, pruebas con agentes reales,
-> contención de helpers Windows desde el lanzamiento, firma/notarización,
-> upgrade firmado, publicación, Homebrew y las migraciones
+> firma/notarización, upgrade firmado, publicación, Homebrew y las migraciones
 > de mantenimiento compatibles con la exclusión de Online/invitaciones.
 > Los tests locales y el ZIP debug ya probados no equivalen a una entrega
 > firmada. No inventes secretos ni resultados. Usá Rust 1.98.0 y mantené baja
