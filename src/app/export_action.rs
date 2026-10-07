@@ -1,7 +1,7 @@
 //! Exportar la salida del terminal enfocado a un archivo de texto en la
 //! carpeta de descargas, con aviso (toast) del resultado.
 
-use crate::terminal::export::{export_file_name, export_timestamp};
+use crate::terminal::export::unique_export_file_name;
 
 use super::TerminalApp;
 
@@ -30,7 +30,7 @@ impl TerminalApp {
             return;
         }
 
-        let name = export_file_name(&title, &export_timestamp(chrono::Local::now()));
+        let name = unique_export_file_name(&title, chrono::Local::now());
         let Some(directory) = crate::utils::app_paths::exports_dir() else {
             self.toast_error("No se pudo resolver la carpeta de exportación");
             return;

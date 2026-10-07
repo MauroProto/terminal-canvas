@@ -498,6 +498,15 @@ pub fn export_timestamp(now: chrono::DateTime<chrono::Local>) -> String {
     now.format("%Y%m%d-%H%M%S").to_string()
 }
 
+/// Each export is a separate document, including repeated clicks in the same
+/// second and panels whose titles produce the same filename slug.
+pub fn unique_export_file_name(title: &str, now: chrono::DateTime<chrono::Local>) -> String {
+    export_file_name(
+        title,
+        &format!("{}-{}", export_timestamp(now), uuid::Uuid::new_v4()),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use alacritty_terminal::grid::Row;
@@ -744,6 +753,24 @@ mod tests {
         let name = super::export_file_name(&"ab ".repeat(60), "ts");
         assert!(name.len() < 80, "got {} chars: {name}", name.len());
         assert!(!name.contains("-.txt"), "got {name}");
+    }
+
+    #[test]
+    fn exports_with_colliding_titles_in_the_same_second_keep_separate_paths() {
+        let now = chrono::Local::now();
+        let names = [
+            super::unique_export_file_name("My Project", now),
+            super::unique_export_file_name("My Project", now),
+            super::unique_export_file_name("My/Project", now),
+        ];
+        assert_eq!(names.iter().collect::<std::collections::HashSet<_>>().len(), 3);
+        let prefix = format!("my-project-{}-", super::export_timestamp(now));
+        for name in names {
+            assert!(name.starts_with(&prefix), "got {name}");
+            assert!(name.ends_with(".txt"), "got {name}");
+            assert!(!name.contains(['/', '\\']), "got {name}");
+            assert!(name.len() < 128, "got {name}");
+        }
     }
 
     #[test]
