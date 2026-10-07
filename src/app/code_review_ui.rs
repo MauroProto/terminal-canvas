@@ -733,8 +733,13 @@ impl TerminalApp {
                     .max_height((height - 44.0).max(80.0))
                     .show_viewport(ui, |ui, viewport| {
                         ui.set_height(total_height.max(1.0));
-                        let left = ui.min_rect().left();
-                        let width = ui.min_rect().width();
+                        // The viewport and row offsets are relative to content;
+                        // painter rectangles use its absolute origin. A fresh
+                        // scroll UI has an empty min_rect, so use max_rect for
+                        // the available width as egui's show_rows does.
+                        let bounds = ui.max_rect();
+                        let left = bounds.left();
+                        let width = bounds.width();
                         let start = offsets
                             .partition_point(|offset| *offset <= viewport.top())
                             .saturating_sub(1)
@@ -745,7 +750,7 @@ impl TerminalApp {
                                 break;
                             }
                             let row_rect = egui::Rect::from_min_size(
-                                pos2(left, y),
+                                pos2(left, bounds.top() + y),
                                 vec2(width, review_row_height(&rows[index])),
                             );
                             match &rows[index] {
