@@ -375,7 +375,7 @@ fn build_ghostty_shapes(
     let mut background_shapes = Vec::with_capacity(estimated_cells.max(64));
     let mut foreground_shapes = Vec::with_capacity(estimated_cells.max(64));
 
-    ctx.fonts(|fonts| {
+    ctx.fonts_mut(|fonts| {
         for (row_index, row) in snapshot.styled_rows.iter().take(max_rows).enumerate() {
             build_ghostty_row_shapes(
                 fonts,
@@ -397,7 +397,7 @@ fn build_ghostty_shapes(
 
 #[cfg(feature = "ghostty-vt")]
 fn build_ghostty_row_shapes(
-    fonts: &egui::epaint::text::Fonts,
+    fonts: &mut egui::epaint::text::FontsView<'_>,
     content_rect: Rect,
     row_index: usize,
     row: &[GhosttyCellSnapshot],
@@ -498,7 +498,7 @@ fn ghostty_cell_style(
 
 #[cfg(feature = "ghostty-vt")]
 fn flush_ghostty_run(
-    fonts: &egui::epaint::text::Fonts,
+    fonts: &mut egui::epaint::text::FontsView<'_>,
     foreground_shapes: &mut Vec<Shape>,
     content_rect: Rect,
     row_index: usize,
@@ -756,7 +756,7 @@ fn build_grid_shapes(
         ));
     }
 
-    ctx.fonts(|fonts| {
+    ctx.fonts_mut(|fonts| {
         let mut push_text = |foreground_shapes: &mut Vec<Shape>,
                              pos: egui::Pos2,
                              text: &str,
@@ -1455,8 +1455,8 @@ mod tests {
         let content_rect = Rect::from_min_size(pos2(20.0, 20.0), vec2(220.0, 120.0));
         let term = sample_term("first\nsecond");
 
-        let output = ctx.run(raw_input, |ctx| {
-            CentralPanel::default().show(ctx, |ui| {
+        let output = ctx.run_ui(raw_input, |ui| {
+            CentralPanel::default().show(ui, |ui| {
                 render_terminal_reduced(
                     ui.painter(),
                     content_rect,
@@ -1494,8 +1494,8 @@ mod tests {
         let term = sample_term("hello");
         let expected_fill = terminal_background_color(term.renderable_content().colors);
 
-        let output = ctx.run(raw_input, |ctx| {
-            CentralPanel::default().show(ctx, |ui| {
+        let output = ctx.run_ui(raw_input, |ui| {
+            CentralPanel::default().show(ui, |ui| {
                 render_terminal(
                     ui.painter(),
                     content_rect,
@@ -1589,7 +1589,7 @@ mod tests {
     #[test]
     fn font_atlas_generation_increments_when_fill_ratio_drops() {
         let ctx = egui::Context::default();
-        let _ = ctx.run(RawInput::default(), |_| {});
+        let _ = ctx.run_ui(RawInput::default(), |_| {});
 
         let initial = super::font_atlas_generation(&ctx);
         assert_eq!(initial, super::font_atlas_generation(&ctx));
@@ -1705,8 +1705,8 @@ mod tests {
         let mut first_hit = false;
         let mut second_hit = false;
 
-        let _ = ctx.run(raw_input.clone(), |ctx| {
-            CentralPanel::default().show(ctx, |ui| {
+        let _ = ctx.run_ui(raw_input.clone(), |ui| {
+            CentralPanel::default().show(ui, |ui| {
                 first_hit = render_terminal(
                     ui.painter(),
                     content_rect,
@@ -1721,8 +1721,8 @@ mod tests {
             });
         });
 
-        let _ = ctx.run(raw_input, |ctx| {
-            CentralPanel::default().show(ctx, |ui| {
+        let _ = ctx.run_ui(raw_input, |ui| {
+            CentralPanel::default().show(ui, |ui| {
                 second_hit = render_terminal(
                     ui.painter(),
                     content_rect,
@@ -1755,8 +1755,8 @@ mod tests {
         let mut first_hit = true;
         let mut second_hit = false;
 
-        let _ = ctx.run(raw_input.clone(), |ctx| {
-            CentralPanel::default().show(ctx, |ui| {
+        let _ = ctx.run_ui(raw_input.clone(), |ui| {
+            CentralPanel::default().show(ui, |ui| {
                 first_hit = render_terminal(
                     ui.painter(),
                     rect_a,
@@ -1773,8 +1773,8 @@ mod tests {
 
         // Mismo tamaño y revisión, distinta posición: el cache debe seguir
         // valiendo (shapes locales + traslación al pintar).
-        let _ = ctx.run(raw_input, |ctx| {
-            CentralPanel::default().show(ctx, |ui| {
+        let _ = ctx.run_ui(raw_input, |ui| {
+            CentralPanel::default().show(ui, |ui| {
                 second_hit = render_terminal(
                     ui.painter(),
                     rect_b,
@@ -1807,8 +1807,8 @@ mod tests {
         let mut first_hit = true;
         let mut second_hit = false;
 
-        let _ = ctx.run(raw_input.clone(), |ctx| {
-            CentralPanel::default().show(ctx, |ui| {
+        let _ = ctx.run_ui(raw_input.clone(), |ui| {
+            CentralPanel::default().show(ui, |ui| {
                 first_hit = render_ghostty_text_snapshot(
                     ui.painter(),
                     content_rect,
@@ -1822,8 +1822,8 @@ mod tests {
             });
         });
 
-        let _ = ctx.run(raw_input, |ctx| {
-            CentralPanel::default().show(ctx, |ui| {
+        let _ = ctx.run_ui(raw_input, |ui| {
+            CentralPanel::default().show(ui, |ui| {
                 second_hit = render_ghostty_text_snapshot(
                     ui.painter(),
                     content_rect,
@@ -1853,8 +1853,8 @@ mod tests {
         // (12 galleys); con run-batching es 1.
         let term = sample_term("abcdefghijkl");
 
-        let output = ctx.run(raw_input, |ctx| {
-            CentralPanel::default().show(ctx, |ui| {
+        let output = ctx.run_ui(raw_input, |ui| {
+            CentralPanel::default().show(ui, |ui| {
                 render_terminal(
                     ui.painter(),
                     content_rect,
@@ -1890,8 +1890,8 @@ mod tests {
         let content_rect = Rect::from_min_size(pos2(20.0, 20.0), vec2(220.0, 120.0));
         let term = sample_term("first\nsecond\nthird");
 
-        let output = ctx.run(raw_input, |ctx| {
-            CentralPanel::default().show(ctx, |ui| {
+        let output = ctx.run_ui(raw_input, |ui| {
+            CentralPanel::default().show(ui, |ui| {
                 render_terminal(
                     ui.painter(),
                     content_rect,
@@ -1942,8 +1942,8 @@ mod tests {
         let content_rect = Rect::from_min_size(pos2(20.0, 20.0), vec2(220.0, 120.0));
         let term = sample_term("\x1b[1mboldtext\x1b[0m");
 
-        let output = ctx.run(raw_input, |ctx| {
-            CentralPanel::default().show(ctx, |ui| {
+        let output = ctx.run_ui(raw_input, |ui| {
+            CentralPanel::default().show(ui, |ui| {
                 render_terminal(
                     ui.painter(),
                     content_rect,

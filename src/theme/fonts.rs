@@ -241,16 +241,18 @@ mod tests {
         );
         let font = FontId::new(15.0, bold_family());
         let before = font_context(fonts.clone());
-        assert!(before.fonts(|fonts| fonts.has_glyph(&font, 'A')));
-        assert!(!before.fonts(|fonts| fonts.has_glyph(&font, '\u{1f600}')));
-        assert!(before.fonts(|fonts| { fonts.has_glyph(&FontId::monospace(15.0), '\u{1f600}') }));
+        assert!(before.fonts_mut(|fonts| fonts.has_glyph(&font, 'A')));
+        assert!(!before.fonts_mut(|fonts| fonts.has_glyph(&font, '\u{1f600}')));
+        assert!(
+            before.fonts_mut(|fonts| { fonts.has_glyph(&FontId::monospace(15.0), '\u{1f600}') })
+        );
 
         complete_bold_family_fallbacks(&mut fonts);
 
         let after = font_context(fonts);
-        assert!(after.fonts(|fonts| fonts.has_glyph(&font, 'A')));
-        assert!(after.fonts(|fonts| fonts.has_glyph(&font, '\u{1f600}')));
-        let galley = after.fonts(|fonts| {
+        assert!(after.fonts_mut(|fonts| fonts.has_glyph(&font, 'A')));
+        assert!(after.fonts_mut(|fonts| fonts.has_glyph(&font, '\u{1f600}')));
+        let galley = after.fonts_mut(|fonts| {
             fonts.layout_no_wrap("A\u{1f600}".into(), font.clone(), egui::Color32::WHITE)
         });
         assert_eq!(galley.text(), "A\u{1f600}");
@@ -260,7 +262,7 @@ mod tests {
     fn font_context(fonts: FontDefinitions) -> egui::Context {
         let ctx = egui::Context::default();
         ctx.set_fonts(fonts);
-        let _ = ctx.run(RawInput::default(), |_| {});
+        let _ = ctx.run_ui(RawInput::default(), |_| {});
         ctx
     }
 }
