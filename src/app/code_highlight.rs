@@ -78,7 +78,17 @@ pub fn syntect_color(color: syntect::highlighting::Color) -> Color32 {
 /// Elige la gramática por extensión y, si no hay, por la primera línea
 /// (shebangs tipo `#!/bin/bash`). Devuelve el nombre del lenguaje detectado.
 pub fn detect_language(file_name: &str, first_line: &str) -> Option<String> {
-    select_syntax(syntax_set(), file_name, first_line).map(|syntax| syntax.name.clone())
+    select_syntax(syntax_set(), file_name, first_line).map(|syntax| {
+        if file_name
+            .rsplit_once('.')
+            .is_some_and(|(_, extension)| extension.eq_ignore_ascii_case("jsx"))
+            && syntax.name == "TypeScriptReact"
+        {
+            "JSX".to_owned()
+        } else {
+            syntax.name.clone()
+        }
+    })
 }
 
 /// Keep the viewer's language indicator and its parser on the same grammar.
@@ -92,6 +102,14 @@ pub(crate) fn select_syntax<'a>(
     // caso devuelve el nombre entero, que igual sirve para buscar por token.
     if !extension.is_empty() {
         if let Some(syntax) = set.find_syntax_by_extension(extension) {
+            return Some(syntax);
+        }
+    }
+    // two-face's fancy-regex set excludes Babel's JSX grammar. The embedded
+    // React grammar also parses JavaScript JSX; use it only after native
+    // extension lookup, keeping future asset definitions authoritative.
+    if file_name.contains('.') && extension.eq_ignore_ascii_case("jsx") {
+        if let Some(syntax) = set.find_syntax_by_name("TypeScriptReact") {
             return Some(syntax);
         }
     }
@@ -118,8 +136,8 @@ fn highlight_text_cancelable(
     }
     let set = syntax_set();
     let first_line = text.lines().next().unwrap_or_default();
-    let syntax = select_syntax(set, file_name, first_line)
-        .unwrap_or_else(|| set.find_syntax_plain_text());
+    let syntax =
+        select_syntax(set, file_name, first_line).unwrap_or_else(|| set.find_syntax_plain_text());
 
     let mut highlighter = HighlightLines::new(syntax, theme());
     let mut out = Vec::new();
@@ -417,6 +435,19 @@ mod tests {
 
     fn joined(line: &[(egui::Color32, String)]) -> String {
         line.iter().map(|(_, text)| text.as_str()).collect()
+    }
+
+    fn coloured_characters(lines: &[super::HighlightedLine]) -> Vec<Vec<([u8; 4], char)>> {
+        lines
+            .iter()
+            .map(|line| {
+                line.iter()
+                    .flat_map(|(color, text)| {
+                        text.chars().map(|character| (color.to_array(), character))
+                    })
+                    .collect()
+            })
+            .collect()
     }
 
     #[test]
@@ -843,6 +874,41 @@ mod tests {
             "a TS file should use several colours, got {}",
             colors.len()
         );
+    }
+
+    #[test]
+    fn jsx_keeps_markup_expressions_and_following_code_colours() {
+        let lf = "// café 🐈 界 e\u{301}\nconst Card = ({ title }) => (\n  <section data-count={42}>\n    <strong>{title || \"hola 👋\"}</strong>\n  </section>\n);\nconst after = 3; // comentario";
+        for source in [
+            lf.to_owned(),
+            lf.replace('\n', "\r\n"),
+            lf.replacen('\n', "\r\n", 2),
+        ] {
+            let reference = highlight_text("Card.tsx", &source);
+            let colors: std::collections::BTreeSet<_> = reference
+                .iter()
+                .flatten()
+                .map(|(color, _)| color.to_array())
+                .collect();
+            assert!(
+                colors.len() >= 4,
+                "JSX markup must have distinct syntax colours"
+            );
+            for file in ["Card.jsx", "Card.JSX"] {
+                assert_eq!(detect_language(file, "").as_deref(), Some("JSX"));
+                let actual = highlight_text(file, &source);
+                assert_eq!(
+                    coloured_characters(&actual),
+                    coloured_characters(&reference),
+                    "{file}"
+                );
+                assert_eq!(
+                    actual.iter().map(|line| joined(line)).collect::<Vec<_>>(),
+                    source.lines().collect::<Vec<_>>(),
+                    "{file}"
+                );
+            }
+        }
     }
 
     #[test]
