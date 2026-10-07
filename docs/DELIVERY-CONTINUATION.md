@@ -109,8 +109,10 @@ sin cambios funcionales de Online ni invitaciones. El recibo externo debe
 acreditar por separado la CI exacta del HEAD corregido.
 
 El [ensayo anterior, 37575466330](https://github.com/MauroProto/terminal-canvas/actions/runs/37575466330),
-del mismo SHA, terminó CANCELLED tras confirmar la misma fixture fallida en
-el preflight daemon de macOS ARM. Dejó **cero artefactos** y no validó paquetes,
+del candidato `6a7e78e0d9b6b667ac6cd8a518d9eaac4a92285f`, terminó CANCELLED
+tras confirmar la fixture fallida de repaint oculto en el preflight daemon
+de macOS ARM. Esta corrida precede al fallo de cleanup TLS descrito arriba.
+Dejó **cero artefactos** y no validó paquetes,
 instaladores, DMG, checksums ni publicación. Esas corridas son evidencia del
 fallo corregido, no una aprobación del nuevo candidato.
 
