@@ -85,6 +85,7 @@ impl FileViewerState {
 
 impl TerminalApp {
     pub(super) fn open_file_viewer(&mut self, path: PathBuf) {
+        self.highlighter.cancel();
         self.file_viewer_keyboard_active = false;
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         let worker_path = path.clone();
@@ -110,12 +111,18 @@ impl TerminalApp {
     }
 
     fn activate_loaded_file(&mut self, mut state: FileViewerState) {
-        if !state.binary && !state.lines.is_empty() {
+        if !state.binary && !state.lines.is_empty() && self.highlighter.is_available() {
             let name = state.file_name();
             // El texto se reensambla para el worker; el visor ya puede pintar
             // el plano mientras tanto.
             let text = state.lines.join("\n");
-            state.highlight_token = Some(self.highlighter.request(name, text));
+            let repaint = self.ctx.clone();
+            state.highlight_token =
+                Some(self.highlighter.request_with_notify(name, text, move || {
+                    if let Some(ctx) = repaint {
+                        ctx.request_repaint();
+                    }
+                }));
         }
         self.file_viewer = Some(state);
     }
@@ -159,6 +166,7 @@ impl TerminalApp {
             // Descartamos lo que corresponda a un archivo ya cerrado o cambiado.
             if viewer.highlight_token == Some(result.token) {
                 viewer.highlighted = result.lines;
+                viewer.highlight_token = None;
             }
         }
     }
@@ -172,6 +180,7 @@ impl TerminalApp {
         if self.file_viewer_keyboard_active
             && ctx.input(|input| input.key_pressed(egui::Key::Escape))
         {
+            self.highlighter.cancel();
             self.file_viewer = None;
             self.file_viewer_rx = None;
             return;
@@ -256,6 +265,7 @@ impl TerminalApp {
             });
 
         if close {
+            self.highlighter.cancel();
             self.file_viewer = None;
             self.file_viewer_rx = None;
         }
