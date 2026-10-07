@@ -474,12 +474,14 @@ impl TerminalApp {
 
     /// Notes remain reviewable even when their files leave the current diff.
     fn code_review_notes_list(&mut self, ui: &mut egui::Ui, height: f32) {
-        let Some(state) = self.code_review.as_ref() else {
+        let Some(state) = self.code_review.as_mut() else {
             return;
         };
-        let notes = state.notes.notes.clone();
-        let notes_ready = state.notes_ready;
         let mut actions = Vec::new();
+        let notes_ready = state.notes_ready;
+        let notes = &state.notes.notes;
+        let files = &state.files;
+        let editing_note = &mut state.editing_note;
         ScrollArea::vertical()
             .id_salt("review-all-notes")
             .max_height(height)
@@ -493,13 +495,9 @@ impl TerminalApp {
                         "Las notas todavía no se pudieron cargar."
                     });
                 }
-                for note in &notes {
-                    let stale = self.code_review.as_ref().is_some_and(|state| {
-                        note_is_stale(
-                            note,
-                            state.files.iter().find(|file| file.path == note.file_path),
-                        )
-                    });
+                for note in notes {
+                    let stale =
+                        note_is_stale(note, files.iter().find(|file| file.path == note.file_path));
                     ui.group(|ui| {
                         ui.label(
                             RichText::new(format!(
@@ -511,10 +509,8 @@ impl TerminalApp {
                             ))
                             .monospace(),
                         );
-                        let editing = self
-                            .code_review
+                        let editing = editing_note
                             .as_mut()
-                            .and_then(|state| state.editing_note.as_mut())
                             .filter(|edit| edit.note_id == Some(note.id));
                         if let Some(edit) = editing {
                             ui.add_enabled(
