@@ -814,3 +814,196 @@ mod streaming_content_tests {
         worker.join().unwrap();
     }
 }
+
+#[cfg(test)]
+mod special_file_write_tests {
+    use std::io;
+    use std::path::{Path, PathBuf};
+    use std::time::SystemTime;
+
+    use super::{backup_path, write_atomic, write_durable, BACKUP_SLOTS};
+
+    type Writer = fn(&Path, &[u8]) -> io::Result<bool>;
+
+    fn writers() -> [Writer; 2] {
+        [write_durable, write_atomic]
+    }
+
+    struct TempDirectory(PathBuf);
+
+    impl TempDirectory {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("tc-special-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct Entry {
+        kind: &'static str,
+        bytes: Option<Vec<u8>>,
+        link: Option<PathBuf>,
+        modified: SystemTime,
+        readonly: bool,
+        #[cfg(unix)]
+        mode: u32,
+        #[cfg(unix)]
+        inode: u64,
+    }
+
+    fn snapshot(root: &Path) -> Vec<(PathBuf, Entry)> {
+        fn visit(root: &Path, path: &Path, entries: &mut Vec<(PathBuf, Entry)>) {
+            let metadata = std::fs::symlink_metadata(path).unwrap();
+            let is_link = metadata.file_type().is_symlink();
+            let kind = if is_link {
+                "link"
+            } else if metadata.is_file() {
+                "file"
+            } else if metadata.is_dir() {
+                "directory"
+            } else {
+                "special"
+            };
+            #[cfg(unix)]
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            entries.push((
+                path.strip_prefix(root).unwrap().to_path_buf(),
+                Entry {
+                    kind,
+                    // Never open a FIFO or follow a link while fingerprinting.
+                    bytes: (kind == "file").then(|| std::fs::read(path).unwrap()),
+                    link: is_link.then(|| std::fs::read_link(path).unwrap()),
+                    modified: metadata.modified().unwrap(),
+                    readonly: metadata.permissions().readonly(),
+                    #[cfg(unix)]
+                    mode: metadata.permissions().mode(),
+                    #[cfg(unix)]
+                    inode: metadata.ino(),
+                },
+            ));
+            if kind == "directory" {
+                for child in std::fs::read_dir(path).unwrap() {
+                    visit(root, &child.unwrap().path(), entries);
+                }
+            }
+        }
+        let mut entries = Vec::new();
+        visit(root, root, &mut entries);
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+        entries
+    }
+
+    fn seed_ring(path: &Path) {
+        for slot in 0..BACKUP_SLOTS {
+            std::fs::write(backup_path(path, slot), format!("backup-{slot}")).unwrap();
+        }
+    }
+
+    #[test]
+    fn write_rejects_directory_destinations_before_any_mutation() {
+        for writer in writers() {
+            let directory = TempDirectory::new();
+            let path = directory.path().join("state");
+            std::fs::create_dir(&path).unwrap();
+            std::fs::write(path.join("child"), b"keep").unwrap();
+            seed_ring(&path);
+            let before = snapshot(directory.path());
+            let error = writer(&path, b"new").unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(error.to_string().contains("state destination"));
+            assert_eq!(snapshot(directory.path()), before);
+        }
+    }
+
+    #[test]
+    fn changed_durable_write_rejects_every_directory_backup_before_mutation() {
+        for main_exists in [false, true] {
+            for slot in 0..BACKUP_SLOTS {
+                let directory = TempDirectory::new();
+                let path = directory.path().join("state");
+                if main_exists {
+                    std::fs::write(&path, b"old").unwrap();
+                }
+                seed_ring(&path);
+                let invalid = backup_path(&path, slot);
+                std::fs::remove_file(&invalid).unwrap();
+                std::fs::create_dir(&invalid).unwrap();
+                std::fs::write(invalid.join("child"), b"keep").unwrap();
+                let before = snapshot(directory.path());
+                let error = write_durable(&path, b"new").unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+                assert!(error.to_string().contains("state backup"));
+                assert_eq!(snapshot(directory.path()), before);
+            }
+        }
+    }
+
+    #[test]
+    fn generic_noop_preserves_anomalous_backup_slots() {
+        for slot in 0..BACKUP_SLOTS {
+            let directory = TempDirectory::new();
+            let path = directory.path().join("state");
+            std::fs::write(&path, b"same").unwrap();
+            seed_ring(&path);
+            let invalid = backup_path(&path, slot);
+            std::fs::remove_file(&invalid).unwrap();
+            std::fs::create_dir(&invalid).unwrap();
+            let before = snapshot(directory.path());
+            for writer in writers() {
+                assert!(!writer(&path, b"same").unwrap());
+                assert_eq!(snapshot(directory.path()), before);
+            }
+        }
+    }
+
+    #[test]
+    fn atomic_write_does_not_validate_or_mutate_an_unrelated_backup() {
+        for main_exists in [false, true] {
+            for slot in 0..BACKUP_SLOTS {
+                let directory = TempDirectory::new();
+                let path = directory.path().join("state");
+                if main_exists {
+                    std::fs::write(&path, b"old").unwrap();
+                }
+                let backup = backup_path(&path, slot);
+                std::fs::create_dir(&backup).unwrap();
+                std::fs::write(backup.join("child"), b"keep").unwrap();
+                let before = snapshot(&backup);
+                assert!(write_atomic(&path, b"new").unwrap());
+                assert_eq!(std::fs::read(&path).unwrap(), b"new");
+                assert_eq!(snapshot(&backup), before);
+                assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 2);
+            }
+        }
+    }
+
+    #[test]
+    fn valid_creation_rotation_spacing_and_noop_remain_compatible() {
+        let directory = TempDirectory::new();
+        let path = directory.path().join("nested").join("state");
+        assert!(write_durable(&path, b"first").unwrap());
+        assert!(!backup_path(&path, 0).exists());
+        assert!(write_durable(&path, b"second").unwrap());
+        let newest = backup_path(&path, 0);
+        assert_eq!(std::fs::read(&newest).unwrap(), b"first");
+        let before = snapshot(directory.path());
+        assert!(!write_durable(&path, b"second").unwrap());
+        assert_eq!(snapshot(directory.path()), before);
+        let backup_before = snapshot(&newest);
+        assert!(write_durable(&path, b"third").unwrap());
+        assert_eq!(snapshot(&newest), backup_before);
+        assert!(!backup_path(&path, 1).exists());
+        assert_eq!(std::fs::read(&path).unwrap(), b"third");
+    }
+}
