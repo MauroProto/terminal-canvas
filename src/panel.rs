@@ -424,7 +424,7 @@ impl WorkspacePanel {
         }
     }
 
-    pub fn leaf_scrollbacks(&self) -> Vec<(Option<uuid::Uuid>, String, usize)> {
+    pub fn leaf_scrollbacks(&self) -> Vec<(Option<uuid::Uuid>, uuid::Uuid, String, usize)> {
         match self {
             Self::Terminal(panel) => panel.leaf_scrollbacks(),
         }
@@ -466,15 +466,22 @@ impl WorkspacePanel {
         }
     }
 
-    pub fn pending_leaf_logs(&self) -> Vec<(uuid::Uuid, Vec<u8>)> {
+    pub fn pending_leaf_logs(&self) -> Vec<(uuid::Uuid, uuid::Uuid, Vec<u8>)> {
         match self {
             Self::Terminal(panel) => panel.pending_leaf_logs(),
         }
     }
 
-    pub fn acknowledge_leaf_log(&self, leaf_id: uuid::Uuid, written_bytes: usize) {
+    pub fn acknowledge_leaf_log(
+        &self,
+        leaf_id: uuid::Uuid,
+        runtime_session_id: uuid::Uuid,
+        written_bytes: usize,
+    ) {
         match self {
-            Self::Terminal(panel) => panel.acknowledge_leaf_log(leaf_id, written_bytes),
+            Self::Terminal(panel) => {
+                panel.acknowledge_leaf_log(leaf_id, runtime_session_id, written_bytes)
+            }
         }
     }
 

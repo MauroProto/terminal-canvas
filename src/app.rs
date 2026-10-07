@@ -1232,7 +1232,11 @@ impl TerminalApp {
                 .flat_map(|workspace| workspace.panels.iter())
                 .find(|panel| panel.id() == acknowledgement.panel_id)
             {
-                panel.acknowledge_leaf_log(leaf_id, acknowledgement.written_bytes);
+                panel.acknowledge_leaf_log(
+                    leaf_id,
+                    acknowledgement.runtime_session_id,
+                    acknowledgement.written_bytes,
+                );
             }
         }
     }
@@ -1616,12 +1620,15 @@ impl TerminalApp {
                     panel
                         .pending_leaf_logs()
                         .into_iter()
-                        .filter(|(_, frames)| !frames.is_empty())
-                        .map(|(leaf, frames)| persistence_worker::IncrementalEntry {
-                            dir: dir.clone(),
-                            panel_id,
-                            leaf_id: Some(leaf),
-                            frames,
+                        .filter(|(_, _, frames)| !frames.is_empty())
+                        .map(|(leaf, runtime_session_id, frames)| {
+                            persistence_worker::IncrementalEntry {
+                                dir: dir.clone(),
+                                panel_id,
+                                leaf_id: Some(leaf),
+                                runtime_session_id,
+                                frames,
+                            }
                         }),
                 );
             }
@@ -1716,12 +1723,15 @@ impl TerminalApp {
                     continue;
                 }
                 entries.extend(panel.leaf_scrollbacks().into_iter().map(
-                    |(leaf, text, pending_bytes)| persistence_worker::FullEntry {
-                        dir: dir.to_path_buf(),
-                        panel_id,
-                        leaf_id: leaf,
-                        text,
-                        pending_bytes,
+                    |(leaf, runtime_session_id, text, pending_bytes)| {
+                        persistence_worker::FullEntry {
+                            dir: dir.to_path_buf(),
+                            panel_id,
+                            leaf_id: leaf,
+                            runtime_session_id,
+                            text,
+                            pending_bytes,
+                        }
                     },
                 ));
             }

@@ -18,6 +18,7 @@ pub(super) struct IncrementalEntry {
     pub(super) dir: PathBuf,
     pub(super) panel_id: Uuid,
     pub(super) leaf_id: Option<Uuid>,
+    pub(super) runtime_session_id: Uuid,
     pub(super) frames: Vec<u8>,
 }
 
@@ -31,6 +32,7 @@ pub(super) struct IncrementalBatch {
 pub(super) struct IncrementalAck {
     pub(super) panel_id: Uuid,
     pub(super) leaf_id: Option<Uuid>,
+    pub(super) runtime_session_id: Uuid,
     pub(super) written_bytes: usize,
 }
 
@@ -38,6 +40,7 @@ pub(super) struct FullEntry {
     pub(super) dir: PathBuf,
     pub(super) panel_id: Uuid,
     pub(super) leaf_id: Option<Uuid>,
+    pub(super) runtime_session_id: Uuid,
     pub(super) text: String,
     pub(super) pending_bytes: usize,
 }
@@ -265,6 +268,7 @@ pub(super) fn persist_full_entries(entries: Vec<FullEntry>) -> Vec<IncrementalAc
         acknowledgements.push(IncrementalAck {
             panel_id: entry.panel_id,
             leaf_id: entry.leaf_id,
+            runtime_session_id: entry.runtime_session_id,
             written_bytes: entry.pending_bytes,
         });
     }
@@ -321,6 +325,7 @@ fn persist_incremental_batch(
             acknowledgements.push(IncrementalAck {
                 panel_id: entry.panel_id,
                 leaf_id: entry.leaf_id,
+                runtime_session_id: entry.runtime_session_id,
                 written_bytes: entry.frames.len(),
             });
             next_sequences.insert(key, next_seq);
@@ -391,6 +396,7 @@ mod tests {
                     dir: invalid_dir,
                     panel_id,
                     leaf_id: Some(leaf_id),
+                    runtime_session_id: uuid::Uuid::new_v4(),
                     frames,
                 }],
                 live_panels: Vec::new(),
@@ -429,6 +435,7 @@ mod tests {
                     dir: root.clone(),
                     panel_id,
                     leaf_id: None,
+                    runtime_session_id: uuid::Uuid::new_v4(),
                     frames: encode_frame(1, FrameKind::Output, b"must survive in memory"),
                 }],
                 live_panels: vec![(panel_id, Vec::new())],
@@ -517,6 +524,7 @@ mod tests {
             dir: root.clone(),
             panel_id,
             leaf_id: Some(leaf_id),
+            runtime_session_id: uuid::Uuid::new_v4(),
             text: "snapshot durable".to_owned(),
             pending_bytes: 123,
         }]);
@@ -548,6 +556,7 @@ mod tests {
             dir: root.clone(),
             panel_id,
             leaf_id: None,
+            runtime_session_id: uuid::Uuid::new_v4(),
             text: "nuevo".to_owned(),
             pending_bytes: 5,
         }]);
@@ -558,6 +567,63 @@ mod tests {
                 .unwrap();
         assert_eq!(generation, Some(u32::MAX));
         assert_eq!(text, "nuevo");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn idle_barrier_returns_incremental_and_full_acknowledgements_once() {
+        let root = std::env::temp_dir().join(format!("tc-barrier-ack-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let panel_id = uuid::Uuid::new_v4();
+        let leaf_id = uuid::Uuid::new_v4();
+        let runtime_session_id = uuid::Uuid::new_v4();
+        let frames = encode_frame(1, FrameKind::Output, b"written once\r\n");
+        let written_bytes = frames.len();
+        let mut worker = super::PersistenceWorker::new();
+        assert!(worker.submit_incremental(IncrementalBatch {
+            dir: root.clone(),
+            entries: vec![IncrementalEntry {
+                dir: root.clone(),
+                panel_id,
+                leaf_id: Some(leaf_id),
+                runtime_session_id,
+                frames,
+            }],
+            live_panels: vec![(panel_id, vec![leaf_id])],
+            known_panels: vec![(panel_id, vec![leaf_id])],
+        }));
+        let completions = worker.wait_until_idle();
+        assert_eq!(completions.len(), 1);
+        let super::Completion::Incremental {
+            acknowledgements, ..
+        } = &completions[0]
+        else {
+            panic!("incremental completion lost")
+        };
+        assert_eq!(acknowledgements.len(), 1);
+        assert_eq!(acknowledgements[0].runtime_session_id, runtime_session_id);
+        assert_eq!(acknowledgements[0].written_bytes, written_bytes);
+        assert!(worker.poll().is_empty());
+        assert!(worker.wait_until_idle().is_empty());
+
+        assert!(worker.submit_full(vec![FullEntry {
+            dir: root.clone(),
+            panel_id,
+            leaf_id: Some(leaf_id),
+            runtime_session_id,
+            text: "checkpoint\n".to_owned(),
+            pending_bytes: written_bytes,
+        }]));
+        let completions = worker.wait_until_idle();
+        assert_eq!(completions.len(), 1);
+        let super::Completion::Full { acknowledgements } = &completions[0] else {
+            panic!("full completion lost")
+        };
+        assert_eq!(acknowledgements.len(), 1);
+        assert_eq!(acknowledgements[0].runtime_session_id, runtime_session_id);
+        assert_eq!(acknowledgements[0].written_bytes, written_bytes);
+        assert!(worker.poll().is_empty());
+        assert!(worker.wait_until_idle().is_empty());
         let _ = std::fs::remove_dir_all(root);
     }
 }

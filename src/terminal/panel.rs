@@ -1701,20 +1701,27 @@ impl TerminalPanel {
     /// acepta `None` como alias legado de la raíz.
     pub fn leaf_scrollbacks(
         &self,
-    ) -> Vec<(Option<crate::terminal::split_tree::LeafId>, String, usize)> {
+    ) -> Vec<(
+        Option<crate::terminal::split_tree::LeafId>,
+        Uuid,
+        String,
+        usize,
+    )> {
         let mut out = Vec::new();
         for leaf in self.active_leaf_ids() {
             let ansi = self.leaf_session(leaf).and_then(|session| {
                 if session.is_remote() {
                     return None;
                 }
+                let runtime_session_id = session.runtime_session_id()?;
                 session.with_pty(|pty| {
                     pty.checkpoint_snapshot(crate::terminal::export::scrollback_to_ansi)
+                        .map(|(text, pending_bytes)| (runtime_session_id, text, pending_bytes))
                 })
             });
             let ansi = ansi.flatten();
-            if let Some((text, pending_bytes)) = ansi {
-                out.push((Some(leaf), text, pending_bytes));
+            if let Some((runtime_session_id, text, pending_bytes)) = ansi {
+                out.push((Some(leaf), runtime_session_id, text, pending_bytes));
             }
         }
         out
@@ -1800,7 +1807,7 @@ impl TerminalPanel {
 
     /// Copia de forma independiente el log incremental no confirmado de cada
     /// hoja activa. El ACK durable lo retira después por identidad de hoja.
-    pub fn pending_leaf_logs(&self) -> Vec<(crate::terminal::split_tree::LeafId, Vec<u8>)> {
+    pub fn pending_leaf_logs(&self) -> Vec<(crate::terminal::split_tree::LeafId, Uuid, Vec<u8>)> {
         self.active_leaf_ids()
             .into_iter()
             .filter_map(|leaf| {
@@ -1809,10 +1816,11 @@ impl TerminalPanel {
                         if session.is_remote() {
                             None
                         } else {
-                            session.with_pty(|pty| pty.pending_log_snapshot())
+                            let runtime_session_id = session.runtime_session_id()?;
+                            session.with_pty(|pty| (runtime_session_id, pty.pending_log_snapshot()))
                         }
                     })
-                    .map(|frames| (leaf, frames))
+                    .map(|(runtime_session_id, frames)| (leaf, runtime_session_id, frames))
             })
             .collect()
     }
@@ -1820,10 +1828,14 @@ impl TerminalPanel {
     pub fn acknowledge_leaf_log(
         &self,
         leaf: crate::terminal::split_tree::LeafId,
+        runtime_session_id: Uuid,
         written_bytes: usize,
     ) {
         if let Some(session) = self.leaf_session(leaf) {
-            if !session.is_remote() {
+            // A resumed agent replaces its PTY while retaining the leaf UUID.
+            // An older worker acknowledgement belongs only to the captured
+            // runtime, never to output produced by that replacement session.
+            if !session.is_remote() && session.runtime_session_id() == Some(runtime_session_id) {
                 session.with_pty(|pty| pty.acknowledge_pending_log(written_bytes));
             }
         }
