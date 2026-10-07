@@ -548,14 +548,15 @@ fn flush_ghostty_run(
         content_rect.left() + metrics.pad_x + start_col as f32 * metrics.cell_width,
         content_rect.top() + metrics.pad_y + row_index as f32 * metrics.cell_height,
     );
-    foreground_shapes.push(Shape::text(
+    push_terminal_text_shapes(
         fonts,
+        foreground_shapes,
         text_pos,
-        Align2::LEFT_TOP,
-        run_text.clone(),
+        run_text,
         FontId::monospace(metrics.font_size),
         style.foreground,
-    ));
+        metrics.cell_width,
+    );
 
     let width = run_text.chars().count() as f32 * metrics.cell_width;
     if style.underline {
@@ -795,14 +796,15 @@ fn build_grid_shapes(
             if metrics.font_size < MIN_TEXT_RENDER_FONT_SIZE || text.is_empty() {
                 return;
             }
-            foreground_shapes.push(Shape::text(
+            push_terminal_text_shapes(
                 fonts,
+                foreground_shapes,
                 pos + vec2(italic_offset * metrics.zoom.max(0.25), 0.0),
-                Align2::LEFT_TOP,
                 text,
                 terminal_font_id(metrics.font_size, bold),
                 fg,
-            ));
+                metrics.cell_width,
+            );
         };
         if row_stride > 1 {
             build_reduced_foreground_shapes(
@@ -839,6 +841,91 @@ fn build_grid_shapes(
 
     background_shapes.extend(foreground_shapes);
     background_shapes
+}
+
+fn push_terminal_text_shapes(
+    fonts: &mut egui::epaint::text::FontsView<'_>,
+    shapes: &mut Vec<Shape>,
+    pos: Pos2,
+    text: &str,
+    font_id: FontId,
+    color: Color32,
+    cell_width: f32,
+) {
+    if !text.is_ascii() {
+        // A VT cell owns this Unicode cluster, including its combining marks.
+        // Shaping it together is safe; adding letter spacing is not.
+        shapes.push(Shape::text(
+            fonts,
+            pos,
+            Align2::LEFT_TOP,
+            text,
+            font_id,
+            color,
+        ));
+        return;
+    }
+
+    // Measure the actual styled advance, including any font tweak. Font size
+    // alone no longer determines it after the switch from ab_glyph to skrifa.
+    let reference = fonts.layout_no_wrap("M".to_owned(), font_id.clone(), Color32::WHITE);
+    let advance = reference
+        .rows
+        .first()
+        .and_then(|row| row.glyphs.first())
+        .map_or(0.0, |glyph| glyph.advance_width);
+    let galley = fonts.layout_job(egui::epaint::text::LayoutJob::simple_format(
+        text.to_owned(),
+        egui::TextFormat {
+            font_id: font_id.clone(),
+            color,
+            extra_letter_spacing: cell_width - advance,
+            ..Default::default()
+        },
+    ));
+
+    if ascii_galley_uses_terminal_columns(&galley, text, advance, cell_width) {
+        shapes.push(Shape::galley(pos, galley, color));
+    } else {
+        // A ligature produces zero-advance continuation glyphs; kerning or a
+        // proportional fallback can also change advances. Anchor those cells
+        // individually instead of letting one shaping run move later columns.
+        for (col, chr) in text.chars().enumerate() {
+            shapes.push(Shape::text(
+                fonts,
+                pos + vec2(col as f32 * cell_width, 0.0),
+                Align2::LEFT_TOP,
+                chr,
+                font_id.clone(),
+                color,
+            ));
+        }
+    }
+}
+
+fn ascii_galley_uses_terminal_columns(
+    galley: &egui::Galley,
+    text: &str,
+    advance: f32,
+    cell_width: f32,
+) -> bool {
+    if galley.rows.len() != 1 || !advance.is_finite() || advance <= 0.0 {
+        return false;
+    }
+    let glyphs = &galley.rows[0].glyphs;
+    glyphs.len() == text.len()
+        && glyphs
+            .iter()
+            .zip(text.chars())
+            .enumerate()
+            .all(|(col, (glyph, chr))| {
+                glyph.chr == chr
+                && (glyph.advance_width - advance).abs() < 0.001
+                // Subpixel binning stores the integer origin in `pos`; the
+                // fraction lives in the rasterized glyph, at most one pixel.
+                && (glyph.pos.x - col as f32 * cell_width).abs()
+                    <= 1.0 / galley.pixels_per_point + 0.001
+            })
 }
 
 /// Run de texto acumulado para emitir un solo `Shape::text` por tramo de
@@ -2005,6 +2092,147 @@ mod tests {
                 assert_eq!(*bold, expected_bold);
             }
         }
+    }
+
+    #[test]
+    fn embedded_monospace_runs_keep_each_ascii_column_at_multiple_sizes_and_dpi() {
+        // Both routes deliberately use an embedded face: this proves the
+        // custom bold-family path, not the OS's actual bold font files.
+        let ctx = egui::Context::default();
+        let bold_family = egui::FontFamily::Name(super::TERMINAL_BOLD_FONT.into());
+        let mut definitions = egui::FontDefinitions::default();
+        definitions
+            .families
+            .insert(bold_family.clone(), vec!["Hack".to_owned()]);
+        ctx.set_fonts(definitions);
+
+        for dpi in [1.0, 1.25, 2.0] {
+            let mut input = RawInput::default();
+            input
+                .viewports
+                .get_mut(&egui::ViewportId::ROOT)
+                .unwrap()
+                .native_pixels_per_point = Some(dpi);
+            run_headless_ui(&ctx, input, |_| {});
+            for base_size in [8.0, 15.0, 32.0] {
+                for zoom in [0.5, 1.0, 1.75] {
+                    let size = base_size * zoom;
+                    let cell_width = size * super::CELL_WIDTH_FACTOR;
+                    for family in [egui::FontFamily::Monospace, bold_family.clone()] {
+                        let font_id = egui::FontId::new(size, family);
+                        ctx.fonts_mut(|fonts| {
+                            for text in ["abcdefghijklmnopqrst", "!=", "->", "==", "fi", "AV"] {
+                                let mut shapes = Vec::new();
+                                super::push_terminal_text_shapes(
+                                    fonts,
+                                    &mut shapes,
+                                    pos2(40.0, 20.0),
+                                    text,
+                                    font_id.clone(),
+                                    egui::Color32::WHITE,
+                                    cell_width,
+                                );
+                                assert_eq!(shapes.len(), 1, "ASCII must remain batched: {text}");
+                                let egui::Shape::Text(shape) = &shapes[0] else {
+                                    panic!("expected a text shape");
+                                };
+                                assert_eq!(shape.pos, pos2(40.0, 20.0));
+                                assert_eq!(shape.galley.text(), text);
+                                assert_eq!(shape.galley.rows.len(), 1);
+                                assert_eq!(shape.galley.rows[0].glyphs.len(), text.len());
+                                for (col, glyph) in shape.galley.rows[0].glyphs.iter().enumerate() {
+                                    let error = (glyph.pos.x - col as f32 * cell_width).abs();
+                                    assert!(
+                                        error <= 1.0 / dpi + 0.001,
+                                        "{text} column={col} size={size} dpi={dpi}: {error}"
+                                    );
+                                    assert!(glyph.advance_width > 0.0);
+                                }
+                                assert!(shape.galley.rows[0]
+                                    .visuals
+                                    .mesh
+                                    .vertices
+                                    .iter()
+                                    .all(|vertex| vertex.pos.is_finite()));
+                            }
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ligatures_and_proportional_advances_fall_back_to_terminal_cell_origins() {
+        let ctx = egui::Context::default();
+        run_headless_ui(&ctx, RawInput::default(), |_| {});
+        ctx.fonts_mut(|fonts| {
+            // Ubuntu-Light is embedded by egui and really has fi/ffi ligatures.
+            let font_id = egui::FontId::proportional(15.0);
+            let ligature =
+                fonts.layout_no_wrap("ffi".to_owned(), font_id.clone(), egui::Color32::WHITE);
+            assert!(ligature.rows[0]
+                .glyphs
+                .iter()
+                .any(|glyph| glyph.advance_width == 0.0));
+
+            let cell_width = 9.0;
+            for text in ["fi", "ffi", "AV", "->", "!="] {
+                let mut shapes = Vec::new();
+                super::push_terminal_text_shapes(
+                    fonts,
+                    &mut shapes,
+                    pos2(40.0, 20.0),
+                    text,
+                    font_id.clone(),
+                    egui::Color32::WHITE,
+                    cell_width,
+                );
+                assert_eq!(shapes.len(), text.len(), "fallback missing: {text}");
+                for (col, (shape, chr)) in shapes.iter().zip(text.chars()).enumerate() {
+                    let egui::Shape::Text(shape) = shape else {
+                        panic!("expected a text shape");
+                    };
+                    assert_eq!(shape.pos, pos2(40.0 + col as f32 * cell_width, 20.0));
+                    assert_eq!(shape.galley.text(), chr.to_string());
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn unicode_cell_layout_keeps_clusters_without_ascii_letter_spacing() {
+        let ctx = egui::Context::default();
+        run_headless_ui(&ctx, RawInput::default(), |_| {});
+        ctx.fonts_mut(|fonts| {
+            // CJK here may use the replacement glyph. This tests placement and
+            // shaping boundaries, not coverage of fonts installed on the OS.
+            for text in ["e\u{301}", "\u{754c}", "\u{1f600}"] {
+                let mut shapes = Vec::new();
+                super::push_terminal_text_shapes(
+                    fonts,
+                    &mut shapes,
+                    pos2(40.0, 20.0),
+                    text,
+                    egui::FontId::monospace(15.0),
+                    egui::Color32::WHITE,
+                    9.0,
+                );
+                assert_eq!(shapes.len(), 1);
+                let egui::Shape::Text(shape) = &shapes[0] else {
+                    panic!("expected a text shape");
+                };
+                assert_eq!(shape.pos, pos2(40.0, 20.0));
+                assert_eq!(shape.galley.text(), text);
+                assert!(shape.galley.size().is_finite());
+                assert!(shape
+                    .galley
+                    .job
+                    .sections
+                    .iter()
+                    .all(|section| section.format.extra_letter_spacing == 0.0));
+            }
+        });
     }
 
     fn capture_foreground_runs(
