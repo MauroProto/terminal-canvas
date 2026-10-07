@@ -439,6 +439,35 @@ fn build_ghostty_row_shapes(
             continue;
         }
 
+        // Shaping/fallback advances must not move the next terminal cell.
+        // Keep ordinary ASCII batched and shape Unicode clusters separately.
+        if cell.text.len() != 1 || !cell.text.is_ascii() || cell.text == " " {
+            flush_ghostty_run(
+                fonts,
+                foreground_shapes,
+                content_rect,
+                row_index,
+                run_start,
+                &mut run_text,
+                run_style,
+                metrics,
+            );
+            run_start = col_index;
+            run_text.push_str(&cell.text);
+            flush_ghostty_run(
+                fonts,
+                foreground_shapes,
+                content_rect,
+                row_index,
+                run_start,
+                &mut run_text,
+                Some(style),
+                metrics,
+            );
+            run_style = None;
+            continue;
+        }
+
         if run_style == Some(style) {
             run_text.push_str(&cell.text);
         } else {
@@ -813,7 +842,7 @@ fn build_grid_shapes(
 }
 
 /// Run de texto acumulado para emitir un solo `Shape::text` por tramo de
-/// celdas contiguas con el mismo estilo, en vez de un shape por carácter
+/// celdas ASCII contiguas con el mismo estilo, en vez de un shape por carácter
 /// (el costo dominante del renderer: miles de galleys por frame en grids
 /// grandes). Los espacios cortan el run: mantienen cada tramo anclado a su
 /// columna y evitan deriva si el avance del glifo no clava `cell_width`.
@@ -826,6 +855,20 @@ struct TextRun {
     fg: Color32,
     italic_offset: f32,
     bold: bool,
+}
+
+fn cell_can_join_ascii_run(cell: &Cell) -> bool {
+    cell.c.is_ascii()
+        && !cell.flags.contains(Flags::WIDE_CHAR)
+        && cell.zerowidth().is_none_or(|marks| marks.is_empty())
+}
+
+fn cell_cluster_text(cell: &Cell) -> String {
+    let mut text = cell.c.to_string();
+    if let Some(marks) = cell.zerowidth() {
+        text.extend(marks);
+    }
+    text
 }
 
 impl TextRun {
@@ -940,6 +983,20 @@ fn build_full_foreground_shapes(
             && !cell.flags.contains(Flags::WIDE_CHAR_SPACER)
             && !cell.flags.contains(Flags::HIDDEN);
 
+        if drawable && !cell_can_join_ascii_run(cell) {
+            run.flush(foreground_shapes, push_text);
+            push_text(
+                foreground_shapes,
+                text_pos,
+                &cell_cluster_text(cell),
+                fg,
+                italic_offset,
+                bold,
+            );
+            draw_decoration_shapes(&mut decorations, text_pos, metrics, cell.flags, fg);
+            continue;
+        }
+
         if drawable && run.can_extend(fg, text_pos.x, text_pos.y, italic_offset, bold) {
             run.extend(ch, width);
         } else {
@@ -1016,6 +1073,19 @@ fn build_reduced_foreground_shapes(
             && !cell.flags.contains(Flags::HIDDEN)
             && !cell.flags.intersects(Flags::ALL_UNDERLINES)
             && !cell.flags.contains(Flags::STRIKEOUT);
+
+        if drawable && !cell_can_join_ascii_run(cell) {
+            run.flush(foreground_shapes, push_text);
+            push_text(
+                foreground_shapes,
+                text_pos,
+                &cell_cluster_text(cell),
+                fg,
+                italic_offset,
+                bold,
+            );
+            continue;
+        }
 
         if drawable && run.can_extend(fg, text_pos.x, text_pos.y, italic_offset, bold) {
             run.extend(ch, width);
@@ -1890,6 +1960,104 @@ mod tests {
             text_shapes, 1,
             "un tramo contiguo del mismo estilo debe emitir un solo shape de texto"
         );
+    }
+
+    #[test]
+    fn full_and_reduced_runs_anchor_unicode_clusters_to_terminal_columns() {
+        // The VT owns widths: the combining mark uses no column, while CJK
+        // and this emoji use two. These assertions do not depend on OS fonts.
+        let expected = [
+            ("A", 0),
+            ("e\u{301}", 1),
+            ("B", 2),
+            ("\u{754c}", 3),
+            ("C", 5),
+            ("\u{1f600}", 6),
+            ("D", 8),
+        ];
+        for reduced in [false, true] {
+            for zoom in [0.5, 1.0, 1.75] {
+                let runs = capture_foreground_runs("Ae\u{301}B\u{754c}C\u{1f600}D", zoom, reduced);
+                assert_eq!(runs.len(), expected.len(), "reduced={reduced}, zoom={zoom}");
+                let metrics = super::scaled_metrics(zoom);
+                for ((text, pos, bold), (expected_text, col)) in runs.iter().zip(expected) {
+                    assert_eq!(text, expected_text);
+                    assert!((pos.x - (40.0 + col as f32 * metrics.cell_width)).abs() < 0.001);
+                    assert_eq!(pos.y, 20.0);
+                    assert!(!bold);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn foreground_runs_preserve_ascii_batching_and_style_boundaries() {
+        for reduced in [false, true] {
+            let runs = capture_foreground_runs("AB \x1b[1mCD\x1b[0m E", 1.0, reduced);
+            assert_eq!(runs.len(), 3);
+            let metrics = super::scaled_metrics(1.0);
+            for ((text, pos, bold), (expected_text, col, expected_bold)) in
+                runs.iter()
+                    .zip([("AB", 0, false), ("CD", 3, true), ("E", 6, false)])
+            {
+                assert_eq!(text, expected_text);
+                assert!((pos.x - (40.0 + col as f32 * metrics.cell_width)).abs() < 0.001);
+                assert_eq!(*bold, expected_bold);
+            }
+        }
+    }
+
+    fn capture_foreground_runs(
+        text: &str,
+        zoom: f32,
+        reduced: bool,
+    ) -> Vec<(String, egui::Pos2, bool)> {
+        let term = sample_term(text);
+        let content = term.renderable_content();
+        let cells: Vec<_> = content.display_iter.collect();
+        let mut backgrounds = Vec::new();
+        let mut foregrounds = Vec::new();
+        let mut runs = Vec::new();
+        let mut capture = |_: &mut Vec<egui::Shape>,
+                           pos: egui::Pos2,
+                           text: &str,
+                           _: egui::Color32,
+                           _: f32,
+                           bold: bool| {
+            runs.push((text.to_owned(), pos, bold));
+        };
+        if reduced {
+            super::build_reduced_foreground_shapes(
+                &cells,
+                content.display_offset,
+                content.cursor,
+                None,
+                content.colors,
+                40.0,
+                20.0,
+                super::scaled_metrics(zoom),
+                1,
+                &mut backgrounds,
+                &mut foregrounds,
+                &mut capture,
+            );
+        } else {
+            super::build_full_foreground_shapes(
+                &cells,
+                content.display_offset,
+                content.cursor,
+                None,
+                content.colors,
+                40.0,
+                20.0,
+                super::scaled_metrics(zoom),
+                1,
+                &mut backgrounds,
+                &mut foregrounds,
+                &mut capture,
+            );
+        }
+        runs
     }
 
     #[test]
