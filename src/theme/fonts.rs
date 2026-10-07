@@ -241,22 +241,37 @@ mod tests {
         );
         let font = FontId::new(15.0, bold_family());
         let before = font_context(fonts.clone());
-        assert!(before.fonts_mut(|fonts| fonts.has_glyph(&font, 'A')));
-        assert!(!before.fonts_mut(|fonts| fonts.has_glyph(&font, '\u{1f600}')));
-        assert!(
-            before.fonts_mut(|fonts| { fonts.has_glyph(&FontId::monospace(15.0), '\u{1f600}') })
-        );
+        assert!(family_contains_character(&before, &font.family, 'A'));
+        assert!(!family_contains_character(
+            &before,
+            &font.family,
+            '\u{1f600}'
+        ));
+        assert!(family_contains_character(
+            &before,
+            &FontFamily::Monospace,
+            '\u{1f600}'
+        ));
 
         complete_bold_family_fallbacks(&mut fonts);
 
         let after = font_context(fonts);
-        assert!(after.fonts_mut(|fonts| fonts.has_glyph(&font, 'A')));
-        assert!(after.fonts_mut(|fonts| fonts.has_glyph(&font, '\u{1f600}')));
+        assert!(family_contains_character(&after, &font.family, 'A'));
+        assert!(family_contains_character(&after, &font.family, '\u{1f600}'));
         let galley = after.fonts_mut(|fonts| {
             fonts.layout_no_wrap("A\u{1f600}".into(), font.clone(), egui::Color32::WHITE)
         });
         assert_eq!(galley.text(), "A\u{1f600}");
         assert!(galley.size().x.is_finite() && galley.size().x > 0.0);
+        assert_eq!(galley.rows[0].glyphs.len(), 2);
+        assert!(!galley.rows[0].glyphs[1].uv_rect.is_nothing());
+    }
+
+    fn family_contains_character(ctx: &egui::Context, family: &FontFamily, chr: char) -> bool {
+        // Read the actual font charmaps. In epaint 0.36.2, has_glyph compares
+        // only font-face IDs and misreports supported characters when their
+        // face also supplies the replacement glyph (including Hack's ASCII).
+        ctx.fonts_mut(|fonts| fonts.fonts.font(family).characters().contains_key(&chr))
     }
 
     fn font_context(fonts: FontDefinitions) -> egui::Context {
