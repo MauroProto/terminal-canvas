@@ -162,6 +162,16 @@ instantáneamente esa llamada. La app conserva el texto original para el parser,
 incluidos CRLF y EOF, y pide repintado cuando termina de leer o colorear.
 Los números de línea no forman parte del texto seleccionado al copiar código.
 
+Si falla la lectura, el visor distingue una ruta ausente, acceso denegado,
+un destino que no es un archivo regular y una lectura interrumpida. Muestra
+la ruta completa y permite **Reintentar** después de resolver el problema.
+El botón **Ruta** copia la ruta completa, también para nombres Unicode largos;
+el nombre de la cabecera muestra esa ruta al pasar el mouse. No se publica un
+documento parcial cuando falla una lectura después de recibir algunos bytes.
+Un reintento reutiliza el lector activo; sólo inicia otro cuando el anterior
+ya terminó o no pudo iniciarse. Reintentar no libera una llamada al sistema
+que sigue bloqueada en un volumen remoto.
+
 Podés seleccionar con arrastre o Shift+clic, y extender la selección con
 Shift+flechas, Shift+Inicio y Shift+Fin. Ctrl+A (Cmd+A en macOS) selecciona todo el contenido
 retenido, incluso fuera de pantalla. Copiar selección conserva los terminadores
@@ -169,3 +179,8 @@ originales; Copiar línea incluye la línea lógica completa aunque se muestre e
 varias continuaciones. La barra y el menú contextual permiten copiar el archivo
 completo. Los atajos pertenecen al visor sólo mientras tiene el foco; abrir la
 paleta o volver a la terminal entrega el teclado a esa superficie.
+Los botones del visor también retienen su entrada de teclado: Tab permite
+alcanzarlos y Enter activarlos sin escribir esos eventos en el shell. Esc
+cierra el visor durante un reintento; un diálogo abierto conserva su propio
+Escape. Las acciones del visor quedan deshabilitadas al perder el foco de
+ventana o mientras hay una superficie modal activa.

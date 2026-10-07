@@ -19,13 +19,31 @@ Los graphemes habituales se mantienen juntos. Un cluster patológico de más de
 íntegro. Los saltos CRLF/LF y EOF se guardan separados del contenido visual.
 Las continuaciones no inventan números de línea ni terminadores.
 
-`file_viewer_selection` dibuja sólo las filas visibles, con un único dueño de
-foco de egui independiente de las filas. Selección, copia, arrastre, Shift+clic,
+`file_viewer_selection` dibuja sólo las filas visibles, con un dueño estable
+de foco para la selección, independiente de las filas. Selección, copia, arrastre, Shift+clic,
 flechas, Inicio/Fin, barra y menú contextual trabajan sobre offsets originales.
 La selección persiste al desplazarse y Ctrl+A incluye el contenido fuera de
 pantalla. Los metadatos de accesibilidad se limitan a los fragmentos visibles.
 La app libera el foco al abrir un modal o perder el foco de ventana y resuelve
 el visor antes de enviar el resto de la entrada a la terminal.
+
+Los errores del lector conservan su operación (`Metadata`, `Open`, `Read`)
+y `ErrorKind`; los checks de archivo regular tienen una causa propia. Un
+fallo después de leer un prefijo descarta ese prefijo. La UI muestra la causa,
+la ruta completa y un reintento que cambia la generación sin crear otro worker
+si el actual sigue disponible. Sólo se reemplaza un lector que ya se cerró.
+La cabecera reserva el ancho de sus acciones antes de truncar el nombre.
+
+El dueño de la selección conserva su identidad. Los botones registran sus
+IDs reales de egui para retener la entrada cuando se usan con Tab/Enter;
+esa autoridad se libera al cerrar, abrir otro archivo, perder foco o abrir
+una superficie modal. El reintento devuelve el foco al dueño de la selección
+cuando lo tenía el visor. Escape usa el foco actual, o el del pase anterior
+si egui acaba de soltarlo por Escape, y nunca toma un foco ajeno presente.
+Una liberación explícita invalida esa autoridad anterior en el mismo pase.
+Si Shift+Tab dejó una transferencia de foco diferida y egui borró su destino
+al recibir Escape, el visor descarta la autoridad anterior: no cierra una
+superficie por un Escape que puede pertenecer al campo de destino.
 
 El resaltador comparte el mismo buffer. Su worker comprueba las líneas antes
 de inicializar gramáticas o llamar al parser: una línea de más de 1.024 bytes,
@@ -43,8 +61,9 @@ navegación y cantidades de texto/meshes de filas visibles. Se conservan las
 regresiones de bounds y copia Unicode de la integración previa.
 
 La ejecución de estas fuentes debe quedar asociada a su SHA exacto en CI.
-El checkpoint de recuperación `d226a0ce` aprobó CI y paquetes, pero esos
-resultados no acreditan este pase posterior. No se compila ni ejecuta una GUI,
+Los checkpoints publicados `d226a0ce` (recuperación) y `1356028e` (líneas
+extensas) aprobaron CI y paquetes. Esos resultados no acreditan cambios
+posteriores de errores, reintento y controles. No se compila ni ejecuta una GUI,
 PTY, WSL o servidor local en la PC de Mauro durante esta integración.
 
 El límite por galley no es un presupuesto global de CPU, GPU o memoria.
