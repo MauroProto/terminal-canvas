@@ -829,21 +829,61 @@ fn final_save_profile_fixture() {
                 .lock()
                 .unwrap()
                 .feed_output_for_persistence_tests(b"hidden next batch\r\n");
-            let snapshot = app.snapshot_state();
+            // Activity metadata is live: a refresh can supersede the layout
+            // while a previous autosave or scrollback ACK is still in flight.
+            // Force that refresh without sleeping or depending on disk speed.
+            app.reconcile_orchestration();
+            let mut orchestration = app.orchestrator.snapshot();
+            let epoch = chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).unwrap();
+            let session = orchestration
+                .sessions
+                .iter_mut()
+                .find(|session| {
+                    session.panel_id == Some(panel_id)
+                        && session.runtime_session_id == Some(runtime_id)
+                })
+                .expect("the attached fixture session must be observed");
+            let session_id = session.session_id;
+            session.last_activity_at = epoch;
+            app.orchestrator = crate::orchestration::Orchestrator::from_saved(Some(orchestration));
+            let superseded_snapshot = app.snapshot_state();
+            app.last_orchestration_refresh = Instant::now()
+                .checked_sub(super::orchestration_ui::ORCHESTRATION_REFRESH_INTERVAL)
+                .unwrap();
+            let mut checked_refresh = false;
             let deadline = Instant::now() + Duration::from_secs(3);
-            loop {
+            let snapshot = loop {
                 let _ = ctx.run_logic(&hidden, |ctx| app.logic_impl(ctx));
-                if handle.lock().unwrap().pending_log_snapshot().is_empty()
-                    && app.persisted_state.as_ref() == Some(&snapshot)
-                {
-                    break;
+                let current_snapshot = app.snapshot_state();
+                if !checked_refresh {
+                    assert_ne!(current_snapshot, superseded_snapshot);
+                    let session = current_snapshot
+                        .orchestration
+                        .sessions
+                        .iter()
+                        .find(|session| session.panel_id == Some(panel_id))
+                        .unwrap();
+                    assert_eq!(session.session_id, session_id);
+                    assert_eq!(session.runtime_session_id, Some(runtime_id));
+                    assert!(session.last_activity_at > epoch);
+                    checked_refresh = true;
+                }
+                let pending_frames = handle.lock().unwrap().pending_log_snapshot().len();
+                let pending_inputs = app.workspaces[0].has_pending_inputs();
+                let latest_state_saved = app.persisted_state.as_ref() == Some(&current_snapshot);
+                if pending_frames == 0 && !pending_inputs && latest_state_saved {
+                    break current_snapshot;
                 }
                 assert!(
                     Instant::now() < deadline,
-                    "hidden autosave/ACK did not finish"
+                    "hidden autosave/ACK did not finish: pending_frames={pending_frames}, \
+                     pending_inputs={pending_inputs}, latest_state_saved={latest_state_saved}, \
+                     state_in_flight={}, scrollback_in_flight={}",
+                    app.persistence_worker.state_in_flight(),
+                    app.persistence_worker.scrollback_in_flight(),
                 );
                 std::thread::sleep(Duration::from_millis(5));
-            }
+            };
             assert!(!app.workspaces[0].has_pending_inputs());
             assert_eq!(
                 ctx.cumulative_pass_nr(),
