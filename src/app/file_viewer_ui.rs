@@ -396,10 +396,13 @@ fn draw_code(ui: &mut egui::Ui, viewer: &FileViewerState) {
                         egui::Layout::right_to_left(egui::Align::Center),
                         |ui| {
                             ui.add_space(8.0);
-                            ui.label(
-                                RichText::new((index + 1).to_string())
-                                    .font(font.clone())
-                                    .color(gutter_fg()),
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new((index + 1).to_string())
+                                        .font(font.clone())
+                                        .color(gutter_fg()),
+                                )
+                                .selectable(false),
                             );
                         },
                     );
@@ -650,5 +653,90 @@ mod tests {
             wide.gutter_width() > narrow.gutter_width(),
             "a 5-digit gutter must be wider than a 1-digit one"
         );
+    }
+
+    #[test]
+    fn copying_across_code_lines_keeps_unicode_and_excludes_gutter_numbers() {
+        use egui::{Event, Modifiers, PointerButton, RawInput};
+
+        let ctx = egui::Context::default();
+        let lines = ["let palabra = \"cafe\u{301}\";", "let 漢字 = 2;"];
+        let viewer = viewer_with(&lines, Vec::new());
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(620.0, 300.0));
+        let frame = |events: Vec<Event>, time: f64| {
+            let mut output = ctx.run_ui(
+                RawInput {
+                    screen_rect: Some(screen),
+                    events,
+                    time: Some(time),
+                    ..Default::default()
+                },
+                |ui| super::draw_code(ui, &viewer),
+            );
+            // This headless test inspects UI output rather than uploading fonts.
+            output.textures_delta.clear();
+            output
+        };
+        frame(Vec::new(), 0.0).drop_without_applying_deltas();
+        let output = frame(Vec::new(), 0.1);
+        let cursor_position = |line: &str, at_end: bool| {
+            let shape = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::epaint::Shape::Text(text) if text.galley.text() == line => Some(text),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("missing code line {line:?}"));
+            let cursor = if at_end {
+                shape.galley.end()
+            } else {
+                shape.galley.begin()
+            };
+            let mut position = shape.pos + shape.galley.pos_from_cursor(cursor).center().to_vec2();
+            // Keep each endpoint inside its label while choosing its first/last
+            // caret. No assumptions about Unicode glyph width or DPI are needed.
+            position.x += if at_end { -0.25 } else { 0.25 };
+            position
+        };
+        let start = cursor_position(lines[0], false);
+        let end = cursor_position(lines[1], true);
+        output.drop_without_applying_deltas();
+
+        frame(
+            vec![
+                Event::PointerMoved(start),
+                Event::PointerButton {
+                    pos: start,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Modifiers::NONE,
+                },
+            ],
+            0.2,
+        )
+        .drop_without_applying_deltas();
+        frame(vec![Event::PointerMoved(end)], 0.3).drop_without_applying_deltas();
+        frame(
+            vec![Event::PointerButton {
+                pos: end,
+                button: PointerButton::Primary,
+                pressed: false,
+                modifiers: Modifiers::NONE,
+            }],
+            0.4,
+        )
+        .drop_without_applying_deltas();
+        let output = frame(vec![Event::Copy], 0.5);
+        let copied = output
+            .platform_output
+            .commands
+            .iter()
+            .find_map(|command| match command {
+                egui::OutputCommand::CopyText(text) => Some(text.as_str()),
+                _ => None,
+            });
+        assert_eq!(copied, Some(lines.join("\n").as_str()));
+        output.drop_without_applying_deltas();
     }
 }
