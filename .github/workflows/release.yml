@@ -49,6 +49,9 @@ jobs:
       - name: Test package validation regressions
         run: python scripts/package-verify-tests.py
 
+      - name: Verify graphics dependencies and native features
+        run: python scripts/graphics-deps-verify.py
+
   macos-dmg:
     needs: metadata
     timeout-minutes: 90
@@ -239,6 +242,10 @@ jobs:
 
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
+
+      - name: Install Linux font dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libfontconfig1-dev libfreetype6-dev
 
       - name: Format check
         run: cargo fmt --all -- --check

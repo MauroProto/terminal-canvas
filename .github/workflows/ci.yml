@@ -49,9 +49,17 @@ jobs:
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
 
+      - name: Install Linux font dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libfontconfig1-dev libfreetype6-dev
+
       - name: Format check
         if: runner.os == 'Linux'
         run: cargo fmt --all -- --check
+
+      - name: Verify graphics dependencies and native features
+        if: runner.os == 'Linux'
+        run: python3 scripts/graphics-deps-verify.py
 
       - name: Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
@@ -110,6 +118,9 @@ jobs:
 
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
+
+      - name: Install Linux font dependencies
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libfontconfig1-dev libfreetype6-dev
 
       - name: Compare hot-path benchmarks
         env:
