@@ -341,10 +341,10 @@ impl PreferencesWorker {
                     },
                 );
             }
-            (Job::SaveNotes(root, _), Completion::NotesSaved(Ok(()))) => {
-                if !self.write_waiting(job.as_ref()) {
-                    self.notes_write_errors.remove(root);
-                }
+            (Job::SaveNotes(root, _), Completion::NotesSaved(Ok(())))
+                if !self.write_waiting(job.as_ref()) =>
+            {
+                self.notes_write_errors.remove(root);
             }
             (Job::SaveSettings(_), Completion::SettingsSaved(Err(error))) => {
                 self.settings_write_error = Some(FailedSave {
@@ -352,10 +352,10 @@ impl PreferencesWorker {
                     reason: format!("{error:#}"),
                 });
             }
-            (Job::SaveSettings(_), Completion::SettingsSaved(Ok(()))) => {
-                if !self.write_waiting(job.as_ref()) {
-                    self.settings_write_error = None;
-                }
+            (Job::SaveSettings(_), Completion::SettingsSaved(Ok(())))
+                if !self.write_waiting(job.as_ref()) =>
+            {
+                self.settings_write_error = None;
             }
             _ => {}
         }
