@@ -39,27 +39,56 @@ Online e invitaciones no reciben cambios funcionales.
 
 ## Evidencia del candidato
 
-La primera [CI, 37571808366](https://github.com/MauroProto/terminal-canvas/actions/runs/37571808366),
-detectó rutas de archivos arrastrados, índices de texto tipados y dos versiones
-incompatibles de los bindings Direct3D. Esos fallos se corrigieron en microcommits.
-Su auditoría terminó con sólo dos avisos de mantenimiento, `bincode 1.3.3` y
-`rustls-pemfile 2.2.0`, sin vulnerabilidades reportadas ni ignores nuevos.
-Los avisos restantes se describen en [DEPENDENCY-MAINTENANCE.md](DEPENDENCY-MAINTENANCE.md).
+El código validado es `a93286e77054bbfd803c4503860ab488585103b0`, de 97 microcommits desde
+la base revisada. Su [CI completa](https://github.com/MauroProto/terminal-canvas/actions/runs/37576723374)
+y su [ensayo de paquetes](https://github.com/MauroProto/terminal-canvas/actions/runs/37576793676)
+terminaron correctamente. Los cuatro jobs de plataforma pasaron Clippy,
+suites normales y seguridad; Unix también check/Clippy/tests con daemon.
+Formato, contrato gráfico, extensión 9/9 y auditoría pasaron. El benchmark
+comparativo se omite en pushes; los smoke tests de benchmarks sí corrieron.
+El ensayo verificó exactamente cinco paquetes y cinco checksums, helpers,
+instalación/desinstalación Inno y ambos DMG montados. Firma, notarización y
+publicación se omitieron. El cierre documental posterior y su CI exacta
+deben registrarse en el recibo externo; los paquetes corresponden al código indicado.
 
-El componente gráfico aislado aprobó 40 pruebas: fuentes, medidas, columnas,
-render completo/reducido y caché. Incluye un probe de pares ASCII en 54
-combinaciones de fuente, tamaño, zoom y DPI. Los caminos Ghostty de ese harness
-usan tipos de snapshot copiados; no ejecutan FFI, PTY ni una ventana real.
-Los cuatro tests de fuentes forman parte de esos casos, no son cuatro casos
-adicionales. La regresión de columnas Unicode falló antes del arreglo. Las
-regresiones de ligaduras/kerning usan Ubuntu-Light embebida y comprueban el
-fallback por celda; no necesitan descargar una fuente ni cargar archivos del OS.
+El componente gráfico aislado aprobó **40 pruebas**, incluidas cuatro de
+fuentes, y Clippy: medidas, columnas, render completo/reducido y caché, con
+pares ASCII en 54 combinaciones de fuente, tamaño, zoom y DPI. La regresión
+Unicode falló antes del arreglo; las regresiones de ligaduras/kerning usan
+Ubuntu-Light embebida. Ese harness usa tipos de snapshot copiados para
+Ghostty; no ejecuta FFI, GPU, PTY ni una ventana real. No sumar los cuatro
+casos de fuentes otra vez ni las suites normales/daemon como casos únicos.
 
-La [segunda CI, 37572505071](https://github.com/MauroProto/terminal-canvas/actions/runs/37572505071),
-corresponde al candidato `96ff357e746f82e352bd906effb2a1efc4443e95`.
-Los resultados de una corrida sólo acreditan su propio commit. La aprobación
-de la matriz y del ensayo de paquetes debe verificarse en el candidato final
-antes de promoverlo a la rama principal.
+| CI histórica | SHA propio | Resultado y corrección posterior |
+| --- | --- | --- |
+| [1: 37571808366](https://github.com/MauroProto/terminal-canvas/actions/runs/37571808366) | `73ba297` | FAILURE: métodos de DroppedFile, índices ByteIndex y bindings Direct3D incompatibles; corregidos. |
+| [2: 37572505071](https://github.com/MauroProto/terminal-canvas/actions/runs/37572505071) | `96ff357` | FAILURE: import ByteRangeExt de una fixture; corregido, producción intacta. |
+| [3: 37573217610](https://github.com/MauroProto/terminal-canvas/actions/runs/37573217610) | `c7745cb` | Detectó cleanup de TexturesDelta y supuesto de panel sin runtime; terminó CANCELLED tras un push posterior. Fixtures corregidas sin reducir bounds ni aserciones. |
+| [4: 37574525612](https://github.com/MauroProto/terminal-canvas/actions/runs/37574525612) | `6a7e78e` | FAILURE: sólo fixture de repaint oculto en Windows/Intel; se separó el test de fallback del polling asíncrono. |
+
+La fixture anterior pedía ver un callback cercano a 2 s aunque Restore
+pudiera pedir 16 ms antes; egui sólo notifica un mínimo nuevo. El test nuevo
+usa un scheduler aislado, un tick vacío como control y exige un deadline
+positivo y acotado por tick. Retirar el fallback de producción lo hace fallar.
+Las aserciones de entrada retenida, foco, unread, passes UI y ausencia de PTY
+real siguen intactas. El cambio afecta sólo `src/app/tests.rs`.
+
+El [ensayo anterior, Release37575466330](https://github.com/MauroProto/terminal-canvas/actions/runs/37575466330),
+de `6a7e78e`, terminó CANCELLED después de confirmar la misma fixture en
+daemon macOS ARM. Dejó **cero artefactos**: no acreditó paquetes, checksums,
+helpers, instaladores, DMG ni publicación. Las corridas anteriores sólo
+acreditan sus propios resultados y nunca los arreglos posteriores.
+
+La auditoría de `a93286e` pasó sin vulnerabilidades reportadas y con dos
+avisos de mantenimiento, `bincode 1.3.3` y `rustls-pemfile 2.2.0`, sin ignores
+nuevos. Es evidencia de esa consulta, no una garantía permanente; ver
+[DEPENDENCY-MAINTENANCE.md](DEPENDENCY-MAINTENANCE.md).
+
+La validación nativa de GPU/driver, fuentes, clipboard, accesibilidad, PTY y
+agentes reales sigue pendiente, además de firma/notarización, upgrades
+firmados, publicación y Homebrew. Las pruebas headless y los paquetes de
+ensayo sin firma no acreditan esas tareas. Online e invitaciones permanecen
+excluidos de cambios funcionales.
 
 ## Validación nativa pendiente
 
@@ -81,6 +110,12 @@ bounds. Mantener salida activa mientras la ventana está oculta, reabrirla,
 cerrar normalmente y repetir una terminación abrupta; comparar layout e
 historial con la copia inicial. Registrar sistema, driver, escala, fuente,
 commit y resultado sin incluir contenido privado.
+
+Medir fluidez, latencia y consumo de CPU/GPU/memoria con varias terminales
+activas y al cambiar fuente o DPI. Los benchmarks actuales comprueban
+serialización de scrollback, diff y highlighting; no miden el dibujo del grid
+en GPU ni la latencia de la ventana. Registrar una comparación en el mismo
+hardware antes de acreditar rendimiento nativo.
 
 Las pruebas headless y los paquetes sin firma no acreditan apariencia nativa,
 accesibilidad real, consumo de GPU ni upgrades firmados. Ghostty conserva su
