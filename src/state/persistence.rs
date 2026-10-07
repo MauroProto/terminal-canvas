@@ -1664,4 +1664,82 @@ mod bounded_layout_tests {
         assert!(save_state_to_path_with_limit(&path, &larger, larger_bytes.len() - 1).is_err());
         assert_eq!(snapshot(directory.path()), before);
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_layout_regular_links_load_but_present_dangling_links_block_fallback() {
+        use std::os::unix::fs::symlink;
+        for link_in_backup in [false, true] {
+            for dangling in [false, true] {
+                let directory = TempDirectory::new();
+                let path = directory.path().join("layout.json");
+                let target = directory.path().join("target.json");
+                let state = sample_state("regular linked source");
+                let bytes = pretty_bytes(&state);
+                if !dangling {
+                    std::fs::write(&target, &bytes).unwrap();
+                }
+                let link = if link_in_backup {
+                    std::fs::write(&path, b"{invalid primary").unwrap();
+                    std::fs::write(backup_path(&path, 1), &bytes).unwrap();
+                    backup_path(&path, 0)
+                } else {
+                    std::fs::write(backup_path(&path, 0), &bytes).unwrap();
+                    path.clone()
+                };
+                symlink(&target, &link).unwrap();
+                let before = snapshot(directory.path());
+                let result = load_state_result_from_path_with_limit(&path, bytes.len());
+                if dangling {
+                    expect_read_error(result, &link);
+                } else {
+                    assert_eq!(result, StateLoadResult::Loaded(state));
+                }
+                assert_eq!(snapshot(directory.path()), before);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_layout_fifo_primary_and_each_backup_fail_without_a_peer_or_unbounded_join() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        for index in 0..=BACKUP_SLOTS {
+            let directory = TempDirectory::new();
+            let path = directory.path().join("layout.json");
+            let state = sample_state("later readable snapshot");
+            let bytes = pretty_bytes(&state);
+            let candidates: Vec<_> = std::iter::once(path.clone())
+                .chain((0..BACKUP_SLOTS).map(|slot| backup_path(&path, slot)))
+                .collect();
+            for earlier in &candidates[..index] {
+                std::fs::write(earlier, b"{invalid earlier snapshot").unwrap();
+            }
+            if let Some(later) = candidates.get(index + 1) {
+                std::fs::write(later, &bytes).unwrap();
+            }
+            let fifo = &candidates[index];
+            let fifo_c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+            // SAFETY: fifo_c owns a NUL-terminated path valid for this call.
+            assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+            let before = snapshot(directory.path());
+            let worker_path = path.clone();
+            let limit = bytes.len();
+            let (sender, receiver) = mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let result = load_state_result_from_path_with_limit(&worker_path, limit);
+                let _ = sender.send(result);
+            });
+            // A timeout detaches this handle during unwinding. No scoped join
+            // or FIFO peer can mask a regression that waits in open/read.
+            let result = receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+            worker.join().unwrap();
+            expect_read_error(result, fifo);
+            assert_eq!(snapshot(directory.path()), before);
+        }
+    }
 }
