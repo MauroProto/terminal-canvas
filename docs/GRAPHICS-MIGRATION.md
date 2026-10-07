@@ -25,6 +25,9 @@ Los clusters Unicode y sus caracteres combinados se dibujan en su columna.
 Los tramos ASCII ordinarios se mantienen agrupados. La caché sigue considerando
 revisión, tamaño real de fuente, DPI y generación del atlas. El fallback de
 negrita conserva la fuente primaria y las fuentes de símbolos/emoji.
+El spacing ASCII se ajusta al avance real de la fuente. Si aparecen ligaduras,
+kerning o avances no uniformes, cada celda se ancla por separado; los clusters
+Unicode no reciben ese spacing adicional.
 
 Se conservan accesibilidad, clipboard, apertura de enlaces, X11, Wayland y los
 backends de render anteriores. Las decoraciones Wayland usan crossfont con
@@ -43,12 +46,14 @@ Su auditoría terminó con sólo dos avisos de mantenimiento, `bincode 1.3.3` y
 `rustls-pemfile 2.2.0`, sin vulnerabilidades reportadas ni ignores nuevos.
 Los avisos restantes se describen en [DEPENDENCY-MAINTENANCE.md](DEPENDENCY-MAINTENANCE.md).
 
-El componente gráfico aislado aprobó 36 pruebas: fuentes, medidas, columnas,
+El componente gráfico aislado aprobó 40 pruebas: fuentes, medidas, columnas,
 render completo/reducido y caché. Incluye un probe de pares ASCII en 54
 combinaciones de fuente, tamaño, zoom y DPI. Los caminos Ghostty de ese harness
 usan tipos de snapshot copiados; no ejecutan FFI, PTY ni una ventana real.
 Los cuatro tests de fuentes forman parte de esos casos, no son cuatro casos
-adicionales. La regresión de columnas Unicode falló antes del arreglo.
+adicionales. La regresión de columnas Unicode falló antes del arreglo. Las
+regresiones de ligaduras/kerning usan Ubuntu-Light embebida y comprueban el
+fallback por celda; no necesitan descargar una fuente ni cargar archivos del OS.
 
 La [segunda CI, 37572505071](https://github.com/MauroProto/terminal-canvas/actions/runs/37572505071),
 corresponde al candidato `96ff357e746f82e352bd906effb2a1efc4443e95`.
