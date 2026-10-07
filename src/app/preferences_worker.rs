@@ -4,7 +4,7 @@
 //! a worker that has stopped.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -375,6 +375,26 @@ impl PreferencesWorker {
     pub(super) fn save_notes(&mut self, root: PathBuf, notes: DiffNotes) {
         self.submit(Job::SaveNotes(root, notes));
     }
+
+    /// Inspect the newest accepted notes payload without retrying, copying or
+    /// clearing its save error. Only an explicit UI action should clone it.
+    pub(super) fn retained_notes_for_repository(&self, root: &Path) -> Option<&DiffNotes> {
+        self.pending
+            .iter()
+            .rev()
+            .chain(self.active.iter())
+            .chain(self.failed_active.iter())
+            .chain(
+                self.notes_write_errors
+                    .get(root)
+                    .map(|failure| &failure.job),
+            )
+            .find_map(|job| match job.as_ref() {
+                Job::SaveNotes(job_root, notes) if job_root.as_path() == root => Some(notes),
+                _ => None,
+            })
+    }
+
     pub(super) fn load_notes(&mut self, key: Uuid, root: PathBuf) -> Uuid {
         if let Some(failure) = self.notes_write_errors.get(&root) {
             if !self.write_waiting(failure.job.as_ref()) {
