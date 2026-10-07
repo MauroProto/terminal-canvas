@@ -167,17 +167,22 @@ fn wait_for_idle(harness: &mut Harness<'_, TerminalApp>) {
 }
 
 fn painted_contains(output: &egui::FullOutput, needle: &str) -> bool {
-    fn contains(shape: &egui::epaint::Shape, needle: &str) -> bool {
+    fn contains(shape: &egui::epaint::Shape, clip: egui::Rect, needle: &str) -> bool {
         match shape {
-            egui::epaint::Shape::Text(text) => text.galley.job.text.contains(needle),
-            egui::epaint::Shape::Vec(shapes) => shapes.iter().any(|shape| contains(shape, needle)),
+            egui::epaint::Shape::Text(text) => {
+                text.galley.job.text.contains(needle)
+                    && clip.intersects(shape.visual_bounding_rect())
+            }
+            egui::epaint::Shape::Vec(shapes) => {
+                shapes.iter().any(|shape| contains(shape, clip, needle))
+            }
             _ => false,
         }
     }
     output
         .shapes
         .iter()
-        .any(|shape| contains(&shape.shape, needle))
+        .any(|shape| contains(&shape.shape, shape.clip_rect, needle))
 }
 
 fn notes_with(body: &str) -> DiffNotes {
