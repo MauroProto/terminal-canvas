@@ -49,6 +49,73 @@ fn detached_test_app_with_panel(ctx: &egui::Context) -> super::TerminalApp {
 }
 
 #[test]
+fn hidden_logic_polls_an_export_without_waiting_for_its_writer() {
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    let ctx = egui::Context::default();
+    let mut app = detached_test_app_with_panel(&ctx);
+    let (started, observed) = mpsc::channel();
+    let (release, resume) = mpsc::channel();
+    app.export_worker = super::export_worker::ExportWorker::with_processor_for_tests(move |_| {
+        started.send(()).unwrap();
+        resume.recv_timeout(Duration::from_secs(5)).unwrap();
+        super::export_worker::Completion {
+            kind: super::export_worker::Kind::Text { lines: 2 },
+            result: Err("controlled disk failure".to_owned()),
+        }
+    });
+    app.submit_export(super::export_worker::Job::Text {
+        path: "controlled-export.txt".into(),
+        text: "one\ntwo\n".to_owned(),
+        lines: 2,
+    });
+    observed.recv_timeout(Duration::from_secs(5)).unwrap();
+    let hidden = RawInput {
+        focused: false,
+        ..Default::default()
+    };
+    let _ = ctx.run_logic(&hidden, |ctx| app.logic_impl(ctx));
+    assert!(
+        app.export_worker.busy(),
+        "logic must not wait for the writer"
+    );
+    app.toasts = Default::default();
+    release.send(()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while app.export_worker.busy() && Instant::now() < deadline {
+        let _ = ctx.run_logic(&hidden, |ctx| app.logic_impl(ctx));
+        std::thread::yield_now();
+    }
+    assert!(!app.export_worker.busy());
+    assert!(!app.toasts.is_empty(), "a failed export must be visible");
+}
+
+#[test]
+fn closing_the_app_finishes_an_accepted_export_even_without_layout_ownership() {
+    use eframe::App;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let ctx = egui::Context::default();
+    let mut app = detached_test_app_with_panel(&ctx);
+    assert!(!app.persistence_writes_enabled);
+    let (finished, observed) = mpsc::channel();
+    app.export_worker = super::export_worker::ExportWorker::with_processor_for_tests(move |_| {
+        finished.send(()).unwrap();
+        super::export_worker::Completion {
+            kind: super::export_worker::Kind::Diagnostics,
+            result: Ok("accepted-diagnostics.zip".into()),
+        }
+    });
+    app.submit_export(super::export_worker::Job::Diagnostics { version: "test" });
+    app.on_exit(None);
+    observed.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(!app.export_worker.busy());
+    assert!(!app.toasts.is_empty());
+}
+
+#[test]
 fn test_app_never_owns_the_users_run_marker() {
     let ctx = egui::Context::default();
     let app = super::TerminalApp::new_for_tests(&ctx);

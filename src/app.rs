@@ -31,6 +31,7 @@ mod collab_ui;
 mod desktop;
 mod dialogs;
 mod export_action;
+mod export_worker;
 mod file_viewer_reader;
 mod file_viewer_ui;
 mod memory_ui;
@@ -95,6 +96,7 @@ pub struct TerminalApp {
     search_panel_id: Option<Uuid>,
     code_review: Option<CodeReviewState>,
     preferences_worker: preferences_worker::PreferencesWorker,
+    export_worker: export_worker::ExportWorker,
     diff_loader: crate::orchestration::DiffLoader,
     worktree_ops: crate::orchestration::WorktreeOps,
     quick_open: Option<QuickOpenState>,
@@ -308,6 +310,7 @@ impl TerminalApp {
                 search_panel_id: None,
                 code_review: None,
                 preferences_worker: Default::default(),
+                export_worker: export_worker::ExportWorker::new(),
                 diff_loader: crate::orchestration::DiffLoader::default(),
                 worktree_ops: crate::orchestration::WorktreeOps::default(),
                 quick_open: None,
@@ -416,6 +419,7 @@ impl TerminalApp {
                 search_panel_id: None,
                 code_review: None,
                 preferences_worker: Default::default(),
+                export_worker: export_worker::ExportWorker::new(),
                 diff_loader: crate::orchestration::DiffLoader::default(),
                 worktree_ops: crate::orchestration::WorktreeOps::default(),
                 quick_open: None,
@@ -1154,6 +1158,7 @@ impl TerminalApp {
             return;
         }
         if self.preferences_worker.busy()
+            || self.export_worker.busy()
             || self.persistence_worker.state_in_flight()
             || self.persistence_worker.scrollback_in_flight()
         {
@@ -1411,6 +1416,7 @@ impl TerminalApp {
         self.maybe_refresh_orchestration();
         self.poll_diff_loader();
         self.poll_preferences_worker();
+        self.poll_exports(ctx);
         if self.preferences_worker.busy() {
             ctx.request_repaint_after(Duration::from_millis(80));
         }
@@ -1648,12 +1654,9 @@ impl TerminalApp {
     /// Exporta el diagnóstico a Descargas (Ship-it 7.5). Sin secretos: los
     /// tokens se redactan y los títulos/paths se hashean.
     fn export_diagnostics(&mut self) {
-        match crate::utils::diagnostics::export(env!("CARGO_PKG_VERSION")) {
-            Ok(path) => {
-                self.toast_success(format!("Diagnóstico en {}", path.display()));
-            }
-            Err(err) => self.toast_error(format!("No se pudo exportar el diagnóstico: {err}")),
-        }
+        self.submit_export(export_worker::Job::Diagnostics {
+            version: env!("CARGO_PKG_VERSION"),
+        });
     }
 
     /// Guarda el scrollback de cada panel vivo de todos los workspaces y borra
@@ -2484,6 +2487,9 @@ impl eframe::App for TerminalApp {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.collab.stop_session();
+        if let Some(completion) = self.export_worker.drain() {
+            self.finish_export(completion);
+        }
         let saved_cleanly = if self.persistence_writes_enabled {
             match self.persist_final_state() {
                 Ok(()) => true,
