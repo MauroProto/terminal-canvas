@@ -109,6 +109,13 @@ pub(crate) fn select_syntax<'a>(
     // embedded React grammar; module extensions use the same grammar as .js.
     // Native extension definitions remain authoritative when assets change.
     if file_name.contains('.') {
+        // Preserve case-sensitive definitions such as .C (C++) before trying
+        // the lowercase spelling of extensions such as .PY or .TSX.
+        if extension.bytes().any(|byte| byte.is_ascii_uppercase()) {
+            if let Some(syntax) = set.find_syntax_by_extension(&extension.to_ascii_lowercase()) {
+                return Some(syntax);
+            }
+        }
         let alias = if extension.eq_ignore_ascii_case("jsx") {
             Some("TypeScriptReact")
         } else if extension.eq_ignore_ascii_case("mjs") || extension.eq_ignore_ascii_case("cjs") {
@@ -940,6 +947,67 @@ mod tests {
                     assert_eq!(actual.iter().map(|line| joined(line)).collect::<Vec<_>>(), source.lines().collect::<Vec<_>>(), "{file}");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn uppercase_extensions_preserve_native_case_and_visible_text() {
+        for (lowercase, uppercase, source) in [
+            (
+                "app.py",
+                "app.PY",
+                "# café 🐈 界 e\u{301}\nvalue = 42\nprint(value)",
+            ),
+            (
+                "app.js",
+                "app.JS",
+                "/* café 🐈 界 e\u{301} */\nconst value = `answer ${42}`;\n",
+            ),
+            (
+                "Card.tsx",
+                "Card.TSX",
+                "const Card = () => <strong>{42}</strong>;\nconst after = 3;",
+            ),
+            (
+                "config.toml",
+                "config.TOML",
+                "# café 🐈 界 e\u{301}\n[settings]\nvalue = 42\n",
+            ),
+        ] {
+            assert_eq!(
+                detect_language(uppercase, ""),
+                detect_language(lowercase, ""),
+                "{uppercase}"
+            );
+            assert!(detect_language(uppercase, "").is_some(), "{uppercase}");
+            for source in [source.to_owned(), source.replace('\n', "\r\n")] {
+                let actual = highlight_text(uppercase, &source);
+                assert_eq!(
+                    coloured_characters(&actual),
+                    coloured_characters(&highlight_text(lowercase, &source)),
+                    "{uppercase}"
+                );
+                assert_eq!(
+                    actual.iter().map(|line| joined(line)).collect::<Vec<_>>(),
+                    source.lines().collect::<Vec<_>>(),
+                    "{uppercase}"
+                );
+            }
+        }
+        for (file, language) in [("app.C", "C++"), ("app.c", "C"), ("analysis.R", "R")] {
+            assert_eq!(
+                detect_language(file, "#!/bin/bash").as_deref(),
+                Some(language),
+                "{file}"
+            );
+        }
+        for file in ["JS", "PY", "TSX", "app.JS.backup", "app."] {
+            assert_eq!(detect_language(file, ""), None, "{file}");
+            assert_eq!(
+                detect_language(file, "#!/bin/bash"),
+                detect_language("deploy", "#!/bin/bash"),
+                "{file}"
+            );
         }
     }
 
