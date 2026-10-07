@@ -182,7 +182,7 @@ impl TerminalApp {
         }
 
         let mut close = false;
-        let screen = ctx.screen_rect();
+        let screen = ctx.content_rect();
         egui::Area::new(egui::Id::new("code-review-backdrop"))
             .order(egui::Order::Middle)
             .fixed_pos(screen.min)
@@ -1340,7 +1340,7 @@ fn file_name(path: &str) -> String {
 
 fn branch_badge(ui: &mut egui::Ui, branch: &str) {
     let font = FontId::monospace(10.5);
-    let text_w = ui.fonts(|fonts| {
+    let text_w = ui.fonts_mut(|fonts| {
         fonts
             .layout_no_wrap(branch.to_owned(), font.clone(), palette::TEXT)
             .size()
@@ -1549,7 +1549,7 @@ fn draw_note_row(
     let sent_suffix = if note.sent_at.is_some() { "  ✓" } else { "" };
     let font = FontId::monospace(MONO_SIZE * 0.95);
     let max_w = rect.width() - GUTTER_W * 2.0 - 120.0;
-    let text_w = ui.fonts(|fonts| {
+    let text_w = ui.fonts_mut(|fonts| {
         fonts
             .layout_no_wrap(format!("{label}{sent_suffix}"), font.clone(), palette::TEXT)
             .size()

@@ -72,7 +72,7 @@ impl TerminalApp {
 
         let mut save = false;
         let mut cancel = false;
-        let screen = ctx.screen_rect();
+        let screen = ctx.content_rect();
 
         egui::Area::new(egui::Id::new("settings-backdrop"))
             .order(egui::Order::Middle)

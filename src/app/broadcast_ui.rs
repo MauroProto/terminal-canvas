@@ -117,7 +117,7 @@ impl TerminalApp {
         self.refresh_broadcast_targets();
         let mut send = false;
         let mut cancel = false;
-        let screen = ctx.screen_rect();
+        let screen = ctx.content_rect();
 
         egui::Area::new(egui::Id::new("broadcast-backdrop"))
             .order(egui::Order::Middle)

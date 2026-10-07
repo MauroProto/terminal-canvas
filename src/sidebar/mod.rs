@@ -247,7 +247,7 @@ impl Sidebar {
 
         // Pre-medir cada label para construir hit-rects ajustados al texto.
         let measure = |text: &str| -> f32 {
-            ui.fonts(|fonts| {
+            ui.fonts_mut(|fonts| {
                 fonts
                     .layout_no_wrap(text.to_owned(), font.clone(), TEXT_PRIMARY)
                     .size()

@@ -133,7 +133,7 @@ impl TerminalApp {
         // fundido avance incluso sin input del usuario.
         ctx.request_repaint();
 
-        let screen = ctx.screen_rect();
+        let screen = ctx.content_rect();
         let font = FontId::proportional(12.0);
         let width = 320.0;
         let margin = 18.0;
@@ -141,7 +141,7 @@ impl TerminalApp {
 
         // De abajo hacia arriba: el más nuevo queda pegado al borde inferior.
         for (toast, alpha) in visible.iter().rev() {
-            let galley = ctx.fonts(|fonts| {
+            let galley = ctx.fonts_mut(|fonts| {
                 fonts.layout(
                     toast.text.clone(),
                     font.clone(),

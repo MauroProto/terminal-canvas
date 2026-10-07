@@ -16,7 +16,7 @@ fn dialog_backdrop(ctx: &egui::Context) {
         .order(Order::Middle)
         .fixed_pos(pos2(0.0, 0.0))
         .show(ctx, |ui| {
-            let rect = ctx.screen_rect();
+            let rect = ctx.content_rect();
             ui.painter()
                 .rect_filled(rect, 0.0, Color32::from_rgba_premultiplied(0, 0, 0, 170));
         });
@@ -88,7 +88,7 @@ fn dialog_multiline(ui: &mut egui::Ui, value: &mut String, height: f32) -> Respo
 
 pub(super) fn dialog_action_button(ui: &mut egui::Ui, label: &str, primary: bool) -> bool {
     let font = FontId::proportional(12.0);
-    let text_w = ui.fonts(|f| {
+    let text_w = ui.fonts_mut(|f| {
         f.layout_no_wrap(label.to_owned(), font.clone(), palette::TEXT)
             .size()
             .x
@@ -141,7 +141,7 @@ fn dialog_button_row(ui: &mut egui::Ui, secondary: &str, primary: &str) -> (bool
 
 fn dialog_inline_link(ui: &mut egui::Ui, label: &str) -> bool {
     let font = FontId::proportional(11.0);
-    let text_w = ui.fonts(|f| {
+    let text_w = ui.fonts_mut(|f| {
         f.layout_no_wrap(label.to_owned(), font.clone(), palette::TEXT)
             .size()
             .x
