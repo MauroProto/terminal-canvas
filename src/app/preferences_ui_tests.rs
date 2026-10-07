@@ -1065,3 +1065,469 @@ fn retained_notes_recovery_requires_failed_matching_review_and_same_root_snapsho
     ))));
     wait_for_idle(&mut harness);
 }
+
+struct BoundedNotesIoControl {
+    observed: Receiver<(AcceptedJob, Option<String>)>,
+    releases: Sender<()>,
+}
+
+impl BoundedNotesIoControl {
+    fn release(&self) {
+        assert!(
+            self.releases.send(()).is_ok(),
+            "bounded notes writer stopped before ACK release"
+        );
+    }
+}
+
+fn bounded_notes_writer(
+    expected_root: PathBuf,
+    current: PathBuf,
+    legacy: PathBuf,
+    limit: usize,
+) -> (PreferencesWorker, BoundedNotesIoControl) {
+    let (accepted, observed) = mpsc::channel();
+    let (releases, resume) = mpsc::channel();
+    let worker = PreferencesWorker::with_processor_for_tests(move |job| {
+        let (snapshot, completion) = match job {
+            Job::LoadNotes(key, request, root) => {
+                assert_eq!(root, &expected_root);
+                (
+                    AcceptedJob::Load(*key, *request, root.clone()),
+                    Completion::NotesLoaded {
+                        key: *key,
+                        request: *request,
+                        repo_root: root.clone(),
+                        result: crate::orchestration::test_load_notes_from_path_with_limit(
+                            &current, limit, false,
+                        )
+                        .map(|notes| (notes, legacy.is_file())),
+                    },
+                )
+            }
+            Job::ImportNotes(key, request, root) => {
+                assert_eq!(root, &expected_root);
+                (
+                    AcceptedJob::Import(*key, *request, root.clone()),
+                    Completion::NotesImported {
+                        key: *key,
+                        request: *request,
+                        repo_root: root.clone(),
+                        result: crate::orchestration::test_load_notes_from_path_with_limit(
+                            &legacy, limit, true,
+                        ),
+                    },
+                )
+            }
+            Job::SaveNotes(root, notes) => {
+                assert_eq!(root, &expected_root);
+                (
+                    AcceptedJob::Notes(root.clone(), notes.clone()),
+                    Completion::NotesSaved(
+                        crate::orchestration::test_save_notes_to_path_with_limit(
+                            &current, notes, limit,
+                        ),
+                    ),
+                )
+            }
+            Job::SaveSettings(_) => panic!("bounded notes fixture must never access configuration"),
+        };
+        let error = match &completion {
+            Completion::NotesLoaded { result, .. } => result.as_ref().err(),
+            Completion::NotesImported { result, .. } => result.as_ref().err(),
+            Completion::NotesSaved(result) | Completion::SettingsSaved(result) => {
+                result.as_ref().err()
+            }
+        }
+        .map(|error| format!("{error:#}"));
+        let _ = accepted.send((snapshot, error));
+        // Only delivery of the real I/O completion is controlled. There is
+        // no synthetic size failure or success without a durable write.
+        if let Err(error) = resume.recv_timeout(DEADLINE) {
+            let reason = format!("bounded notes ACK was not released: {error}");
+            return match job {
+                Job::LoadNotes(key, request, root) => Completion::NotesLoaded {
+                    key: *key,
+                    request: *request,
+                    repo_root: root.clone(),
+                    result: Err(anyhow::anyhow!(reason)),
+                },
+                Job::ImportNotes(key, request, root) => Completion::NotesImported {
+                    key: *key,
+                    request: *request,
+                    repo_root: root.clone(),
+                    result: Err(anyhow::anyhow!(reason)),
+                },
+                Job::SaveNotes(_, _) => Completion::NotesSaved(Err(anyhow::anyhow!(reason))),
+                Job::SaveSettings(_) => unreachable!("settings rejected before I/O"),
+            };
+        }
+        completion
+    });
+    (worker, BoundedNotesIoControl { observed, releases })
+}
+
+fn next_bounded_notes_io(
+    harness: &mut Harness<'_, TerminalApp>,
+    control: &BoundedNotesIoControl,
+) -> (AcceptedJob, Option<String>) {
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        harness.state_mut().poll_preferences_worker();
+        match control.observed.try_recv() {
+            Ok(event) => return event,
+            Err(TryRecvError::Disconnected) => panic!("bounded notes writer disconnected"),
+            Err(TryRecvError::Empty) => {}
+        }
+        assert!(
+            Instant::now() < deadline,
+            "bounded notes I/O did not finish: busy={}, warning={:?}",
+            harness.state().preferences_worker.busy(),
+            harness.state().preferences_worker.warning()
+        );
+        std::thread::yield_now();
+    }
+}
+
+#[test]
+fn oversized_import_merge_survives_review_reopen_and_reduced_notes_reload_durably() {
+    // The existing RAII scratch directory outlives the harness and its worker.
+    // No config_path, notes_dir, real PTY, DiffLoader or profile is used.
+    let temporary = TemporaryConfig::new();
+    std::fs::create_dir_all(&temporary.0).unwrap();
+    let root = temporary.0.join("synthetic-repository");
+    let current_path = temporary.0.join("current.json");
+    let legacy_path = temporary.0.join("legacy.json");
+    let backup_path = crate::state::durable_write::backup_path(&current_path, 0);
+    let fixed_time = chrono::DateTime::parse_from_rfc3339("2024-01-02T03:04:05Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let mut current = notes_with("Shared Unicode: café, 日本語, \"quotes\", \\ and newline\n");
+    current.notes[0].old_side = true;
+    current.notes[0].start_line = Some(1);
+    current.notes[0].review_identity = Some("shared-review-identity".to_owned());
+    current.add(
+        "current-outside-diff.rs",
+        Some(4),
+        6,
+        &"Existing metadata: á\\\n\"保留\"".repeat(4),
+    );
+    let shared_id = current.notes[0].id;
+    let mut legacy = DiffNotes {
+        notes: vec![current.notes[0].clone()],
+    };
+    let imported_id = legacy.add(
+        "imported-outside-diff.rs",
+        Some(8),
+        9,
+        &"Imported Unicode: 👩🏽‍💻 café, \"quotes\", \\ and CRLF\r\n".repeat(32),
+    );
+    for note in current.notes.iter_mut().chain(legacy.notes.iter_mut()) {
+        note.created_at = fixed_time;
+        note.sent_at = Some(fixed_time);
+    }
+    legacy.notes[0] = current.notes[0].clone();
+    legacy.notes[1].old_side = true;
+    legacy.notes[1].review_identity = Some("imported-review-identity".to_owned());
+    let mut merged = current.clone();
+    merged.notes.push(legacy.notes[1].clone());
+    let mut reduced = merged.clone();
+    reduced.edit(imported_id, "small ñ");
+    let current_bytes = serde_json::to_vec_pretty(&current).unwrap();
+    let legacy_bytes = serde_json::to_vec_pretty(&legacy).unwrap();
+    let merged_bytes = serde_json::to_vec_pretty(&merged).unwrap();
+    let reduced_bytes = serde_json::to_vec_pretty(&reduced).unwrap();
+    let limit = current_bytes
+        .len()
+        .max(legacy_bytes.len())
+        .max(reduced_bytes.len());
+    assert!(limit <= 16 * 1024 && merged_bytes.len() > limit);
+    std::fs::write(&current_path, &current_bytes).unwrap();
+    std::fs::write(&legacy_path, &legacy_bytes).unwrap();
+    std::fs::write(&backup_path, b"preserved earlier backup").unwrap();
+    let before: Vec<_> = [&current_path, &legacy_path, &backup_path]
+        .into_iter()
+        .map(|path| {
+            (
+                path.to_path_buf(),
+                std::fs::read(path).unwrap(),
+                std::fs::metadata(path).unwrap().modified().unwrap(),
+            )
+        })
+        .collect();
+    let entries = || {
+        let mut names: Vec<_> = std::fs::read_dir(&temporary.0)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        names.sort();
+        names
+    };
+    let names_before = entries();
+    let assert_preserved = || {
+        for (path, bytes, modified) in &before {
+            assert_eq!(&std::fs::read(path).unwrap(), bytes);
+            assert_eq!(
+                &std::fs::metadata(path).unwrap().modified().unwrap(),
+                modified
+            );
+        }
+        assert_eq!(
+            entries(),
+            names_before,
+            "failed serialization must not create or rotate files"
+        );
+    };
+    let (worker, control) = bounded_notes_writer(
+        root.clone(),
+        current_path.clone(),
+        legacy_path.clone(),
+        limit,
+    );
+    let mut app = detached_app();
+    app.preferences_worker = worker;
+    let key = Uuid::new_v4();
+    app.code_review = Some(review_state(
+        key,
+        Uuid::new_v4(),
+        root.clone(),
+        DiffNotes::default(),
+    ));
+    // Warm the headless UI before starting the bounded ACK clock.
+    let mut harness = preferences_harness(app);
+    let request = harness
+        .state_mut()
+        .preferences_worker
+        .load_notes(key, root.clone());
+    harness
+        .state_mut()
+        .code_review
+        .as_mut()
+        .unwrap()
+        .notes_request = request;
+    let (job, error) = next_bounded_notes_io(&mut harness, &control);
+    assert!(
+        matches!(job, AcceptedJob::Load(actual_key, actual_request, ref actual_root)
+        if actual_key == key && actual_request == request && actual_root == &root)
+    );
+    assert!(error.is_none());
+    control.release();
+    wait_for_idle(&mut harness);
+    let state = harness.state().code_review.as_ref().unwrap();
+    assert!(state.notes_ready && !state.notes_loading && state.legacy_notes_available);
+    assert_eq!(state.notes, current);
+    assert_preserved();
+
+    harness.get_by_label("Importar notas anteriores").click();
+    harness.step();
+    let (job, error) = next_bounded_notes_io(&mut harness, &control);
+    let AcceptedJob::Import(actual_key, import_request, actual_root) = job else {
+        panic!("expected real legacy import");
+    };
+    assert_eq!((actual_key, actual_root), (key, root.clone()));
+    assert!(error.is_none());
+    assert_eq!(
+        harness.state().code_review.as_ref().unwrap().import_request,
+        Some(import_request)
+    );
+    control.release();
+    let (job, error) = next_bounded_notes_io(&mut harness, &control);
+    assert!(
+        matches!(job, AcceptedJob::Notes(ref actual_root, ref value) if actual_root == &root && value == &merged)
+    );
+    let error = error.expect("real pretty JSON merge must exceed the injected limit");
+    assert!(
+        error.contains(&current_path.display().to_string())
+            && error.contains(&format!("{limit} bytes"))
+    );
+    assert_eq!(harness.state().code_review.as_ref().unwrap().notes, merged);
+    assert_eq!(
+        merged
+            .notes
+            .iter()
+            .filter(|note| note.id == shared_id)
+            .count(),
+        1
+    );
+    assert_preserved();
+    control.release();
+    wait_for_idle(&mut harness);
+    let warning = harness
+        .state()
+        .preferences_worker
+        .warning()
+        .expect("size failure must stay visible");
+    assert!(
+        warning.contains(&current_path.display().to_string())
+            && warning.contains(&format!("{limit} bytes"))
+    );
+    assert_eq!(
+        harness
+            .state()
+            .preferences_worker
+            .retained_notes_for_repository(&root),
+        Some(&merged)
+    );
+    assert!(harness
+        .state()
+        .code_review
+        .as_ref()
+        .unwrap()
+        .import_request
+        .is_none());
+
+    harness.key_press(egui::Key::Escape);
+    harness.run_steps(2);
+    assert!(harness.state().code_review.is_none());
+    assert_eq!(
+        harness
+            .state()
+            .preferences_worker
+            .retained_notes_for_repository(&root),
+        Some(&merged)
+    );
+    let reopened_key = Uuid::new_v4();
+    let reopened_request = harness
+        .state_mut()
+        .preferences_worker
+        .load_notes(reopened_key, root.clone());
+    harness.state_mut().code_review = Some(review_state(
+        reopened_key,
+        reopened_request,
+        root.clone(),
+        DiffNotes::default(),
+    ));
+    let (job, error) = next_bounded_notes_io(&mut harness, &control);
+    assert!(
+        matches!(job, AcceptedJob::Notes(ref actual_root, ref value) if actual_root == &root && value == &merged),
+        "normal reopening retries the retained snapshot before a disk read"
+    );
+    assert!(error.unwrap().contains(&format!("{limit} bytes")));
+    assert_preserved();
+    control.release();
+    wait_for_idle(&mut harness);
+    let state = harness.state().code_review.as_ref().unwrap();
+    assert!(!state.notes_ready && !state.notes_loading && state.notes_error.is_some());
+    assert_eq!(
+        state.notes,
+        DiffNotes::default(),
+        "old disk notes must not become editable"
+    );
+    assert!(
+        matches!(control.observed.try_recv(), Err(TryRecvError::Empty)),
+        "blocked LoadNotes must not reach the processor"
+    );
+    assert_eq!(
+        harness.state().preferences_worker.warning().as_deref(),
+        Some(warning.as_str())
+    );
+
+    harness.get_by_label("Editar notas pendientes").click();
+    harness.step();
+    let state = harness.state().code_review.as_ref().unwrap();
+    assert_eq!(
+        state.notes, merged,
+        "recovery must preserve all note identities and metadata"
+    );
+    assert!(
+        state.notes_ready
+            && state.show_all_notes
+            && state.notes_error.is_none()
+            && !state.notes_loading
+    );
+    assert_ne!(
+        state.notes_request, reopened_request,
+        "blocked read token must be invalidated"
+    );
+    assert!(state.import_request.is_none() && !state.importing_notes);
+    assert_eq!(
+        harness.state().preferences_worker.warning().as_deref(),
+        Some(warning.as_str())
+    );
+    assert!(!harness.state().preferences_worker.busy());
+    assert!(
+        matches!(control.observed.try_recv(), Err(TryRecvError::Empty)),
+        "recovery itself must not issue I/O or ACK"
+    );
+    assert_preserved();
+
+    harness
+        .state_mut()
+        .apply_note_action(NoteAction::Edit(imported_id));
+    harness
+        .state_mut()
+        .code_review
+        .as_mut()
+        .unwrap()
+        .editing_note
+        .as_mut()
+        .unwrap()
+        .body = "small ñ".to_owned();
+    harness
+        .state_mut()
+        .apply_note_action(NoteAction::SaveEditor);
+    let (job, error) = next_bounded_notes_io(&mut harness, &control);
+    assert!(
+        matches!(job, AcceptedJob::Notes(ref actual_root, ref value) if actual_root == &root && value == &reduced)
+    );
+    assert!(error.is_none(), "reduced JSON must be durably writable");
+    assert_eq!(std::fs::read(&current_path).unwrap(), reduced_bytes);
+    assert_eq!(std::fs::read(&legacy_path).unwrap(), legacy_bytes);
+    assert_eq!(harness.state().code_review.as_ref().unwrap().notes, reduced);
+    assert_eq!(
+        harness.state().preferences_worker.warning().as_deref(),
+        Some(warning.as_str()),
+        "durable write without ACK must not clear the warning"
+    );
+    control.release();
+    wait_for_idle(&mut harness);
+    assert!(harness.state().preferences_worker.warning().is_none());
+    assert!(harness
+        .state()
+        .preferences_worker
+        .retained_notes_for_repository(&root)
+        .is_none());
+
+    harness.key_press(egui::Key::Escape);
+    harness.run_steps(2);
+    assert!(harness.state().code_review.is_none());
+    let reload_key = Uuid::new_v4();
+    let reload_request = harness
+        .state_mut()
+        .preferences_worker
+        .load_notes(reload_key, root.clone());
+    harness.state_mut().code_review = Some(review_state(
+        reload_key,
+        reload_request,
+        root.clone(),
+        DiffNotes::default(),
+    ));
+    let (job, error) = next_bounded_notes_io(&mut harness, &control);
+    assert!(
+        matches!(job, AcceptedJob::Load(actual_key, actual_request, ref actual_root)
+        if actual_key == reload_key && actual_request == reload_request && actual_root == &root)
+    );
+    assert!(
+        error.is_none(),
+        "final read must come from the real reduced file"
+    );
+    control.release();
+    wait_for_idle(&mut harness);
+    let state = harness.state().code_review.as_ref().unwrap();
+    assert!(state.notes_ready && !state.notes_loading && state.notes_error.is_none());
+    assert_eq!(state.notes, reduced);
+    assert_eq!(state.notes.notes[0], current.notes[0]);
+    assert_eq!(state.notes.notes[1], current.notes[1]);
+    assert_eq!(state.notes.notes[2].id, imported_id);
+    assert!(state.notes.notes[2].sent_at.is_none());
+    assert_eq!(
+        state.notes.notes[2].review_identity,
+        legacy.notes[1].review_identity
+    );
+    assert_eq!(std::fs::read(&current_path).unwrap(), reduced_bytes);
+    assert!(harness.state().preferences_worker.warning().is_none());
+    assert!(matches!(
+        control.observed.try_recv(),
+        Err(TryRecvError::Empty)
+    ));
+}
