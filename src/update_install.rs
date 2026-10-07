@@ -7,7 +7,18 @@
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+#[cfg(not(windows))]
+use std::process::{Child, Stdio};
+use std::process::{Command, Output};
+
+#[cfg(windows)]
+mod windows_command;
+#[cfg(all(test, windows))]
+mod windows_command_tests;
+#[cfg(windows)]
+use windows_command::Command as VerificationCommand;
+#[cfg(not(windows))]
+type VerificationCommand = Command;
 use std::time::{Duration, Instant};
 
 pub const APP_BUNDLE_NAME: &str = "TerminalCanvas.app";
@@ -21,35 +32,34 @@ const MAX_COMMAND_OUTPUT_BYTES: u64 = 256 * 1024;
 /// Capture to private files so neither a full pipe nor an inherited pipe held
 /// open by another process can make waiting unbounded. Polling enforces both a
 /// deadline and a small output budget, and every path kills/reaps the child.
-fn bounded_output(command: &mut Command, timeout: Duration) -> anyhow::Result<Output> {
+fn bounded_output(command: &mut VerificationCommand, timeout: Duration) -> anyhow::Result<Output> {
     let capture = CommandCapture::new()?;
     let stdout = capture.create_file("stdout")?;
     let stderr = capture.create_file("stderr")?;
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr));
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
+    #[cfg(not(windows))]
+    let mut process = {
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::from(stderr));
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+        let spawned = command.spawn();
+        // Release the configured handles before cleaning up a failed spawn.
+        command.stdout(Stdio::null()).stderr(Stdio::null());
+        ScopedCommand::new(spawned?)
+    };
     #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x0800_0000);
-    }
-    let spawned = command.spawn();
-    // Command retains its configured handles: release them before cleanup on
-    // Windows, including when spawning failed.
-    command.stdout(Stdio::null()).stderr(Stdio::null());
-    let mut process = ScopedCommand::new(spawned?)?;
+    let mut process = command.spawn_captured(&stdout, &stderr)?;
     let started = Instant::now();
     loop {
         if capture.exceeds_limit() {
             anyhow::bail!("Update verification command exceeded its output limit");
         }
-        if let Some(status) = process.child.try_wait()? {
+        if let Some(status) = process.try_wait()? {
             // Stop any subprocess that outlived its parent before reading or
             // removing its output files.
             process.terminate_descendants();
@@ -124,30 +134,19 @@ impl Drop for CommandCapture {
     }
 }
 
+#[cfg(not(windows))]
 struct ScopedCommand {
     child: Child,
-    #[cfg(windows)]
-    job: command_job::Job,
 }
 
+#[cfg(not(windows))]
 impl ScopedCommand {
-    fn new(child: Child) -> anyhow::Result<Self> {
-        #[cfg(windows)]
-        let mut child = child;
-        #[cfg(windows)]
-        let job = match command_job::Job::new(&child) {
-            Ok(job) => job,
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(error.into());
-            }
-        };
-        Ok(Self {
-            child,
-            #[cfg(windows)]
-            job,
-        })
+    fn new(child: Child) -> Self {
+        Self { child }
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.child.try_wait()
     }
 
     fn terminate_descendants(&self) {
@@ -157,132 +156,15 @@ impl ScopedCommand {
             // identifier is its PID; the negative PID targets that group only.
             unsafe { libc::kill(-(self.child.id() as libc::pid_t), libc::SIGKILL) };
         }
-        #[cfg(windows)]
-        self.job.terminate();
     }
 }
 
+#[cfg(not(windows))]
 impl Drop for ScopedCommand {
     fn drop(&mut self) {
         self.terminate_descendants();
         let _ = self.child.kill();
         let _ = self.child.wait();
-    }
-}
-
-#[cfg(windows)]
-mod command_job {
-    use std::ffi::c_void;
-    use std::os::windows::io::AsRawHandle;
-    use std::process::Child;
-
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn CreateJobObjectW(attributes: *const c_void, name: *const u16) -> *mut c_void;
-        fn SetInformationJobObject(
-            job: *mut c_void,
-            information_class: i32,
-            information: *const c_void,
-            information_length: u32,
-        ) -> i32;
-        fn AssignProcessToJobObject(job: *mut c_void, process: *mut c_void) -> i32;
-        fn TerminateJobObject(job: *mut c_void, exit_code: u32) -> i32;
-        fn CloseHandle(handle: *mut c_void) -> i32;
-    }
-
-    pub(super) struct Job(*mut c_void);
-
-    #[repr(C)]
-    #[derive(Default)]
-    struct BasicLimitInformation {
-        per_process_user_time_limit: i64,
-        per_job_user_time_limit: i64,
-        limit_flags: u32,
-        minimum_working_set_size: usize,
-        maximum_working_set_size: usize,
-        active_process_limit: u32,
-        affinity: usize,
-        priority_class: u32,
-        scheduling_class: u32,
-    }
-
-    #[repr(C)]
-    #[derive(Default)]
-    struct ExtendedLimitInformation {
-        basic_limit_information: BasicLimitInformation,
-        io_counters: [u64; 6],
-        process_memory_limit: usize,
-        job_memory_limit: usize,
-        peak_process_memory_used: usize,
-        peak_job_memory_used: usize,
-    }
-
-    impl Job {
-        pub(super) fn new(child: &Child) -> std::io::Result<Self> {
-            // SAFETY: null attributes/name create an unnamed, private job. The
-            // Child owns a live process handle during assignment, and the job
-            // handle is closed exactly once by Job::drop.
-            unsafe {
-                let handle = CreateJobObjectW(std::ptr::null(), std::ptr::null());
-                if handle.is_null() {
-                    return Err(std::io::Error::last_os_error());
-                }
-                let job = Self(handle);
-                // Let the OS terminate associated helpers even if the app is
-                // aborted or calls process::exit, which bypasses Rust Drop.
-                // This still does not close the spawn -> assignment window.
-                let limits = ExtendedLimitInformation {
-                    basic_limit_information: BasicLimitInformation {
-                        limit_flags: 0x0000_2000, // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                };
-                // JobObjectExtendedLimitInformation = 9. Both repr(C)
-                // structures follow the documented Win32 layout; unused
-                // limits are zero and the buffer lives through this call.
-                if SetInformationJobObject(
-                    handle,
-                    9,
-                    (&limits as *const ExtendedLimitInformation).cast(),
-                    std::mem::size_of::<ExtendedLimitInformation>() as u32,
-                ) == 0
-                {
-                    return Err(std::io::Error::last_os_error());
-                }
-                if AssignProcessToJobObject(handle, child.as_raw_handle()) == 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(job)
-            }
-        }
-
-        pub(super) fn terminate(&self) {
-            // SAFETY: this owned handle names only the private job containing
-            // this verification command and its children.
-            unsafe { TerminateJobObject(self.0, 1) };
-        }
-
-        #[cfg(test)]
-        pub(super) fn close_without_drop_for_test(self) -> std::io::Result<()> {
-            let job = std::mem::ManuallyDrop::new(self);
-            let handle = job.0;
-            // SAFETY: ManuallyDrop transfers the sole owned handle here.
-            // Deliberately skip TerminateJobObject to test the OS close policy.
-            if unsafe { CloseHandle(handle) } == 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        }
-    }
-
-    impl Drop for Job {
-        fn drop(&mut self) {
-            self.terminate();
-            // SAFETY: this handle was created by CreateJobObjectW and is owned
-            // solely by this Job.
-            unsafe { CloseHandle(self.0) };
-        }
     }
 }
 
@@ -325,7 +207,7 @@ pub fn bundle_in_volume(mount_point: &Path) -> PathBuf {
 
 /// Monta el dmg y devuelve el punto de montaje.
 pub fn mount_dmg(dmg: &Path) -> Option<PathBuf> {
-    let mut command = Command::new("/usr/bin/hdiutil");
+    let mut command = VerificationCommand::new("/usr/bin/hdiutil");
     command
         .args(["attach", "-nobrowse", "-readonly", "-noautoopen", "-plist"])
         .arg(dmg);
@@ -341,7 +223,7 @@ pub fn detach_dmg(mount_point: &Path) {
     if !mount_point.starts_with("/Volumes") || mount_point.parent() != Some(Path::new("/Volumes")) {
         return;
     }
-    let mut command = Command::new("/usr/bin/hdiutil");
+    let mut command = VerificationCommand::new("/usr/bin/hdiutil");
     command.args(["detach", "-quiet"]).arg(mount_point);
     let _ = bounded_output(&mut command, COMMAND_TIMEOUT);
 }
@@ -355,14 +237,14 @@ fn verify_bundle_signature_for_team(app: &Path, team: &str) -> bool {
     if !valid_team_id(team) {
         return false;
     }
-    let mut codesign = Command::new("/usr/bin/codesign");
+    let mut codesign = VerificationCommand::new("/usr/bin/codesign");
     codesign
         .args(["--verify", "--deep", "--strict", "-R"])
         .arg(format!(
             "=identifier \"{APP_BUNDLE_ID}\" and anchor apple generic and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = \"{team}\""
         ))
         .arg(app);
-    let mut gatekeeper = Command::new("/usr/sbin/spctl");
+    let mut gatekeeper = VerificationCommand::new("/usr/sbin/spctl");
     gatekeeper.args(["--assess", "--type", "execute"]).arg(app);
     command_succeeds(&mut codesign) && command_succeeds(&mut gatekeeper)
 }
@@ -400,7 +282,7 @@ fn running_installed_bundle() -> anyhow::Result<PathBuf> {
 
 fn trusted_team_id() -> anyhow::Result<String> {
     let current = running_installed_bundle()?;
-    let mut command = Command::new("/usr/bin/codesign");
+    let mut command = VerificationCommand::new("/usr/bin/codesign");
     command.args(["--display", "--verbose=4"]).arg(&current);
     let details = bounded_output(&mut command, COMMAND_TIMEOUT)?;
     if !details.status.success() {
@@ -475,15 +357,16 @@ try {
 "#;
 
 #[cfg(target_os = "windows")]
-fn windows_system_command(script: &str) -> anyhow::Result<Command> {
+fn windows_system_command(script: &str) -> anyhow::Result<VerificationCommand> {
     let system_root = std::env::var_os("SystemRoot")
         .map(PathBuf::from)
         .ok_or_else(|| anyhow::anyhow!("Windows system directory is unavailable"))?;
     if !system_root.is_absolute() {
         anyhow::bail!("Windows system directory must be absolute");
     }
-    let mut command =
-        Command::new(system_root.join("System32/WindowsPowerShell/v1.0/powershell.exe"));
+    let mut command = VerificationCommand::new(
+        system_root.join("System32/WindowsPowerShell/v1.0/powershell.exe"),
+    );
     // Windows PowerShell otherwise redirects text using the legacy console
     // code page, which corrupts installation paths with non-ASCII characters.
     let script =
@@ -664,7 +547,7 @@ pub fn launch_verified_windows_installer(
 }
 
 fn plist_value(bundle: &Path, key: &str) -> anyhow::Result<String> {
-    let mut command = Command::new("/usr/libexec/PlistBuddy");
+    let mut command = VerificationCommand::new("/usr/libexec/PlistBuddy");
     command
         .args(["-c", &format!("Print :{key}")])
         .arg(bundle.join("Contents/Info.plist"));
@@ -690,7 +573,7 @@ fn verify_bundle_metadata(bundle: &Path, version: &str) -> anyhow::Result<()> {
         "x86_64" => "x86_64",
         _ => anyhow::bail!("This architecture does not support automatic installation"),
     };
-    let mut lipo = Command::new("/usr/bin/lipo");
+    let mut lipo = VerificationCommand::new("/usr/bin/lipo");
     lipo.args(["-verify_arch", architecture])
         .arg(bundle.join("Contents/MacOS/TerminalCanvas"));
     if !command_succeeds(&mut lipo) {
@@ -699,7 +582,7 @@ fn verify_bundle_metadata(bundle: &Path, version: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn command_succeeds(command: &mut Command) -> bool {
+fn command_succeeds(command: &mut VerificationCommand) -> bool {
     bounded_output(command, COMMAND_TIMEOUT)
         .map(|output| output.status.success())
         .unwrap_or(false)
@@ -750,7 +633,7 @@ fn swap_verified_bundle(
     let backup = target.with_file_name(format!(".TerminalCanvas-previous-{operation}.app"));
     // `ditto` preserva permisos, symlinks y metadata del bundle; un copy
     // recursivo común rompe la firma.
-    let mut copy = Command::new("/usr/bin/ditto");
+    let mut copy = VerificationCommand::new("/usr/bin/ditto");
     copy.arg(new_bundle).arg(&staging);
     let copied = bounded_output(&mut copy, COPY_TIMEOUT)
         .map(|output| output.status.success())
@@ -816,12 +699,12 @@ pub fn install_verified_update(dmg: &Path, version: &str) -> anyhow::Result<()> 
 
 #[cfg(test)]
 mod tests {
+    use super::VerificationCommand;
     use super::{
         bundle_in_volume, installed_app_path, is_safe_swap_target, parse_mount_point, swap_bundle,
         APP_BUNDLE_NAME,
     };
     use std::path::{Path, PathBuf};
-    use std::process::Command;
     use std::time::{Duration, Instant};
 
     struct TestDirectory(PathBuf);
@@ -840,8 +723,8 @@ mod tests {
         }
     }
 
-    fn fixture_command(mode: &str, marker: &Path) -> Command {
-        let mut command = Command::new(std::env::current_exe().unwrap());
+    fn fixture_command(mode: &str, marker: &Path) -> VerificationCommand {
+        let mut command = VerificationCommand::new(std::env::current_exe().unwrap());
         command
             .args([
                 "--exact",
@@ -869,8 +752,6 @@ mod tests {
             }
             "failure" => std::process::exit(17),
             "deadline" => std::thread::sleep(Duration::from_secs(15)),
-            #[cfg(windows)]
-            "job-parent-exit" => windows_jobs::exit_parent(Path::new(&marker)),
             "output" => {
                 let line = "x".repeat(1024);
                 for _ in 0..1024 {
@@ -974,161 +855,6 @@ mod tests {
         assert!(error.to_string().contains("output limit"));
         assert!(started.elapsed() < Duration::from_secs(8));
         assert_fixture_process_stopped(&marker);
-    }
-
-    #[cfg(windows)]
-    mod windows_jobs {
-        use super::{fixture_command, TestDirectory};
-        use std::ffi::c_void;
-        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-        use std::os::windows::process::CommandExt;
-        use std::path::Path;
-        use std::process::{Child, ExitStatus, Stdio};
-        use std::time::{Duration, Instant};
-
-        #[link(name = "kernel32")]
-        unsafe extern "system" {
-            fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut c_void;
-            fn WaitForSingleObject(handle: *mut c_void, milliseconds: u32) -> u32;
-            fn TerminateProcess(handle: *mut c_void, exit_code: u32) -> i32;
-        }
-
-        struct FixtureChild(Child);
-
-        impl FixtureChild {
-            fn spawn(mode: &str, marker: &Path) -> Self {
-                Self(
-                    fixture_command(mode, marker)
-                        .creation_flags(0x0800_0000)
-                        .stdin(Stdio::null())
-                        .stdout(Stdio::null())
-                        .stderr(Stdio::null())
-                        .spawn()
-                        .unwrap(),
-                )
-            }
-
-            fn wait(&mut self) -> ExitStatus {
-                let started = Instant::now();
-                loop {
-                    if let Some(status) = self.0.try_wait().unwrap() {
-                        return status;
-                    }
-                    assert!(
-                        started.elapsed() < Duration::from_secs(5),
-                        "The fixture process did not stop"
-                    );
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-            }
-        }
-
-        impl Drop for FixtureChild {
-            fn drop(&mut self) {
-                let _ = self.0.kill();
-                let _ = self.0.wait();
-            }
-        }
-
-        /// Keep an owned process handle before asking the parent to exit so
-        /// PID reuse cannot make the test observe or kill an unrelated process.
-        struct FixtureProcess(OwnedHandle);
-
-        impl FixtureProcess {
-            fn open(pid: u32) -> Self {
-                // SAFETY: the PID came from our UUID-directory handshake.
-                // Only query, synchronization, and cleanup termination access
-                // are requested, and OwnedHandle closes the handle once.
-                let handle = unsafe { OpenProcess(0x0010_1001, 0, pid) };
-                assert!(!handle.is_null(), "{}", std::io::Error::last_os_error());
-                // SAFETY: OpenProcess returned a valid owned handle that has
-                // not been wrapped or closed elsewhere.
-                Self(unsafe { OwnedHandle::from_raw_handle(handle) })
-            }
-
-            fn stopped(&self, milliseconds: u32) -> bool {
-                // SAFETY: this is the owned handle to our live/exited fixture.
-                match unsafe { WaitForSingleObject(self.0.as_raw_handle(), milliseconds) } {
-                    0 => true,
-                    258 => false, // WAIT_TIMEOUT
-                    other => panic!(
-                        "Cannot wait for fixture ({other}): {}",
-                        std::io::Error::last_os_error()
-                    ),
-                }
-            }
-        }
-
-        impl Drop for FixtureProcess {
-            fn drop(&mut self) {
-                // SAFETY: cleanup targets the held fixture handle, never a PID.
-                unsafe {
-                    TerminateProcess(self.0.as_raw_handle(), 1);
-                    WaitForSingleObject(self.0.as_raw_handle(), 1_000);
-                }
-            }
-        }
-
-        fn marker_pid(marker: &Path) -> u32 {
-            let started = Instant::now();
-            loop {
-                if let Ok(contents) = std::fs::read_to_string(marker) {
-                    if let Ok(pid) = contents.parse() {
-                        return pid;
-                    }
-                }
-                assert!(
-                    started.elapsed() < Duration::from_secs(5),
-                    "The fixture did not publish its PID"
-                );
-                std::thread::sleep(Duration::from_millis(10));
-            }
-        }
-
-        pub(super) fn exit_parent(marker: &Path) -> ! {
-            let child_marker = marker.with_extension("child");
-            let child = FixtureChild::spawn("deadline", &child_marker);
-            let _job = super::super::command_job::Job::new(&child.0).unwrap();
-            assert_eq!(marker_pid(&child_marker), child.0.id());
-            std::fs::write(marker.with_extension("ready"), child.0.id().to_string()).unwrap();
-            let started = Instant::now();
-            while !marker.with_extension("exit").is_file() {
-                assert!(started.elapsed() < Duration::from_secs(5));
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            // No Drop runs for either the job or child. Only Windows closing
-            // the process's last private job handle can stop the child here.
-            std::process::exit(0);
-        }
-
-        #[test]
-        fn closing_the_last_job_handle_terminates_the_assigned_process() {
-            let directory = TestDirectory::new();
-            let marker = directory.0.join("pid");
-            let mut child = FixtureChild::spawn("deadline", &marker);
-            let job = super::super::command_job::Job::new(&child.0).unwrap();
-            assert_eq!(marker_pid(&marker), child.0.id());
-            assert!(child.0.try_wait().unwrap().is_none());
-            job.close_without_drop_for_test().unwrap();
-            // Windows does not document the exit code used for job-close
-            // termination; completing before the 15-second fixture sleep is
-            // the observable contract this test verifies.
-            let _ = child.wait();
-        }
-
-        #[test]
-        fn process_exit_without_drop_terminates_the_assigned_helper() {
-            let directory = TestDirectory::new();
-            let marker = directory.0.join("parent-pid");
-            // Deliberately do not put the parent in another Job: an outer Job
-            // could mask a missing close policy on the fixture's own Job.
-            let mut parent = FixtureChild::spawn("job-parent-exit", &marker);
-            let helper = FixtureProcess::open(marker_pid(&marker.with_extension("ready")));
-            assert!(!helper.stopped(0));
-            std::fs::write(marker.with_extension("exit"), []).unwrap();
-            assert!(parent.wait().success());
-            assert!(helper.stopped(5_000), "The helper survived its parent exit");
-        }
     }
 
     #[test]
