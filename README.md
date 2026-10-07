@@ -220,7 +220,7 @@ The repository is in active consolidation. The main priorities are:
 - finish splitting shell/runtime responsibilities
 - reconcile performance budget docs with the actual UI behavior
 - execute the externally credentialed signed/notarized release and publish the Homebrew cask
-- connect the existing release checker to a verified download/install flow
+- validate the implemented verified download/install flow against real signed releases
 
 ## Verification
 
