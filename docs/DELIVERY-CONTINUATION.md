@@ -1,303 +1,212 @@
 # Estado de entrega y continuación — 7 de octubre de 2026
 
-El último checkpoint completamente validado es
-`0dd00e83e10dbc484a7b1a6c9c2d9f6a642e8d96`: **60 microcommits** desde la base
-revisada. Su [CI completa](https://github.com/MauroProto/terminal-canvas/actions/runs/37565219411)
-y su [ensayo de distribución](https://github.com/MauroProto/terminal-canvas/actions/runs/37565273400)
+El checkpoint gráfico de código validado es `a93286e77054bbfd803c4503860ab488585103b0`, de
+**97 microcommits** desde `f0458dd1dae08b3aca080a914042deb5a9454cf3`.
+Su [CI completa](https://github.com/MauroProto/terminal-canvas/actions/runs/37576723374)
+y su [ensayo de distribución](https://github.com/MauroProto/terminal-canvas/actions/runs/37576793676)
 terminaron correctamente en Windows, Linux y macOS Intel/Apple Silicon.
-Pasaron las suites de todos los targets y las suites con daemon en Unix.
-Esas suites no se suman como casos distintos. Formato, Clippy,
-regresiones de seguridad, extensión 9/9 y auditoría pasaron; siguen los cuatro
-avisos de mantenimiento. El benchmark comparativo no corre en pushes.
-El ensayo comprobó exactamente cinco paquetes y cinco checksums, incluyendo
-instalación/desinstalación de Inno y montaje de ambos DMG. No publicó una
-release y sus paquetes son de prueba, sin firma del proveedor.
+Pasaron Clippy, las suites normales y de seguridad, las suites con daemon en
+Unix, formato, contrato gráfico, extensión 9/9 y auditoría. El benchmark
+comparativo no corre para pushes. Las suites se solapan y no deben sumarse
+como casos únicos. Quedan dos avisos de mantenimiento, sin ignores nuevos.
 
-El pase actual corrige confirmaciones de persistencia, cierre durante la
-restauración, migración del historial antiguo, reintentos de append,
-coloreado, lectura del visor, fuentes y caché de render. Captura inicial y
-escrituras comparten una cola; un cierre con replay pendiente conserva el
-checkpoint anterior y rescata la salida nueva sin declarar un guardado completo.
-Una hoja con snapshot no disponible sigue contando como guardado incompleto;
-un grid que falló puede rescatar su log sano sin reemplazar el checkpoint.
-Los errores de lectura inicial se propagan y bloquean escrituras/poda del
-historial durante esa ejecución, incluso si se cierra el panel afectado. La app
-avisa que la salida nueva queda en memoria y debe copiarse antes de reiniciar.
-Las lecturas fallidas posteriores tampoco permiten resetear logs ni confirmar
-bytes; las secuencias avanzan después del append durable. La generación de un
-checkpoint nuevo excluye también la del log que podría quedar retenido si
-falla borrarlo, incluido el wraparound. Un manager PTY no disponible tampoco
-puede hacer desaparecer una hoja del conjunto que debe guardarse.
-El visor mantiene un lector y un resaltador, cada uno con un pedido y resultado
-reemplazables; cancela trabajo obsoleto y conserva los saltos de línea originales.
-Online e invitaciones no reciben cambios funcionales.
+El ensayo comprobó exactamente cinco paquetes y cinco checksums, helpers,
+instalación/desinstalación Inno y montaje de ambos DMG. Firma, notarización y
+publicación quedaron omitidas; sus paquetes son de prueba, sin firma del
+proveedor. No se acredita una release de producción publicada.
 
-Las comprobaciones locales de componentes pasaron: resaltador 25 casos,
-lector de archivos 13, fallback de fuentes 4 y log/durable write 22, además de
-Clippy de cada harness. El componente de captura, guardas de escritura y
-generaciones retenidas pasó 58 casos,
-incluyendo un bloqueo de lectura real de Windows que permitía reemplazar el
-archivo anterior. Ese harness incluye pruebas de store/log/durable write;
-sus casos se solapan con el componente de append y no deben sumarse como únicos.
-Las dos regresiones de colisión de generación fallaron antes del fix y pasaron
-después; incluyen un fallo de borrado del log anterior.
-Se ejecutaron sin GUI, con un job y uno o dos threads de pruebas.
-Formato y revisión independiente del diff completo también pasaron. Los seis
-casos nuevos de cierre/restauración, los de snapshot no disponible, captura
-fallida y los cambios de render requieren
-la suite completa en GitHub. Los resultados anteriores corresponden al SHA
-indicado: no validan estos cambios nuevos. Comprobar la CI y el ensayo de
-distribución del nuevo HEAD antes de distribuirlo.
+Este cierre actualiza GRAPHICS-MIGRATION y este documento después del código
+validado. Son documentos que no se copian dentro de los paquetes. El recibo
+externo de continuación debe registrar el HEAD documental posterior, su CI
+exacta, mapas, bundles y SHA256 al cerrar la entrega. Las corridas anteriores
+sólo acreditan sus propios
+commits; comparar las fuentes no demuestra identidad binaria de recompilaciones.
 
-## Checkpoints anteriores
+## Implementación actual
 
-El checkpoint de contención Windows `65d81a7`, de 45 microcommits, pasó
-[CI](https://github.com/MauroProto/terminal-canvas/actions/runs/37558769570)
-y [paquetes](https://github.com/MauroProto/terminal-canvas/actions/runs/37558823335).
-Su CI histórica pasó 908 pruebas en Windows; Linux 956 normales y 996 con
-daemon; ambos macOS 955 normales y 995 con daemon, con tres ignoradas por suite.
+El stack usa egui/eframe/egui_kittest 0.36.2 y wgpu 30.0.1. El mínimo de Rust
+es 1.95; la matriz usa 1.98.0. `App::logic` procesa PTY, workers, restauración,
+ACK, autosave y pedidos de repaint aun sin un pass de dibujo. `App::ui`
+procesa teclado, puntero, animaciones y paneles. La entrada retenida por egui
+al ocultar la ventana no se reenvía desde lógica; el foco se toma de la entrada
+raw actual. Cada fase conserva su propio contador de panics.
 
-La rama principal del repositorio se llama `master`. La reversión pedida en
-septiembre quedó integrada mediante `bc5768d`; la base remota revisada para
-este pase es `f0458dd1dae08b3aca080a914042deb5a9454cf3`. Este pase agrega
-perfiles aislados, diagnóstico de paquetes, actualización verificada,
-instalador Windows, validaciones de distribución, limpieza de dependencias y
-correcciones de persistencia al cerrar. El checkpoint de entrega contiene
-29 microcommits publicados sobre esa base remota. El checkpoint publicado es
-`d79f0fa856ca24a873920b47134000fd9df22262`; los commits locales originales
-se conservaron antes de sincronizar el checkout con GitHub.
-Después se publicaron dos microcommits de infraestructura, hasta `9f0e84d`,
-para usar acciones Node 24 fijadas por SHA y Ubuntu 24.04. No cambian código
-de la app, permisos de publicación ni controles de firma.
-El siguiente microcommit, `5107f41`, limita los metadatos ZIP antes de construir
-el parser del validador de paquetes. El checkpoint `5107f41` contiene
-**32 microcommits publicados** sobre la base revisada; el código Rust conserva
-el mismo árbol que la CI del checkpoint `d79f0fa` en ese checkpoint histórico.
-El cierre documental posterior llegó a **37 microcommits** en `b6ea26a` y su
-[CI completa](https://github.com/MauroProto/terminal-canvas/actions/runs/37553410152)
-también pasó. El nuevo pase agrega cinco microcommits de contención Windows,
-hasta `7097d3ae51d64b2ec384179f7c38704257e8962d`: **42 microcommits** desde la
-base revisada, antes de su documentación. La validación completa posterior
-corresponde al checkpoint de 45 commits descrito arriba.
-Online e invitaciones no reciben cambios funcionales en este pase.
+Sidebar, barra de tareas, visor y canvas comparten la UI raíz. Los overlays
+y comandos reciben el rectángulo restante antes de que el panel central lo
+consuma. El visor conserva su borde personalizado y su ancho completo.
+El render ancla clusters Unicode y caracteres combinados a sus columnas;
+agrupa ASCII ordinario y usa anclaje por celda cuando ligaduras, kerning o
+avances no uniformes podrían desplazarlo. La caché considera revisión,
+tamaño real de fuente, DPI y generación del atlas. El fallback de negrita
+conserva la fuente primaria y los símbolos/emoji.
 
-## Verificación realizada en esta PC
+Se conservan accesibilidad, clipboard, enlaces, X11, Wayland y los backends
+nativos. Las decoraciones Wayland usan crossfont con Fontconfig/FreeType;
+ver [PORTABLE.md](PORTABLE.md). El lockfile ya no incluye `paste`,
+`ttf-parser`, `ab_glyph` ni el backend antiguo `metal`. El verificador
+`scripts/graphics-deps-verify.py` comprueba features de ventanas, parsers
+retirados y compatibilidad de bindings Direct3D. Ver los detalles y la matriz
+nativa en [GRAPHICS-MIGRATION.md](GRAPHICS-MIGRATION.md).
 
-- Rust/Cargo/Clippy 1.98.0, Windows x86_64, máximo dos jobs de compilación y
-  dos threads de pruebas. El último pase usó un solo job con prioridad baja.
-  No se usó WSL ni se inició un servidor persistente.
-- Formato y Clippy de todos los targets del checkpoint histórico, con warnings
-  como errores; el nuevo pase tiene además la validación de componente descrita abajo.
-- Suite completa de todos los targets: **889 pruebas aprobadas y tres ignoradas**,
-  incluyendo **850 pruebas de librería aprobadas y tres ignoradas**, más los tres
-  benchmarks en modo smoke. El código comprobado termina en el commit local
-  `c2faf67`, publicado como `1588988`. Hasta `5107f41`, los cambios posteriores
-  afectaban scripts, infraestructura y documentación. Estos recuentos locales
-  son históricos: no corresponden al nuevo lanzador Windows.
-  Dos pruebas ignoradas son fixtures que las regresiones normales invocan
-  explícitamente en procesos hijos; la tercera depende de sesiones Claude reales.
-- Pruebas de perfil mediante procesos independientes: layout, configuración,
-  historial de dos hojas, notas y memoria conservan datos entre ejecuciones.
-  Una salida con `process::exit` antes del cleanup conserva el marcador y los
-  datos para la siguiente ejecución; esto no simula corte de energía ni crash
-  nativo. El CLI de consulta no altera bytes, fechas ni permisos de un perfil
-  poblado con marcador pendiente. Rutas bloqueadas por archivos fallan sin
-  generar datos de respaldo en el directorio de trabajo.
-- El cierre final y el cierre de workspace esperan los autosaves aceptados
-  antes de publicar su layout. Los fallos de configuración, layout o historial
-  mantienen el marcador de recuperación; se rescatan los datos que pueden
-  guardarse. La poda espera el layout actual confirmado y conserva el historial
-  anterior si falla publicarlo. Nueve regresiones usan perfiles y procesos
-  independientes, sin abrir interfaz ni terminales reales.
-- Los ZIP de diagnóstico se terminan antes de publicarlos atómicamente y usan
-  nombres únicos. Las regresiones comprueban dos exports con la misma fecha y la
-  conservación del destino y limpieza temporal ante fallos. La aserción de
-  permisos Unix está incluida, pero requiere ejecución en Unix.
-- Se agregaron pruebas con un servidor HTTPS local y certificado propio para
-  descarga completa, progreso, checksum incorrecto, respuesta incompleta,
-  límites, redirección rechazada y cancelación de una respuesta detenida.
-  Usan caches temporales independientes y no modifican el perfil habitual.
-- Los comandos del instalador tienen plazo y límite de salida. Windows exige
-  que el registro de Inno nombre la copia que está ejecutándose y entrega esa
-  carpeta mediante `/DIR`; una copia portable firmada usa actualización manual.
-  Las regresiones incluyen Unicode, espacios y rutas UNC.
-- Los helpers de verificación Windows se crean dentro de su Job privado con
-  `PROC_THREAD_ATTRIBUTE_JOB_LIST`, antes de ejecutar código del hijo. Se inicia
-  el proceso suspendido, se comprueba su asociación a ese Job exacto y luego se
-  reanuda; un fallo aborta el lanzamiento. El Job termina sus descendientes al
-  cerrar su último handle, incluso si la app sale sin ejecutar `Drop`.
-  La validación local del componente pasó sus **21 casos**: siete pruebas puras,
-  trece regresiones con procesos reales y un fixture inerte. Comprueba nietos
-  creados inmediatamente, timeout, límite de salida, abandono antes de reanudar,
-  cierre del guard y salida del padre; también argumentos, entorno Unicode y
-  PowerShell real. Clippy del componente pasó con warnings como errores.
-  Se usó un harness pequeño con el código de producción, un job y prioridad
-  Idle; no se recompiló ni abrió la app completa en esta PC. Exigir una CI nueva
-  del HEAD publicado antes de dar por validada su integración multiplataforma.
-- **27 pruebas del validador de paquetes**. Un TAR con 5.006 entradas se rechaza
-  tras leer sólo ocho encabezados, sin extraer archivos. Un ZIP con 3.005
-  entradas se rechaza antes de construir `ZipFile`; también se comprueban
-  conteos falsificados, ZIP64, offsets, comentarios y límites de metadatos.
-  Las nueve pruebas de la extensión pasaron también en GitHub.
-- Se extrajo y comprobó un nuevo ZIP **debug sin firma**, con arquitectura, manifiesto,
-  SHA256, versión, diagnóstico, helper de memoria y handshake/listado MCP.
-  El mismo ZIP real volvió a pasar el nuevo preflight ZIP y los smoke tests,
-  sin recompilar ni abrir la interfaz.
-  Esto no valida un instalador de producción ni una firma.
-- `cargo-audit 0.22.2`: cero vulnerabilidades conocidas, cuatro avisos de
-  mantenimiento (`bincode`, `paste`, `rustls-pemfile`, `ttf-parser`), sin ignores.
+Los arreglos previos de persistencia siguen implementados: ACK asociados a la
+sesión runtime capturada, barreras antes del cierre, captura inicial y
+escrituras en FIFO, rescate de salida nueva durante replay, alias legacy,
+rollback de append y lectura estricta. Un snapshot o manager no disponible
+no elimina una hoja del conjunto que debe guardarse. Un checkpoint nuevo
+excluye generaciones de logs retenidos, incluido el wraparound. Fallos de
+layout, configuración o historial mantienen el marcador de recuperación;
+la poda espera el layout confirmado. Si falla la captura inicial, la app
+conserva los archivos anteriores, pausa su persistencia durante esa ejecución
+y avisa que la salida nueva queda en memoria y debe copiarse antes de reiniciar.
+Cerrar el panel no elimina esa guarda.
 
-Los logs del último cierre se guardan en `dist/validation-clippy-job-cleanup.log`,
-`dist/validation-tests-job-cleanup.log` y `dist/validation-package-job-cleanup.log`;
-la auditoría previa está en
-`dist/validation-audit.json`. No se deben confundir
-los resultados locales con una CI multiplataforma del candidato.
-Los resultados nuevos están en `dist/validation-contained-launch-tests.*.log`,
-`dist/validation-contained-launch-errors.*.log`,
-`dist/validation-contained-launch-powershell.*.log`,
-`dist/validation-contained-launch-clippy-fixed.*.log` y
-`dist/validation-contained-launch-owner-fixed.*.log`. Las corridas filtradas
-comprueban los casos agregados y la corrección del fixture; no son suites
-completas adicionales ni se deben sumar como casos distintos.
-La [CI del checkpoint publicado](https://github.com/MauroProto/terminal-canvas/actions/runs/37544616708)
-y el [ensayo manual de distribución](https://github.com/MauroProto/terminal-canvas/actions/runs/37545144493)
-apuntan exactamente a `d79f0fa`. La auditoría y las nueve pruebas de la extensión
-ya pasaron; el ensayo pasó sus 15 regresiones del validador de paquetes.
-La CI de ese checkpoint y la
-[CI de la revisión ZIP](https://github.com/MauroProto/terminal-canvas/actions/runs/37549072652)
-(`5107f41`, con Node 24 y el validador ZIP corregido) terminaron completamente
-en verde, con estos mismos resultados:
+También están implementados el lanzador Windows contenido en un Job, el visor
+con lector/resaltador acotados y cancelables, la conservación de saltos de
+línea y la invalidación del render al cambiar la fuente. La cancelación del
+visor no interrumpe una syscall ni una regex ya bloqueadas. Revisar las
+regresiones existentes antes de repetir estos arreglos.
+Online e invitaciones quedan fuera de cambios funcionales.
 
-| Plataforma | Suite normal | Suite con daemon | Regresiones de seguridad |
-| --- | --- | --- | --- |
-| Windows x86_64 | 889 aprobadas, 3 ignoradas | No aplica | 17 aprobadas |
-| Linux x86_64 | 956 aprobadas, 3 ignoradas | 996 aprobadas, 3 ignoradas | 20 aprobadas |
-| macOS Intel | 955 aprobadas, 3 ignoradas | 995 aprobadas, 3 ignoradas | 20 aprobadas |
-| macOS Apple Silicon | 955 aprobadas, 3 ignoradas | 995 aprobadas, 3 ignoradas | 20 aprobadas |
+## Evidencia actual y checkpoints históricos
 
-Las suites normal y daemon son configuraciones separadas; no sumar sus
-recuentos como pruebas distintas. El benchmark comparativo del workflow se
-omitió porque sólo corre para pull requests.
+El componente gráfico aislado aprobó **40 pruebas**, incluidas cuatro de
+fuentes, y Clippy. Comprueba medidas, columnas, render completo/reducido y
+caché, con pares ASCII en 54 combinaciones de fuente, tamaño, zoom y DPI.
+La regresión de columnas Unicode falló antes del arreglo; también hay
+regresiones de ligaduras/kerning con fuentes embebidas. Ese harness no
+ejecuta FFI Ghostty, GPU, PTY ni una ventana real. Los casos de fuentes
+forman parte de las 40 pruebas; no se suman otra vez.
 
-La [CI de las acciones actualizadas](https://github.com/MauroProto/terminal-canvas/actions/runs/37546104540)
-apunta a `9f0e84d`: Windows, Linux, extensión y auditoría pasaron. Se canceló
-cuando macOS seguía esperando runners, para dar paso al candidato ZIP.
-Su [ensayo de distribución](https://github.com/MauroProto/terminal-canvas/actions/runs/37546248753)
-se canceló mientras esperaba, sin jobs ni artefactos, para reemplazarlo por
-la revisión ZIP. La [CI de la revisión ZIP](https://github.com/MauroProto/terminal-canvas/actions/runs/37549072652)
-y el [ensayo actualizado](https://github.com/MauroProto/terminal-canvas/actions/runs/37549143310)
-apuntan exactamente a `5107f4155d7899968753e2fa3b215f4f137d04d4`.
-CI y Release tienen grupos separados de concurrencia. Tanto la CI ZIP como
-el ensayo ZIP terminaron completamente en verde. El ensayo ZIP validó
-el ZIP Windows con el nuevo verificador, construyó/instaló/desinstaló Inno,
-montó y comprobó ambos DMG y verificó el tarball Linux, incluidos sus helpers.
-`verify-set` comprobó los cinco paquetes y cinco checksums, sin extras; `publish`
-quedó omitido. El ensayo base también terminó completamente en verde:
-ZIP Windows, instalador Inno construido/instalado/desinstalado en el runner,
-tarball Linux y ambos DMG macOS montados y comprobados. Los helpers pasaron
-sus smoke tests. `verify-set` descargó los cuatro grupos de artefactos y
-validó exactamente cinco paquetes y sus cinco SHA256, sin extras. `publish`
-quedó omitido. El ensayo actualizado ya pasó las 27 regresiones Python.
-El ensayo manual no crea tags ni releases. Sus artefactos `dry-run-*` se conservan
-14 días en Actions y, en este repositorio público, son descargables por lectores
-autenticados. No hay una release firmada publicada.
-Los logs y herramientas dentro de `dist` son locales y no forman parte del bundle.
+Las nuevas fixtures de entrada retenida, contadores y bounds usan paneles
+detached, sin shell ni PTY real; la regresión de persistencia oculta usa un
+PTY en memoria y un perfil aislado. La integración de estos casos pasó
+la CI del checkpoint de código indicado arriba. No se ejecutaron builds
+completos ni una GUI de la app en esta PC durante la migración gráfica.
 
-Los cinco commits documentales entre `5107f41` y `b6ea26a` actualizaron documentación, incluida
-`PORTABLE.md`, que se copia dentro de los paquetes. Los artefactos del ensayo
-`5107f41` se verifican con ese mismo checkout: el validador compara también
-LICENSE y PORTABLE con su fuente. No usar una revisión documental posterior
-para comprobar byte por byte esos archivos anteriores. El workflow de una
-release real reconstruye los paquetes y su documentación desde el tag exacto.
+La [CI anterior, 37574525612](https://github.com/MauroProto/terminal-canvas/actions/runs/37574525612),
+del candidato `6a7e78e0d9b6b667ac6cd8a518d9eaac4a92285f`, terminó FAILURE:
+Windows e Intel detectaron sólo una aserción de la fixture de repaint oculto.
+Un Restore pendiente pedía 16 ms antes del fallback de 2 s; egui conserva el
+menor plazo y no emite un callback por cada pedido. El nuevo test separa el
+scheduler de los pollers, comprueba primero un tick vacío sin callbacks y luego
+exige un plazo positivo y acotado en cada tick. Conserva las aserciones de
+entrada retenida, foco, unread, ausencia de passes UI y de PTY real; retirar
+el fallback de producción deja el nuevo test sin callback y lo hace fallar.
+El cambio afecta sólo pruebas, no la lógica de producción.
 
-## Publicación y respaldo
+El [ensayo anterior, 37575466330](https://github.com/MauroProto/terminal-canvas/actions/runs/37575466330),
+del mismo SHA, terminó CANCELLED tras confirmar la misma fixture fallida en
+el preflight daemon de macOS ARM. Dejó **cero artefactos** y no validó paquetes,
+instaladores, DMG, checksums ni publicación. Esas corridas son evidencia del
+fallo corregido, no una aprobación del nuevo candidato.
 
-La publicación del checkpoint histórico `5107f41` está realizada: se verificaron los
-32 árboles, mensajes y padres antes de avanzar `master`, sin force push.
-El conector autorizado de `MauroProto` pudo publicar también los workflows.
-Git Data API asignó nuevos IDs, fechas y metadatos de autor; los originales
-permanecen en la rama local `codex/local-delivery-20261006` y el bundle original.
-Usar la rama publicada para continuar. Los originales de los siguientes pases
-quedan en `codex/ci-runtime-delivery-20261006` y
-`codex/zip-preflight-delivery-20261006`. El CLI de esta PC conserva su cuenta
-de sólo lectura. Revalidar la CI cuando se cambie código, sin bajar aserciones.
-Los originales del pase de contención Windows se conservan en
-`codex/windows-contained-launch-delivery-20261006`; los árboles, mensajes y
-padres publicados se comprueban antes de avanzar la rama sin force push.
+La [auditoría del checkpoint gráfico](https://github.com/MauroProto/terminal-canvas/actions/runs/37576723374)
+pasó sin vulnerabilidades reportadas y con **dos avisos de mantenimiento**,
+`bincode 1.3.3` y `rustls-pemfile 2.2.0`, sin ignores nuevos. El resultado
+acredita esa consulta y no es una garantía permanente. Ver [DEPENDENCY-MAINTENANCE.md](DEPENDENCY-MAINTENANCE.md).
+
+| Checkpoint histórico validado | Código/HEAD documental | Evidencia cerrada |
+| --- | --- | --- |
+| 70 microcommits | Código `62bc6e73008e9d57f9011e36b4ef6ce4c77a902d`; HEAD documental `c2b4aca415bba4dbf591cd4aa71c6118d824b580` | [CI código](https://github.com/MauroProto/terminal-canvas/actions/runs/37567581842), [CI documental](https://github.com/MauroProto/terminal-canvas/actions/runs/37567972413) y [paquetes del código](https://github.com/MauroProto/terminal-canvas/actions/runs/37567632160): SUCCESS. |
+| 60 microcommits | `0dd00e83e10dbc484a7b1a6c9c2d9f6a642e8d96` | [CI](https://github.com/MauroProto/terminal-canvas/actions/runs/37565219411) y [paquetes](https://github.com/MauroProto/terminal-canvas/actions/runs/37565273400): SUCCESS. |
+| 45 microcommits | `65d81a7`, contención Windows | [CI](https://github.com/MauroProto/terminal-canvas/actions/runs/37558769570) y [paquetes](https://github.com/MauroProto/terminal-canvas/actions/runs/37558823335): SUCCESS. |
+
+Los checkpoints históricos pasaron las matrices de Windows, Linux y ambos
+macOS; en Unix incluyeron daemon. Las suites normal, seguridad y daemon se
+registran por separado y se solapan: no sumar sus recuentos como casos únicos.
+Los ensayos comprobaron exactamente cinco paquetes y cinco checksums,
+helpers, instalación/desinstalación Inno y montaje de ambos DMG. Firma,
+notarización y publicación quedaron omitidas. El benchmark comparativo sólo
+corre para pull requests. Los cuatro avisos de mantenimiento de esos
+lockfiles anteriores son evidencia histórica; el candidato gráfico tiene
+los dos avisos descritos arriba.
+
+Para cerrar el candidato actual, exigir éxito de los cuatro jobs de plataforma,
+Clippy, suites normales/seguridad/daemon, extensión y auditoría, además del
+ensayo completo con `verify-set`. Registrar cada SHA y recibo por separado.
+Si el HEAD final sólo añade documentación no empaquetada, distinguirlo del
+SHA de código validado y del SHA de los paquetes. `LICENSE` y
+`docs/PORTABLE.md` se copian dentro de los paquetes: verificarlos con el mismo
+checkout del ensayo. Comparar inputs no demuestra que una recompilación
+produzca binarios idénticos. Una publicación real reconstruye desde su tag.
 
 ## Pendientes concretos
 
-1. Probar interfaz, cierre/reapertura, recuperación tras crash y agentes reales
-   en instalaciones nativas. Comprobar además que los datos previos se conservan.
-2. Antes de publicar, configurar las credenciales reales documentadas en `RELEASE.md`: Windows
-   Authenticode con timestamp; macOS Developer ID, notarización y Team ID.
-   Probar upgrade desde una versión firmada por el mismo editor/certificado.
-   Comprobar cancelación de la descarga, error de disco, publisher distinto y
-   sesiones vivas. La instalación y los helpers no ofrecen cancelación mediante
-   un token del usuario; los helpers tienen timeout, límite de salida y cleanup.
-3. Publicar sólo después de validar el dry-run y el candidato. Los tags deben
-   coincidir con Cargo; el workflow impide publicación sin firmas verificadas.
-   Descargar y verificar los paquetes que se publicaron realmente.
-4. Reemplazar placeholders de versión/SHA256 del cask con los DMG finales y
-   publicar el tap con acceso real. Revisar protección de rama y permisos de
-   archivos en instalaciones reales. No afirmar que ya existe una release/tap.
-5. Ejecutar las migraciones de mantenimiento descritas en
-   [DEPENDENCY-MAINTENANCE.md](DEPENDENCY-MAINTENANCE.md), respetando la exclusión
-   de Online/invitaciones. Requieren validación multiplataforma, sin ignores.
-
-Para la validación nativa, usar una copia de los datos y un perfil aislado:
-crear dos workspaces con divisiones, escribir historial distinto, agregar notas
-y memoria, cerrar y reabrir; comparar layout y datos. Repetir un cierre con
-autosave pendiente y una terminación abrupta, comprobando el aviso de recuperación
-y los archivos conservados. En Unix, verificar la reconexión al daemon y el
-cierre explícito de sus sesiones; en Windows, verificar ConPTY y las terminales
-nuevas al reabrir. Probar los agentes que se usan realmente, incluyendo Unicode,
-paste, clipboard y sesiones activas al intentar actualizar. Registrar plataforma,
-versión y resultados sin adjuntar contenido privado del perfil.
+1. Validar en hardware nativo, con perfil aislado y copia de datos: GPU/driver,
+   fuentes ASCII/CJK/emoji/combining/negrita, ligaduras, DPI/zoom, clipboard,
+   accesibilidad, paneles/visor/paleta, resize, minimizar/ocultar, salida continua,
+   autosave, cierre y terminación abrupta. Comparar layout e historial al reabrir.
+   Medir fluidez, latencia, CPU/GPU y memoria con varias terminales activas.
+   Probar ConPTY en Windows, daemon/reconexión en Unix y agentes reales.
+   En Wayland comprobar decoraciones del cliente y del compositor. Ghostty
+   sigue experimental fuera de la matriz de distribución.
+2. Configurar Authenticode con timestamp y Developer ID/notarización con
+   credenciales reales; probar upgrade desde una versión firmada por el mismo
+   editor, cancelación de descarga, error de disco, publisher distinto y
+   sesiones vivas. Los helpers de instalación tienen timeout, límite de salida
+   y cleanup; no ofrecen cancelación mediante un token del usuario.
+3. Publicar después de validar candidato, dry-run y firmas. Comprobar los
+   paquetes descargados de la release real. Ver [RELEASE.md](RELEASE.md).
+4. Actualizar versión/SHA256 del cask con los DMG finales y publicar Homebrew
+   con acceso real. Revisar protección de rama y permisos en instalaciones reales.
+5. Resolver los dos avisos sin ignores: bincode requiere migrar serializador y
+   assets de syntect/two-face juntos. PEM afecta TLS/colaboración y requiere
+   un alcance compatible con la exclusión de Online/invitaciones.
 
 ## Prompt para continuar en otra máquina
 
-> Continuá Terminal Canvas (`MauroProto/terminal-canvas`) desde la rama publicada
-> `master`; usá el HEAD publicado actual y conservá los checkpoints anteriores.
-> Antes de editar comprobá HEAD, estado de trabajo, remoto y permisos. Leé
-> `docs/DELIVERY-CONTINUATION.md`, `docs/RELEASE.md`, `docs/PORTABLE.md`,
-> `docs/SUPPORT.md` y `docs/DEPENDENCY-MAINTENANCE.md`. Comprobá en Actions
-> la CI y el ensayo Release cuyo headSha coincida con ese HEAD; las corridas
-> históricas descritas arriba sólo validan sus respectivos commits.
-> Conservá todos los microcommits e integrá mediante fast-forward en `master`,
-> sin descartar cambios ni reescribir historial. Los IDs del respaldo original
-> difieren de los publicados por Git Data API: no mezcles ambos historiales.
-> Ya están implementados el lanzador Windows contenido en un Job, los ACK
-> por sesión, captura/restauración y escrituras en FIFO, rescate durante replay,
-> alias legacy, rollback de append, lectura estricta y protección ante snapshots
-> o managers indisponibles y colisiones con generaciones de logs retenidos.
-> También el visor acotado y cancelable, saltos de línea del parser, fallback
-> de negrita e invalidación de render al cambiar el tamaño de fuente.
-> Revisá sus regresiones antes de repetir esos arreglos. Una captura inicial
-> fallida pausa la persistencia durante esa ejecución y avisa que la salida
-> nueva debe copiarse antes de reiniciar; cerrar el panel no elimina la guarda.
-> La cancelación del visor no interrumpe una syscall ni regex ya bloqueadas.
-> Para verificar archivos empaquetados del ensayo, usá su mismo checkout.
-> No repitas builds completos sin cambios ni una falla que investigar.
-> No modifiques Online/invitaciones. Cerrá los pendientes con evidencia real:
-> preservación de datos e interfaz en sistemas nativos, pruebas con agentes reales,
-> firma/notarización, upgrade firmado, publicación, Homebrew y las migraciones
-> de mantenimiento compatibles con la exclusión de Online/invitaciones.
-> Los tests y paquetes de ensayo no equivalen a uso nativo ni entrega firmada.
-> No inventes secretos ni resultados. La PC de Mauro se sobrecargó: allí no
-> ejecutar builds completos, GUI, WSL ni servidores; usar GitHub para integración
-> y paquetes. Para componentes pequeños, Rust 1.98.0 con PATH/RUSTC/RUSTDOC
-> coherentes, un job, hasta dos threads, prioridad baja y procesos ocultos.
-> En otra máquina adecuada, usar perfiles aislados para las pruebas nativas.
-> Corregí fallos en commits pequeños y reportá por separado lo
-> comprobado, lo publicado y lo que necesita credenciales o hardware externo.
+> Continuá Terminal Canvas (`MauroProto/terminal-canvas`) desde el HEAD publicado
+> de `master`; conservá los checkpoints anteriores. El código gráfico validado
+> es `a93286e77054bbfd803c4503860ab488585103b0`, de 97 microcommits, con CI 37576723374
+> y Release 37576793676 aprobadas. El cierre documental posterior debe registrarse
+> en el recibo externo con su SHA y CI exacta. Comprobá HEAD, rama, estado,
+> remoto y SHAs de las corridas antes de editar; no atribuyas éxito a otro SHA.
+> Leé este documento, GRAPHICS-MIGRATION, DEPENDENCY-MAINTENANCE, RELEASE,
+> PORTABLE y SUPPORT. Conservá todos los microcommits y el revert bc5768d;
+> integrá por fast-forward en master, sin force push ni descartar datos.
+> Los IDs originales difieren de los publicados por Git Data API: no mezcles
+> ambos historiales. Ya están implementadas egui/eframe/kittest 0.36.2 y
+> wgpu 30.0.1, separación logic/ui, polling y persistencia con ventana oculta,
+> contadores por fase, UI raíz, bounds, fallback de fuentes y columnas
+> ASCII/Unicode, además de las guardas de persistencia descritas arriba.
+> Revisá sus regresiones; no rehagas esos arreglos sin un fallo reproducible.
+> Online e invitaciones quedan fuera de cambios funcionales.
+> En otra máquina adecuada, probá GPU/driver, UI, PTY y agentes reales con
+> perfiles aislados y copia de datos, incluyendo minimizar/ocultar, autosave,
+> cierre y recuperación. Medí fluidez, latencia y consumo con varias terminales
+> activas: los benchmarks actuales no miden el dibujo real en GPU.
+> Después cerrá firmas/notarización, upgrade firmado,
+> publicación y Homebrew con acceso real, y el mantenimiento permitido de
+> bincode/rustls-pemfile. No inventes credenciales ni resultados.
+> La PC de Mauro se sobrecargó: allí no ejecutar builds completos, GUI, WSL ni
+> servidores; usar GitHub para integración y paquetes. Componentes pequeños:
+> Rust 1.98.0 con PATH/RUSTC/RUSTDOC coherentes, un job, hasta dos threads,
+> prioridad Idle y procesos ocultos. Corregí fallos en microcommits y reportá
+> SHA, evidencia y límites por separado. Las pruebas headless no acreditan
+> apariencia nativa, consumo de GPU, accesibilidad real ni entrega firmada.
 
-En la otra máquina, preferir un clon actualizado de `master`. Si se usa un
-bundle local, comprobar primero su ref anunciada y prerrequisitos mediante
-`git bundle verify`; los bundles anteriores sólo conservan sus respectivos
-checkpoints y no contienen `dist/`. El recibo externo de continuación identifica
-el respaldo del último pase y las corridas exactas. Para actualizar un checkout
-limpio con la historia publicada:
+## Publicación y respaldo
+
+La rama principal se llama `master`; la reversión pedida quedó integrada en
+`bc5768d`. Git Data API generó IDs y metadatos diferentes de los commits
+locales originales. El CLI de esta PC conserva su cuenta de sólo lectura;
+la publicación usa el conector autorizado. Los mapas comprueban árboles,
+padres y mensajes antes de avanzar la rama. Usar la historia publicada para
+continuar; los originales son respaldo, no una rama para mezclar.
+
+El checkpoint de 70 commits conserva sus bundles y recibos externos. El cierre
+gráfico debe adjuntar un manifiesto con los SHAs público/original, código
+validado, paquetes y HEAD documental, las corridas exactas y hashes de cada
+archivo. Sus bundles previstos son
+`terminal-canvas-graphics-final-published-20261007.bundle` (base `f0458dd1`) y
+`terminal-canvas-graphics-final-original-20261007.bundle` (base `c2b4aca`);
+la creación y verificación de los bundles se registra por separado en el recibo
+externo, después de comprobar sus refs y hashes. Los bundles no
+contienen `dist/` ni datos del perfil; los recibos se entregan aparte.
+
+Preferir un clon actualizado de master. Con bundles, comprobar la ref y los
+prerrequisitos mediante `git bundle verify`, usando la base completa indicada
+en el manifiesto. Para actualizar un checkout limpio:
 
 ```bash
 git fetch origin
@@ -307,5 +216,6 @@ git merge --ff-only origin/master
 ```
 
 Si hay cambios locales o el fast-forward falla, inspeccionarlos sin descartar
-datos. Revisar el candidato y sus comprobaciones antes de publicar cambios.
-No pegar tokens, certificados ni contraseñas en una conversación.
+datos. Verificar SHA256SUMS y recibos del paquete de continuación. No incluir
+tokens, certificados, contraseñas ni contenido privado de perfiles en una
+conversación o en evidencia de pruebas.
