@@ -75,17 +75,22 @@ impl SessionController {
     }
 
     pub fn is_attached(&self) -> bool {
+        self.attachment_state_for_recovery().unwrap_or(false)
+    }
+
+    /// An unreadable manager cannot establish that a recovery snapshot is
+    /// unnecessary. Ordinary attachment checks retain their false fallback.
+    pub(super) fn attachment_state_for_recovery(&self) -> Option<bool> {
         let Some(manager) = &self.pty_manager else {
-            return false;
+            return Some(false);
         };
         let Some(session_id) = self.session_id else {
-            return false;
+            return Some(false);
         };
         manager
             .lock()
             .ok()
             .map(|manager| manager.is_attached(session_id))
-            .unwrap_or(false)
     }
 
     pub fn is_alive(&self) -> bool {

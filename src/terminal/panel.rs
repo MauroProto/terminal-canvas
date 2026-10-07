@@ -1724,8 +1724,9 @@ impl TerminalPanel {
                         )
                     })
                     .or_else(|| {
-                        session
-                            .is_attached()
+                        // A poisoned manager leaves attachment unknown; it
+                        // cannot authorize omitting a terminal from recovery.
+                        (session.attachment_state_for_recovery() != Some(false))
                             .then_some(crate::terminal::pty::RecoverySnapshot::Unavailable)
                     })
                     .map(|snapshot| (runtime_session_id, snapshot))
