@@ -1508,8 +1508,26 @@ fn taskbar_reveals_a_focused_terminal_beyond_the_window_width() {
 #[test]
 fn docked_panels_share_the_root_ui_and_overlays_keep_the_remaining_canvas_bounds() {
     let ctx = egui::Context::default();
-    let mut app = super::TerminalApp::new_for_tests(&ctx);
-    app.sidebar_visible = true;
+    // The default test constructor starts a terminal. Load an empty workspace
+    // instead, then add a panel without a session spec so rendering stays PTY-free.
+    let workspace = Workspace::new("Bounds regression", None);
+    let state = crate::state::AppState {
+        schema_version: crate::state::persistence::APP_STATE_SCHEMA_VERSION,
+        workspaces: vec![workspace.to_saved()],
+        active_ws: 0,
+        sidebar_visible: true,
+        legacy_canvas_ui: Default::default(),
+        local_device_id: Uuid::new_v4().to_string(),
+        trusted_devices: Vec::new(),
+        orchestration: Default::default(),
+    };
+    let mut app = super::TerminalApp::build(&ctx, None, Some(state), None, false, false);
+    app.ws_mut().add_restored_terminal(TerminalPanel::new(
+        pos2(0.0, 0.0),
+        vec2(300.0, 200.0),
+        Color32::WHITE,
+        1,
+    ));
     app.onboarding_dismissed = true;
     assert!(app.ws().panels[0].runtime_session_id().is_none());
     let panel_id = app.ws().panels[0].id();
@@ -1541,6 +1559,7 @@ fn docked_panels_share_the_root_ui_and_overlays_keep_the_remaining_canvas_bounds
         // Clear before assertions too: a bounds regression should report
         // its assertion, rather than panic again while dropping font deltas.
         output.textures_delta.clear();
+        assert!(app.ws().panels[0].runtime_session_id().is_none());
         let regions = [
             ("sidebar", sidebar, crate::theme::colors::INK),
             ("taskbar", taskbar, crate::theme::colors::INK),
