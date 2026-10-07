@@ -188,6 +188,11 @@ fn unavailable_attached_pty_cannot_disappear_from_the_final_save() {
 }
 
 #[test]
+fn unavailable_pty_manager_cannot_disappear_from_the_final_save() {
+    run_final_save_fixture("ack-poisoned-manager");
+}
+
+#[test]
 fn failed_history_capture_blocks_queued_autosave_and_keeps_recovery_state() {
     run_final_save_fixture("ack-capture-failed");
 }
@@ -643,7 +648,10 @@ fn final_save_profile_fixture() {
             }
             assert!(marker.exists());
         }
-        "ack-poisoned-grid" | "ack-poisoned-pending" | "ack-poisoned-handle" => {
+        "ack-poisoned-grid"
+        | "ack-poisoned-pending"
+        | "ack-poisoned-handle"
+        | "ack-poisoned-manager" => {
             let panel_id = app.workspaces[0].panels[0].id();
             let leaf_id = app.workspaces[0].panels[0].root_leaf_id();
             let runtime_id = app.workspaces[0].panels[0].runtime_session_id().unwrap();
@@ -699,6 +707,7 @@ fn final_save_profile_fixture() {
                 .lock()
                 .unwrap()
                 .feed_output_for_persistence_tests(b"new unacknowledged output\r\n");
+            let pending_before = handle.lock().unwrap().pending_log_snapshot();
 
             if phase == "ack-poisoned-grid" {
                 let term = handle.lock().unwrap().term.clone();
@@ -714,12 +723,21 @@ fn final_save_profile_fixture() {
                     .lock()
                     .unwrap()
                     .poison_pending_log_for_persistence_tests();
-            } else {
+            } else if phase == "ack-poisoned-handle" {
                 let unavailable = handle.clone();
                 assert!(
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
                         let _handle = unavailable.lock().unwrap();
                         panic!("injected PTY handle poison");
+                    }))
+                    .is_err()
+                );
+            } else {
+                let unavailable = manager.clone();
+                assert!(
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                        let _manager = unavailable.lock().unwrap();
+                        panic!("injected PTY manager poison");
                     }))
                     .is_err()
                 );
@@ -779,6 +797,13 @@ fn final_save_profile_fixture() {
                     log_before,
                     "unavailable output is not acknowledged or written"
                 );
+                if phase == "ack-poisoned-manager" {
+                    assert_eq!(
+                        handle.lock().unwrap().pending_log_snapshot(),
+                        pending_before,
+                        "an unavailable manager cannot acknowledge its healthy pending output"
+                    );
+                }
             }
         }
         "ack-restoring-shutdown" | "ack-restoring-completed" => {
