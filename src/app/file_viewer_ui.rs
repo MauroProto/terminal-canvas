@@ -19,7 +19,7 @@ use crate::theme::colors as palette;
 
 use super::code_highlight::HighlightedLine;
 use super::file_viewer_document::SourceDocument;
-use super::file_viewer_reader::{FileContents, FileViewerReader};
+use super::file_viewer_reader::{FileContents, FileReadError, FileReadOperation, FileViewerReader};
 use super::file_viewer_selection::{self, SelectionState, ViewerStyle};
 use super::TerminalApp;
 
@@ -57,7 +57,7 @@ pub(super) struct FileViewerState {
     pub(super) path: PathBuf,
     pub(super) document: Option<Arc<SourceDocument>>,
     pub(super) selection: SelectionState,
-    pub(super) read_error: Option<String>,
+    pub(super) read_error: Option<FileReadError>,
     pub(super) truncated: bool,
     pub(super) binary: bool,
     /// Líneas ya coloreadas; vacío mientras el worker trabaja.
@@ -97,7 +97,7 @@ impl TerminalApp {
         if !available {
             if let Some(viewer) = self.file_viewer.as_mut() {
                 viewer.loading = false;
-                viewer.read_error = Some("(no se pudo iniciar la lectura del archivo)".to_owned());
+                viewer.read_error = Some(FileReadError::WorkerUnavailable);
             }
         }
     }
@@ -154,7 +154,7 @@ impl TerminalApp {
                         ctx.request_repaint_after(std::time::Duration::from_millis(50));
                     } else {
                         viewer.loading = false;
-                        viewer.read_error = Some("(no se pudo leer el archivo)".to_owned());
+                        viewer.read_error = Some(FileReadError::WorkerUnavailable);
                     }
                 }
             }
@@ -311,7 +311,8 @@ impl TerminalApp {
                     return;
                 }
 
-                if let Some(message) = &viewer.read_error {
+                if let Some(error) = viewer.read_error {
+                    let (message, _) = read_error_message(error);
                     ui.add_space(16.0);
                     ui.label(RichText::new(message).size(11.0).color(palette::DIM));
                     return;
@@ -455,12 +456,51 @@ fn loaded_file_state(path: PathBuf, contents: FileContents) -> (FileViewerState,
             state.binary = true;
             None
         }
-        FileContents::Unreadable => {
-            state.read_error = Some("(no se pudo leer el archivo)".to_owned());
+        FileContents::Unreadable(error) => {
+            state.read_error = Some(error);
             None
         }
     };
     (state, source)
+}
+
+fn read_error_message(error: FileReadError) -> (&'static str, &'static str) {
+    use std::io::ErrorKind;
+    match error {
+        FileReadError::NotRegularFile => (
+            "Esta ruta no es un archivo regular.",
+            "Las carpetas, dispositivos, pipes y sockets no se muestran. Abrí un archivo o soltalo sobre el visor.",
+        ),
+        FileReadError::Io {
+            kind: ErrorKind::NotFound,
+            ..
+        } => (
+            "El archivo no existe o su ruta ya no está disponible.",
+            "Comprobá la ruta. Si restaurás el archivo o el volumen, podés reintentar.",
+        ),
+        FileReadError::Io {
+            kind: ErrorKind::PermissionDenied,
+            ..
+        } => (
+            "No se pudo leer el archivo: acceso denegado.",
+            "Comprobá los permisos del archivo y de sus carpetas antes de reintentar.",
+        ),
+        FileReadError::Io {
+            operation: FileReadOperation::Read,
+            ..
+        } => (
+            "La lectura del archivo se interrumpió.",
+            "Comprobá que el disco o volumen esté disponible y reintentá.",
+        ),
+        FileReadError::Io { .. } => (
+            "No se pudo abrir el archivo.",
+            "Comprobá la ruta, los permisos y la disponibilidad del volumen.",
+        ),
+        FileReadError::WorkerUnavailable => (
+            "El lector de archivos dejó de estar disponible.",
+            "Reintentá para iniciar un lector nuevo.",
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -488,11 +528,13 @@ mod tests {
         assert!(!state.binary);
         assert!(!state.truncated);
         assert!(state.document.is_none());
-        assert!(state
-            .read_error
-            .as_deref()
-            .unwrap()
-            .contains("no se pudo leer"));
+        assert!(matches!(
+            state.read_error,
+            Some(super::FileReadError::Io {
+                kind: std::io::ErrorKind::NotFound,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -672,7 +714,8 @@ mod tests {
             let mut viewer = super::loading_file_state("placeholder.txt".into());
             viewer.loading = kind == "loading";
             viewer.binary = kind == "binary";
-            viewer.read_error = (kind == "error").then(|| "controlled read failure".to_owned());
+            viewer.read_error =
+                (kind == "error").then_some(super::FileReadError::WorkerUnavailable);
             app.file_viewer = Some(viewer);
             let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 600.0));
             let mut frame = |events| {

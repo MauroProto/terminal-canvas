@@ -13,6 +13,32 @@ pub(super) const MAX_VIEW_BYTES: u64 = 2 * 1024 * 1024;
 pub(super) const MAX_VIEW_LINES: usize = 100_000;
 const READ_CHUNK_BYTES: usize = 32 * 1024;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FileReadOperation {
+    Metadata,
+    Open,
+    Read,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FileReadError {
+    NotRegularFile,
+    Io {
+        operation: FileReadOperation,
+        kind: io::ErrorKind,
+    },
+    WorkerUnavailable,
+}
+
+impl FileReadError {
+    fn io(operation: FileReadOperation, error: io::Error) -> Self {
+        Self::Io {
+            operation,
+            kind: error.kind(),
+        }
+    }
+}
+
 pub(super) enum FileContents {
     Text {
         /// Fuente y rangos completos preparados en el reader, sin copiar cada
@@ -22,7 +48,7 @@ pub(super) enum FileContents {
         language: Option<String>,
     },
     Binary,
-    Unreadable,
+    Unreadable(FileReadError),
 }
 
 pub(super) struct FileReadResult {
@@ -85,6 +111,14 @@ impl FileViewerReader {
         Self::with_loader(move |path, cancelled| {
             load_file_for_view(path, cancelled, &detect_language)
         })
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_test_loader<F>(load: F) -> Self
+    where
+        F: Fn(&Path, &dyn Fn() -> bool) -> Option<FileContents> + Send + 'static,
+    {
+        Self::with_loader(load)
     }
 
     fn with_loader<F>(load: F) -> Self
@@ -233,14 +267,14 @@ impl Drop for FileViewerReader {
     }
 }
 
-fn open_regular_file(path: &Path) -> io::Result<std::fs::File> {
+fn open_regular_file(path: &Path) -> Result<std::fs::File, FileReadError> {
     // Evita abrir dispositivos cuando ya se sabe que no son archivos. La
     // segunda comprobación sobre el handle cubre reemplazos entre stat/open.
-    if !std::fs::metadata(path)?.is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "the file viewer only reads regular files",
-        ));
+    if !std::fs::metadata(path)
+        .map_err(|error| FileReadError::io(FileReadOperation::Metadata, error))?
+        .is_file()
+    {
+        return Err(FileReadError::NotRegularFile);
     }
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
@@ -251,12 +285,16 @@ fn open_regular_file(path: &Path) -> io::Result<std::fs::File> {
         // tampoco adquirir un terminal de control al abrir un dispositivo.
         options.custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY);
     }
-    let file = options.open(path)?;
-    if !file.metadata()?.is_file() || !is_disk_file(&file) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "the file viewer only reads regular files",
-        ));
+    let file = options
+        .open(path)
+        .map_err(|error| FileReadError::io(FileReadOperation::Open, error))?;
+    if !file
+        .metadata()
+        .map_err(|error| FileReadError::io(FileReadOperation::Metadata, error))?
+        .is_file()
+        || !is_disk_file(&file)
+    {
+        return Err(FileReadError::NotRegularFile);
     }
     Ok(file)
 }
@@ -317,12 +355,26 @@ pub(super) fn load_file_for_view(
     }
     let mut file = match open_regular_file(path) {
         Ok(file) => file,
-        Err(_) => return Some(FileContents::Unreadable),
+        Err(error) => return Some(FileContents::Unreadable(error)),
     };
-    let (bytes, truncated_bytes) = match read_bounded(&mut file, cancelled) {
+    load_reader_for_view(path, &mut file, cancelled, detect_language)
+}
+
+fn load_reader_for_view(
+    path: &Path,
+    reader: &mut impl Read,
+    cancelled: &dyn Fn() -> bool,
+    detect_language: &dyn Fn(&str, &str) -> Option<String>,
+) -> Option<FileContents> {
+    let (bytes, truncated_bytes) = match read_bounded(reader, cancelled) {
         Ok(Some(read)) => read,
         Ok(None) => return None,
-        Err(_) => return Some(FileContents::Unreadable),
+        Err(error) => {
+            return Some(FileContents::Unreadable(FileReadError::io(
+                FileReadOperation::Read,
+                error,
+            )))
+        }
     };
     if bytes.contains(&0) {
         return Some(FileContents::Binary);
@@ -490,10 +542,121 @@ mod tests {
     #[test]
     fn binary_missing_and_directory_paths_preserve_their_fallbacks() {
         let fixture = Fixture::new("binary.dat");
-        assert!(matches!(load(&fixture.path), FileContents::Unreadable));
-        assert!(matches!(load(&fixture.directory), FileContents::Unreadable));
+        assert!(matches!(
+            load(&fixture.path),
+            FileContents::Unreadable(FileReadError::Io {
+                operation: FileReadOperation::Metadata,
+                kind: io::ErrorKind::NotFound,
+            })
+        ));
+        assert!(matches!(
+            load(&fixture.directory),
+            FileContents::Unreadable(FileReadError::NotRegularFile)
+        ));
         std::fs::write(&fixture.path, b"ELF\0data").expect("write binary");
         assert!(matches!(load(&fixture.path), FileContents::Binary));
+    }
+
+    #[test]
+    fn permission_errors_from_reads_preserve_the_operation_and_kind() {
+        struct DeniedReader;
+        impl Read for DeniedReader {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::from(io::ErrorKind::PermissionDenied))
+            }
+        }
+
+        let contents = load_reader_for_view(
+            Path::new("denied.rs"),
+            &mut DeniedReader,
+            &|| false,
+            &|_, _| panic!("failed reads must not detect a language"),
+        )
+        .expect("read error is a result, not cancellation");
+        assert!(matches!(
+            contents,
+            FileContents::Unreadable(FileReadError::Io {
+                operation: FileReadOperation::Read,
+                kind: io::ErrorKind::PermissionDenied,
+            })
+        ));
+    }
+
+    #[test]
+    fn an_error_after_partial_input_never_publishes_a_partial_document() {
+        struct PartialErrorReader {
+            calls: usize,
+        }
+        impl Read for PartialErrorReader {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                self.calls += 1;
+                if self.calls == 1 {
+                    let partial = b"// partial\r\nconst value = ";
+                    buffer[..partial.len()].copy_from_slice(partial);
+                    Ok(partial.len())
+                } else {
+                    Err(io::Error::from(io::ErrorKind::UnexpectedEof))
+                }
+            }
+        }
+
+        let mut reader = PartialErrorReader { calls: 0 };
+        let contents =
+            load_reader_for_view(Path::new("partial.rs"), &mut reader, &|| false, &|_, _| {
+                panic!("partial reads must not detect a language")
+            })
+            .expect("read failure is a result");
+        assert_eq!(reader.calls, 2);
+        assert!(matches!(
+            contents,
+            FileContents::Unreadable(FileReadError::Io {
+                operation: FileReadOperation::Read,
+                kind: io::ErrorKind::UnexpectedEof,
+            })
+        ));
+    }
+
+    #[test]
+    fn a_missing_file_can_be_created_and_retried_on_the_same_worker() {
+        let fixture = Fixture::new("later.rs");
+        let mut reader = FileViewerReader::new(|_, _| None);
+        let original_shared = Arc::clone(&reader.shared);
+        let (missing_tx, missing_rx) = std::sync::mpsc::channel();
+        let first = reader.request(fixture.path.clone(), move || {
+            let _ = missing_tx.send(());
+        });
+        missing_rx.recv_timeout(DEADLINE).expect("missing ready");
+        let missing = reader.poll().expect("missing result");
+        assert_eq!(missing.token, first);
+        assert_eq!(missing.path, fixture.path);
+        assert!(matches!(
+            missing.contents,
+            FileContents::Unreadable(FileReadError::Io {
+                operation: FileReadOperation::Metadata,
+                kind: io::ErrorKind::NotFound,
+            })
+        ));
+        assert!(
+            reader.is_available(),
+            "a file error does not close the worker"
+        );
+
+        let source = "const título = \"café 🐈\";\r\n";
+        std::fs::write(&fixture.path, source).expect("create missing file");
+        let (retry_tx, retry_rx) = std::sync::mpsc::channel();
+        let latest = reader.request(fixture.path.clone(), move || {
+            let _ = retry_tx.send(());
+        });
+        retry_rx.recv_timeout(DEADLINE).expect("retry ready");
+        let result = reader.poll().expect("retry result");
+        assert_ne!(first, latest);
+        assert!(!reader.is_current(first));
+        assert_eq!(result.token, latest);
+        assert_eq!(result.path, fixture.path);
+        assert_source(result.contents, source, false);
+        assert!(reader.is_available());
+        assert!(Arc::ptr_eq(&original_shared, &reader.shared));
+        assert!(reader.poll().is_none());
     }
 
     #[test]
@@ -628,10 +791,13 @@ mod tests {
         // SAFETY: path es una CString viva y el único destino está dentro del
         // directorio temporal exclusivo de este fixture; mode es válido.
         assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
-        assert!(matches!(load(&fixture.path), FileContents::Unreadable));
+        assert!(matches!(
+            load(&fixture.path),
+            FileContents::Unreadable(FileReadError::NotRegularFile)
+        ));
         assert!(matches!(
             load(Path::new("/dev/null")),
-            FileContents::Unreadable
+            FileContents::Unreadable(FileReadError::NotRegularFile)
         ));
     }
 
@@ -650,7 +816,10 @@ mod tests {
     fn windows_character_devices_are_not_disk_files() {
         let file = std::fs::File::open("NUL").expect("open Windows NUL device");
         assert!(!is_disk_file(&file));
-        assert!(matches!(load(Path::new("NUL")), FileContents::Unreadable));
+        assert!(matches!(
+            load(Path::new("NUL")),
+            FileContents::Unreadable(_)
+        ));
     }
 
     #[test]
@@ -705,7 +874,7 @@ mod tests {
 
     #[test]
     fn a_new_generation_discards_the_previous_unpolled_result() {
-        let mut reader = FileViewerReader::with_loader(|_, _| Some(text_contents("loaded")));
+        let mut reader = FileViewerReader::with_test_loader(|_, _| Some(text_contents("loaded")));
         let (first_tx, first_rx) = std::sync::mpsc::channel();
         let first = reader.request(PathBuf::from("same.rs"), move || {
             let _ = first_tx.send(());
@@ -731,6 +900,45 @@ mod tests {
         let result = reader.poll().expect("latest result");
         assert_eq!(result.token, latest);
         assert!(reader.poll().is_none());
+    }
+
+    #[test]
+    fn a_panicking_loader_closes_its_reader_and_rejects_future_requests() {
+        let mut reader = FileViewerReader::with_test_loader(|_, _| {
+            panic!("synthetic loader exit");
+        });
+        let notifications = Arc::new(AtomicU64::new(0));
+        let initial_notifications = Arc::clone(&notifications);
+        let initial = reader.request(PathBuf::from("failed.rs"), move || {
+            initial_notifications.fetch_add(1, Ordering::Relaxed);
+        });
+        let deadline = std::time::Instant::now() + DEADLINE;
+        let mut state = reader.shared.state.lock().unwrap();
+        while !reader.shared.closed.load(Ordering::Acquire) {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            assert!(!remaining.is_zero(), "loader exit must close the reader");
+            state = reader
+                .shared
+                .ready
+                .wait_timeout(state, remaining)
+                .unwrap()
+                .0;
+        }
+        assert!(state.pending.is_none());
+        assert!(state.completed.is_none());
+        drop(state);
+        assert!(!reader.is_available());
+        assert_eq!(notifications.load(Ordering::Relaxed), 0);
+
+        let retry_notifications = Arc::clone(&notifications);
+        let rejected = reader.request(PathBuf::from("retry.rs"), move || {
+            retry_notifications.fetch_add(1, Ordering::Relaxed);
+        });
+        assert_ne!(initial, rejected);
+        assert!(reader.is_current(rejected));
+        assert!(reader.shared.state.lock().unwrap().pending.is_none());
+        assert!(reader.poll().is_none());
+        assert_eq!(notifications.load(Ordering::Relaxed), 0);
     }
 
     #[test]
