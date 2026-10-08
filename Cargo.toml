@@ -82,7 +82,7 @@ rfd = "0.15"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
 futures-util = "0.3"
-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
+tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
 chacha20poly1305 = { version = "0.10", features = ["std"] }
 argon2 = "0.5"
 base64 = "0.22"
