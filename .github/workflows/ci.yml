@@ -36,7 +36,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0, Node 24
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5.1.0, Node 24
         with:
           persist-credentials: false
 
@@ -90,7 +90,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Checkout
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0, Node 24
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5.1.0, Node 24
         with:
           persist-credentials: false
       - name: Verify browser extension
@@ -105,7 +105,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0, Node 24
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5.1.0, Node 24
         with:
           persist-credentials: false
           # El script necesita el commit base para armar el worktree.
@@ -133,7 +133,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0, Node 24
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5.1.0, Node 24
         with:
           persist-credentials: false
 
