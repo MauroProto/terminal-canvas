@@ -107,7 +107,7 @@ fn start_daemon() -> (DaemonProcess, String) {
         .env("MI_TERMINAL_SCROLLBACK_DIR", dir.join("scrollback"))
         .spawn()
         .expect("arranca el daemon");
-    let process = DaemonProcess {
+    let mut process = DaemonProcess {
         child,
         dir: dir.clone(),
         _permit: permit,
@@ -115,10 +115,26 @@ fn start_daemon() -> (DaemonProcess, String) {
 
     let socket = protocol::socket_path(&dir);
     let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline && !socket.exists() {
+    // A pathname can exist between bind and listen. Probe the listening socket
+    // before handing it to fixtures that intentionally connect in parallel.
+    loop {
+        match std::os::unix::net::UnixStream::connect(&socket) {
+            Ok(stream) => {
+                drop(stream);
+                break;
+            }
+            Err(error) => {
+                if let Some(status) = process.child.try_wait().expect("estado del daemon") {
+                    panic!("el daemon terminó antes de aceptar conexiones: {status}; {error}");
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "el daemon no aceptó conexiones antes del plazo: {error}"
+                );
+            }
+        }
         std::thread::sleep(Duration::from_millis(50));
     }
-    assert!(socket.exists(), "el daemon nunca abrió el socket");
 
     let token = protocol::ensure_token(&dir).expect("token");
     (process, token)
