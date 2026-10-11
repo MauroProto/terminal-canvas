@@ -168,7 +168,7 @@ fn start_daemon() -> (DaemonProcess, String) {
     // bytes de `sun_path` (un uuid completo en /var/folders/... no entra).
     let short_id = uuid::Uuid::new_v4().simple().to_string()[..8].to_owned();
     let dir = std::path::PathBuf::from("/tmp").join(format!("tcd-{short_id}"));
-    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::create_dir(&dir).expect("exclusive daemon fixture directory");
     let binary = daemon_binary();
     assert!(
         binary.exists(),
@@ -177,6 +177,7 @@ fn start_daemon() -> (DaemonProcess, String) {
     );
 
     let child = Command::new(&binary)
+        .env("TERMINAL_CANVAS_HOME", dir.join("profile"))
         .env("MI_TERMINAL_DAEMON_DIR", &dir)
         .env("MI_TERMINAL_SCROLLBACK_DIR", dir.join("scrollback"))
         .spawn()
@@ -481,6 +482,7 @@ fn a_second_daemon_cannot_take_over_an_active_socket() {
     let (mut daemon, _token) = start_daemon();
     let first_pid = daemon.child.id();
     let mut second = Command::new(daemon_binary())
+        .env("TERMINAL_CANVAS_HOME", daemon.dir.join("profile"))
         .env("MI_TERMINAL_DAEMON_DIR", &daemon.dir)
         .env("MI_TERMINAL_SCROLLBACK_DIR", daemon.dir.join("scrollback"))
         .spawn()

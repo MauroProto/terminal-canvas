@@ -1,5 +1,5 @@
 //! Real process proof for the managed nonce and durable physical-close producer.
-//! Each child gets its own SQLite, daemon socket and scrollback directory.
+//! Each child gets its own app profile, SQLite, socket and scrollback directory.
 
 use super::*;
 use crate::hook_authority::{BirthBinding, Claim, ClaimPhase, HostEvidence, LeafKey};
@@ -45,6 +45,7 @@ fn start(root: PathBuf, db: &Path) -> (TestDaemon, String) {
         binary.display()
     );
     let child = Command::new(binary)
+        .env("TERMINAL_CANVAS_HOME", root.join("profile"))
         .env("MI_TERMINAL_DAEMON_DIR", &dir)
         .env("MI_TERMINAL_SCROLLBACK_DIR", &history)
         .env("TC_MEMORY_DB", db)
@@ -298,7 +299,14 @@ fn real_managed_birth_transfer_and_close_confirm_native_wait_eof_and_durable_out
         if completed_markers == 2 {
             break;
         }
-        assert!(Instant::now() < deadline, "managed payload did not finish");
+        assert!(
+            Instant::now() < deadline,
+            "managed payload did not finish: bytes={}, markers={}, head={:?}, tail={:?}",
+            output.len(),
+            completed_markers,
+            String::from_utf8_lossy(&output[..output.len().min(128)]),
+            String::from_utf8_lossy(&output[output.len().saturating_sub(128)..]),
+        );
     }
     assert!(
         output
