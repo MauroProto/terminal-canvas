@@ -3852,6 +3852,7 @@ fn rename_escape_cancels_even_with_enter_and_preserves_the_terminal_title() {
         }
         rename_dialog_frame_for_test(&ctx, &mut app, events);
         assert!(app.renaming_panel.is_none());
+        assert_eq!(rename_dialog_pending_focus_for_test(&ctx), None);
         assert_eq!(app.ws().panels[0].title(), original);
         assert!(!ctx.input(|input| input.key_pressed(egui::Key::Escape)));
         assert_ne!(
