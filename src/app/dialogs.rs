@@ -4,6 +4,7 @@ use egui::{pos2, Color32, FontId, Response};
 const DIALOG_INPUT_BG: Color32 = palette::SURFACE;
 
 pub(super) const RENAME_TITLE_ID: &str = "rename-dialog-title";
+pub(super) const RENAME_FOCUS_PENDING_ID: &str = "rename-dialog-focus-pending";
 
 fn dialog_frame() -> egui::Frame {
     egui::Frame::default()
@@ -203,15 +204,19 @@ impl TerminalApp {
         ctx.input_mut(|input| {
             input.consume_key(egui::Modifiers::NONE, Key::Enter);
         });
-        ctx.memory_mut(|memory| memory.request_focus(Id::new(RENAME_TITLE_ID)));
+        ctx.data_mut(|data| {
+            data.insert_temp(Id::new(RENAME_FOCUS_PENDING_ID), panel_id);
+        });
     }
 
     pub(super) fn show_rename_dialog(&mut self, ctx: &egui::Context) {
         let Some(panel_id) = self.renaming_panel else {
+            ctx.data_mut(|data| data.remove::<Uuid>(Id::new(RENAME_FOCUS_PENDING_ID)));
             return;
         };
         if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, Key::Escape)) {
             self.renaming_panel = None;
+            ctx.data_mut(|data| data.remove::<Uuid>(Id::new(RENAME_FOCUS_PENDING_ID)));
             ctx.memory_mut(|memory| memory.surrender_focus(Id::new(RENAME_TITLE_ID)));
             return;
         }
@@ -226,6 +231,23 @@ impl TerminalApp {
                     ui.set_min_width(360.0);
                     dialog_title(ui, "Rename terminal");
                     dialog_field_label(ui, "Title");
+                    // A new Area sizes itself invisibly before its first interactive frame.
+                    // Request focus before building the field, so that frame keeps its text events.
+                    let pending_focus = ui
+                        .ctx()
+                        .data(|data| data.get_temp::<Uuid>(Id::new(RENAME_FOCUS_PENDING_ID)));
+                    if pending_focus == Some(panel_id)
+                        && ui.is_enabled()
+                        && ui.is_visible()
+                        && ui
+                            .ctx()
+                            .memory(|memory| memory.allows_interaction(ui.layer_id()))
+                    {
+                        ui.ctx()
+                            .memory_mut(|memory| memory.request_focus(Id::new(RENAME_TITLE_ID)));
+                        ui.ctx()
+                            .data_mut(|data| data.remove::<Uuid>(Id::new(RENAME_FOCUS_PENDING_ID)));
+                    }
                     let response = dialog_singleline_with_id(
                         ui,
                         &mut self.rename_buf,
@@ -260,6 +282,7 @@ impl TerminalApp {
             self.renaming_panel = None;
         }
         if close || save {
+            ctx.data_mut(|data| data.remove::<Uuid>(Id::new(RENAME_FOCUS_PENDING_ID)));
             ctx.memory_mut(|memory| memory.surrender_focus(Id::new(RENAME_TITLE_ID)));
         }
     }
