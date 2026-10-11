@@ -272,27 +272,37 @@ impl TerminalApp {
         let text = state.text.trim().to_owned();
         let ids = state.selected_ids();
         let workspace_id = state.workspace_id;
-        self.broadcast = None;
-
         let mut sent = 0usize;
-        let mut failed = 0usize;
+        let mut failed = Vec::new();
         for panel_id in ids {
-            if self
+            let result = self
                 .workspaces
                 .iter_mut()
                 .find(|workspace| workspace.id == workspace_id)
-                .is_some_and(|workspace| workspace.send_prompt_to_panel(panel_id, &text))
-            {
-                sent += 1;
-            } else {
-                failed += 1;
+                .ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::NotFound, "El workspace ya no existe.")
+                })
+                .and_then(|workspace| workspace.submit_prompt_to_ready_panel(panel_id, &text));
+            match result {
+                Ok(()) => sent += 1,
+                Err(error) => failed.push((panel_id, error.to_string())),
+            }
+        }
+        if failed.is_empty() {
+            self.broadcast = None;
+        } else if let Some(state) = self.broadcast.as_mut() {
+            for target in &mut state.targets {
+                target.selected = failed.iter().any(|(id, _)| *id == target.panel_id);
             }
         }
         if sent > 0 {
-            self.toast_success(format!("Enviado a {sent} terminal(es)"));
+            self.toast_success(format!("Texto encolado en {sent} terminal(es)"));
         }
-        if failed > 0 {
-            self.toast_error(format!("{failed} panel(es) ya no existían"));
+        if let Some((_, reason)) = failed.first() {
+            self.toast_error(format!(
+                "{} envío(s) fallaron. Se conservó el borrador: {reason}",
+                failed.len()
+            ));
         }
     }
 }
@@ -396,5 +406,66 @@ mod tests {
         );
         assert_eq!(state.alive_count(), 2);
         assert_eq!(state.selected_count(), 1);
+    }
+
+    #[test]
+    fn prompt_delivery_broadcast_retry_preserves_only_failed_destinations() {
+        use crate::terminal::{panel::TerminalPanel, pty::PtyHandle};
+        use std::sync::Arc;
+
+        let mut app = crate::app::preferences_ui_tests::detached_app();
+        let manager = app.workspaces[0].pty_manager();
+        manager
+            .lock()
+            .unwrap()
+            .set_remote_spawner(Box::new(|_, _, _, _, wanted| {
+                Ok((
+                    wanted.unwrap_or_else(Uuid::new_v4),
+                    PtyHandle::for_persistence_tests(b""),
+                ))
+            }));
+        let mut destinations = Vec::new();
+        for _ in 0..2 {
+            let mut panel = TerminalPanel::new(
+                egui::Pos2::ZERO,
+                egui::vec2(400.0, 240.0),
+                egui::Color32::WHITE,
+                0,
+            );
+            panel.attach_session_with_spec(
+                Arc::clone(&manager),
+                None,
+                crate::runtime::SessionSpec::default(),
+            );
+            let handle = manager
+                .lock()
+                .unwrap()
+                .handle(panel.runtime_session_id().unwrap())
+                .unwrap();
+            destinations.push((panel.id, handle));
+            app.workspaces[0].add_restored_terminal(panel);
+        }
+        destinations[1]
+            .1
+            .lock()
+            .unwrap()
+            .close_input_for_prompt_tests();
+        app.open_broadcast();
+        app.broadcast.as_mut().unwrap().text = "broadcast draft".to_owned();
+        app.dispatch_broadcast();
+
+        let state = app.broadcast.as_ref().unwrap();
+        assert_eq!(state.text, "broadcast draft");
+        assert_eq!(state.selected_ids(), vec![destinations[1].0]);
+        assert_eq!(destinations[0].1.lock().unwrap().activity_revision(), 1);
+        assert_eq!(destinations[1].1.lock().unwrap().activity_revision(), 0);
+
+        app.dispatch_broadcast();
+        assert_eq!(
+            destinations[0].1.lock().unwrap().activity_revision(),
+            1,
+            "retry must not duplicate accepted input"
+        );
+        assert_eq!(app.broadcast.as_ref().unwrap().text, "broadcast draft");
     }
 }

@@ -2412,10 +2412,12 @@ impl TerminalApp {
             "Mirá esta captura: {}",
             crate::terminal::shell_quote::quote_path(&path.to_string_lossy())
         );
-        if self.workspaces[index].send_prompt_to_panel(panel_id, &prompt) {
-            self.toast_success("Captura enviada al agente");
-        } else {
-            self.toast_error("No se pudo escribir en ese terminal");
+        match self.workspaces[index].submit_prompt_to_ready_panel(panel_id, &prompt) {
+            Ok(()) => self.toast_success("Captura encolada en el terminal"),
+            Err(error) => self.toast_error(format!(
+                "No se pudo enviar la captura: {error}. Guardada en {}",
+                path.display()
+            )),
         }
     }
 
