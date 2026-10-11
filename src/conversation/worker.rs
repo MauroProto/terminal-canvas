@@ -60,8 +60,23 @@ pub struct Worker {
 }
 impl Worker {
     pub fn start(database: PathBuf, ctx: egui::Context) -> std::io::Result<Self> {
-        let (jobs, rx) = mpsc::sync_channel(64);
-        let (tx, events) = mpsc::sync_channel(64);
+        Self::start_bounded(database, ctx, 64)
+    }
+    #[cfg(test)]
+    pub(crate) fn start_for_test(
+        database: PathBuf,
+        ctx: egui::Context,
+        capacity: usize,
+    ) -> std::io::Result<Self> {
+        Self::start_bounded(database, ctx, capacity)
+    }
+    fn start_bounded(
+        database: PathBuf,
+        ctx: egui::Context,
+        capacity: usize,
+    ) -> std::io::Result<Self> {
+        let (jobs, rx) = mpsc::sync_channel(capacity);
+        let (tx, events) = mpsc::sync_channel(capacity);
         let active = Arc::new(AtomicBool::new(true));
         let enabled = active.clone();
         std::thread::Builder::new()

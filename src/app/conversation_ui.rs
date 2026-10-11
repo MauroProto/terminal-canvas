@@ -633,6 +633,9 @@ mod tests {
         }
     }
     fn fixture() -> Fixture {
+        fixture_with_capacity(64)
+    }
+    fn fixture_with_capacity(capacity: usize) -> Fixture {
         let ctx = egui::Context::default();
         let mut app = crate::app::preferences_ui_tests::detached_app();
         app.persistence_writes_enabled = true;
@@ -696,7 +699,7 @@ mod tests {
             .unwrap();
         let source = descriptors[0].clone();
         let target = descriptors[1].clone();
-        let worker = Worker::start(path, ctx).unwrap();
+        let worker = Worker::start_for_test(path, ctx, capacity).unwrap();
         worker
             .submit(Job::Observe(
                 descriptors
@@ -937,11 +940,14 @@ mod tests {
     }
     #[test]
     fn shutdown_drains_full_channels_and_persists_late_delivery_without_terminal_input() {
-        let mut fixture = fixture();
+        // Both queues must actually be full, but disk speed must not determine
+        // whether the test can reach that state before shutdown starts.
+        const CAPACITY: usize = 2;
+        let mut fixture = fixture_with_capacity(CAPACITY);
         let hub = fixture.app.conversations.as_mut().unwrap();
         hub.worker.active(false);
         let mut ids = Vec::new();
-        for _ in 0..64 {
+        for _ in 0..CAPACITY {
             let id = Uuid::new_v4();
             hub.worker
                 .jobs
@@ -955,7 +961,7 @@ mod tests {
         }
         // The worker has filled its output channel and must block on the next
         // event. Queue a delivery and fill its input channel as well.
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now() + Duration::from_secs(30);
         while fixture
             .store
             .message(Caller::User, *ids.last().unwrap())
@@ -972,7 +978,7 @@ mod tests {
             .jobs
             .send(Job::DeliverNow(request.operation_id))
             .unwrap();
-        for _ in 0..64 {
+        for _ in 0..CAPACITY {
             let id = Uuid::new_v4();
             hub.worker
                 .jobs
