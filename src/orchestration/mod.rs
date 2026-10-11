@@ -11,6 +11,7 @@ mod linear_client;
 mod manager;
 mod matching;
 pub(crate) mod portable_context;
+mod provider_paths;
 mod worktree_archive;
 mod worktree_removal_safety;
 mod worktree_trash;

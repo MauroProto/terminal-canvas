@@ -81,7 +81,7 @@ pub fn slug_variants(cwd: &Path) -> Vec<String> {
 }
 
 fn claude_projects_root() -> Option<PathBuf> {
-    crate::utils::platform::home_dir().map(|home| home.join(".claude").join("projects"))
+    super::provider_paths::claude_config_dir().map(|dir| dir.join("projects"))
 }
 
 /// Conversaciones anteriores de Claude Code para ese directorio de trabajo,
@@ -90,6 +90,10 @@ pub fn list_claude_sessions(cwd: &Path) -> Vec<AgentSessionEntry> {
     let Some(root) = claude_projects_root() else {
         return Vec::new();
     };
+    list_claude_sessions_from_root(&root, cwd)
+}
+
+fn list_claude_sessions_from_root(root: &Path, cwd: &Path) -> Vec<AgentSessionEntry> {
     for slug in slug_variants(cwd) {
         let dir = root.join(&slug);
         if dir.is_dir() {
@@ -237,6 +241,46 @@ mod tests {
             slug_variants(Path::new("/Users/mauro/Desktop/proyectos/terminalcanvas")),
             vec!["-Users-mauro-Desktop-proyectos-terminalcanvas".to_owned()]
         );
+    }
+
+    #[test]
+    fn a_custom_profile_lists_only_its_own_project_history() {
+        let root = std::env::temp_dir().join(format!(
+            "tc-claude-profiles-{}",
+            uuid::Uuid::new_v4().as_simple()
+        ));
+        let home = root.join("home");
+        let custom = root.join("custom profile");
+        let cwd = root.join("project with spaces");
+        let slug = &super::slug_variants(&cwd)[0];
+        let original_project = home.join(".claude/projects").join(slug);
+        let custom_project = custom.join("projects").join(slug);
+        std::fs::create_dir_all(&original_project).unwrap();
+        std::fs::create_dir_all(&custom_project).unwrap();
+        std::fs::write(
+            original_project.join("original-session.jsonl"),
+            r#"{"type":"ai-title","aiTitle":"Original profile history"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            custom_project.join("custom-session.jsonl"),
+            r#"{"type":"ai-title","aiTitle":"Custom profile history"}"#,
+        )
+        .unwrap();
+        let configured = super::super::provider_paths::resolve_claude_config_dir(
+            Some(custom.clone().into_os_string()),
+            Some(home),
+        )
+        .unwrap();
+        let sessions = super::list_claude_sessions_from_root(&configured.join("projects"), &cwd);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "custom-session");
+        assert_eq!(sessions[0].title, "Custom profile history");
+        std::fs::remove_file(custom_project.join("custom-session.jsonl")).unwrap();
+        assert!(
+            super::list_claude_sessions_from_root(&configured.join("projects"), &cwd).is_empty()
+        );
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

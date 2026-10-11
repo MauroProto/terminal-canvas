@@ -25,8 +25,7 @@ pub const MANAGED_EVENTS: &[&str] = &[
 
 /// Path del settings.json de Claude.
 pub fn settings_path() -> Option<PathBuf> {
-    let base = directories::BaseDirs::new()?;
-    Some(base.home_dir().join(".claude").join("settings.json"))
+    super::provider_paths::claude_config_dir().map(|dir| dir.join("settings.json"))
 }
 
 /// Path del endpoint file que sourcean los hooks.
@@ -144,7 +143,7 @@ pub fn install_to_disk() -> anyhow::Result<()> {
         return Ok(());
     }
     let Some(path) = settings_path() else {
-        anyhow::bail!("no se pudo resolver ~/.claude/settings.json");
+        anyhow::bail!("no se pudo resolver el settings.json del perfil de Claude");
     };
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -162,7 +161,7 @@ pub fn uninstall_from_disk() -> anyhow::Result<()> {
         return Ok(());
     }
     let Some(path) = settings_path() else {
-        anyhow::bail!("no se pudo resolver ~/.claude/settings.json");
+        anyhow::bail!("no se pudo resolver el settings.json del perfil de Claude");
     };
     if !path.exists() {
         return Ok(());
