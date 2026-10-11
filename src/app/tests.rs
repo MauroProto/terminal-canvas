@@ -331,6 +331,10 @@ fn run_final_save_fixture(phase: &str) {
     use std::time::{Duration, Instant};
 
     let profile = unique_temp_dir("tc-final-save-profile");
+    // Keep diagnostics readable even if the child stalls. Waiting before
+    // draining a pipe can itself block a verbose child on Windows.
+    let stdout_path = profile.join("fixture.stdout");
+    let stderr_path = profile.join("fixture.stderr");
     let mut command = Command::new(std::env::current_exe().unwrap());
     command
         .args([
@@ -345,8 +349,8 @@ fn run_final_save_fixture(phase: &str) {
         .env_remove("MI_TERMINAL_SCROLLBACK_DIR")
         .env_remove("MI_TERMINAL_DAEMON_DIR")
         .env_remove("TC_MEMORY_DB")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stdout(Stdio::from(fs::File::create_new(&stdout_path).unwrap()))
+        .stderr(Stdio::from(fs::File::create_new(&stderr_path).unwrap()));
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -354,23 +358,24 @@ fn run_final_save_fixture(phase: &str) {
     }
     let mut child = command.spawn().unwrap();
     let deadline = Instant::now() + Duration::from_secs(15);
-    while child.try_wait().unwrap().is_none() {
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
+            let stdout = fs::read_to_string(&stdout_path).unwrap_or_default();
+            let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();
             let _ = fs::remove_dir_all(&profile);
-            panic!("Final save fixture timed out: {phase}");
+            panic!("Final save fixture timed out: {phase}\n{stdout}\n{stderr}");
         }
         std::thread::sleep(Duration::from_millis(20));
-    }
-    let output = child.wait_with_output().unwrap();
+    };
+    let stdout = fs::read_to_string(&stdout_path).unwrap_or_default();
+    let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();
     let _ = fs::remove_dir_all(&profile);
-    assert!(
-        output.status.success(),
-        "{phase}: {}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert!(status.success(), "{phase}: {stdout}\n{stderr}");
 }
 
 #[test]
@@ -544,6 +549,7 @@ fn final_save_profile_fixture() {
     }
 
     let phase = std::env::var("TC_FINAL_SAVE_FIXTURE").expect("isolated fixture phase");
+    eprintln!("Final save fixture {phase}: profile setup");
     let profile = std::path::PathBuf::from(
         std::env::var_os("TERMINAL_CANVAS_HOME").expect("isolated fixture profile"),
     );
@@ -559,6 +565,7 @@ fn final_save_profile_fixture() {
     assert!(crate::state::run_marker::current_process_may_write());
     assert!(marker.exists());
     let ctx = egui::Context::default();
+    eprintln!("Final save fixture {phase}: app construction");
     let mut app = if phase.starts_with("ack-") {
         // A saved layout creates detached sessions. Install an in-memory
         // spawner before attaching them so these regressions start no shell.
@@ -599,6 +606,7 @@ fn final_save_profile_fixture() {
     } else {
         super::TerminalApp::new_for_tests(&ctx)
     };
+    eprintln!("Final save fixture {phase}: app ready");
     app.persistence_writes_enabled = true;
     app.run_marker_active = true;
     app.workspaces[0].name = "Final workspace".to_owned();
@@ -1244,6 +1252,7 @@ fn final_save_profile_fixture() {
             } else {
                 assert!(app.persist_scrollbacks(false));
             }
+            eprintln!("Final save fixture {phase}: replacing runtime through ledger ACK");
             let workspace_id = app.workspaces[0].id;
             let CanvasPanel::Terminal(panel) = &mut app.workspaces[0].panels[0];
             assert!(panel.replace_focused_session_with_fixture_alias_ack(
@@ -1253,6 +1262,7 @@ fn final_save_profile_fixture() {
                 "in-memory-resume".to_owned(),
                 "test agent".to_owned()
             ));
+            eprintln!("Final save fixture {phase}: runtime replaced");
             assert_eq!(panel.root_leaf_id(), leaf_id);
             let new_runtime = panel.runtime_session_id().unwrap();
             assert_ne!(old_runtime, new_runtime);
