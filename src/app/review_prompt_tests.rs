@@ -74,6 +74,81 @@ fn defer_feedback(app: &mut TerminalApp, runtime_id: Uuid) {
     });
 }
 
+fn restored_fixture() -> (TerminalApp, Uuid, Uuid) {
+    let (mut app, panel_id, _, handle) = fixture();
+    let saved = app.workspaces[0].panels[0].to_saved();
+    let manager = app.workspaces[0].pty_manager();
+    app.workspaces[0].panels.clear();
+    drop(handle);
+    let panel = TerminalPanel::from_saved(
+        saved,
+        &egui::Context::default(),
+        None,
+        app.workspaces[0].id,
+        Arc::clone(&manager),
+    );
+    let runtime_id = panel.runtime_session_id().unwrap();
+    assert!(!manager.lock().unwrap().is_attached(runtime_id));
+    app.workspaces[0].add_restored_terminal(panel);
+    (app, panel_id, runtime_id)
+}
+
+#[test]
+fn prompt_delivery_review_restored_terminal_defers_feedback_and_ready_send_does_not_spawn() {
+    let (mut app, panel_id, runtime_id) = restored_fixture();
+    let manager = app.workspaces[0].pty_manager();
+    assert_eq!(
+        app.workspaces[0]
+            .submit_prompt_to_ready_panel(panel_id, "capture")
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::NotConnected
+    );
+    assert!(!manager.lock().unwrap().is_attached(runtime_id));
+
+    app.send_code_review_feedback();
+    let review = app.code_review.as_ref().unwrap();
+    assert_eq!(review.feedback, "original feedback");
+    assert!(review.pending_delivery.is_some());
+    let handle = manager.lock().unwrap().handle(runtime_id).unwrap();
+    assert_eq!(handle.lock().unwrap().activity_revision(), 0);
+    app.workspaces[0].flush_pending_inputs();
+    app.poll_review_prompt_delivery();
+    assert!(!app.code_review.as_ref().unwrap().feedback_sent);
+    handle.lock().unwrap().mark_render_dirty();
+    app.workspaces[0].flush_pending_inputs();
+    app.poll_review_prompt_delivery();
+    let review = app.code_review.as_ref().unwrap();
+    assert!(review.feedback.is_empty());
+    assert!(review.feedback_sent);
+    assert_eq!(review.notes.pending().len(), 1);
+    assert_eq!(handle.lock().unwrap().activity_revision(), 1);
+}
+
+#[test]
+fn prompt_delivery_review_restored_terminal_acknowledges_notes_after_startup() {
+    let (mut app, panel_id, runtime_id) = restored_fixture();
+    app.send_pending_notes(panel_id);
+    let review = app.code_review.as_ref().unwrap();
+    assert!(review.pending_delivery.is_some());
+    assert_eq!(review.notes.pending().len(), 1);
+    assert!(!app.preferences_worker.busy());
+    let handle = app.workspaces[0]
+        .pty_manager()
+        .lock()
+        .unwrap()
+        .handle(runtime_id)
+        .unwrap();
+    handle.lock().unwrap().mark_render_dirty();
+    app.workspaces[0].flush_pending_inputs();
+    app.poll_review_prompt_delivery();
+    let review = app.code_review.as_ref().unwrap();
+    assert!(review.notes.pending().is_empty());
+    assert!(review.pending_delivery.is_none());
+    assert_eq!(review.feedback, "original feedback");
+    assert_eq!(handle.lock().unwrap().activity_revision(), 1);
+}
+
 #[test]
 fn prompt_delivery_review_keeps_feedback_after_the_input_channel_closes() {
     let (mut app, _, _, handle) = fixture();
