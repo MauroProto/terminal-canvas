@@ -3437,3 +3437,36 @@ fn older_layout_ack_does_not_clear_a_warning_or_confirm_newer_ui_changes() {
         crate::state::persistence::AutosaveDecision::SaveNow,
     );
 }
+
+#[test]
+fn current_layout_ack_clears_its_warning_and_allows_a_new_failure_notice() {
+    use std::time::Instant;
+
+    let ctx = egui::Context::default();
+    let mut app = detached_test_app_with_panel(&ctx);
+    let current = app.snapshot_state();
+    apply_layout_save_result(
+        &mut app,
+        current.clone(),
+        Err(anyhow::anyhow!("controlled disk full")),
+    );
+    app.toasts = Default::default();
+    apply_layout_save_result(&mut app, current.clone(), Ok(()));
+    assert!(app.layout_save_warning.is_none());
+    assert_eq!(app.persisted_state.as_ref(), Some(&current));
+    assert_eq!(
+        app.autosave
+            .should_persist(&current, app.persisted_state.as_ref(), Instant::now(),),
+        crate::state::persistence::AutosaveDecision::Idle,
+    );
+    assert!(!layout_save_warning_labels(&app, &ctx, 0.0).contains("No se pudo guardar el layout"));
+    apply_layout_save_result(
+        &mut app,
+        current,
+        Err(anyhow::anyhow!("controlled disk full")),
+    );
+    assert!(
+        !app.toasts.is_empty(),
+        "a new failed-save episode is visible"
+    );
+}
