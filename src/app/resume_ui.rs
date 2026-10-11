@@ -627,4 +627,45 @@ mod resume_identity_tests {
         assert_eq!(gemini_latest.exact_session_id, None);
         assert!(ResumePlan::exact(AgentProvider::GeminiCli, "gemini", "latest").is_none());
     }
+
+    #[test]
+    fn latest_resume_does_not_restore_the_old_exact_identity() {
+        let mut panel = panel_with_old_identity();
+        let launch_command = panel.agent_command().expect("launch command").to_owned();
+        let resume = resume_plan_for_provider(AgentProvider::ClaudeCode, &launch_command, None)
+            .expect("latest resume");
+        assert_eq!(resume.command, "claude --model sonnet --continue");
+        assert!(replace_and_remember_resume_session(
+            &mut panel,
+            resume.exact_session_id,
+            |panel| {
+                panel.set_agent_session_id(None);
+                true
+            },
+        ));
+        assert_eq!(panel.agent_session_id(), None);
+        assert_eq!(panel.agent_command(), Some(launch_command.as_str()));
+        let saved = panel.to_saved();
+        assert_eq!(saved.agent_session_id, None);
+        assert!(saved.leaf_agent_session_ids.is_empty());
+        assert_eq!(
+            saved.agent_command.as_deref(),
+            Some("claude --model sonnet")
+        );
+        let manager = Arc::new(Mutex::new(PtyManager::new_for_tests()));
+        let cold = TerminalPanel::from_saved(
+            saved,
+            &egui::Context::default(),
+            None,
+            Uuid::from_u128(43),
+            Arc::clone(&manager),
+        );
+        let guard = manager.lock().expect("detached manager");
+        assert_eq!(guard.attached_session_count(), 0);
+        assert_eq!(guard.detached_session_count(), 1);
+        assert_eq!(
+            guard.startup_command_for_tests(cold.all_runtime_session_ids()[0]),
+            Some("claude --model sonnet --continue")
+        );
+    }
 }
