@@ -399,9 +399,6 @@ async fn hook_handler(
         leaf: query.leaf.as_deref(),
         runtime: query.runtime.as_deref(),
         generation: query.generation.as_deref(),
-
-        hook_generation: None,
-        hook_owner: None,
     })
     .classify()
     {

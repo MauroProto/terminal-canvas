@@ -46,7 +46,7 @@ pub fn hook_command(endpoint_file: &str) -> String {
          [ -n \"$TC_HOOK_URL\" ] || exit 0\n\
          curl -fsS -m 1.5 --connect-timeout 0.5 -H \"X-TC-Token: $TC_HOOK_TOKEN\" \
 -H 'Content-Type: application/json' -d @- \
-\"$TC_HOOK_URL/hook/claude?panel=$TC_PANEL_ID&workspace=$TC_WORKSPACE_ID&leaf=$TC_LEAF_ID${TC_RUNTIME_ID+&runtime=$TC_RUNTIME_ID}${TC_HOOK_GENERATION+&generation=$TC_HOOK_GENERATION}\" 2>/dev/null || true\n"
+\"$TC_HOOK_URL/hook/claude?panel=$TC_PANEL_ID&workspace=$TC_WORKSPACE_ID&leaf=$TC_LEAF_ID${{TC_RUNTIME_ID+&runtime=$TC_RUNTIME_ID}}${{TC_HOOK_GENERATION+&generation=$TC_HOOK_GENERATION}}\" 2>/dev/null || true\n"
     )
 }
 

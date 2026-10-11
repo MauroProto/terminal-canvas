@@ -442,9 +442,6 @@ mod tests {
             leaf: None,
             runtime,
             generation,
-
-            hook_generation: None,
-            hook_owner: None,
         };
         assert_eq!(
             raw(None, None).classify(),
@@ -456,32 +453,26 @@ mod tests {
             Err(Denial::BindingInvalid)
         );
         assert_eq!(
-                    RawHookIdentity {
-                        workspace: Some(""),
-                        panel: Some(""),
-                        leaf: None,
-                        runtime: None,
-                        generation: None
-
-        hook_generation: None,
-        hook_owner: None,
-        }
-                    .classify(),
-                    Ok(QueryIdentity::UnscopedMemory)
-                );
+            RawHookIdentity {
+                workspace: Some(""),
+                panel: Some(""),
+                leaf: None,
+                runtime: None,
+                generation: None
+            }
+            .classify(),
+            Ok(QueryIdentity::UnscopedMemory)
+        );
         assert_eq!(
-                    RawHookIdentity {
-                        workspace: None,
-                        panel: Some("bad"),
-                        leaf: None,
-                        runtime: None,
-                        generation: None
-
-        hook_generation: None,
-        hook_owner: None,
-        }
-                    .classify(),
-                    Err(Denial::TargetInvalid)
-                );
+            RawHookIdentity {
+                workspace: None,
+                panel: Some("bad"),
+                leaf: None,
+                runtime: None,
+                generation: None
+            }
+            .classify(),
+            Err(Denial::TargetInvalid)
+        );
     }
 }
