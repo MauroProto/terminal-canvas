@@ -178,6 +178,7 @@ pub struct RemoteReader {
     attached_seq: u64,
     exited: bool,
     input_error: Option<String>,
+    transport_failed: bool,
 }
 
 impl RemoteReader {
@@ -197,6 +198,7 @@ impl RemoteReader {
             attached_seq,
             exited: false,
             input_error: None,
+            transport_failed: false,
         }
     }
 
@@ -212,10 +214,16 @@ impl RemoteReader {
     /// Próximo bloque de salida de esta sesión. `None` cuando el socket cierra
     /// o la sesión terminó.
     pub fn next_output(&mut self) -> Option<Vec<u8>> {
+        if self.transport_failed || self.exited {
+            return None;
+        }
         loop {
             let line = match read_protocol_line(&mut self.lines) {
                 Ok(Some(line)) => line,
-                Ok(None) | Err(_) => return None,
+                Ok(None) | Err(_) => {
+                    self.transport_failed = true;
+                    return None;
+                }
             };
             match decode_line::<Response>(&line) {
                 Some(Response::InputError { id, message }) if id == self.session_id => {
@@ -237,12 +245,16 @@ impl RemoteReader {
                         .is_some_and(|(id, _)| id == self.session_id)
                     {
                         // Recovery refusal retires transport, never the process.
+                        self.transport_failed = true;
                         return None;
                     }
                 }
-                None => return None,
-                // Evento de otra sesión, respuesta a un pedido, o línea
-                // corrupta: se ignora y se sigue leyendo.
+                None => {
+                    self.transport_failed = true;
+                    return None;
+                }
+                // Eventos ajenos y respuestas a pedidos se ignoran.
+                // Framing corrupto retira este transporte de forma permanente.
                 _ => continue,
             }
         }
@@ -445,7 +457,7 @@ mod tests {
     }
 
     #[test]
-    fn a_corrupt_line_does_not_break_the_stream() {
+    fn a_corrupt_line_permanently_retires_transport_without_claiming_process_exit() {
         let (ours, mut theirs) = socket_pair();
         let id = Uuid::new_v4();
         theirs.write_all(b"no soy json\n").unwrap();
@@ -462,7 +474,17 @@ mod tests {
         drop(theirs);
 
         let mut reader = RemoteReader::new(ours, id, 0);
-        assert_eq!(reader.next_output(), Some(b"ok".to_vec()));
+        assert_eq!(reader.next_output(), None);
+        assert_eq!(
+            reader.next_output(),
+            None,
+            "later valid bytes cannot revive corrupt framing"
+        );
+        assert_eq!(reader.attached_seq, 0);
+        assert!(
+            !reader.exited(),
+            "a framing error cannot confirm process closure"
+        );
     }
 
     #[test]
