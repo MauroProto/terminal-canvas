@@ -185,9 +185,13 @@ fn a_stale_local_handle_cannot_fence_a_new_generation_with_the_same_runtime_id()
     let active = fixture.activate(birth);
     let store = fixture.runtime.store().unwrap();
     let (retired, stale_handle) = fixture.retire_actual_handle(active);
+    // B belongs to a fresh endpoint, as after a host restart. A's endpoint
+    // keeps its cancelled UUID permanently; never clear that safety guard.
+    let mut successor_endpoint = Fixture::new();
+    successor_endpoint.runtime.store = Some(store.clone());
     let successor = store
         .hook_transition(
-            fixture.runtime.owner,
+            successor_endpoint.runtime.owner,
             Uuid::new_v4(),
             &LedgerIntent::Reserve {
                 expected: Some(retired),
@@ -196,7 +200,7 @@ fn a_stale_local_handle_cannot_fence_a_new_generation_with_the_same_runtime_id()
                     runtime: birth.runtime,
                     generation: Uuid::new_v4(),
                 },
-                owner: fixture.runtime.owner,
+                owner: successor_endpoint.runtime.owner,
             },
         )
         .unwrap()
@@ -208,8 +212,8 @@ fn a_stale_local_handle_cannot_fence_a_new_generation_with_the_same_runtime_id()
         .unwrap()
         .run_guarded(store, |_| Ok(()))
         .unwrap();
-    let successor = fixture.activate(successor);
-    let ticket = fixture
+    let successor = successor_endpoint.activate(successor);
+    let ticket = successor_endpoint
         .runtime
         .admit(QueryIdentity::Bound {
             key: successor.key,
@@ -219,15 +223,17 @@ fn a_stale_local_handle_cannot_fence_a_new_generation_with_the_same_runtime_id()
             },
         })
         .unwrap();
-    let cancellations_before = fixture.runtime.cancelled.lock().unwrap().clone();
+    let cancellations_before = successor_endpoint.runtime.cancelled.lock().unwrap().clone();
     let stale_evidence = stale_handle.lock().unwrap().hook_host_evidence();
-    assert!(fixture
+    assert!(successor_endpoint
         .runtime
         .prepare_physical_close_bound(stale_evidence)
         .is_err());
-    // Repeating A's already acknowledged close is idempotent for A only.
-    fixture.runtime.request_local_close(stale_handle).unwrap();
-    assert!(!fixture
+    assert!(successor_endpoint
+        .runtime
+        .request_local_close(stale_handle)
+        .is_err());
+    assert!(!successor_endpoint
         .runtime
         .local_queued
         .lock()
@@ -235,25 +241,33 @@ fn a_stale_local_handle_cannot_fence_a_new_generation_with_the_same_runtime_id()
         .contains_key(&(successor.runtime, successor.generation)));
     assert_eq!(store.hook_claim(successor.key).unwrap(), Some(successor));
     assert_eq!(
-        fixture
+        successor_endpoint
             .runtime
             .current_claim_for_runtime(successor.key, successor.runtime),
         Some(successor)
     );
     assert_eq!(
-        fixture.runtime.authority.validate_ui(&ticket).unwrap(),
+        successor_endpoint
+            .runtime
+            .authority
+            .validate_ui(&ticket)
+            .unwrap(),
         successor
     );
-    assert!(fixture.runtime.closing.lock().unwrap().is_empty());
+    assert!(successor_endpoint
+        .runtime
+        .closing
+        .lock()
+        .unwrap()
+        .is_empty());
     assert_eq!(
-        *fixture.runtime.cancelled.lock().unwrap(),
+        *successor_endpoint.runtime.cancelled.lock().unwrap(),
         cancellations_before
     );
-    // The actual previous retirement may have queued its own Finish wakeup;
-    // no request for B's local controller may have been admitted.
-    while let Ok(work) = fixture.work.try_recv() {
-        assert!(!matches!(work, Work::CloseLocal(_)));
-    }
+    assert!(
+        successor_endpoint.work.try_recv().is_err(),
+        "no close work for B may be admitted"
+    );
 }
 
 #[test]
