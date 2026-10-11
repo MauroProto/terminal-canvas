@@ -4212,4 +4212,41 @@ mod workspace_close_focus_tests {
             .any(|panel| panel.id == panel_id.to_string() && panel.focused));
         assert_no_runtime_sessions(&app);
     }
+
+    #[test]
+    fn pressing_another_terminal_body_inside_desktop_still_changes_focus() {
+        use crate::terminal::panel::{PanelHitArea, TerminalPanel};
+
+        let ctx = egui::Context::default();
+        let (mut app, original_panel) = focused_app(&ctx);
+        let other = TerminalPanel::new(pos2(0.0, 0.0), vec2(300.0, 200.0), egui::Color32::WHITE, 2);
+        let other_panel = other.id;
+        app.ws_mut().add_restored_terminal(other);
+        let desktop = super::super::desktop_canvas_rect(canvas_rect());
+        super::super::taskbar::clamp_workspace_panels_to_desktop(app.ws_mut(), desktop);
+        let pos = canvas_rect().min
+            + app
+                .ws()
+                .panel(other_panel)
+                .expect("other panel")
+                .rect()
+                .center()
+                .to_vec2();
+        assert!(super::super::desktop_screen_rect(canvas_rect(), desktop).contains(pos));
+        assert!(matches!(
+            super::super::top_panel_hit(app.ws(), pos, &app.viewport, canvas_rect())
+                .map(|hit| hit.area),
+            Some(PanelHitArea::Body),
+        ));
+        assert_eq!(
+            app.ws().focused_panel().map(|panel| panel.id()),
+            Some(original_panel)
+        );
+        press_canvas(&mut app, &ctx, pos);
+        assert_eq!(
+            app.ws().focused_panel().map(|panel| panel.id()),
+            Some(other_panel)
+        );
+        assert_no_runtime_sessions(&app);
+    }
 }
