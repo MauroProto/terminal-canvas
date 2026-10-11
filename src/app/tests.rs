@@ -3699,3 +3699,32 @@ fn file_drop_with_control_characters_rejects_the_whole_drop_visibly() {
         assert!(!panel.runtime_session_attached());
     }
 }
+
+#[cfg(windows)]
+#[test]
+fn windows_file_drop_preserves_special_paths_as_data_without_attaching_a_terminal() {
+    let ctx = egui::Context::default();
+    let mut app = detached_test_app_with_panel(&ctx);
+    app.viewport = Viewport::default();
+    let paths = [
+        r"C:\drop\with spaces.txt",
+        r"C:\drop\a&echo TEST&b.txt",
+        r"C:\drop\it's.txt",
+        r"C:\drop\%PATH%.txt",
+        r#"C:\drop\double"quote.txt"#,
+        r"C:\drop\back\slash\file.txt",
+        r"C:\drop\!EXPAND!.txt",
+        "C:\\drop\\smart\u{2019}quote.txt",
+    ];
+    for path in paths {
+        let (hit, copied) = file_drop_output(&mut app, &ctx, &[path], pos2(50.0, 50.0));
+        assert_eq!(hit, Some(0));
+        assert_eq!(copied, vec![path]);
+        assert!(app.ws().all_runtime_session_ids().is_empty());
+        let CanvasPanel::Terminal(panel) = &app.ws().panels[0];
+        assert!(
+            !panel.runtime_session_attached(),
+            "a file drop must not attach a shell to write the clipboard contents"
+        );
+    }
+}
