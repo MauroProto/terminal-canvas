@@ -973,4 +973,52 @@ mod source_quality_tests {
         assert!(report.contains("PermissionDenied"));
         assert!(!report.contains("private-path-and-error-text"));
     }
+
+    #[test]
+    fn valid_support_zip_preserves_sanitizers_and_reports_the_bounded_utf8_log_tail() {
+        let dir = TempDirectory::new();
+        let config = dir.0.join("config.toml");
+        let panic = dir.0.join("panic.log");
+        std::fs::write(&config, "token='hidden'\n").unwrap();
+        std::fs::write(&panic, "panic safe\n").unwrap();
+        std::fs::write(dir.0.join("layout.json"), r#"{"title":"private"}"#).unwrap();
+        std::fs::write(dir.0.join("runs.log"), "é\n".repeat(20)).unwrap();
+        let entries = collect_entries_with_limit(&dir.0, &config, &panic, "test", 24);
+        let source_report = report(&entries);
+        assert_eq!(source(&source_report, "runs.log")["truncated"], true);
+        assert_eq!(source(&source_report, "runs.log")["lossy_utf8"], false);
+        for row in source_report["sources"].as_array().unwrap() {
+            assert_eq!(row["status"], "included");
+        }
+        let DiagnosticRead::Included { bytes, truncated } =
+            read_diagnostic(&dir.0.join("runs.log"), true, 8)
+        else {
+            panic!("regular log tail available");
+        };
+        let (tail, lossy) = log_text(&bytes, truncated);
+        assert!(tail.starts_with("[Earlier log entries omitted]\n"));
+        assert!(!lossy && !tail.contains('\u{fffd}'));
+        let destination = dir.0.join("support.zip");
+        write_zip(&destination, &entries).unwrap();
+        let mut archive = zip::ZipArchive::new(std::fs::File::open(destination).unwrap()).unwrap();
+        assert_eq!(archive.len(), entries.len());
+        for entry in &entries {
+            let mut restored = String::new();
+            archive
+                .by_name(&entry.name)
+                .unwrap()
+                .read_to_string(&mut restored)
+                .unwrap();
+            assert_eq!(restored, entry.contents);
+            if entry.name == "config.toml" {
+                assert!(!restored.contains("hidden") && restored.contains("<redacted>"));
+            }
+            if entry.name == "layout.json" {
+                assert!(
+                    !restored.contains("private")
+                        && serde_json::from_str::<serde_json::Value>(&restored).is_ok()
+                );
+            }
+        }
+    }
 }
