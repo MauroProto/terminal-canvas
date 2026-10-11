@@ -608,6 +608,8 @@ impl PtyHandle {
 
         reader_retirement::prepare_nonblocking(&*pair.master)
             .context("prepare cancellable PTY reader")?;
+        let readiness_for_reader = reader_retirement::ReadinessWaiter::new(&*pair.master)
+            .context("prepare PTY readability wait")?;
         let mut reader = pair.master.try_clone_reader().context("clone PTY reader")?;
         let writer = pair.master.take_writer().context("take PTY writer")?;
 
@@ -781,8 +783,12 @@ impl PtyHandle {
                         });
                     match completion {
                         ReadCompletion::Eof => break,
-                        ReadCompletion::Paused | ReadCompletion::Retry => {
+                        ReadCompletion::Paused => {
                             retirement_for_reader.wait_retry();
+                            continue;
+                        }
+                        ReadCompletion::Retry => {
+                            readiness_for_reader.wait(&retirement_for_reader);
                             continue;
                         }
                         ReadCompletion::Failed(error) => {

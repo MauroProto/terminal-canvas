@@ -141,6 +141,59 @@ impl ReaderRetirement {
     }
 }
 
+/// A readiness notification only schedules another physical read. It never
+/// consumes bytes or certifies EOF, including POLLHUP/POLLERR. Keep an owned
+/// duplicate so closing or reusing the master's descriptor cannot retarget it.
+pub(super) struct ReadinessWaiter {
+    #[cfg(unix)]
+    fd: std::os::fd::OwnedFd,
+}
+
+impl ReadinessWaiter {
+    pub(super) fn new(master: &dyn portable_pty::MasterPty) -> io::Result<Self> {
+        #[cfg(unix)]
+        {
+            let fd = master.as_raw_fd().filter(|fd| *fd >= 0).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::Unsupported, "PTY master has no readable fd")
+            })?;
+            // SAFETY: the borrowed master keeps fd open until duplication completes.
+            let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+            Ok(Self {
+                fd: borrowed.try_clone_to_owned()?,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = master;
+            Ok(Self {})
+        }
+    }
+
+    pub(super) fn wait(&self, retirement: &ReaderRetirement) {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let mut descriptor = libc::pollfd {
+                fd: self.fd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: descriptor is initialized and points to exactly one entry;
+            // the owned fd stays open throughout this bounded, read-only wait.
+            let result = unsafe { libc::poll(&mut descriptor, 1, 20) };
+            if (result < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted)
+                || descriptor.revents & (libc::POLLERR | libc::POLLNVAL) != 0
+            {
+                // Unsupported polling/errors still get the old bounded delay,
+                // never a hot retry loop or a fabricated physical completion.
+                retirement.wait_retry();
+            }
+        }
+        #[cfg(not(unix))]
+        retirement.wait_retry();
+    }
+}
+
 /// The cloned reader and writer share the master open-file description. Set
 /// this before starting either worker; InputWriter retains partial offsets.
 #[cfg(unix)]
@@ -271,6 +324,56 @@ mod tests {
         ));
         assert!(matches!(
             control.read_and_retain(&mut &b""[..], &mut [0; 8], |_| Ok(())),
+            ReadCompletion::Eof
+        ));
+        assert!(control.eof());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn readiness_keeps_bytes_and_hangup_separate_from_physical_eof() {
+        use std::io::Write;
+        use std::os::unix::net::UnixStream;
+        let (mut reader, mut writer) = UnixStream::pair().unwrap();
+        reader.set_nonblocking(true).unwrap();
+        let waiter = ReadinessWaiter {
+            fd: reader.try_clone().unwrap().into(),
+        };
+        let control = ReaderRetirement::default();
+        let mut bytes = [0; 8];
+        waiter.wait(&control);
+        assert!(matches!(
+            control.read_and_retain(&mut reader, &mut bytes, |_| panic!("no bytes")),
+            ReadCompletion::Retry
+        ));
+        assert!(!control.eof());
+
+        writer.write_all(b"tail").unwrap();
+        waiter.wait(&control);
+        let mut retained = Vec::new();
+        assert!(matches!(
+            control.read_and_retain(&mut reader, &mut bytes, |raw| {
+                retained.extend_from_slice(raw);
+                Ok(())
+            }),
+            ReadCompletion::Data
+        ));
+        assert_eq!(retained, b"tail");
+        assert!(!control.eof());
+
+        drop(writer);
+        waiter.wait(&control);
+        assert!(!control.eof(), "hangup readiness is not a read receipt");
+        control.request();
+        assert!(matches!(
+            control.read_and_retain(&mut reader, &mut bytes, |_| panic!("paused")),
+            ReadCompletion::Paused
+        ));
+        assert!(control.quiescent());
+        assert!(!control.eof());
+        control.resume_drain();
+        assert!(matches!(
+            control.read_and_retain(&mut reader, &mut bytes, |_| panic!("EOF has no bytes")),
             ReadCompletion::Eof
         ));
         assert!(control.eof());
