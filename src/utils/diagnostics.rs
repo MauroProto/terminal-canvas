@@ -1021,4 +1021,27 @@ mod source_quality_tests {
             }
         }
     }
+
+    #[test]
+    fn invalid_utf8_structured_sources_are_reported_instead_of_exporting_lossy_data() {
+        let dir = TempDirectory::new();
+        let config = dir.0.join("config.toml");
+        std::fs::write(&config, b"token='\xff'").unwrap();
+        std::fs::write(dir.0.join("layout.json"), b"{\"title\":\"\xff\"}").unwrap();
+        let entries =
+            collect_entries_with_limit(&dir.0, &config, &dir.0.join("panic.log"), "test", 64);
+        assert_eq!(entries.len(), 2);
+        let source_report = report(&entries);
+        assert_eq!(
+            source(&source_report, "config.toml")["reason"],
+            "invalid-format"
+        );
+        assert_eq!(
+            source(&source_report, "layout.json")["reason"],
+            "invalid-format"
+        );
+        assert!(!entries
+            .iter()
+            .any(|entry| entry.name == "config.toml" || entry.name == "layout.json"));
+    }
 }
