@@ -66,7 +66,11 @@ pub fn prepare(
     provider: AgentProvider,
     brief: &str,
 ) -> anyhow::Result<Option<PreparedAgentLaunch>> {
-    if brief.trim().is_empty()
+    if (brief.trim().is_empty()
+        && !matches!(
+            provider,
+            AgentProvider::ClaudeCode | AgentProvider::CodexCli
+        ))
         || !matches!(
             provider,
             AgentProvider::ClaudeCode
@@ -273,12 +277,19 @@ pub fn run_from_cli(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<
     let executable =
         super::agent_detect::resolve_in_path(command, &std::env::var("PATH").unwrap_or_default())
             .ok_or_else(|| anyhow::anyhow!("No se encontró {command} en PATH"))?;
-    let command = native_provider_command(&executable)?;
+    let mut command = native_provider_command(&executable)?;
+    crate::conversation::launch::configure_app_launch(
+        &mut command,
+        request.provider,
+        &request.brief,
+    )?;
     execute_request(request, command).map(Some)
 }
 
 fn execute_request(request: LaunchRequest, mut command: Command) -> anyhow::Result<i32> {
-    append_prompt_args(&mut command, request.provider, &request.brief);
+    if !request.brief.trim().is_empty() {
+        append_prompt_args(&mut command, request.provider, &request.brief);
+    }
     let status = command
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
@@ -501,6 +512,21 @@ fn main() {
         );
         assert!(!request.exists());
         assert!(ordinary.exists());
+    }
+
+    #[test]
+    fn empty_claude_and_codex_requests_start_without_a_positional_prompt() {
+        let fixture = Fixture::new();
+        let executable = fixture.executable();
+        let capture = fixture.0.join("empty-capture.bin");
+        for provider in [AgentProvider::ClaudeCode, AgentProvider::CodexCli] {
+            let token = write_request(&fixture.0, provider, "").unwrap();
+            let request = consume_request(&fixture.0, token).unwrap();
+            let mut command = native_provider_command(&executable).unwrap();
+            command.env("TC_LAUNCH_CAPTURE", &capture);
+            assert_eq!(execute_request(request, command).unwrap(), 0);
+            assert!(captured(&capture).is_empty());
+        }
     }
 
     #[test]

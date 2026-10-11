@@ -25,6 +25,10 @@ fn main() -> Result<()> {
         }
     }
     utils::app_paths::get()?;
+    if args.first().is_some_and(|arg| arg == "--chat-mcp") {
+        anyhow::ensure!(args.len() == 1, "Uso interno: --chat-mcp");
+        return mi_terminal::conversation::mcp::serve_stdio();
+    }
     if cli_mode {
         if args[0] == "--health-check" {
             let report = utils::health::check()?;
