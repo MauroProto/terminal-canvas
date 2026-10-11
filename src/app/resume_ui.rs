@@ -45,7 +45,8 @@ impl TerminalApp {
         // en un shell nuevo, nunca como texto dentro del prompt del agente.
         if let Some((provider, command, session_id)) = focused_agent {
             if provider != crate::orchestration::AgentProvider::ClaudeCode {
-                let Some(resume) = resume_for_provider(provider, &command, session_id.as_deref())
+                let Some(resume) =
+                    resume_plan_for_provider(provider, &command, session_id.as_deref())
                 else {
                     self.toast_error(format!(
                         "{} no ofrece reanudación automática verificada",
@@ -276,7 +277,7 @@ impl TerminalApp {
         // `--continue`, que toma la más reciente. `resume_invocation`
         // sanitiza el id: un archivo de sesión malicioso no puede inyectar
         // flags.
-        let Some(command) = crate::orchestration::resume_invocation(
+        let Some(resume) = ResumePlan::exact(
             crate::orchestration::AgentProvider::ClaudeCode,
             &launch_command,
             &entry.id,
@@ -291,15 +292,15 @@ impl TerminalApp {
             self.toast_error("No hay terminal enfocado donde retomarla");
             return;
         };
-        self.replace_agent_in_panel(panel_id, command, launch_command, title);
+        self.replace_agent_in_panel(panel_id, resume, launch_command, title);
     }
 
-    fn replace_focused_agent(&mut self, command: String, launch_command: String, title: String) {
+    fn replace_focused_agent(&mut self, resume: ResumePlan, launch_command: String, title: String) {
         let Some(panel_id) = self.ws().focused_panel().map(|panel| panel.id()) else {
             self.toast_error("No hay terminal enfocado donde retomarla");
             return;
         };
-        self.replace_agent_in_panel(panel_id, command, launch_command, title);
+        self.replace_agent_in_panel(panel_id, resume, launch_command, title);
     }
 
     /// Un comando de resume pertenece al shell, no al prompt del agente que
@@ -308,7 +309,7 @@ impl TerminalApp {
     fn replace_agent_in_panel(
         &mut self,
         panel_id: uuid::Uuid,
-        command: String,
+        resume: ResumePlan,
         launch_command: String,
         title: String,
     ) {
@@ -324,13 +325,16 @@ impl TerminalApp {
             self.toast_error("No se encontró el terminal donde retomarla");
             return;
         };
-        let resumed = panel.replace_focused_session(
-            manager,
-            cwd.as_deref(),
-            workspace_id,
-            command,
-            launch_command,
-        );
+        let resumed =
+            replace_and_remember_resume_session(panel, resume.exact_session_id, |panel| {
+                panel.replace_focused_session(
+                    manager,
+                    cwd.as_deref(),
+                    workspace_id,
+                    resume.command,
+                    launch_command,
+                )
+            });
         if resumed {
             self.toast_success(format!("Retomando: {title}"));
         } else {
@@ -339,17 +343,66 @@ impl TerminalApp {
     }
 }
 
+struct ResumePlan {
+    command: String,
+    exact_session_id: Option<String>,
+}
+
+impl ResumePlan {
+    fn exact(
+        provider: crate::orchestration::AgentProvider,
+        command: &str,
+        session_id: &str,
+    ) -> Option<Self> {
+        // Gemini's own latest selector is not a stable conversation identity.
+        if provider == crate::orchestration::AgentProvider::GeminiCli && session_id == "latest" {
+            return None;
+        }
+        let command = crate::orchestration::resume_invocation(provider, command, session_id)?;
+        Some(Self {
+            command,
+            exact_session_id: Some(session_id.to_owned()),
+        })
+    }
+}
+
+fn resume_plan_for_provider(
+    provider: crate::orchestration::AgentProvider,
+    command: &str,
+    session_id: Option<&str>,
+) -> Option<ResumePlan> {
+    session_id
+        .and_then(|id| ResumePlan::exact(provider, command, id))
+        .or_else(|| {
+            crate::orchestration::supports_latest_resume(provider).then(|| ResumePlan {
+                command: crate::orchestration::resume_command(provider, command),
+                exact_session_id: None,
+            })
+        })
+}
+
+/// Replacement clears the old hook identity. Publish only the ID carried by
+/// this successful exact resume, before any new hook or layout snapshot.
+fn replace_and_remember_resume_session(
+    panel: &mut crate::panel::CanvasPanel,
+    exact_session_id: Option<String>,
+    replace: impl FnOnce(&mut crate::panel::CanvasPanel) -> bool,
+) -> bool {
+    let leaf_id = panel.focused_leaf_id();
+    if !replace(panel) {
+        return false;
+    }
+    panel.set_agent_session_id_for_leaf(leaf_id, exact_session_id);
+    true
+}
+
+#[cfg(test)]
 fn resume_for_provider(
     provider: crate::orchestration::AgentProvider,
     command: &str,
     session_id: Option<&str>,
 ) -> Option<String> {
-    session_id
-        .and_then(|id| crate::orchestration::resume_invocation(provider, command, id))
-        .or_else(|| {
-            crate::orchestration::supports_latest_resume(provider)
-                .then(|| crate::orchestration::resume_command(provider, command))
-        })
+    resume_plan_for_provider(provider, command, session_id).map(|plan| plan.command)
 }
 
 #[cfg(test)]
