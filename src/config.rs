@@ -982,4 +982,31 @@ mod config_recovery_tests {
             .write_permission()
             .is_ok());
     }
+
+    #[test]
+    fn oversize_save_rejects_before_creation_and_preserves_existing_candidates() {
+        let dir = TempDirectory::new();
+        let path = dir.path();
+        let small = AppConfig {
+            linear_token: Some("dummy-secret".to_owned()),
+            ..Default::default()
+        };
+        let raw = serialize_config_with_limit(&small, 4096).unwrap();
+        let cap = raw.len();
+        save_to_path_with_limit(&small, &path, cap).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), raw.as_bytes());
+        assert_eq!(load_from_path(&path), small);
+        let before = entries(&path);
+        assert!(save_to_path_with_limit(&small, &path, cap - 1).is_err());
+        assert_eq!(entries(&path), before);
+        let missing = dir.0.join("new-parent").join("config.toml");
+        assert!(save_to_path_with_limit(&small, &missing, 1).is_err());
+        assert!(!missing.parent().unwrap().exists());
+        let enormous = AppConfig {
+            shell: Some("x".repeat(65)),
+            ..Default::default()
+        };
+        assert!(save_to_path_with_limit(&enormous, &path, 64).is_err());
+        assert_eq!(entries(&path), before);
+    }
 }
