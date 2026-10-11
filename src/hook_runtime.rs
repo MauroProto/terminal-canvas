@@ -646,7 +646,7 @@ impl HookRuntime {
     /// UI-safe ownership handoff. No SQLite, fsync, wait, or device closure.
     /// The caller retains its handle when the bounded worker queue refuses it.
     pub fn request_local_close(&self, handle: crate::runtime::SharedPtyHandle) -> Result<()> {
-        let mut pty = handle
+        let pty = handle
             .lock()
             .map_err(|_| anyhow!("local retirement handle poisoned"))?;
         anyhow::ensure!(!pty.is_remote(), "local closer cannot certify remote birth");
