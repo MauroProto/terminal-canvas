@@ -3374,3 +3374,37 @@ fn layout_save_failure_preserves_last_ack_and_stays_visible_without_toasts() {
         assert!(!labels.contains("Guardado de layout e historial desactivado"));
     }
 }
+
+#[test]
+fn repeated_layout_save_errors_do_not_repeat_toasts_but_changed_reasons_do() {
+    let ctx = egui::Context::default();
+    let mut app = detached_test_app_with_panel(&ctx);
+    let current = app.snapshot_state();
+    apply_layout_save_result(
+        &mut app,
+        current.clone(),
+        Err(anyhow::anyhow!("controlled disk full")),
+    );
+    assert!(!app.toasts.is_empty());
+    app.toasts = Default::default();
+    apply_layout_save_result(
+        &mut app,
+        current.clone(),
+        Err(anyhow::anyhow!("controlled disk full")),
+    );
+    assert!(app.toasts.is_empty());
+    assert_eq!(
+        app.layout_save_warning.as_deref(),
+        Some("controlled disk full")
+    );
+    apply_layout_save_result(
+        &mut app,
+        current,
+        Err(anyhow::anyhow!("controlled backup is not a regular file")),
+    );
+    assert!(!app.toasts.is_empty());
+    assert_eq!(
+        app.layout_save_warning.as_deref(),
+        Some("controlled backup is not a regular file"),
+    );
+}
