@@ -411,7 +411,26 @@ impl PreferencesWorker {
         request
     }
     pub(super) fn save_settings(&mut self, config: crate::config::AppConfig) {
+        if let Err(error) = self.try_save_settings(config) {
+            log::warn!("{error}");
+        }
+    }
+
+    pub(super) fn try_save_settings(
+        &mut self,
+        config: crate::config::AppConfig,
+    ) -> Result<(), crate::config::ConfigWriteBlocked> {
+        self.save_settings_with_status(config, crate::config::runtime_config_status())
+    }
+
+    fn save_settings_with_status(
+        &mut self,
+        config: crate::config::AppConfig,
+        status: crate::config::ConfigRuntimeStatus,
+    ) -> Result<(), crate::config::ConfigWriteBlocked> {
+        status.write_permission()?;
         self.submit(Job::SaveSettings(config));
+        Ok(())
     }
 
     /// In-flight or runnable work. An unavailable writer is an error, never
