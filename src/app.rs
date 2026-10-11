@@ -194,6 +194,9 @@ pub struct TerminalApp {
     /// A future or unreadable layout blocks profile writes and history pruning.
     persistence_writes_enabled: bool,
     persistence_warning: Option<String>,
+    /// A save failure is independent from a read/lease pause and is cleared
+    /// only after the current layout receives a successful acknowledgement.
+    layout_save_warning: Option<String>,
 }
 
 impl TerminalApp {
@@ -388,6 +391,7 @@ impl TerminalApp {
                 run_marker_active: side_effects,
                 persistence_writes_enabled,
                 persistence_warning: None,
+                layout_save_warning: None,
             }
         } else {
             let collab = CollabManager::new();
@@ -497,6 +501,7 @@ impl TerminalApp {
                 run_marker_active: side_effects,
                 persistence_writes_enabled,
                 persistence_warning: None,
+                layout_save_warning: None,
             }
         };
 
@@ -872,6 +877,7 @@ impl TerminalApp {
             let snapshot = self.snapshot_state();
             match crate::state::persistence::try_save_state(&snapshot) {
                 Ok(()) => {
+                    self.clear_layout_save_warning_if_current(&snapshot);
                     self.persisted_state = Some(snapshot);
                     self.autosave.mark_saved(Instant::now());
                     // Pruning closed panels is safe only after their removal
@@ -1134,6 +1140,7 @@ impl TerminalApp {
         let layout_saved = crate::state::persistence::try_save_state(&snapshot);
         let history_saved = self.persist_scrollbacks_with_pruning(true, layout_saved.is_ok());
         if layout_saved.is_ok() {
+            self.clear_layout_save_warning_if_current(&snapshot);
             self.persisted_state = Some(snapshot);
         }
         layout_saved?;
@@ -1270,11 +1277,17 @@ impl TerminalApp {
                 }
                 persistence_worker::Completion::State { snapshot, result } => match result {
                     Ok(()) => {
+                        self.clear_layout_save_warning_if_current(&snapshot);
                         self.persisted_state = Some(snapshot);
                         self.autosave.mark_saved(Instant::now());
                     }
                     Err(err) => {
-                        log::warn!("Autosave failed: {err}");
+                        let reason = format!("{err:#}");
+                        if self.layout_save_warning.as_deref() != Some(reason.as_str()) {
+                            log::warn!("Autosave failed: {reason}");
+                            self.toast_error(format!("No se pudo guardar el layout: {reason}"));
+                            self.layout_save_warning = Some(reason);
+                        }
                         if let Some(ctx) = ctx {
                             ctx.request_repaint_after(AUTOSAVE_INTERVAL);
                         }
@@ -1293,6 +1306,14 @@ impl TerminalApp {
             }
         }
         rollover
+    }
+
+    fn clear_layout_save_warning_if_current(&mut self, snapshot: &AppState) {
+        // The worker may have saved an older snapshot while the UI changed.
+        // That ACK remains truthful, but cannot dismiss a newer save warning.
+        if self.layout_save_warning.is_some() && snapshot == &self.snapshot_state() {
+            self.layout_save_warning = None;
+        }
     }
 
     fn acknowledge_persisted_logs(
@@ -1413,6 +1434,7 @@ impl TerminalApp {
             self.execute_command(command, &ctx, ui.available_rect_before_wrap());
         }
         self.show_persistence_warning(ui);
+        self.show_layout_save_warning(ui);
         self.show_preferences_warning(ui);
         self.show_sidebar(ui);
         self.show_taskbar(ui);
@@ -1460,6 +1482,23 @@ impl TerminalApp {
                     .strong().color(Color32::from_rgb(235, 170, 95)))
                     .on_hover_text(reason);
                 ui.label("Revisá el motivo antes de continuar con cambios; el detalle aparece al pasar el mouse.");
+            });
+    }
+
+    fn show_layout_save_warning(&self, ui: &mut egui::Ui) {
+        let Some(reason) = self.layout_save_warning.as_deref() else {
+            return;
+        };
+        Panel::top("layout-save-warning")
+            .resizable(false)
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new("No se pudo guardar el layout")
+                        .strong()
+                        .color(Color32::from_rgb(235, 170, 95)),
+                );
+                ui.label(reason);
+                ui.label("Revisá el motivo. Los cambios sin guardar pueden perderse al cerrar esta sesión.");
             });
     }
 
