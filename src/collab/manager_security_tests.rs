@@ -11,6 +11,7 @@ fn host_fixture(panel_count: usize) -> (CollabManager, GuestId, SharedWorkspaceS
         terminal_controls: Vec::new(),
         panels: (0..panel_count)
             .map(|_| SharedPanelSnapshot {
+                input_target: None,
                 panel_id: Uuid::new_v4(),
                 title: "Fixture terminal".to_owned(),
                 position: [0.0, 0.0],

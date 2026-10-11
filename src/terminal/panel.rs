@@ -1927,6 +1927,13 @@ impl TerminalPanel {
         .unwrap_or(false)
     }
 
+    pub fn remote_input_target(&self) -> crate::collab::SharedTerminalTarget {
+        crate::collab::SharedTerminalTarget {
+            leaf_id: self.focused_leaf,
+            runtime_session_id: self.focused_runtime_session_id(),
+        }
+    }
+
     pub fn shared_snapshot(&self) -> SharedPanelSnapshot {
         let mut visible_text = String::new();
         let mut history_text = String::new();
@@ -1944,6 +1951,7 @@ impl TerminalPanel {
         }
 
         SharedPanelSnapshot {
+            input_target: Some(self.remote_input_target()),
             panel_id: self.id,
             title: self.title.clone(),
             position: [self.position.x, self.position.y],

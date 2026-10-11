@@ -117,8 +117,16 @@ pub struct TerminalControlState {
     pub queue: Vec<GuestId>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedTerminalTarget {
+    pub leaf_id: Uuid,
+    pub runtime_session_id: Option<Uuid>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SharedPanelSnapshot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_target: Option<SharedTerminalTarget>,
     pub panel_id: Uuid,
     pub title: String,
     pub position: [f32; 2],
@@ -463,6 +471,8 @@ pub enum TerminalInputEvent {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GuestTerminalInput {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<SharedTerminalTarget>,
     pub terminal_id: Uuid,
     pub events: Vec<TerminalInputEvent>,
 }

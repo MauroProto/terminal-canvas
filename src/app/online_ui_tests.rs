@@ -67,6 +67,7 @@ fn test_snapshot() -> SharedWorkspaceSnapshot {
         guests: Vec::new(),
         terminal_controls: Vec::new(),
         panels: vec![SharedPanelSnapshot {
+            input_target: None,
             panel_id: Uuid::from_u128(2),
             title: "Remote test terminal".into(),
             position: [0.0, 0.0],

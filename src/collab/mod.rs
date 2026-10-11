@@ -15,7 +15,7 @@ pub use manager::{
 };
 pub use models::{
     GuestId, PanelShareScope, SerializableKey, SerializableModifiers, SharedPanelSnapshot,
-    SharedWorkspaceSnapshot, TerminalInputEvent, TrustedDevice,
+    SharedTerminalTarget, SharedWorkspaceSnapshot, TerminalInputEvent, TrustedDevice,
 };
 pub use protocol::invite_code_from_launch_sources;
 pub use view::{draw_remote_workspace, RemotePanelAction};

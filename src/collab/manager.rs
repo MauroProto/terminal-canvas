@@ -860,8 +860,17 @@ impl CollabManager {
         let Some(guest) = &mut self.guest else {
             return;
         };
+        let Some(panel) = self.guest_view.snapshot.as_ref().and_then(|snapshot| {
+            snapshot
+                .panels
+                .iter()
+                .find(|panel| panel.panel_id == terminal_id)
+        }) else {
+            return;
+        };
         let payload = SessionPayload::GuestInput {
             input: GuestTerminalInput {
+                target: panel.input_target.clone(),
                 terminal_id,
                 events,
             },
@@ -2046,6 +2055,7 @@ mod tests {
     fn collaboration_input_limits_reject_oversized_remote_paste() {
         let payload = SessionPayload::GuestInput {
             input: GuestTerminalInput {
+                target: None,
                 terminal_id: Uuid::new_v4(),
                 events: vec![TerminalInputEvent::Paste(
                     "x".repeat(MAX_INPUT_TEXT_BYTES + 1),
@@ -2064,6 +2074,7 @@ mod tests {
         snapshot
             .panels
             .push(crate::collab::models::SharedPanelSnapshot {
+                input_target: None,
                 panel_id: Uuid::new_v4(),
                 title: "Terminal".to_owned(),
                 position: [f32::NAN, 0.0],
@@ -2209,6 +2220,7 @@ mod tests {
         // Input de invitado en vuelo cifrado con la clave vieja.
         let payload = SessionPayload::GuestInput {
             input: crate::collab::models::GuestTerminalInput {
+                target: None,
                 terminal_id: Uuid::new_v4(),
                 events: Vec::new(),
             },
