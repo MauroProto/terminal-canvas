@@ -160,6 +160,7 @@ impl InputWriter {
                 fn CancelSynchronousIo(thread: *mut std::ffi::c_void) -> i32;
             }
             // Retry on subsequent close calls if the worker has not admitted IO yet.
+            // SAFETY: this InputWriter retains the worker JoinHandle throughout the call.
             unsafe {
                 CancelSynchronousIo(self._thread.as_raw_handle());
             }

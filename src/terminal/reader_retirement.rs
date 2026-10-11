@@ -148,8 +148,13 @@ pub(super) fn prepare_nonblocking(master: &dyn portable_pty::MasterPty) -> io::R
     let fd = master
         .as_raw_fd()
         .ok_or_else(|| io::Error::new(io::ErrorKind::Unsupported, "PTY master has no fd"))?;
+    // SAFETY: the borrowed master retains fd; F_GETFL takes no pointer argument.
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fd remains borrowed from the master; F_SETFL receives integer flags.
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
@@ -169,6 +174,7 @@ pub(super) fn cancel_blocked_read(thread: &std::thread::JoinHandle<()>) -> io::R
     extern "system" {
         fn CancelSynchronousIo(thread: *mut std::ffi::c_void) -> i32;
     }
+    // SAFETY: the borrowed JoinHandle retains the native thread handle for this call.
     if unsafe { CancelSynchronousIo(thread.as_raw_handle()) } != 0 {
         return Ok(());
     }

@@ -72,13 +72,11 @@ impl PhysicalChild for PortableChild {
             }
             // SAFETY: the owning child keeps this process handle alive through wait.
             match unsafe { WaitForSingleObject(handle, u32::MAX) } {
-                0 => return Ok(()),
-                u32::MAX => return Err(io::Error::last_os_error()),
-                result => {
-                    return Err(io::Error::other(format!(
-                        "unconfirmed process wait: {result}"
-                    )))
-                }
+                0 => Ok(()),
+                u32::MAX => Err(io::Error::last_os_error()),
+                result => Err(io::Error::other(format!(
+                    "unconfirmed process wait: {result}"
+                ))),
             }
         }
         // The Windows dependency's wait/try_wait duplicate a handle with
