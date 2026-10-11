@@ -2329,13 +2329,6 @@ impl TerminalApp {
         }
     }
 
-    /// Drag & drop de archivos del SO sobre el canvas.
-    ///
-    /// Mientras hay archivos en vuelo (`hovered_files`) se pide repaint y se
-    /// devuelve el índice del panel bajo el puntero para resaltarlo. Al soltar
-    /// (`dropped_files`) se tipean los paths shell-escapados en ese panel,
-    /// precedidos de espacio, igual que Terminal.app: varios archivos quedan
-    /// en una sola línea listos para Enter.
     /// Lanza la captura interactiva de pantalla en un worker (bloquea hasta
     /// que el usuario selecciona el área o cancela) y deja el receiver para
     /// mandarle el path al agente enfocado cuando llegue.
@@ -2434,6 +2427,9 @@ impl TerminalApp {
         }
     }
 
+    /// Resalta el panel bajo el puntero durante el drag. Al soltar, conserva
+    /// el pegado POSIX en Unix y copia las rutas en Windows, donde el proceso
+    /// que lee la hoja no se puede identificar de forma confiable.
     fn handle_file_drop(
         &mut self,
         ctx: &egui::Context,
@@ -2453,6 +2449,7 @@ impl TerminalApp {
         ctx.request_repaint();
         let hit = pointer_pos
             .and_then(|pos| top_panel_hit(self.ws(), pos, &self.viewport, canvas_rect))?;
+        #[cfg(not(windows))]
         let panel_id = self.ws().panels[hit.index].id();
 
         // Los dropped_files sin path local (drag entre apps sin archivo real)
@@ -2462,26 +2459,53 @@ impl TerminalApp {
             .map(|file| file.path().to_path_buf())
             .filter(|path| !path.as_os_str().is_empty())
             .collect();
+        if paths
+            .iter()
+            .any(|path| path.to_string_lossy().chars().any(char::is_control))
+        {
+            self.toast_error(
+                "La ruta contiene caracteres de control y no se puede pegar en la terminal.",
+            );
+            return Some(hit.index);
+        }
         if !paths.is_empty() {
-            let mut text = String::new();
-            for path in &paths {
-                text.push(' ');
-                text.push_str(&crate::terminal::shell_quote::quote_path(
-                    &path.to_string_lossy(),
+            #[cfg(windows)]
+            {
+                // La configuración y el título no identifican el intérprete que
+                // está leyendo ahora: puede ser cmd, PowerShell, WSL o un TUI.
+                // Conservar las rutas como datos sin escribir comandos al PTY.
+                let text = paths
+                    .iter()
+                    .map(|path| path.to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                ctx.copy_text(text);
+                self.toast_success(
+                    "Rutas copiadas. Revisá el formato de tu shell antes de pegarlas.",
+                );
+            }
+            #[cfg(not(windows))]
+            {
+                let mut text = String::new();
+                for path in &paths {
+                    text.push(' ');
+                    text.push_str(&crate::terminal::shell_quote::quote_path(
+                        &path.to_string_lossy(),
+                    ));
+                }
+                if let Some(panel) = self.ws_mut().panel_mut(panel_id) {
+                    panel.insert_text(&text);
+                }
+                let count_label = if paths.len() == 1 { "" } else { "s" };
+                self.toast_success(format!(
+                    "{}: path{count_label} pegado{count_label} en el terminal",
+                    paths
+                        .first()
+                        .and_then(|path| path.file_name())
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "archivo".to_owned()),
                 ));
             }
-            if let Some(panel) = self.ws_mut().panel_mut(panel_id) {
-                panel.insert_text(&text);
-            }
-            let count_label = if paths.len() == 1 { "" } else { "s" };
-            self.toast_success(format!(
-                "{}: path{count_label} pegado{count_label} en el terminal",
-                paths
-                    .first()
-                    .and_then(|path| path.file_name())
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "archivo".to_owned()),
-            ));
         }
         Some(hit.index)
     }
