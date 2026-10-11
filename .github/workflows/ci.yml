@@ -51,7 +51,7 @@ jobs:
 
       - name: Install Linux font dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y pkg-config libfontconfig1-dev libfreetype6-dev
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libfontconfig1-dev libfreetype6-dev xvfb xauth openbox xdotool imagemagick tesseract-ocr libvulkan1 mesa-vulkan-drivers
 
       - name: Format check
         if: runner.os == 'Linux'
@@ -69,6 +69,43 @@ jobs:
 
       - name: Security regressions
         run: cargo test --lib --locked security_ -- --nocapture
+
+      - name: Build native GUI smoke binary
+        if: runner.os == 'Linux'
+        run: cargo build --locked --bin mi-terminal
+
+      - name: Native GUI persistence and recovery
+        if: runner.os == 'Linux'
+        timeout-minutes: 6
+        env:
+          WGPU_BACKEND: vulkan
+          LIBGL_ALWAYS_SOFTWARE: "1"
+        run: |
+          install -d -m 700 "$RUNNER_TEMP/native-gui-runtime"
+          export XDG_RUNTIME_DIR="$RUNNER_TEMP/native-gui-runtime"
+          xvfb-run -a --server-args="-screen 0 1280x800x24 -nolisten tcp" bash <<'DESKTOP'
+          set -euo pipefail
+          openbox > "$RUNNER_TEMP/native-gui-openbox.log" 2>&1 &
+          wm_pid=$!
+          trap 'kill "$wm_pid" 2>/dev/null || true' EXIT
+          python3 scripts/gui-smoke.py --binary target/debug/mi-terminal --output "$RUNNER_TEMP/native-gui-smoke"
+          DESKTOP
+
+      - name: Upload native GUI evidence
+        if: always() && runner.os == 'Linux'
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0, Node 24
+        with:
+          name: native-gui-evidence-${{ github.sha }}
+          if-no-files-found: ignore
+          retention-days: 14
+          path: |
+            ${{ runner.temp }}/native-gui-smoke/result.json
+            ${{ runner.temp }}/native-gui-smoke/app-*.stdout
+            ${{ runner.temp }}/native-gui-smoke/app-*.stderr
+            ${{ runner.temp }}/native-gui-smoke/screen-*.png
+            ${{ runner.temp }}/native-gui-smoke/screen-*.txt
+            ${{ runner.temp }}/native-gui-smoke/export-*.txt
+            ${{ runner.temp }}/native-gui-smoke/layout-*.json
 
       # El daemon usa Unix sockets. Ubuntu y macOS validan el artefacto que se
       # distribuye; Windows conserva la cobertura del fallback in-process.
