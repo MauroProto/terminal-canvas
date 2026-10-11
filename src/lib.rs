@@ -11,6 +11,7 @@ pub mod canvas;
 pub mod collab;
 pub mod command_palette;
 pub mod config;
+pub mod conversation;
 // El daemon usa unix sockets: en Windows la app corre siempre in-process.
 #[cfg(unix)]
 pub mod daemon;
