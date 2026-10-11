@@ -95,6 +95,20 @@ No borres el original ni reemplaces `layout.json` por un backup mientras no
 se pueda leer. Un archivo ausente permite crear un perfil; un error de lectura
 en un archivo existente detiene la recuperación automática desde backups.
 
+Si aparece la franja «No se pudo guardar el layout», falló un intento de
+guardado. El motivo sigue visible aunque desaparezca el toast; repetir el
+mismo error no acumula avisos idénticos. Esta franja no desactiva por sí sola
+el guardado de layout e historial. Los cambios actuales siguen en la sesión
+y no deben darse por guardados.
+
+Resolvé el motivo indicado y mantené abierta la sesión mientras se vuelve a
+guardar. La franja se retira cuando se confirma un guardado del layout actual;
+una confirmación de un estado anterior no la retira. Si necesitás cerrar antes,
+copiá o exportá la salida que quieras conservar y esperá el resultado de esa
+exportación. Anotá también los cambios de workspaces o paneles que debas
+reconstruir. El aviso vive sólo durante esa ejecución: reabrir la app no
+recupera cambios que no llegaron a disco.
+
 El layout admite hasta 16 MiB de JSON completo en UTF-8, incluido el salto
 final que agrega el guardado. El historial de terminales y las notas tienen
 sus propios archivos y límites. Si la carga encuentra un layout o backup

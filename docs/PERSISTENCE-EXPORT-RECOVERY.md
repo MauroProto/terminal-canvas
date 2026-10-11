@@ -27,6 +27,15 @@ es el daemon local de terminales Unix.
   estrictos.
 - La UI conserva una franja visible con el motivo; no depende del toast inicial.
   La pérdida de propiedad de escritura también mantiene ese aviso.
+- Un fallo del guardado automático mantiene la franja «No se pudo guardar el
+  layout» y su motivo después del toast. No confirma el estado fallido ni
+  desactiva por sí solo las escrituras; conserva la política de guardado
+  existente. Los errores consecutivos con el mismo motivo no repiten el toast.
+- Sólo un guardado exitoso del layout actual retira esa franja. Una confirmación
+  de un estado anterior mantiene el aviso mientras hay cambios actuales sin
+  confirmar. El aviso queda en memoria durante esa sesión y no recupera cambios
+  pendientes después de terminar el proceso.
+
 - Las consultas periódicas de terminales no actualizan por sí solas las fechas
   de actividad ni de tareas. La entrada aceptada, la salida nueva, los hooks
   recibidos y los cambios
