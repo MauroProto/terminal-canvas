@@ -117,6 +117,7 @@ impl TerminalApp {
         let Some((repo_root, label, target_panel)) = self.code_review_target() else {
             return;
         };
+        self.poll_review_prompt_delivery();
         let key = Uuid::new_v4();
         let notes_request = self.preferences_worker.load_notes(key, repo_root.clone());
         self.code_review = Some(CodeReviewState {
@@ -179,6 +180,9 @@ impl TerminalApp {
     }
 
     pub(super) fn show_code_review(&mut self, ctx: &egui::Context) {
+        // Runtime input may have been accepted after this frame's logic poll.
+        // Apply that result before an Escape/close discards the review state.
+        self.poll_review_prompt_delivery();
         if self.code_review.is_none() {
             return;
         }
@@ -994,7 +998,7 @@ impl TerminalApp {
         }
     }
 
-    fn poll_review_prompt_delivery(&mut self) {
+    pub(super) fn poll_review_prompt_delivery(&mut self) {
         let Some(pending) = self
             .code_review
             .as_ref()

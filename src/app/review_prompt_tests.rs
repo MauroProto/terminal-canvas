@@ -74,6 +74,26 @@ fn defer_feedback(app: &mut TerminalApp, runtime_id: Uuid) {
     });
 }
 
+fn close_review_with_escape(app: &mut TerminalApp) {
+    let ctx = egui::Context::default();
+    let mut output = ctx.run_ui(
+        egui::RawInput {
+            focused: true,
+            events: vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        },
+        |ui| app.show_code_review(ui.ctx()),
+    );
+    output.textures_delta.clear();
+    output.drop_without_applying_deltas();
+}
+
 fn restored_fixture() -> (TerminalApp, Uuid, Uuid) {
     let (mut app, panel_id, _, handle) = fixture();
     let saved = app.workspaces[0].panels[0].to_saved();
@@ -298,11 +318,45 @@ fn prompt_delivery_review_acknowledges_only_the_exact_submitted_note_versions() 
 fn prompt_delivery_review_closing_the_view_cancels_unaccepted_input() {
     let (mut app, _, runtime_id, handle) = fixture();
     defer_feedback(&mut app, runtime_id);
-    app.code_review = None;
+    close_review_with_escape(&mut app);
+    assert!(app.code_review.is_none());
     handle.lock().unwrap().mark_render_dirty();
     app.workspaces[0].flush_pending_inputs();
     assert_eq!(handle.lock().unwrap().activity_revision(), 0);
     assert!(!app.workspaces[0].has_pending_inputs());
+}
+
+#[test]
+fn prompt_delivery_review_closing_the_view_persists_already_accepted_notes() {
+    let (mut app, panel_id, runtime_id) = restored_fixture();
+    let (accepted, observed) = std::sync::mpsc::channel();
+    app.preferences_worker = PreferencesWorker::with_processor_for_tests(move |job| match job {
+        Job::SaveNotes(_, notes) => {
+            accepted.send(notes.clone()).unwrap();
+            Completion::NotesSaved(Ok(()))
+        }
+        _ => panic!("unexpected preference job while closing a review"),
+    });
+    app.send_pending_notes(panel_id);
+    let handle = app.workspaces[0]
+        .pty_manager()
+        .lock()
+        .unwrap()
+        .handle(runtime_id)
+        .unwrap();
+    handle.lock().unwrap().mark_render_dirty();
+    app.workspaces[0].flush_pending_inputs();
+    assert!(app.code_review.as_ref().unwrap().pending_delivery.is_some());
+
+    // Close between runtime acceptance and the next logic poll.
+    close_review_with_escape(&mut app);
+    assert!(app.code_review.is_none());
+    let persisted = observed
+        .recv_timeout(std::time::Duration::from_secs(3))
+        .unwrap();
+    assert_eq!(persisted.notes.len(), 1);
+    assert!(persisted.notes[0].sent_at.is_some());
+    assert_eq!(handle.lock().unwrap().activity_revision(), 1);
 }
 
 #[test]

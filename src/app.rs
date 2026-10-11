@@ -1122,6 +1122,8 @@ impl TerminalApp {
         if !self.ensure_persistence_ownership() {
             anyhow::bail!("This app does not own its saved profile");
         }
+        // Accepted notes must enter the existing final preference-save barrier.
+        self.poll_review_prompt_delivery();
         let preferences_saved = self.drain_preferences_for_shutdown();
         let _ = self.drain_persistence_worker();
         // Ownership may have changed while the worker was finishing its queue.
