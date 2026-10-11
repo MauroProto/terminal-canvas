@@ -1,3 +1,4 @@
+#[cfg(test)]
 use std::io::Read;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
@@ -2662,6 +2663,8 @@ mod tests {
                 workspace_id: Some(workspace),
                 leaf_id: Some(leaf),
                 memory_task_id: None,
+                hook_generation: None,
+                hook_owner: None,
             },
         );
 

@@ -213,6 +213,7 @@ impl Workspace {
                 panel_id: Some(panel.id),
                 workspace_id: Some(self.id),
                 leaf_id: Some(panel.root_leaf_id()),
+                hook_legacy_root: false,
             },
         );
         let id = panel.id;
