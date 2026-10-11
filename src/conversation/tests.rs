@@ -793,7 +793,6 @@ fn credential_rotation_fences_calls_authenticated_before_the_effect_transaction(
             "test",
         )
         .unwrap();
-    store.send(current, &rejected_send).unwrap();
     store.cancel(current, outgoing.id).unwrap();
     store.set_available(current, true).unwrap();
     assert_eq!(
@@ -803,6 +802,9 @@ fn credential_rotation_fences_calls_authenticated_before_the_effect_transaction(
             .state,
         TransferState::Completed
     );
+    // Complete the inbound operation before delegating back to its source;
+    // otherwise the cycle guard correctly refuses this unrelated auth check.
+    store.send(current, &rejected_send).unwrap();
     assert_eq!(store.bridge_availability(a.id).unwrap(), Some(true));
 }
 #[test]
