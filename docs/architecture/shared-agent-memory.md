@@ -40,7 +40,7 @@ la ausencia de un handle no conceden una confirmación de cierre. El daemon
 y el fallback local mantienen caminos distintos para conservar las sesiones
 remotas al desconectar una ventana.
 
-La app abre o actualiza la base al iniciar. El cambio de esquema 2 a 3 requiere
+La app abre o actualiza la base al iniciar. El cambio de esquema 1 o 2 a 3 requiere
 una copia exclusiva verificada y una transacción con protección de escritores
 antiguos. La CLI genérica conserva el cambio explícito mediante el comando
 de upgrade; no hace un downgrade automático. Las copias y los recibos se
