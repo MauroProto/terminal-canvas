@@ -210,6 +210,7 @@ fn security_expired_or_decided_join_cannot_return_after_http_failure() {
 fn security_departed_guest_loses_control_without_a_disconnected_presence() {
     let (mut manager, guest, snapshot) = host_fixture(1);
     let terminal = snapshot.panels[0].panel_id;
+    manager.note_control_request(request(terminal, guest));
     manager.grant_control(terminal, guest);
     assert_eq!(manager.controller_for(terminal), Some(guest));
     manager.handle_broker_message(BrokerControlMessage::Presence { guests: Vec::new() });
