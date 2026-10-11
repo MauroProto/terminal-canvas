@@ -274,6 +274,7 @@ pub struct PtyHandle {
     hot_reattached: bool,
     reader_retirement: Arc<ReaderRetirement>,
     retirement_log_owned: AtomicBool,
+    retirement_checkpoint_ready: AtomicBool,
     legacy_unowned_transfer: AtomicBool,
     semantic_output_ready: Arc<AtomicBool>,
     /// usize::MAX keeps ordinary local FlowGate policy; daemon ownership opts in.
@@ -393,6 +394,7 @@ impl PtyHandle {
             hot_reattached: false,
             reader_retirement,
             retirement_log_owned: AtomicBool::new(false),
+            retirement_checkpoint_ready: AtomicBool::new(false),
             legacy_unowned_transfer: AtomicBool::new(false),
             semantic_output_ready: Arc::new(AtomicBool::new(false)),
             durable_pressure: Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX)),
@@ -510,9 +512,17 @@ impl PtyHandle {
             let permit = store
                 .hook_consume_birth_once(claim)?
                 .ok_or_else(|| anyhow::anyhow!("birth already consumed"))?;
+            let local_admission = endpoint
+                .filter(|runtime| runtime.owner == owner)
+                .map(|runtime| runtime.begin_local_factory(claim));
             let mut attempt = SpawnAttempt::managed(claim);
             let result = permit.run_guarded(&store, |_| {
                 attempt.entered = true;
+                if let Some(admission) = local_admission {
+                    // A refused admission still enters the consumed guard,
+                    // producing the existing no-child proof without spawning.
+                    admission?;
+                }
                 Self::spawn_with_history_unfenced(
                     cwd,
                     cols,
@@ -874,6 +884,7 @@ impl PtyHandle {
             hot_reattached: false,
             reader_retirement,
             retirement_log_owned: AtomicBool::new(false),
+            retirement_checkpoint_ready: AtomicBool::new(false),
             legacy_unowned_transfer: AtomicBool::new(false),
             semantic_output_ready,
             durable_pressure,
@@ -1080,6 +1091,7 @@ impl PtyHandle {
             hot_reattached,
             reader_retirement,
             retirement_log_owned: AtomicBool::new(false),
+            retirement_checkpoint_ready: AtomicBool::new(false),
             legacy_unowned_transfer: AtomicBool::new(false),
             semantic_output_ready,
             durable_pressure,
@@ -1292,9 +1304,7 @@ impl PtyHandle {
     }
 
     pub fn with_term<R>(&self, f: impl FnOnce(&mut Term<EventProxy>) -> R) -> Option<R> {
-        if self.retirement_log_owned.load(Ordering::Acquire)
-            || self.restoring_history.load(Ordering::Acquire)
-        {
+        if self.retirement_snapshot_blocked() || self.restoring_history.load(Ordering::Acquire) {
             return None;
         }
         let mut term = self.term.try_lock().ok()?;
@@ -1414,7 +1424,7 @@ impl PtyHandle {
         &self,
         export: impl FnOnce(&Term<EventProxy>) -> R,
     ) -> Option<(R, usize)> {
-        if self.retirement_log_owned.load(Ordering::Acquire)
+        if self.retirement_snapshot_blocked()
             || self.restoring_history.load(Ordering::Acquire)
             || self.history_restore_failed.load(Ordering::Acquire)
         {
@@ -1431,7 +1441,7 @@ impl PtyHandle {
         restore_pending: bool,
         export: impl FnOnce(&Term<EventProxy>) -> R,
     ) -> RecoverySnapshot<R> {
-        if self.retirement_log_owned.load(Ordering::Acquire) {
+        if self.retirement_snapshot_blocked() {
             return RecoverySnapshot::Unavailable;
         }
         let checkpoint = if restore_pending || self.restoring_history.load(Ordering::Acquire) {
@@ -1555,6 +1565,33 @@ impl PtyHandle {
         pending.clear();
         self.set_daemon_durable_pressure(durable.len());
         Ok(true)
+    }
+
+    fn retirement_snapshot_blocked(&self) -> bool {
+        self.retirement_log_owned.load(Ordering::Acquire)
+            && !self.retirement_checkpoint_ready.load(Ordering::Acquire)
+    }
+
+    /// Only the local durable coordinator can publish this stable final grid.
+    /// Normal log consumers stay fenced; readonly export resumes after all raw
+    /// frames have moved to the journal and physical output can no longer grow.
+    pub(crate) fn complete_local_retirement_checkpoint(&self) -> std::io::Result<()> {
+        if !self.retirement_log_owned.load(Ordering::Acquire)
+            || !self.retirement_physical_complete()
+            || !self
+                .pending_log
+                .lock()
+                .map_err(|_| std::io::Error::other("final raw log poisoned"))?
+                .is_empty()
+        {
+            return Err(std::io::Error::other(
+                "final retirement boundary incomplete",
+            ));
+        }
+        self.retirement_checkpoint_ready
+            .store(true, Ordering::Release);
+        self.mark_render_dirty();
+        Ok(())
     }
 
     /// Called only after the complete pretermination prefix is durably ACKed.

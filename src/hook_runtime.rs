@@ -124,6 +124,8 @@ pub(crate) struct HookRuntime {
     aliases: Mutex<HashMap<(Uuid, Uuid), AliasFence>>,
     work: SyncSender<Work>,
     publications: SyncSender<PublicationJob>,
+    birth_admission_closed: Mutex<bool>,
+    local_factories_pending: Mutex<HashSet<(Uuid, Option<Uuid>)>>,
     local_queued: Mutex<HashMap<(Uuid, Option<Uuid>), bool>>,
     observed_local: Mutex<HashMap<(Uuid, Option<Uuid>), crate::runtime::SharedPtyHandle>>,
 }
@@ -141,6 +143,8 @@ impl HookRuntime {
             aliases: Mutex::new(HashMap::new()),
             work,
             publications,
+            birth_admission_closed: Mutex::new(false),
+            local_factories_pending: Mutex::new(HashSet::new()),
             local_queued: Mutex::new(HashMap::new()),
             observed_local: Mutex::new(HashMap::new()),
         });
@@ -223,6 +227,11 @@ impl HookRuntime {
     /// PTY factory. A retry retains the same authorized nonce and never consumes
     /// it on the client side for a remote host.
     pub fn authorize_birth(&self, key: LeafKey, runtime: Uuid) -> Result<Claim> {
+        let admission = self
+            .birth_admission_closed
+            .lock()
+            .map_err(|_| anyhow!("birth admission poisoned"))?;
+        anyhow::ensure!(!*admission, "app is closing; new births are disabled");
         anyhow::ensure!(
             !self
                 .cancelled
@@ -425,6 +434,10 @@ impl HookRuntime {
             target: Some(claim.key.into()),
         })?;
         self.physical_close_confirmed(claim.runtime);
+        self.local_factories_pending
+            .lock()
+            .map_err(|_| anyhow!("local factory registry poisoned"))?
+            .remove(&(claim.runtime, claim.generation));
         Ok(())
     }
     /// Runs on the closer worker before any remote Kill/CloseBirth. Winning this
@@ -588,6 +601,11 @@ impl HookRuntime {
             // The worker will acquire the owner CAS before terminating it.
             Arc::clone(handle),
         );
+        drop(observed);
+        self.local_factories_pending
+            .lock()
+            .map_err(|_| anyhow!("local factory registry poisoned"))?
+            .remove(&(evidence.runtime, evidence.generation));
         Ok(())
     }
     fn observed_local_handles(&self) -> Vec<(crate::runtime::SharedPtyHandle, bool)> {
@@ -604,6 +622,110 @@ impl HookRuntime {
             })
             .unwrap_or_default()
     }
+    /// Bridge the consumed permit to publication of its actual physical handle.
+    /// Register before the factory enters its guarded spawn; retain uncertainty
+    /// until observation, a proved no-child attempt, or the aggregate close ACK.
+    pub(crate) fn begin_local_factory(&self, claim: Claim) -> Result<()> {
+        let admission = self
+            .birth_admission_closed
+            .lock()
+            .map_err(|_| anyhow!("birth admission poisoned"))?;
+        anyhow::ensure!(!*admission, "app is closing; local factory refused");
+        anyhow::ensure!(
+            claim.owner == Some(self.owner),
+            "local factory owner differs"
+        );
+        self.local_factories_pending
+            .lock()
+            .map_err(|_| anyhow!("local factory registry poisoned"))?
+            .insert((claim.runtime, claim.generation));
+        Ok(())
+    }
+
+    /// Exit-only barrier. Freeze new births, retain handles through true EOF,
+    /// native wait and durable tail ACK, then wait for their ledger retirement.
+    /// Remote endpoint release remains a separate operation; hot births survive.
+    pub(crate) fn drain_local_for_shutdown(&self, timeout: Duration) -> Result<()> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            match self.birth_admission_closed.try_lock() {
+                Ok(mut admission) => {
+                    *admission = true;
+                    break;
+                }
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    anyhow::bail!("birth admission poisoned")
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    anyhow::ensure!(
+                        std::time::Instant::now() < deadline,
+                        "birth reservation still in flight; shutdown remains unclean"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+        let mut last_error = None;
+        loop {
+            let handles = self
+                .observed_local
+                .lock()
+                .map_err(|_| anyhow!("local observer poisoned"))?
+                .values()
+                .cloned()
+                .collect::<Vec<_>>();
+            for handle in handles {
+                if let Err(error) = self.request_local_close(handle) {
+                    last_error = Some(error.to_string());
+                }
+            }
+            let factories_pending = !self
+                .local_factories_pending
+                .lock()
+                .map_err(|_| anyhow!("local factory registry poisoned"))?
+                .is_empty();
+            let births_pending = self
+                .claims
+                .lock()
+                .map_err(|_| anyhow!("claim registry poisoned"))?
+                .values()
+                .any(|context| context.claim.phase == ClaimPhase::AuthorizedBirth);
+            let handles_pending = !self
+                .observed_local
+                .lock()
+                .map_err(|_| anyhow!("local observer poisoned"))?
+                .is_empty();
+            let queued_pending = self
+                .local_queued
+                .lock()
+                .map_err(|_| anyhow!("local retire registry poisoned"))?
+                .values()
+                .any(|complete| !*complete);
+            let retirement_pending = self
+                .closing
+                .lock()
+                .map_err(|_| anyhow!("close registry poisoned"))?
+                .values()
+                .any(|closing| closing.permanent);
+            if !factories_pending
+                && !births_pending
+                && !handles_pending
+                && !queued_pending
+                && !retirement_pending
+            {
+                return Ok(());
+            }
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "local terminal shutdown incomplete; keep recovery marker: {}",
+                last_error
+                    .as_deref()
+                    .unwrap_or("waiting for physical and durable closure")
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     /// Factory/recovery worker only. Preserve the handle on queue pressure;
     /// returning an error/absence may not drop a spawned managed child.
     pub fn request_local_close_from_factory(&self, handle: crate::runtime::SharedPtyHandle) {
@@ -1044,7 +1166,16 @@ impl LocalRetirement {
             .take_retirement_tail(&mut self.durable, &mut self.dest_seq, true)?;
         self.append()?;
         if physical && tail && self.durable.is_empty() {
+            self.handle
+                .lock()
+                .map_err(|_| anyhow!("retirement poisoned"))?
+                .complete_local_retirement_checkpoint()?;
             runtime.physical_close_confirmed(evidence.runtime);
+            runtime
+                .local_factories_pending
+                .lock()
+                .map_err(|_| anyhow!("local factory registry poisoned"))?
+                .remove(&(evidence.runtime, evidence.generation));
             if let Ok(mut queued) = runtime.local_queued.lock() {
                 queued.insert((evidence.runtime, evidence.generation), true);
             }

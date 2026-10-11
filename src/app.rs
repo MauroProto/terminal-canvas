@@ -2670,7 +2670,7 @@ impl eframe::App for TerminalApp {
         if let Some(completion) = self.export_worker.drain() {
             self.finish_export(completion);
         }
-        let saved_cleanly = if self.persistence_writes_enabled {
+        let saved_before_close = if self.persistence_writes_enabled {
             match self.persist_final_state() {
                 Ok(()) => true,
                 Err(error) => {
@@ -2681,6 +2681,34 @@ impl eframe::App for TerminalApp {
         } else {
             false
         };
+        // Preserve a recovery prefix before closure, then wait without holding
+        // workspace/manager locks. The final stable grid includes the last read.
+        let local_closed =
+            crate::hook_runtime::process_runtime().is_none_or(|runtime| {
+                match runtime.drain_local_for_shutdown(Duration::from_secs(10)) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        log::error!(
+                            "Local terminal shutdown failed; keeping recovery marker: {error}"
+                        );
+                        false
+                    }
+                }
+            });
+        let saved_after_close = if self.persistence_writes_enabled && local_closed {
+            match self.persist_final_state() {
+                Ok(()) => true,
+                Err(error) => {
+                    log::error!(
+                        "Final terminal history save failed; keeping recovery marker: {error}"
+                    );
+                    false
+                }
+            }
+        } else {
+            false
+        };
+        let saved_cleanly = saved_before_close && local_closed && saved_after_close;
         // El daemon se apaga solo si no le quedan sesiones (P3.15, T5).
         #[cfg(all(unix, feature = "daemon"))]
         self.daemon.shutdown_if_idle();
