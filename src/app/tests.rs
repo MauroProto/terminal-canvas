@@ -3916,7 +3916,13 @@ fn rename_title_focus_is_not_requested_again_after_tab_navigation() {
         &mut app,
         vec![rename_dialog_input_for_test(egui::Key::F2)],
     );
+    assert_eq!(rename_dialog_pending_focus_for_test(&ctx), Some(panel_id));
     rename_dialog_frame_for_test(&ctx, &mut app, Vec::new());
+    assert_eq!(rename_dialog_pending_focus_for_test(&ctx), None);
+    assert_eq!(
+        ctx.memory(|memory| memory.focused()),
+        Some(egui::Id::new(super::dialogs::RENAME_TITLE_ID))
+    );
     rename_dialog_frame_for_test(
         &ctx,
         &mut app,
