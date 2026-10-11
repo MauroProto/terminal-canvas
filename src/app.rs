@@ -704,11 +704,8 @@ impl TerminalApp {
                 }
             }
             Command::RenameTerminal => {
-                if let Some(panel) = self.ws().focused_panel() {
-                    let panel_id = panel.id();
-                    let panel_title = panel.title().to_owned();
-                    self.renaming_panel = Some(panel_id);
-                    self.rename_buf = panel_title;
+                if let Some(panel_id) = self.ws().focused_panel().map(|panel| panel.id()) {
+                    self.open_rename_dialog(ctx, panel_id);
                 }
             }
             Command::SearchTerminal => self.open_search_bar(),
@@ -970,12 +967,7 @@ impl TerminalApp {
                     self.reconcile_orchestration();
                 }
                 SidebarResponse::RenamePanel(panel_id) => {
-                    self.renaming_panel = Some(panel_id);
-                    if let Some(panel) =
-                        self.ws().panels.iter().find(|panel| panel.id() == panel_id)
-                    {
-                        self.rename_buf = panel.title().to_owned();
-                    }
+                    self.open_rename_dialog(ctx, panel_id);
                 }
                 SidebarResponse::OpenShareWorkspace => self.open_share_workspace_dialog(),
                 SidebarResponse::OpenJoinSession => self.open_join_session_dialog(),

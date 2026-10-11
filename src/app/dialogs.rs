@@ -3,6 +3,8 @@ use egui::{pos2, Color32, FontId, Response};
 
 const DIALOG_INPUT_BG: Color32 = palette::SURFACE;
 
+pub(super) const RENAME_TITLE_ID: &str = "rename-dialog-title";
+
 fn dialog_frame() -> egui::Frame {
     egui::Frame::default()
         .fill(palette::INK)
@@ -66,6 +68,15 @@ fn dialog_input_visuals(ui: &mut egui::Ui) {
 }
 
 fn dialog_singleline(ui: &mut egui::Ui, value: &mut String, password: bool) -> Response {
+    dialog_singleline_with_id(ui, value, password, None)
+}
+
+fn dialog_singleline_with_id(
+    ui: &mut egui::Ui,
+    value: &mut String,
+    password: bool,
+    id: Option<Id>,
+) -> Response {
     dialog_input_visuals(ui);
     let mut edit = egui::TextEdit::singleline(value)
         .margin(egui::Margin::symmetric(10, 6))
@@ -73,6 +84,9 @@ fn dialog_singleline(ui: &mut egui::Ui, value: &mut String, password: bool) -> R
         .desired_width(f32::INFINITY);
     if password {
         edit = edit.password(true);
+    }
+    if let Some(id) = id {
+        edit = edit.id(id);
     }
     ui.add_sized(egui::vec2(ui.available_width(), 30.0), edit)
 }
@@ -172,10 +186,35 @@ fn dialog_inline_link(ui: &mut egui::Ui, label: &str) -> bool {
 }
 
 impl TerminalApp {
+    pub(super) fn open_rename_dialog(&mut self, ctx: &egui::Context, panel_id: Uuid) {
+        let Some(title) = self
+            .workspaces
+            .iter()
+            .flat_map(|workspace| &workspace.panels)
+            .find(|panel| panel.id() == panel_id)
+            .map(|panel| panel.title().to_owned())
+        else {
+            return;
+        };
+        self.renaming_panel = Some(panel_id);
+        self.rename_buf = title;
+        // Enter may already have selected Rename in the command palette.
+        // Every entrypoint opens the same field without accepting it twice.
+        ctx.input_mut(|input| {
+            input.consume_key(egui::Modifiers::NONE, Key::Enter);
+        });
+        ctx.memory_mut(|memory| memory.request_focus(Id::new(RENAME_TITLE_ID)));
+    }
+
     pub(super) fn show_rename_dialog(&mut self, ctx: &egui::Context) {
         let Some(panel_id) = self.renaming_panel else {
             return;
         };
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, Key::Escape)) {
+            self.renaming_panel = None;
+            ctx.memory_mut(|memory| memory.surrender_focus(Id::new(RENAME_TITLE_ID)));
+            return;
+        }
         dialog_backdrop(ctx);
         let mut close = false;
         let mut save = false;
@@ -187,7 +226,12 @@ impl TerminalApp {
                     ui.set_min_width(360.0);
                     dialog_title(ui, "Rename terminal");
                     dialog_field_label(ui, "Title");
-                    let response = dialog_singleline(ui, &mut self.rename_buf, false);
+                    let response = dialog_singleline_with_id(
+                        ui,
+                        &mut self.rename_buf,
+                        false,
+                        Some(Id::new(RENAME_TITLE_ID)),
+                    );
                     if response.lost_focus()
                         && ui.input(|i: &egui::InputState| i.key_pressed(Key::Enter))
                     {
@@ -202,12 +246,21 @@ impl TerminalApp {
                     }
                 });
             });
-        if save {
+        if close {
+            self.renaming_panel = None;
+        } else if save {
             let title = self.rename_buf.clone();
-            self.ws_mut().rename_panel(panel_id, title);
+            if let Some(workspace) = self
+                .workspaces
+                .iter_mut()
+                .find(|workspace| workspace.panels.iter().any(|panel| panel.id() == panel_id))
+            {
+                workspace.rename_panel(panel_id, title);
+            }
             self.renaming_panel = None;
-        } else if close {
-            self.renaming_panel = None;
+        }
+        if close || save {
+            ctx.memory_mut(|memory| memory.surrender_focus(Id::new(RENAME_TITLE_ID)));
         }
     }
 
