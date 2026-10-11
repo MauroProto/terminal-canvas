@@ -936,4 +936,16 @@ mod config_recovery_tests {
         );
         assert_eq!(overflow.calls, 0);
     }
+
+    #[test]
+    fn interrupted_reads_retry_without_discarding_the_complete_document() {
+        let valid = b"[terminal]\nfont_size = 22.0\n";
+        let mut input = reader(valid);
+        input.interrupt_once = true;
+        assert_eq!(
+            read_config_bytes(&mut input, valid.len() as u64, 128).unwrap(),
+            valid
+        );
+        assert_eq!(input.calls, 3);
+    }
 }
