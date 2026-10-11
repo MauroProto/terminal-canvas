@@ -22,15 +22,26 @@ fn session_spec(configure: impl FnOnce(&mut WireSpec)) -> WireSpec {
     spec
 }
 
-// A real close is asynchronous: durable prefix, child wait and EOF may need
-// several pumps. These tests observe a known live identity disappearing; the
-// stronger hook-generation ACK is covered independently by host fixtures.
-fn kill_known_session(conn: &mut DaemonConn, id: uuid::Uuid) {
-    assert!(conn.list_checked().unwrap().contains(&id));
+// A real close is asynchronous and deliberately disconnects its subscribers.
+// Observe removal on an independent authenticated socket, then reconnect the
+// command client with its original identity. A dead socket is never absence.
+fn kill_known_session(daemon: &DaemonProcess, token: &str, conn: &mut DaemonConn, id: uuid::Uuid) {
+    let client_id = conn.client_id();
+    assert!(conn
+        .list_checked()
+        .expect("live command connection")
+        .contains(&id));
+    let mut observer =
+        DaemonConn::try_connect(&daemon.dir, token).expect("authenticated closure observer");
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let _ = conn.kill(id);
-        if !conn.list_checked().unwrap().contains(&id) {
+        let remaining = observer.list_checked().expect("closure observer list");
+        if !remaining.contains(&id) {
+            *conn = DaemonConn::try_connect_as(&daemon.dir, token, client_id)
+                .expect("reconnect original client after closure");
+            assert_eq!(conn.client_id(), client_id);
+            assert!(!conn.list_checked().expect("reconnected list").contains(&id));
             return;
         }
         assert!(
@@ -41,17 +52,32 @@ fn kill_known_session(conn: &mut DaemonConn, id: uuid::Uuid) {
     }
 }
 
-fn reconcile_known_sessions(conn: &mut DaemonConn, live: Vec<uuid::Uuid>, removed: &[uuid::Uuid]) {
+fn reconcile_known_sessions(
+    daemon: &DaemonProcess,
+    token: &str,
+    conn: &mut DaemonConn,
+    live: Vec<uuid::Uuid>,
+    removed: &[uuid::Uuid],
+) {
+    let client_id = conn.client_id();
+    let mut observer =
+        DaemonConn::try_connect(&daemon.dir, token).expect("authenticated reconcile observer");
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let killed = conn.reconcile_live(live.clone());
         assert!(killed.iter().all(|id| removed.contains(id)));
-        let remaining = conn.list_checked().unwrap();
+        let remaining = observer.list_checked().expect("reconcile observer list");
         assert!(
             live.iter().all(|id| remaining.contains(id)),
             "reconcile killed a live session"
         );
         if removed.iter().all(|id| !remaining.contains(id)) {
+            *conn = DaemonConn::try_connect_as(&daemon.dir, token, client_id)
+                .expect("reconnect original client after reconcile");
+            assert_eq!(conn.client_id(), client_id);
+            let remaining = conn.list_checked().expect("reconnected reconcile list");
+            assert!(live.iter().all(|id| remaining.contains(id)));
+            assert!(removed.iter().all(|id| !remaining.contains(id)));
             return;
         }
         assert!(
@@ -395,7 +421,7 @@ fn attach_snapshot_and_seq_share_one_atomic_output_boundary() {
             assert!(Instant::now() < deadline, "el marker no llegó");
             std::thread::sleep(Duration::from_millis(10));
         }
-        kill_known_session(&mut conn, id);
+        kill_known_session(&daemon, &token, &mut conn, id);
     }
 }
 
@@ -416,7 +442,7 @@ fn reconcile_kills_the_sessions_the_app_no_longer_knows() {
     let keep = conn.spawn_session(WireSpec::default()).expect("spawn");
     let orphan = conn.spawn_session(WireSpec::default()).expect("spawn");
 
-    reconcile_known_sessions(&mut conn, vec![keep], &[orphan]);
+    reconcile_known_sessions(&daemon, &token, &mut conn, vec![keep], &[orphan]);
     assert_eq!(conn.list(), vec![keep]);
 }
 
@@ -447,7 +473,7 @@ fn reconcile_preserves_sessions_owned_by_another_live_app() {
 
     drop(first);
     std::thread::sleep(Duration::from_millis(100));
-    reconcile_known_sessions(&mut second, vec![second_id], &[first_id]);
+    reconcile_known_sessions(&daemon, &token, &mut second, vec![second_id], &[first_id]);
 }
 
 #[test]
@@ -497,9 +523,12 @@ fn killing_a_session_removes_it_for_every_client() {
     second
         .attach(id)
         .expect("adopción explícita antes de cerrar");
-    kill_known_session(&mut second, id);
+    kill_known_session(&daemon, &token, &mut second, id);
     assert!(
-        first.list().is_empty(),
+        first
+            .list_checked()
+            .expect("creator observes actual removal")
+            .is_empty(),
         "matarla desde una app la saca para todas"
     );
 }
