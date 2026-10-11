@@ -113,6 +113,28 @@ resultado. La captura del grid permanece en el hilo de UI. El polling funciona
 también con la ventana oculta, y el cierre normal espera el trabajo aceptado.
 Los errores de creación del worker y escritura se muestran al usuario.
 
+El diagnóstico incluye `collection-report.json` (schema 1) para las cuatro
+fuentes `panic.log`, `runs.log`, `config.toml` y `layout.json`. El límite de
+entrada es 4 MiB por archivo, separado del máximo de 16 MiB del layout guardado.
+Los archivos estructurados demasiado grandes, ilegibles o inválidos se omiten
+con un motivo; no se reemplazan por un prefijo o contenido de relleno. Los logs
+grandes aportan una cola acotada y declaran el recorte y cualquier decodificación
+con reemplazos.
+
+Que el ZIP se complete no confirma que todas las fuentes estén incluidas:
+consultá los estados `included` y `omitted` del reporte. Los motivos de omisión
+son `missing`, `read-error`, `oversize` e `invalid-format`; la ausencia de una
+fuente opcional no hace fallar el diagnóstico. El reporte no copia rutas ni
+mensajes privados del sistema, pero los logs incluidos y campos no cubiertos
+por la redacción requieren revisión antes de compartir. El layout del ZIP
+proviene del disco, no de cambios pendientes en memoria.
+
+La recopilación no es un snapshot atómico de las fuentes ni tiene un plazo
+garantizado para las llamadas al sistema en volúmenes remotos. El límite acota
+bytes de entrada, no el tamaño total del texto formateado o del ZIP. Ver
+[SUPPORT.md](SUPPORT.md) para interpretar los campos del reporte y preparar un
+respaldo completo.
+
 La selección del visor conserva el texto Unicode, CRLF y el salto final, sin
 los números del gutter. El visor fragmenta las líneas largas antes de
 renderizarlas y aplica un presupuesto separado al resaltado, según

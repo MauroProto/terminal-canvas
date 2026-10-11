@@ -151,12 +151,50 @@ no la trunques ni reemplaces por una colección vacía para ocultar el error.
 
 ## Diagnósticos
 
-La exportación de diagnóstico recoge configuración, layout y logs con límites
-de tamaño. Redacta campos estructurados sensibles y omite una configuración
-que no se pueda interpretar con seguridad. Los mensajes de error y logs aún
-pueden contener texto privado: revisá el ZIP antes de adjuntarlo a un issue.
-No hace falta publicar la base de memoria ni el historial completo para
-reportar un problema de interfaz.
+La exportación de diagnóstico recoge configuración, layout y logs. Redacta
+campos estructurados sensibles y anonimiza campos conocidos del layout.
+El `layout.json` del ZIP se lee del disco: no rescata cambios de workspaces o
+paneles que todavía estén sin guardar en la sesión. No hace falta publicar la
+base de memoria ni el historial completo para reportar un problema de interfaz.
+
+El límite de lectura es **4 MiB (4.194.304 bytes) por fuente**. Es independiente
+del máximo de 16 MiB para guardar el layout de la app: un layout válido de más
+de 4 MiB se omite del diagnóstico con el motivo `oversize`. La configuración y
+el layout deben caber completos, ser UTF-8 válido y tener un formato interpretable;
+el layout debe ser un objeto JSON. No se exporta un prefijo ni un archivo de
+relleno cuando esa comprobación falla.
+
+Para `panic.log` y `runs.log` grandes se recoge la cola de hasta 4 MiB y se
+descarta la primera línea que pueda estar incompleta. El texto indica que se
+omitieron registros anteriores. Si hay bytes que no son UTF-8 válido en los
+registros incluidos, se muestran con reemplazos y el reporte lo informa.
+El límite se aplica a los bytes de entrada; el texto formateado y el ZIP no
+tienen un máximo total de 4 MiB.
+
+El ZIP incluye `collection-report.json`, con `schema_version: 1`,
+`source_byte_limit: 4194304` y `optional_missing_is_an_error: false`.
+Su lista `sources` informa el resultado de `panic.log`, `runs.log`,
+`config.toml` y `layout.json`:
+
+| Resultado | Significado |
+| --- | --- |
+| `included` | La fuente está en el ZIP. `truncated` indica si se recortó el log y `lossy_utf8` si se reemplazaron bytes inválidos en el texto incluido. |
+| `omitted` / `missing` | La fuente opcional no existe. Su ausencia no hace fallar la exportación. |
+| `omitted` / `read-error` | No se pudo abrir o leer un archivo regular. `operation` e `io_kind` identifican la operación y el tipo de error. |
+| `omitted` / `oversize` | La fuente excede el límite de lectura; no se incluyó su contenido parcial. |
+| `omitted` / `invalid-format` | La configuración o el layout no se pudieron interpretar con seguridad, incluido UTF-8 inválido. |
+
+Una exportación completada confirma la escritura del ZIP, aunque haya fuentes
+omitidas. Mirá el reporte para saber qué se pudo recoger. El reporte usa nombres
+lógicos y códigos de error, sin rutas completas ni mensajes del sistema.
+Los logs y campos que no cubren las reglas de redacción aún pueden contener
+texto privado: revisá todo el ZIP antes de adjuntarlo a un issue.
+
+La recopilación no congela los archivos mientras otra instancia los escribe.
+También puede seguir esperando una llamada al sistema en un volumen remoto;
+el límite de bytes no garantiza un plazo de lectura. Para respaldar los datos,
+usá el procedimiento de copia del perfil de esta guía; el diagnóstico no
+reemplaza ese respaldo.
 
 Los diagnósticos y exports de texto se escriben en segundo plano. La app
 acepta una exportación por vez e informa el resultado y su ruta cuando termina;
