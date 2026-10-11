@@ -70,12 +70,13 @@ jobs:
       - name: Security regressions
         run: cargo test --lib --locked security_ -- --nocapture
 
+      # Preserve independent GUI evidence even when a unit regression fails.
       - name: Build native GUI smoke binary
-        if: runner.os == 'Linux'
+        if: !cancelled() && runner.os == 'Linux'
         run: cargo build --locked --bin mi-terminal
 
       - name: Native GUI persistence and recovery
-        if: runner.os == 'Linux'
+        if: !cancelled() && runner.os == 'Linux'
         timeout-minutes: 6
         env:
           WGPU_BACKEND: vulkan
