@@ -317,10 +317,14 @@ impl PtyHandle {
         let sequence = Arc::clone(&handle.log_seq);
         handle.reader_retirement = control;
         handle._reader_thread = thread::spawn(move || {
+            let mut parser = Processor::<StdSyncHandler>::new();
             let mut bytes = [0; 64];
             loop {
                 match runner.read_and_retain(&mut *reader, &mut bytes, |raw| {
-                    retain_raw_read_and_parse(&term, &pending, &sequence, raw, |_| ()).map(|_| ())
+                    retain_raw_read_and_parse(&term, &pending, &sequence, raw, |grid| {
+                        parser.advance(grid, raw);
+                    })
+                    .map(|_| ())
                 }) {
                     ReadCompletion::Data => {}
                     ReadCompletion::Retry | ReadCompletion::Paused => runner.wait_retry(),

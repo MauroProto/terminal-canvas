@@ -81,6 +81,31 @@ impl Fixture {
             _ => panic!("expected actual local close ownership handoff"),
         }
     }
+    fn retire_actual_handle(&self, claim: Claim) -> (Claim, crate::runtime::SharedPtyHandle) {
+        let mut pty = PtyHandle::for_persistence_tests(b"");
+        pty.bind_local_hook_for_retirement_tests(claim);
+        let handle = Arc::new(Mutex::new(pty));
+        self.runtime.observe_local(&handle).unwrap();
+        self.runtime
+            .request_local_close(Arc::clone(&handle))
+            .unwrap();
+        let mut retirement = self.next_local_retirement();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !retirement.advance(&self.runtime).unwrap() {
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert!(self.runtime.finish(claim.runtime, false).unwrap());
+        let retired = self
+            .runtime
+            .store()
+            .unwrap()
+            .hook_claim(claim.key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(retired.phase, ClaimPhase::Retired);
+        (retired, handle)
+    }
     fn journal_output(&self, claim: Claim) -> Vec<u8> {
         let path = self
             .directory
@@ -159,15 +184,7 @@ fn a_stale_local_handle_cannot_fence_a_new_generation_with_the_same_runtime_id()
     let birth = fixture.birth();
     let active = fixture.activate(birth);
     let store = fixture.runtime.store().unwrap();
-    let retired = store
-        .hook_transition(
-            fixture.runtime.owner,
-            Uuid::new_v4(),
-            &LedgerIntent::Retire { expected: active },
-        )
-        .unwrap()
-        .claim
-        .unwrap();
+    let (retired, stale_handle) = fixture.retire_actual_handle(active);
     let successor = store
         .hook_transition(
             fixture.runtime.owner,
@@ -202,12 +219,20 @@ fn a_stale_local_handle_cannot_fence_a_new_generation_with_the_same_runtime_id()
             },
         })
         .unwrap();
-    let mut stale = PtyHandle::for_persistence_tests(b"OLD");
-    stale.bind_local_hook_for_retirement_tests(birth);
+    let cancellations_before = fixture.runtime.cancelled.lock().unwrap().clone();
+    let stale_evidence = stale_handle.lock().unwrap().hook_host_evidence();
     assert!(fixture
         .runtime
-        .request_local_close(Arc::new(Mutex::new(stale)))
+        .prepare_physical_close_bound(stale_evidence)
         .is_err());
+    // Repeating A's already acknowledged close is idempotent for A only.
+    fixture.runtime.request_local_close(stale_handle).unwrap();
+    assert!(!fixture
+        .runtime
+        .local_queued
+        .lock()
+        .unwrap()
+        .contains_key(&(successor.runtime, successor.generation)));
     assert_eq!(store.hook_claim(successor.key).unwrap(), Some(successor));
     assert_eq!(
         fixture
@@ -220,13 +245,15 @@ fn a_stale_local_handle_cannot_fence_a_new_generation_with_the_same_runtime_id()
         successor
     );
     assert!(fixture.runtime.closing.lock().unwrap().is_empty());
-    assert!(!fixture
-        .runtime
-        .cancelled
-        .lock()
-        .unwrap()
-        .contains(&successor.runtime));
-    assert!(fixture.work.try_recv().is_err());
+    assert_eq!(
+        *fixture.runtime.cancelled.lock().unwrap(),
+        cancellations_before
+    );
+    // The actual previous retirement may have queued its own Finish wakeup;
+    // no request for B's local controller may have been admitted.
+    while let Ok(work) = fixture.work.try_recv() {
+        assert!(!matches!(work, Work::CloseLocal(_)));
+    }
 }
 
 #[test]
@@ -381,15 +408,7 @@ fn a_delayed_authority_refresh_keeps_the_successor_registry_and_ui_ticket() {
         legacy_alias_epoch: None,
     };
     let store = fixture.runtime.store().unwrap();
-    let retired = store
-        .hook_transition(
-            fixture.runtime.owner,
-            Uuid::new_v4(),
-            &LedgerIntent::Retire { expected: active },
-        )
-        .unwrap()
-        .claim
-        .unwrap();
+    let (retired, _prior_handle) = fixture.retire_actual_handle(active);
     let successor = store
         .hook_transition(
             fixture.runtime.owner,

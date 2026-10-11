@@ -3040,8 +3040,12 @@ mod tests {
         let other = spawn_one(&mut state);
         state.priority_session = Some(focused);
 
-        // El cliente no lista `focused` como viva → la mata reconcile.
+        // The default Spawn fixture belongs to the nil client. A foreign
+        // client cannot retire its session or change that session's priority.
         state.reconcile_live(Uuid::new_v4(), &[other]);
+        assert_eq!(state.priority_session, Some(focused));
+        assert!(state.session(focused).is_some());
+        state.reconcile_live(Uuid::nil(), &[other]);
         assert_eq!(state.priority_session, None);
     }
 
@@ -3983,7 +3987,9 @@ mod full_attach_birth_retirement_fixtures {
         );
         assert_eq!(reply, Response::Spawned { id });
         assert_eq!(state.session_ids(), vec![id]);
-        assert_eq!(state.session(id).unwrap().spec, spec);
+        let mut owned_spec = spec;
+        owned_spec.hook_owner = Some(creator);
+        assert_eq!(state.session(id).unwrap().spec, owned_spec);
         assert_eq!(state.session(id).unwrap().persist_pending, before);
         assert_eq!(state.session(id).unwrap().birth_client, Some(creator));
     }
