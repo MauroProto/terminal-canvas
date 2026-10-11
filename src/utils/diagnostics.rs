@@ -936,4 +936,41 @@ mod source_quality_tests {
             self.bytes.seek(position)
         }
     }
+
+    #[test]
+    fn diagnostic_reader_retries_interrupts_but_preserves_an_error_after_complete_json() {
+        let bytes = b"{\"v\":1}".to_vec();
+        let mut successful = InterruptedThenFailure {
+            bytes: Cursor::new(bytes.clone()),
+            interrupted: false,
+            fail_at_eof: false,
+        };
+        assert_eq!(
+            read_from_regular(&mut successful, bytes.len() as u64, false, 32),
+            DiagnosticRead::Included {
+                bytes: bytes.clone(),
+                truncated: false
+            }
+        );
+        let mut failed = InterruptedThenFailure {
+            bytes: Cursor::new(bytes.clone()),
+            interrupted: false,
+            fail_at_eof: true,
+        };
+        let DiagnosticRead::Omitted(issue) =
+            read_from_regular(&mut failed, bytes.len() as u64, false, 32)
+        else {
+            panic!("read failure after JSON must not export that prefix");
+        };
+        assert_eq!(
+            issue,
+            DiagnosticIssue::ReadError {
+                operation: "read",
+                kind: io::ErrorKind::PermissionDenied
+            }
+        );
+        let report = omission_report("layout.json", issue).to_string();
+        assert!(report.contains("PermissionDenied"));
+        assert!(!report.contains("private-path-and-error-text"));
+    }
 }
