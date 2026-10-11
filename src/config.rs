@@ -797,4 +797,27 @@ mod config_recovery_tests {
         assert!(config.onboarding_dismissed);
         assert_eq!(entries(&path), before);
     }
+
+    #[test]
+    fn all_readable_invalid_candidates_block_and_preserve_the_ring() {
+        let dir = TempDirectory::new();
+        let path = dir.path();
+        for (entry, _) in entries(&path) {
+            std::fs::write(entry, "[broken").unwrap();
+        }
+        let before = entries(&path);
+        let report = load_result_from_path(&path);
+        assert!(matches!(
+            report,
+            ConfigLoadReport::Failed(ConfigLoadIssue {
+                kind: ConfigLoadIssueKind::InvalidToml,
+                ..
+            })
+        ));
+        assert_eq!(entries(&path), before);
+        assert!(RuntimeConfigState::from_report(report)
+            .status
+            .write_permission()
+            .is_err());
+    }
 }
