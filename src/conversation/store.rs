@@ -117,13 +117,24 @@ impl ConversationStore {
         let conversation = self
             .conversation(target)?
             .context("La conversación no existe")?;
-        if let Caller::Agent(source) = caller {
-            let enabled: bool = self.db.query_row(
-                "SELECT EXISTS(SELECT 1 FROM credentials WHERE conversation=?1 AND enabled=1)",
-                [source.to_string()],
-                |row| row.get(0),
-            )?;
-            anyhow::ensure!(enabled, "Credencial de chat revocada");
+        if let Some(source) = caller.agent_id() {
+            let digest: Option<Vec<u8>> = self
+                .db
+                .query_row(
+                    "SELECT digest FROM credentials WHERE conversation=?1 AND enabled=1",
+                    [source.to_string()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            anyhow::ensure!(digest.is_some(), "Credencial de chat revocada");
+            if let Caller::AuthenticatedAgent(auth) = caller {
+                anyhow::ensure!(
+                    digest
+                        .as_ref()
+                        .is_some_and(|current| credential_matches(current, &auth.digest)),
+                    "Credencial de chat renovada; reconectá el puente MCP"
+                );
+            }
             let own = self
                 .conversation(source)?
                 .context("El chat llamante no existe")?;
@@ -201,16 +212,14 @@ impl ConversationStore {
             )
             .optional()?;
         let actual = Sha256::digest(token.as_bytes());
-        let valid = digest.as_ref().is_some_and(|expected| {
-            expected.len() == actual.len()
-                && expected
-                    .iter()
-                    .zip(actual.iter())
-                    .fold(0u8, |diff, (a, b)| diff | (a ^ b))
-                    == 0
-        });
+        let valid = digest
+            .as_ref()
+            .is_some_and(|expected| credential_matches(expected, &actual));
         anyhow::ensure!(valid, "Credencial de chat inválida o revocada");
-        Ok(Caller::Agent(id))
+        Ok(Caller::AuthenticatedAgent(AgentAuthentication {
+            id,
+            digest: actual.into(),
+        }))
     }
     pub fn revoke(&self, id: Uuid) -> Result<()> {
         let tx = rusqlite::Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
@@ -243,11 +252,13 @@ impl ConversationStore {
         Ok(self.db.query_row("SELECT MIN(available) FROM bridges JOIN credentials USING(conversation) WHERE conversation=?1 AND bridges.digest=credentials.digest AND credentials.enabled=1 AND expires>?2",params![id.to_string(),chrono::Utc::now().timestamp_millis()],|row|row.get(0))?)
     }
     pub fn set_available(&self, caller: Caller, available: bool) -> Result<()> {
-        let Caller::Agent(id) = caller else {
+        let tx = rusqlite::Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
+        let Some(id) = caller.agent_id() else {
             anyhow::bail!("La disponibilidad la declara el chat receptor")
         };
         self.authorize(caller, id)?;
         self.db.execute("UPDATE bridges SET available=?1 WHERE conversation=?2 AND digest=(SELECT digest FROM credentials WHERE conversation=?2 AND enabled=1)",params![available,id.to_string()])?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -261,7 +272,7 @@ impl ConversationStore {
         source: &str,
     ) -> Result<ConversationMessage> {
         let tx = rusqlite::Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
-        if let Caller::Agent(own) = caller {
+        if let Some(own) = caller.agent_id() {
             anyhow::ensure!(
                 own == thread,
                 "Sólo se registran mensajes en el chat propio"
@@ -296,7 +307,7 @@ impl ConversationStore {
         let value = self.db.query_row("SELECT id,sequence,conversation,role,text,source,created,origin FROM messages WHERE id=?1", [id.to_string()], read_message).optional()?;
         if let Some(message) = &value {
             if let Err(error) = self.authorize(caller, message.conversation_id) {
-                let Caller::Agent(own) = caller else {
+                let Some(own) = caller.agent_id() else {
                     return Err(error);
                 };
                 self.authorize(caller, own)?;
@@ -419,7 +430,7 @@ impl ConversationStore {
             request.source_id != request.target_id,
             "Elegí otro chat de destino"
         );
-        if let Caller::Agent(own) = caller {
+        if let Some(own) = caller.agent_id() {
             anyhow::ensure!(
                 own == request.source_id,
                 "No se puede suplantar al chat de origen"
@@ -461,13 +472,13 @@ impl ConversationStore {
         }
         let automatic: bool = match caller {
             Caller::User => true,
-            Caller::Agent(_) => self.db.query_row(
+            Caller::Agent(_) | Caller::AuthenticatedAgent(_) => self.db.query_row(
                 "SELECT automatic FROM links WHERE source=?1 AND target=?2",
                 params![request.source_id.to_string(), request.target_id.to_string()],
                 |row| row.get(0),
             )?,
         };
-        let parent_id: Option<Uuid> = if let Caller::Agent(own) = caller {
+        let parent_id: Option<Uuid> = if let Some(own) = caller.agent_id() {
             self.db.query_row("SELECT id FROM transfers WHERE target=?1 AND state IN ('dispatching','input_queued') ORDER BY rowid LIMIT 1",[own.to_string()],|row|uuid_column(row,0)).optional()?
         } else {
             None
@@ -510,7 +521,7 @@ impl ConversationStore {
                 TransferState::AwaitingApproval
             },
             target_binding: target.binding_id,
-            requested_by_agent: matches!(caller, Caller::Agent(_)),
+            requested_by_agent: caller.agent_id().is_some(),
             result: None,
             error: None,
             created_at: chrono::Utc::now().timestamp_millis(),
@@ -531,7 +542,7 @@ impl ConversationStore {
     }
 
     fn check_transfer_access(&self, caller: Caller, transfer: &Transfer) -> Result<()> {
-        if let Caller::Agent(own) = caller {
+        if let Some(own) = caller.agent_id() {
             self.authorize(caller, own)?;
             anyhow::ensure!(
                 own == transfer.source_id || own == transfer.target_id,
@@ -567,6 +578,7 @@ impl ConversationStore {
         self.transition(&mut transfer, TransferState::Pending, None)
     }
     pub fn cancel(&self, caller: Caller, id: Uuid) -> Result<()> {
+        let tx = rusqlite::Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
         let mut transfer = self.transfer(caller, id)?;
         anyhow::ensure!(
             matches!(
@@ -578,7 +590,9 @@ impl ConversationStore {
             ),
             "La entrada ya pudo haber sido enviada; no puede retirarse"
         );
-        self.transition(&mut transfer, TransferState::Cancelled, None)
+        self.transition(&mut transfer, TransferState::Cancelled, None)?;
+        tx.commit()?;
+        Ok(())
     }
     fn transition(
         &self,
@@ -686,7 +700,7 @@ impl ConversationStore {
     pub fn reply(&mut self, caller: Caller, id: Uuid, text: &str) -> Result<Transfer> {
         let tx = rusqlite::Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
         let mut transfer = self.transfer(caller, id)?;
-        if let Caller::Agent(own) = caller {
+        if let Some(own) = caller.agent_id() {
             anyhow::ensure!(
                 own == transfer.target_id,
                 "Sólo el destinatario puede responder la operación"
@@ -764,17 +778,14 @@ impl ConversationStore {
         workspace: Uuid,
         after: Option<Uuid>,
     ) -> Result<Vec<Conversation>> {
-        if let Caller::Agent(own) = caller {
+        if let Some(own) = caller.agent_id() {
             anyhow::ensure!(
                 self.authorize(caller, own)?.workspace_id == workspace,
                 "Workspace fuera del alcance"
             );
         }
         let mut query=self.db.prepare("SELECT data FROM conversations WHERE workspace=?1 AND id>?2 AND (?3 IS NULL OR id=?3 OR EXISTS(SELECT 1 FROM links WHERE source=?3 AND target=conversations.id)) ORDER BY id LIMIT 51")?;
-        let own = match caller {
-            Caller::User => None,
-            Caller::Agent(id) => Some(id.to_string()),
-        };
+        let own = caller.agent_id().map(|id| id.to_string());
         let result = query
             .query_map(
                 params![
@@ -791,6 +802,12 @@ impl ConversationStore {
             .collect()
     }
     pub fn snapshot(&self, caller: Caller, workspace: Uuid) -> Result<HubSnapshot> {
+        if let Some(own) = caller.agent_id() {
+            anyhow::ensure!(
+                self.authorize(caller, own)?.workspace_id == workspace,
+                "Workspace fuera del alcance"
+            );
+        }
         let mut conversations = Vec::new();
         let mut query = self
             .db
@@ -842,7 +859,9 @@ impl ConversationStore {
         })? {
             let transfer = value?;
             if matches!(caller, Caller::User)
-                || matches!(caller,Caller::Agent(own) if own==transfer.source_id || own==transfer.target_id)
+                || caller
+                    .agent_id()
+                    .is_some_and(|own| own == transfer.source_id || own == transfer.target_id)
             {
                 transfers.push(transfer)
             }
@@ -872,6 +891,15 @@ impl ConversationStore {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(result)
     }
+}
+
+fn credential_matches(expected: &[u8], actual: &[u8]) -> bool {
+    expected.len() == actual.len()
+        && expected
+            .iter()
+            .zip(actual)
+            .fold(0u8, |diff, (a, b)| diff | (a ^ b))
+            == 0
 }
 
 fn state_name(state: TransferState) -> &'static str {

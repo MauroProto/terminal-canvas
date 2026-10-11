@@ -692,11 +692,12 @@ fn generated_mcp_config_uses_a_private_credential_file_and_revokes_old_token() {
     assert!(!content.contains(&original));
     assert!(store.authenticate(a.id, &original).is_err());
     assert_eq!(
-        store.authenticate(a.id, &auth.token).unwrap(),
-        Caller::Agent(a.id)
+        store.authenticate(a.id, &auth.token).unwrap().agent_id(),
+        Some(a.id)
     );
     assert_eq!(auth.database, path);
 }
+
 #[test]
 fn queue_capacity_and_message_id_conflicts_leave_no_partial_history() {
     let (mut store, a, b) = fixture();

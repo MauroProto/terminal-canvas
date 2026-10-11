@@ -150,7 +150,26 @@ impl Transfer {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Caller {
     User,
+    /// Trusted in-process identity. MCP callers use the authenticated variant.
     Agent(Uuid),
+    AuthenticatedAgent(AgentAuthentication),
+}
+
+/// Credential generation retained across authentication and transactional effects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentAuthentication {
+    pub(super) id: Uuid,
+    pub(super) digest: [u8; 32],
+}
+
+impl Caller {
+    pub(crate) fn agent_id(self) -> Option<Uuid> {
+        match self {
+            Self::User => None,
+            Self::Agent(id) => Some(id),
+            Self::AuthenticatedAgent(auth) => Some(auth.id),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
