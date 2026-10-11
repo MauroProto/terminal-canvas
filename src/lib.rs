@@ -5,8 +5,8 @@
 
 pub mod app;
 pub mod canvas;
-// Online/invitations are outside this maintenance pass. Keep their existing
-// formatting/type-inference behavior while checking the rest with Rust 1.98.
+// Preserve the collaboration module's existing formatting/type-inference lint
+// policy. Its transport and input contracts have dedicated regression coverage.
 #[allow(clippy::uninlined_format_args, float_literal_f32_fallback)]
 pub mod collab;
 pub mod command_palette;

@@ -2,7 +2,8 @@
 //!
 //! Los CLI guardan su propio historial en disco; nosotros no lo duplicamos, lo
 //! leemos. Claude Code escribe un JSONL por sesión en
-//! `~/.claude/projects/<cwd-slug>/<session-id>.jsonl`, con registros tipados:
+//! `<CLAUDE_CONFIG_DIR>/projects/<cwd-slug>/<session-id>.jsonl` (por defecto
+//! `~/.claude/projects`), con registros tipados:
 //! `ai-title` trae el título que el propio Claude le puso a la conversación y
 //! los registros `user` traen `cwd`, `timestamp` y el mensaje.
 //!

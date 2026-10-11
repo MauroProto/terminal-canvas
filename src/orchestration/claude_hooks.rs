@@ -1,4 +1,5 @@
-//! Instalación de nuestros hooks en `~/.claude/settings.json` (P2.12, T2).
+//! Instalación de hooks en el settings.json del perfil de Claude (P2.12, T2).
+//! Respeta CLAUDE_CONFIG_DIR; por defecto usa `~/.claude/settings.json`.
 //!
 //! El merge es cuidadoso: se insertan grupos marcados con
 //! `"_managed_by": "terminalcanvas"` y **nunca** se tocan los hooks del

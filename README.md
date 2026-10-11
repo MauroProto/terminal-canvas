@@ -248,6 +248,10 @@ On macOS/Linux, repeat Clippy and tests with `--features daemon`. CI covers
 Windows x86_64, Linux x86_64, macOS Intel and Apple Silicon. The live PTY test
 starts twenty real shells and checks output, resizing and exit handling.
 
+Linux CI also opens the native WGPU window and exercises persistence, save
+failure/recovery and closing with active output. See [GUI and integration
+validation](docs/GUI-VALIDATION.md) for evidence artifacts and coverage limits.
+
 See [support and recovery](docs/SUPPORT.md) for persistence boundaries,
 diagnostics and Windows toolchain selection, and [portable packages](docs/PORTABLE.md)
 for installation and manual updates.
