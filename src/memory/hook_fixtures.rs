@@ -482,6 +482,125 @@ fn app_startup_verifies_a_backup_before_upgrade_and_never_repeats_it() {
 }
 
 #[test]
+fn app_startup_preserves_a_verified_v1_backup_and_fences_the_old_prepared_writer() {
+    let directory = crate::memory::test_support::temp_dir();
+    let path = directory.join("memory.db");
+    let mut old = Connection::open(&path).unwrap();
+    baseline_v2::configure(&old).unwrap();
+    baseline_v2::migrate(&mut old).unwrap();
+    old.execute_batch(
+        "DELETE FROM schema_migrations; INSERT INTO schema_migrations VALUES (1);
+         DROP INDEX tasks_project_orchestrator;",
+    )
+    .unwrap();
+    old.execute(
+        "INSERT INTO handoffs(id,project_id,task_id,summary,created_at)
+         VALUES ('v1-preserved','p','t','before-v1-upgrade',1)",
+        [],
+    )
+    .unwrap();
+    let logical_before = crate::memory::cutover::logical_digest(&old).unwrap();
+    let mut cached = old
+        .prepare(
+            "INSERT INTO handoffs(id,project_id,task_id,summary,created_at)
+         VALUES ('v1-old-late','p','t','old-writer',2)",
+        )
+        .unwrap();
+    assert!(super::MemoryStore::open(&path).is_err());
+    assert_eq!(
+        old.query_row("SELECT MAX(version) FROM schema_migrations", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        1,
+        "a generic open must leave the old schema intact"
+    );
+    let store = super::MemoryStore::open_for_app(&path).unwrap();
+    assert!(
+        cached.execute([]).is_err(),
+        "a prepared old writer must hit the committed v3 fence"
+    );
+    drop(cached);
+    drop(old);
+    let backup_dir = directory.join("memory-backups");
+    let files = std::fs::read_dir(&backup_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    assert_eq!(files.len(), 2);
+    let backup = files
+        .iter()
+        .find(|file| file.extension().is_some_and(|ext| ext == "sqlite3"))
+        .unwrap();
+    assert!(backup
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .starts_with("memory-v1-"));
+    let snapshot =
+        Connection::open_with_flags(backup, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    assert_eq!(
+        snapshot
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        crate::memory::cutover::logical_digest(&snapshot).unwrap(),
+        logical_before
+    );
+    let evidence: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(backup.with_extension("cutover.json")).unwrap())
+            .unwrap();
+    assert_eq!(evidence["previous_version"].as_i64(), Some(1));
+    assert_eq!(
+        evidence["logical_sha256"].as_str(),
+        Some(logical_before.as_str())
+    );
+    use sha2::Digest;
+    assert_eq!(
+        format!("{:x}", sha2::Sha256::digest(std::fs::read(backup).unwrap())),
+        evidence["backup_sha256"].as_str().unwrap()
+    );
+    assert_eq!(
+        store
+            .with_conn(|conn| Ok(conn.query_row(
+                "SELECT MAX(version) FROM schema_migrations",
+                [],
+                |r| r.get::<_, i64>(0)
+            )?))
+            .unwrap(),
+        3
+    );
+    assert_eq!(
+        store
+            .with_conn(|conn| Ok(conn.query_row(
+                "SELECT summary FROM handoffs WHERE id='v1-preserved'",
+                [],
+                |r| r.get::<_, String>(0)
+            )?))
+            .unwrap(),
+        "before-v1-upgrade"
+    );
+    super::MemoryStore::open_for_app(&path).unwrap();
+    assert_eq!(
+        std::fs::read_dir(&backup_dir).unwrap().count(),
+        2,
+        "a schema 3 reopen must not repeat the backup"
+    );
+    drop(snapshot);
+    drop(store);
+    for file in files {
+        std::fs::remove_file(file).unwrap();
+    }
+    std::fs::remove_dir(backup_dir).unwrap();
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(directory.join(format!("memory.db{suffix}")));
+    }
+    std::fs::remove_dir(directory).unwrap();
+}
+
+#[test]
 fn real_old_v2_connection_and_cached_statement_are_fenced_after_cutover() {
     let fixture = Fixture::empty_file();
     let mut old = Connection::open(&fixture.path).unwrap();

@@ -80,23 +80,24 @@ impl MemoryStore {
                                 |row| row.get::<_, i64>(0),
                             )
                         });
-                if !matches!(version, Ok(2)) {
+                let Ok(version @ (1 | 2)) = version else {
                     return Err(open_error);
-                }
+                };
                 let directory = path
                     .parent()
                     .ok_or_else(|| anyhow!("memory DB has no parent"))?
                     .join("memory-backups");
                 std::fs::create_dir_all(&directory)?;
                 protect_private_directory(&directory)?;
-                let backup = directory.join(format!("memory-v2-{}.sqlite3", Uuid::new_v4()));
+                let backup =
+                    directory.join(format!("memory-v{version}-{}.sqlite3", Uuid::new_v4()));
                 if let Err(cutover_error) = Self::upgrade_with_backup(path, &backup) {
                     // A concurrent new app may already have committed the same
                     // schema upgrade. Reopen that DB; preserve any partial backup.
                     return Self::open(path).with_context(|| format!("verified memory upgrade failed; preserved backup path {}: {cutover_error}", backup.display()));
                 }
                 log::info!(
-                    "Memory upgraded to schema 3; verified v2 backup: {}",
+                    "Memory upgraded from schema {version} to 3; verified backup: {}",
                     backup.display()
                 );
                 Self::open(path)
@@ -907,7 +908,7 @@ pub(super) fn migrate_locked(tx: &Transaction<'_>, allow_upgrade: bool) -> Resul
         );
     }
     if current.is_some_and(|version| version < 3) && !allow_upgrade {
-        anyhow::bail!("memory.db v2 requires explicit verified backup and v3 cutover; automatic migration disabled");
+        anyhow::bail!("memory.db schema {} requires explicit verified backup and v3 cutover; automatic migration disabled", current.unwrap());
     }
     conn.execute_batch(
         "

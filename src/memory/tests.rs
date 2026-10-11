@@ -180,7 +180,7 @@ fn schema_v1_task_binding_keeps_history_after_upgrade() {
     )
     .unwrap();
     drop(conn);
-    let upgraded = MemoryStore::open(store.path()).unwrap();
+    let upgraded = MemoryStore::open_for_app(store.path()).unwrap();
     for task in [None, Some(old_orchestrator)] {
         let retained = upgraded.latest_handoff(&repo, task).unwrap().unwrap();
         assert_eq!(retained.id, legacy.id);

@@ -40,10 +40,11 @@ revisá esas variables antes de preparar un respaldo.
 
 ## Memoria al actualizar la aplicación
 
-La app actualiza una base de memoria de esquema 2 a 3 antes de iniciar
+La app actualiza una base de memoria de esquema 1 o 2 a 3 antes de iniciar
 terminales gestionadas. Primero guarda una copia nueva y verificada en
-`memory-backups/memory-v2-UUID.sqlite3`, junto a la base efectiva, y un
-recibo `.cutover.json`. La copia incluye las páginas de WAL; se comprueban
+`memory-backups/memory-vVERSION-UUID.sqlite3`, junto a la base efectiva, y un
+recibo `.cutover.json`. VERSION corresponde al esquema anterior (1 o 2).
+La copia incluye las páginas de WAL; se comprueban
 la integridad y el contenido mientras SQLite mantiene bloqueado el cambio.
 Las memorias, revisiones y handoffs anteriores permanecen en la base nueva.
 Reabrir una base de esquema 3 no genera copias adicionales.

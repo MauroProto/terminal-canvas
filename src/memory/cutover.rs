@@ -1,4 +1,4 @@
-//! Verified v2 -> v3 cutover used by app startup and the explicit CLI upgrade.
+//! Verified v1/v2 -> v3 cutover used by app startup and the explicit CLI upgrade.
 //! Existing prepared v2 writers are fenced by committed schema triggers, not by
 //! the version integer alone. Failed migration rolls back the one SQLite tx.
 
@@ -42,8 +42,8 @@ pub(super) fn upgrade(path: &Path, backup: &Path) -> Result<CutoverReceipt> {
         r.get(0)
     })?;
     anyhow::ensure!(
-        version == 2,
-        "explicit cutover requires schema 2, found {version}"
+        matches!(version, 1 | 2),
+        "explicit cutover requires schema 1 or 2, found {version}"
     );
     let pages: i64 = tx.query_row("PRAGMA page_count", [], |r| r.get(0))?;
     let page_size: i64 = tx.query_row("PRAGMA page_size", [], |r| r.get(0))?;
@@ -97,7 +97,7 @@ pub(super) fn upgrade(path: &Path, backup: &Path) -> Result<CutoverReceipt> {
     anyhow::ensure!(
         check.query_row("SELECT MAX(version) FROM schema_migrations", [], |r| r
             .get::<_, i64>(0))?
-            == 2,
+            == version,
         "backup schema changed"
     );
     drop(check);
@@ -106,7 +106,7 @@ pub(super) fn upgrade(path: &Path, backup: &Path) -> Result<CutoverReceipt> {
         backup: backup.clone(),
         backup_sha256,
         logical_sha256,
-        previous_version: 2,
+        previous_version: version,
         current_version: 3,
         migration_committed: false,
     };
@@ -135,7 +135,7 @@ pub fn explain_downgrade(path: &Path) -> Result<String> {
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let count: i64 =
         conn.query_row("SELECT COUNT(*) FROM tc_hook_generations", [], |r| r.get(0))?;
-    Ok(format!("Schema 3 retained with {count} generation records. In-place downgrade is refused. Keep this DB and cutover receipt; inspect the v2 backup under a separate path only. A running managed endpoint must continue using schema 3.\n"))
+    Ok(format!("Schema 3 retained with {count} generation records. In-place downgrade is refused. Keep this DB and cutover receipt; inspect the verified legacy backup under a separate path only. A running managed endpoint must continue using schema 3.\n"))
 }
 
 pub(super) fn logical_digest(conn: &Connection) -> Result<String> {
