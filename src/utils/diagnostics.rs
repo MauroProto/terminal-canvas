@@ -789,3 +789,93 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
+
+#[cfg(test)]
+mod source_quality_tests {
+    use super::*;
+    use std::io::{self, Cursor};
+
+    struct TempDirectory(PathBuf);
+
+    impl TempDirectory {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("diag-quality-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn report(entries: &[DiagnosticEntry]) -> serde_json::Value {
+        serde_json::from_str(
+            &entries
+                .iter()
+                .find(|entry| entry.name == "collection-report.json")
+                .unwrap()
+                .contents,
+        )
+        .unwrap()
+    }
+
+    fn source<'a>(report: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
+        report["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["file"] == name)
+            .unwrap()
+    }
+
+    #[test]
+    fn support_report_exposes_omissions_without_private_paths_or_placeholder_sources() {
+        let dir = TempDirectory::new();
+        std::fs::create_dir(dir.0.join("panic.log")).unwrap();
+        let config = dir.0.join("private-config-path.toml");
+        std::fs::write(&config, "token='private-secret'".repeat(8)).unwrap();
+        std::fs::write(dir.0.join("layout.json"), "{private-invalid-json").unwrap();
+        let entries =
+            collect_entries_with_limit(&dir.0, &config, &dir.0.join("panic.log"), "test", 32);
+        assert_eq!(
+            entries.len(),
+            2,
+            "only version and explicit report; never placeholder config/layout"
+        );
+        let source_report = report(&entries);
+        assert_eq!(source(&source_report, "panic.log")["reason"], "read-error");
+        assert_eq!(source(&source_report, "runs.log")["reason"], "missing");
+        assert_eq!(source(&source_report, "config.toml")["reason"], "oversize");
+        assert_eq!(
+            source(&source_report, "layout.json")["reason"],
+            "invalid-format"
+        );
+        assert_eq!(source_report["optional_missing_is_an_error"], false);
+        let encoded = source_report.to_string();
+        for private in [
+            dir.0.to_str().unwrap(),
+            "private-config-path",
+            "private-secret",
+            "private-invalid-json",
+        ] {
+            assert!(!encoded.contains(private), "report leaked source data");
+        }
+        std::fs::write(&config, "token='private-unclosed").unwrap();
+        let entries =
+            collect_entries_with_limit(&dir.0, &config, &dir.0.join("panic.log"), "test", 32);
+        assert_eq!(
+            source(&report(&entries), "config.toml")["reason"],
+            "invalid-format"
+        );
+        std::fs::write(dir.0.join("layout.json"), r#""private scalar layout""#).unwrap();
+        let entries =
+            collect_entries_with_limit(&dir.0, &config, &dir.0.join("panic.log"), "test", 32);
+        assert_eq!(
+            source(&report(&entries), "layout.json")["reason"],
+            "invalid-format"
+        );
+    }
+}
