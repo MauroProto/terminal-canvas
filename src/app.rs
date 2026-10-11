@@ -2229,7 +2229,7 @@ impl TerminalApp {
         let mut split_preview_rect = split_hit.map(|hit| hit.hit_rect);
         let fast_path_render = self.panel_gesture.is_some();
         let needs_interaction_repaint = scroll_capture_active || self.panel_gesture.is_some();
-        if primary_pressed {
+        if primary_pressed && pointer_pos.is_some_and(|pos| desktop_screen.contains(pos)) {
             self.begin_panel_gesture(split_hit, hovered_hit, desktop_rect, pointer_pos);
         }
 
