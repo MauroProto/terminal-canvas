@@ -734,3 +734,67 @@ mod private_config_security_tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 }
+
+#[cfg(test)]
+mod config_recovery_tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    struct TempDirectory(PathBuf);
+
+    impl TempDirectory {
+        fn new() -> Self {
+            let path =
+                std::env::temp_dir().join(format!("tc-config-recovery-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> PathBuf {
+            self.0.join("config.toml")
+        }
+    }
+
+    impl Drop for TempDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn entries(path: &Path) -> Vec<(PathBuf, Option<Vec<u8>>)> {
+        std::iter::once(path.to_path_buf())
+            .chain(
+                (0..crate::state::durable_write::BACKUP_SLOTS)
+                    .map(|slot| crate::state::durable_write::backup_path(path, slot)),
+            )
+            .map(|entry| {
+                let bytes = std::fs::read(&entry).ok();
+                (entry, bytes)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn missing_empty_and_recovered_configs_have_distinct_known_provenance() {
+        let dir = TempDirectory::new();
+        let path = dir.path();
+        assert_eq!(load_result_from_path(&path), ConfigLoadReport::Missing);
+        std::fs::write(&path, "").unwrap();
+        assert!(
+            matches!(load_result_from_path(&path), ConfigLoadReport::Loaded { source: ConfigCandidate::Primary, config } if config == AppConfig::default())
+        );
+        std::fs::write(&path, "[broken").unwrap();
+        let backup = crate::state::durable_write::backup_path(&path, 0);
+        std::fs::write(&backup, "[terminal]\nfont_size = 19.0\nshell = ' /bin/fish '\n[integrations]\nlinear_token = ' dummy-token '\n[onboarding]\ndismissed = true\n").unwrap();
+        let before = entries(&path);
+        let ConfigLoadReport::Loaded { config, source } = load_result_from_path(&path) else {
+            panic!("valid backup was not recovered")
+        };
+        assert_eq!(source, ConfigCandidate::Backup(0));
+        assert_eq!(config.font_size, 19.0);
+        assert_eq!(config.shell.as_deref(), Some("/bin/fish"));
+        assert_eq!(config.linear_token.as_deref(), Some("dummy-token"));
+        assert!(config.onboarding_dismissed);
+        assert_eq!(entries(&path), before);
+    }
+}
