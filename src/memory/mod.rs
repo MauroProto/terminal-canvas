@@ -6,6 +6,8 @@
 
 mod cli;
 mod context;
+pub(crate) mod cutover;
+pub(crate) mod hook_ledger;
 mod identity;
 mod inject;
 mod mcp;
@@ -23,6 +25,7 @@ pub use context::{
     build_context_pack, build_context_pack_scoped, format_context_pack, pack_contains,
 };
 pub use identity::{fingerprint_remote, resolve_location};
+pub(crate) use inject::respond_to_hook_owned;
 pub use inject::{
     format_remember_status, launch_brief_with_memory, launch_brief_with_memory_scoped,
     process_store, remember_selection, respond_to_hook, respond_to_hook_scoped, PromptBoundary,

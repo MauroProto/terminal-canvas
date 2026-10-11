@@ -146,6 +146,65 @@ pub fn respond_to_hook_scoped(
     }))
 }
 
+pub(crate) fn respond_to_hook_owned(
+    store: Option<&MemoryStore>,
+    boundary: PromptBoundary,
+    event_name: &str,
+    cwd: Option<&Path>,
+    handoff_summary: Option<&str>,
+    orchestrator_task_id: Option<Uuid>,
+    workspace_id: Option<Uuid>,
+    hook: &crate::hook_authority::OwnedHookContext,
+) -> Option<Value> {
+    let store = store?;
+    if boundary.records_handoff() {
+        if let Some(cwd) = cwd {
+            if let Some(summary) = nonempty_handoff_summary(handoff_summary) {
+                if let Err(err) = store.create_handoff_owned(
+                    HandoffRequest {
+                        cwd: cwd.to_path_buf(),
+                        summary: summary.to_owned(),
+                        provider: None,
+                        session_id: None,
+                        orchestrator_task_id,
+                        ttl_secs: Some(72 * 3600),
+                    },
+                    hook,
+                ) {
+                    log::warn!("memory handoff on stop failed: {err}");
+                }
+            }
+        }
+        // Un hook de observación exitoso debe quedar en silencio. Tanto Claude
+        // como Codex validan cualquier JSON de stdout como una salida de hook.
+        return None;
+    }
+    if !boundary.injects_context() {
+        return None;
+    }
+    let pack = cwd.and_then(|cwd| {
+        super::context::build_context_pack_owned(
+            store,
+            cwd,
+            None,
+            orchestrator_task_id,
+            workspace_id,
+            hook,
+        )
+        .ok()
+    });
+    let text = pack.as_ref().map(format_context_pack).unwrap_or_default();
+    if text.is_empty() {
+        return None;
+    }
+    Some(json!({
+        "hookSpecificOutput": {
+            "hookEventName": event_name,
+            "additionalContext": text
+        }
+    }))
+}
+
 /// Un Stop típico de Claude no trae resumen: no inventar un handoff genérico
 /// que tape uno explícito.
 fn nonempty_handoff_summary(handoff_summary: Option<&str>) -> Option<&str> {

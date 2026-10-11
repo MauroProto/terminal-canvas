@@ -27,10 +27,52 @@ pub fn build_context_pack_scoped(
     orchestrator_task_id: Option<Uuid>,
     workspace_id: Option<Uuid>,
 ) -> Result<ContextPack> {
-    let (project, task_id, active, handoff) =
-        store.load_visible_active(cwd, orchestrator_task_id, workspace_id)?;
+    build_context_pack_guarded(store, cwd, query, orchestrator_task_id, workspace_id, None)
+}
+
+pub(crate) fn build_context_pack_owned(
+    store: &MemoryStore,
+    cwd: &Path,
+    query: Option<&str>,
+    orchestrator_task_id: Option<Uuid>,
+    workspace_id: Option<Uuid>,
+    hook: &crate::hook_authority::OwnedHookContext,
+) -> Result<ContextPack> {
+    build_context_pack_guarded(
+        store,
+        cwd,
+        query,
+        orchestrator_task_id,
+        workspace_id,
+        Some(hook),
+    )
+}
+
+fn build_context_pack_guarded(
+    store: &MemoryStore,
+    cwd: &Path,
+    query: Option<&str>,
+    orchestrator_task_id: Option<Uuid>,
+    workspace_id: Option<Uuid>,
+    hook: Option<&crate::hook_authority::OwnedHookContext>,
+) -> Result<ContextPack> {
+    let (project, task_id, active, handoff) = match hook {
+        Some(hook) => {
+            store.load_visible_active_owned(cwd, orchestrator_task_id, workspace_id, hook)?
+        }
+        None => store.load_visible_active(cwd, orchestrator_task_id, workspace_id)?,
+    };
     let searched = match query.map(str::trim).filter(|q| !q.is_empty()) {
-        Some(query) => store.search_for_context(cwd, query, orchestrator_task_id, workspace_id)?,
+        Some(query) => match hook {
+            Some(hook) => store.search_for_context_owned(
+                cwd,
+                query,
+                orchestrator_task_id,
+                workspace_id,
+                hook,
+            )?,
+            None => store.search_for_context(cwd, query, orchestrator_task_id, workspace_id)?,
+        },
         None => Vec::new(),
     };
 

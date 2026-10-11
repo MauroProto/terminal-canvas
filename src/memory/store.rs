@@ -22,7 +22,7 @@ use super::model::{
 };
 use super::redaction::prepare_content;
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(2);
 const BUSY_RETRY_ATTEMPTS: usize = 6;
 pub(crate) const MAX_SEARCH_RESULTS: usize = 100;
@@ -64,11 +64,65 @@ impl MemoryStore {
         Self::open(default_db_path().ok_or_else(|| anyhow!("no hay data dir"))?)
     }
 
+    /// App startup authorizes a verified upgrade before starting managed PTYs.
+    /// Generic opens and old CLI clients still require an explicit cutover.
+    pub(crate) fn open_for_app(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        match Self::open(path) {
+            Ok(store) => Ok(store),
+            Err(open_error) => {
+                let version =
+                    Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                        .and_then(|conn| {
+                            conn.query_row(
+                                "SELECT MAX(version) FROM schema_migrations",
+                                [],
+                                |row| row.get::<_, i64>(0),
+                            )
+                        });
+                if !matches!(version, Ok(2)) {
+                    return Err(open_error);
+                }
+                let directory = path
+                    .parent()
+                    .ok_or_else(|| anyhow!("memory DB has no parent"))?
+                    .join("memory-backups");
+                std::fs::create_dir_all(&directory)?;
+                protect_private_directory(&directory)?;
+                let backup = directory.join(format!("memory-v2-{}.sqlite3", Uuid::new_v4()));
+                if let Err(cutover_error) = Self::upgrade_with_backup(path, &backup) {
+                    // A concurrent new app may already have committed the same
+                    // schema upgrade. Reopen that DB; preserve any partial backup.
+                    return Self::open(path).with_context(|| format!("verified memory upgrade failed; preserved backup path {}: {cutover_error}", backup.display()));
+                }
+                log::info!(
+                    "Memory upgraded to schema 3; verified v2 backup: {}",
+                    backup.display()
+                );
+                Self::open(path)
+            }
+        }
+    }
+
+    pub(crate) fn open_default_for_app() -> Result<Self> {
+        Self::open_for_app(default_db_path().ok_or_else(|| anyhow!("no hay data dir"))?)
+    }
+
+    pub fn upgrade_with_backup(
+        path: &Path,
+        backup: &Path,
+    ) -> Result<super::cutover::CutoverReceipt> {
+        super::cutover::upgrade(path, backup)
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
 
-    fn with_conn<T>(&self, body: impl FnOnce(&mut Connection) -> Result<T>) -> Result<T> {
+    pub(super) fn with_conn<T>(
+        &self,
+        body: impl FnOnce(&mut Connection) -> Result<T>,
+    ) -> Result<T> {
         let mut conn = Connection::open(&self.path)
             .with_context(|| format!("abrir {}", self.path.display()))?;
         configure(&conn)?;
@@ -78,7 +132,7 @@ impl MemoryStore {
     /// Una operación de memoria puede competir con la UI, la CLI y MCP. Un
     /// BUSY_SNAPSHOT exige abandonar el snapshot y repetir la transacción
     /// completa; esperar o reintentar sólo el statement no puede resolverlo.
-    fn with_immediate_tx<T>(
+    pub(super) fn with_immediate_tx<T>(
         &self,
         mut body: impl FnMut(&Transaction<'_>) -> Result<T>,
     ) -> Result<T> {
@@ -90,6 +144,131 @@ impl MemoryStore {
                 Ok(value)
             })
         })
+    }
+
+    pub(crate) fn hook_transition(
+        &self,
+        owner: Uuid,
+        operation: Uuid,
+        intent: &super::hook_ledger::LedgerIntent,
+    ) -> Result<super::hook_ledger::LedgerReceipt> {
+        self.with_immediate_tx(|tx| super::hook_ledger::apply_intent(tx, owner, operation, intent))
+    }
+
+    pub(crate) fn hook_consume_birth_once(
+        &self,
+        expected: crate::hook_authority::Claim,
+    ) -> Result<Option<super::hook_ledger::SpawnPermit>> {
+        self.with_immediate_tx(|tx| super::hook_ledger::consume_birth_once(tx, expected))
+    }
+
+    pub(crate) fn hook_claim(
+        &self,
+        key: crate::hook_authority::LeafKey,
+    ) -> Result<Option<crate::hook_authority::Claim>> {
+        self.with_immediate_tx(|tx| super::hook_ledger::load_claim(tx, key))
+    }
+
+    /// Exact durable physical-close fence, including adopted legacy births.
+    /// UUID absence alone is never evidence that an already consumed factory
+    /// finished or that the host reaped an unregistered child.
+    pub(crate) fn hook_close_claim(
+        &self,
+        runtime: Uuid,
+        owner: Option<Uuid>,
+    ) -> Result<Option<crate::hook_authority::Claim>> {
+        self.with_immediate_tx(|tx| {
+            let mut statement=tx.prepare("SELECT workspace_id,panel_id,leaf_id FROM tc_hook_leaf_authority WHERE runtime_id=?1 AND phase='retiring'")?;
+            let keys=statement.query_map([runtime.to_string()], |r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            anyhow::ensure!(keys.len()<=1,"ambiguous runtime close identity");
+            let Some((workspace,panel,leaf))=keys.into_iter().next() else { return Ok(None); };
+            let key=crate::hook_authority::LeafKey{workspace:Uuid::parse_str(&workspace)?,panel:Uuid::parse_str(&panel)?,leaf:Uuid::parse_str(&leaf)?};
+            let claim=super::hook_ledger::load_claim(tx,key)?.ok_or_else(||anyhow!("close claim disappeared"))?;
+            anyhow::ensure!(owner.is_none_or(|owner| claim.owner==Some(owner)),"physical close belongs to another endpoint");
+            Ok(Some(claim))
+        })
+    }
+
+    pub(crate) fn hook_birth_consumed(&self, claim: crate::hook_authority::Claim) -> Result<bool> {
+        let generation = claim
+            .generation
+            .ok_or_else(|| anyhow!("legacy birth has no no-factory proof"))?;
+        self.with_immediate_tx(|tx| {
+            let consumed:Option<bool>=tx.query_row("SELECT spawn_consumed FROM tc_hook_generations WHERE generation=?1 AND runtime_id=?2 AND workspace_id=?3 AND panel_id=?4 AND leaf_id=?5",params![generation.to_string(),claim.runtime.to_string(),claim.key.workspace.to_string(),claim.key.panel.to_string(),claim.key.leaf.to_string()],|r|r.get(0)).optional()?;
+            consumed.ok_or_else(||anyhow!("birth generation absent"))
+        })
+    }
+
+    pub(crate) fn hook_resolve(
+        &self,
+        identity: crate::hook_authority::QueryIdentity,
+        owner: Uuid,
+    ) -> Result<crate::hook_authority::OwnedHookContext> {
+        self.with_immediate_tx(|tx| super::hook_ledger::resolve_context(tx, identity, owner))
+    }
+
+    pub(crate) fn hook_validate(
+        &self,
+        hook: &crate::hook_authority::OwnedHookContext,
+    ) -> Result<()> {
+        self.with_immediate_tx(|tx| super::hook_ledger::validate_owned(tx, hook))
+    }
+
+    pub(crate) fn hook_alias_state(
+        &self,
+        key: crate::hook_authority::LeafKey,
+    ) -> Result<(Option<i64>, bool, Option<Uuid>)> {
+        self.with_immediate_tx(|tx| {
+            let row:Option<(i64,bool,String)>=tx.query_row("SELECT alias_epoch,legacy_root_alias_closed,root_leaf_id FROM tc_hook_panel_legacy_policy WHERE workspace_id=?1 AND panel_id=?2",params![key.workspace.to_string(),key.panel.to_string()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+            match row {None=>Ok((None,false,None)),Some((epoch,closed,root))=>Ok((Some(epoch),closed,Some(Uuid::parse_str(&root)?)))}
+        })
+    }
+
+    pub(crate) fn with_hook_publication<T>(
+        &self,
+        context: &crate::hook_authority::OwnedHookContext,
+        body: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        self.with_conn(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            super::hook_ledger::validate_owned(&tx, context)?;
+            anyhow::ensure!(
+                super::hook_ledger::load_claim(&tx, context.claim.key)?
+                    .is_some_and(|c| c.phase == crate::hook_authority::ClaimPhase::Active),
+                "birth not installed"
+            );
+            let result = body()?;
+            tx.commit()?;
+            Ok(result)
+        })
+    }
+
+    pub(crate) fn run_spawn_guarded<T>(
+        &self,
+        expected: crate::hook_authority::Claim,
+        factory: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        // Consume has already committed. Acquire a fresh lock and validate again
+        // immediately before the actual one-shot factory. Never retry a factory.
+        self.with_conn(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            super::hook_ledger::validate_spawn(&tx, expected)?;
+            let value = factory()?;
+            tx.commit()?;
+            Ok(value)
+        })
+    }
+
+    fn validate_hook_before_location(
+        &self,
+        hook: Option<&crate::hook_authority::OwnedHookContext>,
+    ) -> Result<()> {
+        if let Some(hook) = hook {
+            self.with_immediate_tx(|tx| super::hook_ledger::validate_owned(tx, hook))?;
+        }
+        // This preflight avoids Git work for a claim already lost. It is NOT
+        // captured authorization: the real transaction validates again.
+        Ok(())
     }
 
     pub fn resolve_project(&self, cwd: &Path) -> Result<ResolvedProject> {
@@ -313,8 +492,28 @@ impl MemoryStore {
     }
 
     pub fn create_handoff(&self, request: HandoffRequest) -> Result<HandoffRecord> {
+        self.create_handoff_guarded(request, None)
+    }
+
+    pub(crate) fn create_handoff_owned(
+        &self,
+        request: HandoffRequest,
+        hook: &crate::hook_authority::OwnedHookContext,
+    ) -> Result<HandoffRecord> {
+        self.create_handoff_guarded(request, Some(hook))
+    }
+
+    fn create_handoff_guarded(
+        &self,
+        request: HandoffRequest,
+        hook: Option<&crate::hook_authority::OwnedHookContext>,
+    ) -> Result<HandoffRecord> {
+        self.validate_hook_before_location(hook)?;
         let location = resolve_location(&request.cwd);
         self.with_immediate_tx(|tx| {
+            if let Some(hook) = hook {
+                super::hook_ledger::validate_owned(tx, hook)?;
+            }
             let request = request.clone();
             let project = upsert_project(tx, &location)?;
             let task = upsert_task(
@@ -429,8 +628,42 @@ impl MemoryStore {
         Vec<MemoryRecord>,
         Option<HandoffRecord>,
     )> {
+        self.load_visible_active_guarded(cwd, orchestrator_task_id, workspace_id, None)
+    }
+
+    pub(crate) fn load_visible_active_owned(
+        &self,
+        cwd: &Path,
+        orchestrator_task_id: Option<Uuid>,
+        workspace_id: Option<Uuid>,
+        hook: &crate::hook_authority::OwnedHookContext,
+    ) -> Result<(
+        ResolvedProject,
+        String,
+        Vec<MemoryRecord>,
+        Option<HandoffRecord>,
+    )> {
+        self.load_visible_active_guarded(cwd, orchestrator_task_id, workspace_id, Some(hook))
+    }
+
+    fn load_visible_active_guarded(
+        &self,
+        cwd: &Path,
+        orchestrator_task_id: Option<Uuid>,
+        workspace_id: Option<Uuid>,
+        hook: Option<&crate::hook_authority::OwnedHookContext>,
+    ) -> Result<(
+        ResolvedProject,
+        String,
+        Vec<MemoryRecord>,
+        Option<HandoffRecord>,
+    )> {
+        self.validate_hook_before_location(hook)?;
         let location = resolve_location(cwd);
         self.with_immediate_tx(|tx| {
+            if let Some(hook) = hook {
+                super::hook_ledger::validate_owned(tx, hook)?;
+            }
             let project = upsert_project(tx, &location)?;
             let task = upsert_task(tx, &project.canonical_id, &location, orchestrator_task_id)?;
             let scopes = scopes_for(&project, &task, location.cwd.as_path(), workspace_id);
@@ -452,8 +685,34 @@ impl MemoryStore {
         orchestrator_task_id: Option<Uuid>,
         workspace_id: Option<Uuid>,
     ) -> Result<Vec<MemoryRecord>> {
+        self.search_for_context_guarded(cwd, query, orchestrator_task_id, workspace_id, None)
+    }
+
+    pub(crate) fn search_for_context_owned(
+        &self,
+        cwd: &Path,
+        query: &str,
+        orchestrator_task_id: Option<Uuid>,
+        workspace_id: Option<Uuid>,
+        hook: &crate::hook_authority::OwnedHookContext,
+    ) -> Result<Vec<MemoryRecord>> {
+        self.search_for_context_guarded(cwd, query, orchestrator_task_id, workspace_id, Some(hook))
+    }
+
+    fn search_for_context_guarded(
+        &self,
+        cwd: &Path,
+        query: &str,
+        orchestrator_task_id: Option<Uuid>,
+        workspace_id: Option<Uuid>,
+        hook: Option<&crate::hook_authority::OwnedHookContext>,
+    ) -> Result<Vec<MemoryRecord>> {
+        self.validate_hook_before_location(hook)?;
         let location = resolve_location(cwd);
         self.with_immediate_tx(|tx| {
+            if let Some(hook) = hook {
+                super::hook_ledger::validate_owned(tx, hook)?;
+            }
             let scopes = visible_scopes(tx, &location, orchestrator_task_id, workspace_id)?;
             search_visible(tx, &scopes, query)
         })
@@ -578,7 +837,8 @@ fn platform_default_db_path() -> Option<PathBuf> {
     crate::utils::app_paths::data_dir().map(|dir| dir.join("memory").join("memory.db"))
 }
 
-fn configure(conn: &Connection) -> Result<()> {
+pub(super) fn configure(conn: &Connection) -> Result<()> {
+    super::hook_ledger::register_writer(conn)?;
     conn.busy_timeout(BUSY_TIMEOUT)?;
     // Memoria curada es estado de usuario, no caché. FULL evita confirmar una
     // transacción que todavía podría perderse ante corte de energía.
@@ -610,9 +870,21 @@ fn is_busy_error(error: &anyhow::Error) -> bool {
     })
 }
 
-fn migrate(conn: &mut Connection) -> Result<()> {
+pub(super) fn migrate(conn: &mut Connection) -> Result<()> {
+    migrate_impl(conn, false)
+}
+
+// Default open never silently upgrades an existing older schema. The explicit
+// cutover API verifies a locked backup before calling migrate_locked(true).
+fn migrate_impl(conn: &mut Connection, allow_upgrade: bool) -> Result<()> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let conn = &tx;
+    migrate_locked(&tx, allow_upgrade)?;
+    tx.commit()?;
+    Ok(())
+}
+
+pub(super) fn migrate_locked(tx: &Transaction<'_>, allow_upgrade: bool) -> Result<()> {
+    let conn = tx;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS schema_migrations (
             version INTEGER PRIMARY KEY
@@ -630,6 +902,9 @@ fn migrate(conn: &mut Connection) -> Result<()> {
             current.unwrap_or_default(),
             SCHEMA_VERSION
         );
+    }
+    if current.is_some_and(|version| version < 3) && !allow_upgrade {
+        anyhow::bail!("memory.db v2 requires explicit verified backup and v3 cutover; automatic migration disabled");
     }
     conn.execute_batch(
         "
@@ -711,13 +986,13 @@ fn migrate(conn: &mut Connection) -> Result<()> {
         );
         ",
     )?;
+    super::hook_ledger::migrate_v3(tx)?;
     if current != Some(SCHEMA_VERSION) {
         conn.execute(
             "INSERT OR IGNORE INTO schema_migrations(version) VALUES (?1)",
             params![SCHEMA_VERSION],
         )?;
     }
-    tx.commit()?;
     Ok(())
 }
 
@@ -1604,3 +1879,7 @@ fn protect_private_directory(path: &Path) -> Result<()> {
     let _ = path;
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "hook_fixtures.rs"]
+mod hook_fixtures;

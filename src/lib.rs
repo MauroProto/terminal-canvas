@@ -15,6 +15,8 @@ pub mod conversation;
 // El daemon usa unix sockets: en Windows la app corre siempre in-process.
 #[cfg(unix)]
 pub mod daemon;
+pub(crate) mod hook_authority;
+pub(crate) mod hook_runtime;
 pub mod memory;
 pub mod orchestration;
 pub mod panel;

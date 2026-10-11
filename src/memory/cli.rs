@@ -18,6 +18,19 @@ pub fn run(args: &[String]) -> Result<String> {
         return Ok(usage());
     }
     let parsed = parse_args(args)?;
+    if parsed.command == "upgrade" {
+        let backup = parsed
+            .other_cwd
+            .as_ref()
+            .ok_or_else(|| anyhow!("upgrade requires --backup NEW_PATH"))?;
+        return Ok(
+            serde_json::to_string_pretty(&MemoryStore::upgrade_with_backup(&parsed.db, backup)?)?
+                + "\n",
+        );
+    }
+    if parsed.command == "downgrade-status" {
+        return super::cutover::explain_downgrade(&parsed.db);
+    }
     let store = MemoryStore::open(&parsed.db)?;
     match parsed.command.as_str() {
         "health" => Ok(serde_json::json!({
@@ -197,6 +210,7 @@ fn parse_args(args: &[String]) -> Result<Parsed> {
                 db = PathBuf::from(next(args, &mut i, "--db")?);
             }
             "--cwd" => cwd = Some(PathBuf::from(next(args, &mut i, "--cwd")?)),
+            "--backup" => other_cwd = Some(PathBuf::from(next(args, &mut i, "--backup")?)),
             "--other-cwd" => other_cwd = Some(PathBuf::from(next(args, &mut i, "--other-cwd")?)),
             "--key" => key = Some(next(args, &mut i, "--key")?),
             "--content" => content = Some(next(args, &mut i, "--content")?),
@@ -303,7 +317,7 @@ fn required_cwd(parsed: &Parsed) -> Result<PathBuf> {
 
 fn usage() -> String {
     "tc-memory [--db PATH] <command> [options]\n\
-     commands: health remember propose approve reject forget context search pending handoff export link\n\
+     commands: health remember propose approve reject forget context search pending handoff export link upgrade downgrade-status\n\
      context prints JSON by default; add --text for an injectable context block\n\
      --task UUID overrides TC_MEMORY_TASK_ID for task-scoped context, search and writes\n"
         .to_owned()
