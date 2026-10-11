@@ -2,6 +2,10 @@
 //! izquierda y el diff unificado coloreado a la derecha. Se abre desde la
 //! paleta (Review Changes) o del flujo de agentes; carga el diff en un worker.
 
+#[cfg(test)]
+#[path = "review_prompt_tests.rs"]
+mod prompt_delivery_tests;
+
 use std::path::{Path, PathBuf};
 
 use egui::{pos2, vec2, Align2, Color32, FontId, RichText, ScrollArea, Sense, Stroke};
@@ -36,6 +40,7 @@ pub(super) struct CodeReviewState {
     pub(super) target_panel: Option<Uuid>,
     pub(super) feedback: String,
     pub(super) feedback_sent: bool,
+    pub(super) pending_delivery: Option<PendingReviewDelivery>,
     /// Worktrees del repo (ciclo de vida: listar/limpiar).
     pub(super) worktrees: Vec<WorktreeInfo>,
     pub(super) show_worktrees: bool,
@@ -54,6 +59,16 @@ pub(super) struct CodeReviewState {
     pub(super) editing_note: Option<NoteEditState>,
     /// Selector de destinos abierto para mandar las notas pendientes.
     pub(super) note_target_picker: bool,
+}
+
+pub(super) struct PendingReviewDelivery {
+    receipt: crate::runtime::DeferredPrompt,
+    content: ReviewDeliveryContent,
+}
+
+enum ReviewDeliveryContent {
+    Feedback(String),
+    Notes(Vec<crate::orchestration::DiffNote>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -116,6 +131,7 @@ impl TerminalApp {
             target_panel,
             feedback: String::new(),
             feedback_sent: false,
+            pending_delivery: None,
             worktrees: Vec::new(),
             show_worktrees: false,
             worktree_error: None,
@@ -135,6 +151,7 @@ impl TerminalApp {
     }
 
     pub(super) fn poll_diff_loader(&mut self) {
+        self.poll_review_prompt_delivery();
         for result in self.diff_loader.poll() {
             let Some(state) = self.code_review.as_mut() else {
                 continue;
@@ -381,7 +398,7 @@ impl TerminalApp {
                         "Enviar {pending_count} nota{}",
                         if pending_count == 1 { "" } else { "s" }
                     );
-                    let notes_ready = self.code_review.as_ref().is_some_and(|state| state.notes_ready);
+                    let notes_ready = self.code_review.as_ref().is_some_and(|state| state.notes_ready && state.pending_delivery.is_none());
                     if ui.add_enabled(notes_ready, egui::Button::new(&send_label).small()).clicked() {
                         self.begin_note_send();
                     }
@@ -867,9 +884,19 @@ impl TerminalApp {
                     .code_review
                     .as_ref()
                     .is_some_and(|state| state.feedback_sent);
-                if sent {
+                if self
+                    .code_review
+                    .as_ref()
+                    .is_some_and(|state| state.pending_delivery.is_some())
+                {
                     ui.label(
-                        RichText::new("Feedback enviado al agente ✓")
+                        RichText::new("Esperando que el terminal acepte el feedback…")
+                            .size(11.0)
+                            .color(palette::DIM),
+                    );
+                } else if sent {
+                    ui.label(
+                        RichText::new("Feedback encolado en el terminal ✓")
                             .size(11.0)
                             .color(ADD_FG),
                     );
@@ -886,11 +913,23 @@ impl TerminalApp {
                         .text_color(palette::TEXT_STRONG)
                         .desired_rows(2)
                         .margin(egui::Margin::symmetric(8, 5));
-                ui.add_sized(vec2(ui.available_width() - 130.0, 44.0), edit);
+                if ui
+                    .add_sized(vec2(ui.available_width() - 130.0, 44.0), edit)
+                    .changed()
+                {
+                    self.code_review.as_mut().unwrap().feedback_sent = false;
+                }
             });
             ui.vertical(|ui| {
                 ui.add_space(20.0);
-                if ui.button("Enviar al agente").clicked() {
+                let ready = self
+                    .code_review
+                    .as_ref()
+                    .is_some_and(|state| state.pending_delivery.is_none());
+                if ui
+                    .add_enabled(ready, egui::Button::new("Enviar al agente"))
+                    .clicked()
+                {
                     self.send_code_review_feedback();
                 }
             });
@@ -900,31 +939,88 @@ impl TerminalApp {
     }
 
     fn send_code_review_feedback(&mut self) {
+        if self
+            .code_review
+            .as_ref()
+            .is_some_and(|state| state.pending_delivery.is_some())
+        {
+            return;
+        }
         let Some((target_panel, feedback)) = self
             .code_review
             .as_ref()
-            .map(|state| (state.target_panel, state.feedback.trim().to_owned()))
+            .map(|state| (state.target_panel, state.feedback.clone()))
         else {
             return;
         };
         let Some(panel_id) = target_panel else {
             return;
         };
-        if feedback.is_empty() {
+        if feedback.trim().is_empty() {
             return;
         }
-        let mut delivered = false;
-        for workspace in &mut self.workspaces {
-            if workspace.send_prompt_to_panel(panel_id, &feedback) {
-                delivered = true;
-                break;
+        let result = self
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.panel(panel_id).is_some())
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "El panel del agente ya no existe.",
+                )
+            })
+            .and_then(|workspace| workspace.submit_prompt_to_panel(panel_id, &feedback));
+        match result {
+            Ok(crate::runtime::PromptSubmission::InputQueued) => {
+                self.finish_review_feedback(&feedback)
             }
+            Ok(crate::runtime::PromptSubmission::Deferred(receipt)) => {
+                self.code_review.as_mut().unwrap().pending_delivery = Some(PendingReviewDelivery {
+                    receipt,
+                    content: ReviewDeliveryContent::Feedback(feedback),
+                });
+            }
+            Err(error) => self.toast_error(format!("No se pudo enviar el feedback: {error}")),
         }
-        if delivered {
-            if let Some(state) = self.code_review.as_mut() {
+    }
+
+    fn finish_review_feedback(&mut self, submitted: &str) {
+        if let Some(state) = self.code_review.as_mut() {
+            // The user may edit a draft while a startup submission is pending.
+            if state.feedback == submitted {
                 state.feedback.clear();
                 state.feedback_sent = true;
             }
+        }
+    }
+
+    fn poll_review_prompt_delivery(&mut self) {
+        let Some(pending) = self
+            .code_review
+            .as_ref()
+            .and_then(|state| state.pending_delivery.as_ref())
+        else {
+            return;
+        };
+        let Some(result) = pending.receipt.poll() else {
+            if let Some(ctx) = &self.ctx {
+                ctx.request_repaint_after(std::time::Duration::from_millis(50));
+            }
+            return;
+        };
+        let pending = self
+            .code_review
+            .as_mut()
+            .unwrap()
+            .pending_delivery
+            .take()
+            .unwrap();
+        match result {
+            Ok(()) => match pending.content {
+                ReviewDeliveryContent::Feedback(text) => self.finish_review_feedback(&text),
+                ReviewDeliveryContent::Notes(notes) => self.finish_review_notes(&notes),
+            },
+            Err(error) => self.toast_error(format!("El feedback sigue pendiente: {error}")),
         }
     }
 
@@ -1389,7 +1485,7 @@ impl TerminalApp {
 
     /// Manda todas las notas pendientes al agente con el formato de contrato.
     fn send_pending_notes(&mut self, panel_id: Uuid) {
-        let Some((pending, repo_root)) = self.code_review.as_ref().filter(|state| state.notes_ready).map(|state| {
+        let Some((pending, submitted)) = self.code_review.as_ref().filter(|state| state.notes_ready && state.pending_delivery.is_none()).map(|state| {
             (
                 state
                     .notes
@@ -1402,7 +1498,7 @@ impl TerminalApp {
                         } else { formatted }
                     })
                     .collect::<Vec<_>>(),
-                state.repo_root.clone(),
+                state.notes.pending().into_iter().cloned().collect::<Vec<_>>(),
             )
         }) else {
             return;
@@ -1411,29 +1507,57 @@ impl TerminalApp {
             return;
         }
         let prompt = pending.join("\n\n");
-        let mut delivered = false;
-        for workspace in &mut self.workspaces {
-            if workspace.send_prompt_to_panel(panel_id, &prompt) {
-                delivered = true;
-                break;
+        let result = self
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.panel(panel_id).is_some())
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "El panel del agente ya no existe.",
+                )
+            })
+            .and_then(|workspace| workspace.submit_prompt_to_panel(panel_id, &prompt));
+        match result {
+            Ok(crate::runtime::PromptSubmission::InputQueued) => {
+                self.finish_review_notes(&submitted)
             }
+            Ok(crate::runtime::PromptSubmission::Deferred(receipt)) => {
+                self.code_review.as_mut().unwrap().pending_delivery = Some(PendingReviewDelivery {
+                    receipt,
+                    content: ReviewDeliveryContent::Notes(submitted),
+                });
+            }
+            Err(error) => self.toast_error(format!("Las notas siguen pendientes: {error}")),
         }
-        if !delivered {
-            self.toast_error("No se pudo escribir en ese terminal");
-            return;
-        }
-        let sent_count = pending.len();
+    }
+
+    fn finish_review_notes(&mut self, submitted: &[crate::orchestration::DiffNote]) {
+        let snapshots: std::collections::HashSet<_> = submitted.iter().collect();
+        let now = chrono::Utc::now();
+        let mut marked = 0usize;
         if let Some(state) = self.code_review.as_mut() {
-            let ids: Vec<Uuid> = state.notes.pending().iter().map(|note| note.id).collect();
-            state.notes.mark_sent(&ids, chrono::Utc::now());
+            // A delayed receipt only acknowledges the exact note versions sent.
+            for note in &mut state.notes.notes {
+                if note.sent_at.is_none() && snapshots.contains(&&*note) {
+                    note.sent_at = Some(now);
+                    marked += 1;
+                }
+            }
             state.note_target_picker = false;
         }
-        self.persist_review_notes();
-        let _ = repo_root;
+        if marked > 0 {
+            self.persist_review_notes();
+        }
+        let sent_count = submitted.len();
+        let changed = sent_count.saturating_sub(marked);
+        let suffix = if changed > 0 {
+            format!("; {changed} modificada(s) siguen pendientes")
+        } else {
+            String::new()
+        };
         self.toast_success(format!(
-            "{sent_count} nota{} enviada{} al agente",
-            if sent_count == 1 { "" } else { "s" },
-            if sent_count == 1 { "" } else { "s" }
+            "{sent_count} nota(s) encolada(s) en el terminal{suffix}"
         ));
     }
 
@@ -1443,7 +1567,7 @@ impl TerminalApp {
         if !self
             .code_review
             .as_ref()
-            .is_some_and(|state| state.notes_ready)
+            .is_some_and(|state| state.notes_ready && state.pending_delivery.is_none())
         {
             return;
         }

@@ -3,7 +3,8 @@
 //! `src/shared/diff-comments-format.ts`).
 //!
 //! Dos reglas de Orca que se preservan porque son el corazón del flujo:
-//! - **`sent_at` marca "ya entregada"**; editar el cuerpo borra `sent_at`,
+//! - **`sent_at` marca aceptación por la entrada del terminal**, no ejecución
+//!   o lectura por el agente; editar el cuerpo borra `sent_at`,
 //!   así la nota se re-encola sola sin intervención del usuario.
 //! - El **formato del prompt es un contrato** byte-exacto con el agente, no
 //!   un detalle de presentación; el test lo fija.
@@ -21,7 +22,7 @@ use uuid::Uuid;
 /// Una nota sobre el diff. `line == 0` significa "comentario al archivo
 /// entero" (convención de Orca); si no, es el número de línea en el archivo
 /// **nuevo**. `start_line` convierte la nota en un rango (`start_line..=line`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct DiffNote {
     pub id: Uuid,
     pub file_path: String,
@@ -34,7 +35,7 @@ pub struct DiffNote {
     pub review_identity: Option<String>,
     pub body: String,
     pub created_at: DateTime<Utc>,
-    /// `Some` = ya se mandó al agente. Editar el cuerpo la devuelve a `None`.
+    /// `Some` = aceptada por la entrada del terminal. Editar borra la marca.
     #[serde(default)]
     pub sent_at: Option<DateTime<Utc>>,
 }

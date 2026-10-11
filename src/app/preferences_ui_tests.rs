@@ -91,7 +91,7 @@ fn controlled_writer(config_path: Option<PathBuf>) -> (PreferencesWorker, Writer
     )
 }
 
-fn detached_app() -> TerminalApp {
+pub(super) fn detached_app() -> TerminalApp {
     let ctx = egui::Context::default();
     let workspace = Workspace::new("Preferences regression", None);
     let state = crate::state::AppState {
@@ -191,7 +191,12 @@ fn notes_with(body: &str) -> DiffNotes {
     notes
 }
 
-fn review_state(key: Uuid, request: Uuid, root: PathBuf, notes: DiffNotes) -> CodeReviewState {
+pub(super) fn review_state(
+    key: Uuid,
+    request: Uuid,
+    root: PathBuf,
+    notes: DiffNotes,
+) -> CodeReviewState {
     CodeReviewState {
         key,
         repo_root: root,
@@ -214,6 +219,7 @@ fn review_state(key: Uuid, request: Uuid, root: PathBuf, notes: DiffNotes) -> Co
         target_panel: None,
         feedback: String::new(),
         feedback_sent: false,
+        pending_delivery: None,
         worktrees: Vec::new(),
         show_worktrees: false,
         worktree_error: None,

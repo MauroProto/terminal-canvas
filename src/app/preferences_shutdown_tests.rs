@@ -140,6 +140,7 @@ fn refused_preferences_shutdown_applies_loaded_and_imported_notes_and_flushes_th
         target_panel: None,
         feedback: String::new(),
         feedback_sent: false,
+        pending_delivery: None,
         worktrees: Vec::new(),
         show_worktrees: false,
         worktree_error: None,
