@@ -3829,6 +3829,39 @@ fn rename_shortcut_focuses_title_before_the_next_text_event() {
     assert!(app.rename_buf.ends_with(" nombre"));
     assert_eq!(app.ws().panels[0].title(), original);
     assert!(app.ws().panels[0].runtime_session_id().is_none());
+
+    // A fresh dialog accepts Enter in its first interactive frame, without
+    // receiving a text event or an empty warm-up frame after F2.
+    {
+        let ctx = egui::Context::default();
+        let mut app = detached_test_app_with_panel(&ctx);
+        let panel_id = app.ws().panels[0].id();
+        app.ws_mut().bring_to_front(panel_id);
+        assert!(app.ws().panels[0].runtime_session_id().is_none());
+        rename_dialog_frame_for_test(
+            &ctx,
+            &mut app,
+            vec![rename_dialog_input_for_test(egui::Key::F2)],
+        );
+        assert_eq!(app.renaming_panel, Some(panel_id));
+        assert_eq!(rename_dialog_pending_focus_for_test(&ctx), Some(panel_id));
+        assert!(ctx.memory(|memory| memory.focused()).is_none());
+        app.rename_buf = "confirmed on first Enter".to_owned();
+        rename_dialog_frame_for_test(
+            &ctx,
+            &mut app,
+            vec![rename_dialog_input_for_test(egui::Key::Enter)],
+        );
+        assert!(app.renaming_panel.is_none());
+        assert_eq!(rename_dialog_pending_focus_for_test(&ctx), None);
+        assert_eq!(app.ws().panels[0].title(), "confirmed on first Enter");
+        assert_ne!(
+            ctx.memory(|memory| memory.focused()),
+            Some(egui::Id::new(super::dialogs::RENAME_TITLE_ID))
+        );
+        assert!(app.terminal_input_is_routable());
+        assert!(app.ws().panels[0].runtime_session_id().is_none());
+    }
 }
 
 #[test]
