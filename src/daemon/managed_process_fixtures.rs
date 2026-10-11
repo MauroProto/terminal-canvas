@@ -270,7 +270,10 @@ fn real_managed_birth_transfer_and_close_confirm_native_wait_eof_and_durable_out
         id,
         data: command.into_bytes(),
     });
-    let deadline = Instant::now() + Duration::from_secs(20);
+    // Match the existing eight-PTY load fixture: the debug test suite can
+    // consume CPU concurrently while this real child streams the full payload.
+    // The physical-close deadline below remains independent and unchanged.
+    let deadline = Instant::now() + Duration::from_secs(30);
     let end = format!("{marker}:END");
     let mut output = Vec::new();
     let mut completed_markers = 0;
