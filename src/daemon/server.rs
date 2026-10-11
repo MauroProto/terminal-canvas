@@ -1516,6 +1516,58 @@ mod tests {
     }
 
     #[test]
+    fn failed_pty_creation_does_not_replace_a_colliding_desired_session() {
+        let mut state = DaemonState::new();
+        let existing = Uuid::new_v4();
+        let owner = Uuid::new_v4();
+        let existing_spec = WireSpec {
+            title: "keep original".to_owned(),
+            ..WireSpec::default()
+        };
+        state.insert_session(existing, existing_spec.clone());
+        state
+            .session_mut(existing)
+            .unwrap()
+            .push_output(b"retained output");
+        state
+            .session_claimants
+            .entry(existing)
+            .or_default()
+            .insert(owner);
+        state.priority_session = Some(existing);
+        let result = state.spawn_with_pty_in_history_dir_using(
+            WireSpec::default(),
+            Some(existing),
+            None,
+            |id, _, _| {
+                assert_ne!(id, existing);
+                Err(anyhow::anyhow!("injected creation failure"))
+            },
+        );
+        assert_eq!(result.unwrap_err().to_string(), "injected creation failure");
+        assert_eq!(state.session_ids(), vec![existing]);
+        let session = state.session(existing).unwrap();
+        assert_eq!(session.spec, existing_spec);
+        assert_eq!(session.snapshot, b"retained output");
+        assert_eq!(session.seq, 1);
+        assert!(session.alive);
+        assert_eq!(state.priority_session, Some(existing));
+        assert_eq!(state.session_claimants.len(), 1);
+        assert!(state.session_claimants[&existing].contains(&owner));
+        let response = super::handle_request_for_client(
+            &mut state,
+            Request::Attach { id: existing },
+            None,
+            owner,
+        );
+        assert!(matches!(
+            response,
+            Response::Attached { id, snapshot, seq: 1, alive: true }
+                if id == existing && snapshot == b"retained output"
+        ));
+    }
+
+    #[test]
     fn spawning_registers_the_session() {
         let mut state = DaemonState::new();
         let id = spawn_one(&mut state);
