@@ -381,8 +381,8 @@ fn resume_plan_for_provider(
         })
 }
 
-/// Replacement clears the old hook identity. Publish only the ID carried by
-/// this successful exact resume, before any new hook or layout snapshot.
+/// Stage the selected identity on the accepted replacement. The production
+/// ACK consumer publishes it after that exact leaf's new controller starts.
 fn replace_and_remember_resume_session(
     panel: &mut crate::panel::CanvasPanel,
     exact_session_id: Option<String>,
@@ -392,8 +392,18 @@ fn replace_and_remember_resume_session(
     if !replace(panel) {
         return false;
     }
-    panel.set_agent_session_id_for_leaf(leaf_id, exact_session_id);
-    true
+    if panel.stage_replacement_resume_id(leaf_id, exact_session_id.clone()) {
+        return true;
+    }
+    // Existing pure T3 fixtures model synchronous replacement metadata and
+    // do not attach a runtime. Production must have a matching intention.
+    #[cfg(test)]
+    {
+        panel.set_agent_session_id_for_leaf(leaf_id, exact_session_id);
+        return true;
+    }
+    #[cfg(not(test))]
+    false
 }
 
 #[cfg(test)]

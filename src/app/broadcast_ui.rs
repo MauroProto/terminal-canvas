@@ -655,7 +655,7 @@ mod tests {
                     let workspace_id = app.workspaces[0].id;
                     let crate::panel::WorkspacePanel::Terminal(panel) =
                         &mut app.workspaces[0].panels[2];
-                    assert!(panel.replace_focused_session(
+                    assert!(panel.replace_focused_session_with_fixture_alias_ack(
                         Arc::clone(&manager),
                         None,
                         workspace_id,
@@ -739,7 +739,7 @@ mod tests {
         let manager = app.workspaces[0].pty_manager();
         let workspace_id = app.workspaces[0].id;
         let crate::panel::WorkspacePanel::Terminal(panel) = &mut app.workspaces[0].panels[1];
-        assert!(panel.replace_focused_session(
+        assert!(panel.replace_focused_session_with_fixture_alias_ack(
             Arc::clone(&manager),
             None,
             workspace_id,

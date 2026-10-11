@@ -1246,7 +1246,7 @@ fn final_save_profile_fixture() {
             }
             let workspace_id = app.workspaces[0].id;
             let CanvasPanel::Terminal(panel) = &mut app.workspaces[0].panels[0];
-            assert!(panel.replace_focused_session(
+            assert!(panel.replace_focused_session_with_fixture_alias_ack(
                 manager.clone(),
                 None,
                 workspace_id,
