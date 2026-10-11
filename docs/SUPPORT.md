@@ -338,3 +338,12 @@ Revisá el perfil indicado por la app y recuperá el archivo o corregí su acces
 El límite de un archivo de configuración completo es 4 MiB, separado del límite de layout y de los archivos incluidos en diagnostics. Solo un archivo TOML/UTF-8 leído completamente pero inválido permite probar el backup siguiente. Un error de acceso, privacidad, tipo de archivo o tamaño bloquea la carga sin aceptar un backup más viejo como prueba de que el principal era inválido. Si todos los candidatos están confirmados ausentes, el primer perfil sigue permitiendo configurar y guardar normalmente.
 
 El aviso contiene el candidato lógico y la categoría; no incluye el contenido TOML ni el token de integración. No compartas los archivos privados al pedir ayuda. Un directorio privado inválido, un enlace o un backup inseguro también puede impedir la carga aunque el principal sea válido; conservar la frontera privada exige revisar todo el ring.
+
+
+On app exit, managed local terminals are fenced against new births and receive
+up to ten seconds to finish the aggregate close: raw prefix sync, native wait,
+reader EOF, and final tail sync. The stable grid is then saved as the normal
+history checkpoint before the clean-run marker is cleared. A blocked factory,
+failed durable write, or incomplete physical close keeps the recovery marker
+and the earlier checkpoint. Closure journals remain rescue data when the final
+checkpoint cannot be published. Remote daemon sessions keep their hot lifetime.
