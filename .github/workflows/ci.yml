@@ -72,11 +72,11 @@ jobs:
 
       # Preserve independent GUI evidence even when a unit regression fails.
       - name: Build native GUI smoke binary
-        if: !cancelled() && runner.os == 'Linux'
+        if: "!cancelled() && runner.os == 'Linux'"
         run: cargo build --locked --bin mi-terminal
 
       - name: Native GUI persistence and recovery
-        if: !cancelled() && runner.os == 'Linux'
+        if: "!cancelled() && runner.os == 'Linux'"
         timeout-minutes: 6
         env:
           WGPU_BACKEND: vulkan
