@@ -4306,3 +4306,7 @@ mod unscoped_durable_destination_fixtures {
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
+
+#[cfg(test)]
+#[path = "managed_process_fixtures.rs"]
+mod managed_process_fixtures;
