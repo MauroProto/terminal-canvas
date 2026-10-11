@@ -1569,21 +1569,32 @@ fn broker_ws_url(
     role: SessionRole,
 ) -> anyhow::Result<String> {
     let trimmed = broker_url.trim().trim_end_matches('/');
-    let parsed = Url::parse(trimmed)?;
-    if parsed.scheme() != "https" {
+    let mut url = Url::parse(trimmed)?;
+    if url.scheme() != "https" {
         anyhow::bail!("Trusted Live requires https:// broker URLs");
     }
-    let mut url = trimmed.replacen("https://", "wss://", 1);
-    url.push_str(&format!(
-        "/v1/share-sessions/{}/stream?token={}&role={}",
+    url.set_scheme("wss")
+        .map_err(|()| anyhow::anyhow!("Invalid secure WebSocket URL"))?;
+    let path = format!(
+        "{}/v1/share-sessions/{}/stream",
+        url.path().trim_end_matches('/'),
         session_id.0,
-        token,
-        match role {
-            SessionRole::Host => "host",
-            SessionRole::Guest => "guest",
-        }
-    ));
-    Ok(url)
+    );
+    url.set_path(&path);
+    url.set_fragment(None);
+    // Broker tokens use standard Base64. A literal '+' in a query decodes as
+    // a space, making valid host/guest credentials fail nondeterministically.
+    url.query_pairs_mut()
+        .clear()
+        .append_pair("token", token)
+        .append_pair(
+            "role",
+            match role {
+                SessionRole::Host => "host",
+                SessionRole::Guest => "guest",
+            },
+        );
+    Ok(url.to_string())
 }
 
 fn validate_invite_broker_transport(invite: &InviteCode) -> anyhow::Result<()> {
@@ -1864,6 +1875,26 @@ mod tests {
         let err =
             validate_invite_broker_transport(&invite).expect_err("missing pinned cert should fail");
         assert!(err.to_string().contains("certificate"));
+    }
+
+    #[test]
+    fn broker_ws_url_preserves_base64_credentials_for_host_and_guest() {
+        let session = ShareSessionId(Uuid::new_v4());
+        let token = "abc+def/ghi+jkl=";
+        for (role, expected_role) in [(SessionRole::Host, "host"), (SessionRole::Guest, "guest")] {
+            let url =
+                Url::parse(&broker_ws_url("https://127.0.0.1:8787", session, token, role).unwrap())
+                    .unwrap();
+            assert_eq!(url.scheme(), "wss");
+            assert_eq!(
+                url.path(),
+                format!("/v1/share-sessions/{}/stream", session.0)
+            );
+            let pairs: std::collections::HashMap<_, _> = url.query_pairs().collect();
+            assert_eq!(pairs.len(), 2);
+            assert_eq!(pairs["token"], token);
+            assert_eq!(pairs["role"], expected_role);
+        }
     }
 
     #[test]
