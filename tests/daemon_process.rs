@@ -22,6 +22,46 @@ fn session_spec(configure: impl FnOnce(&mut WireSpec)) -> WireSpec {
     spec
 }
 
+// A real close is asynchronous: durable prefix, child wait and EOF may need
+// several pumps. These tests observe a known live identity disappearing; the
+// stronger hook-generation ACK is covered independently by host fixtures.
+fn kill_known_session(conn: &mut DaemonConn, id: uuid::Uuid) {
+    assert!(conn.list_checked().unwrap().contains(&id));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let _ = conn.kill(id);
+        if !conn.list_checked().unwrap().contains(&id) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "known session did not finish durable closure: {id}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn reconcile_known_sessions(conn: &mut DaemonConn, live: Vec<uuid::Uuid>, removed: &[uuid::Uuid]) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let killed = conn.reconcile_live(live.clone());
+        assert!(killed.iter().all(|id| removed.contains(id)));
+        let remaining = conn.list_checked().unwrap();
+        assert!(
+            live.iter().all(|id| remaining.contains(id)),
+            "reconcile killed a live session"
+        );
+        if removed.iter().all(|id| !remaining.contains(id)) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "reconcile did not finish durable orphan closure"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 #[path = "support/daemon_response.rs"]
 mod daemon_response;
 
@@ -355,7 +395,7 @@ fn attach_snapshot_and_seq_share_one_atomic_output_boundary() {
             assert!(Instant::now() < deadline, "el marker no llegó");
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(conn.kill(id));
+        kill_known_session(&mut conn, id);
     }
 }
 
@@ -376,8 +416,7 @@ fn reconcile_kills_the_sessions_the_app_no_longer_knows() {
     let keep = conn.spawn_session(WireSpec::default()).expect("spawn");
     let orphan = conn.spawn_session(WireSpec::default()).expect("spawn");
 
-    let killed = conn.reconcile_live(vec![keep]);
-    assert_eq!(killed, vec![orphan], "el huérfano se va");
+    reconcile_known_sessions(&mut conn, vec![keep], &[orphan]);
     assert_eq!(conn.list(), vec![keep]);
 }
 
@@ -408,11 +447,7 @@ fn reconcile_preserves_sessions_owned_by_another_live_app() {
 
     drop(first);
     std::thread::sleep(Duration::from_millis(100));
-    assert_eq!(
-        second.reconcile_live(vec![second_id]),
-        vec![first_id],
-        "cuando la dueña desaparece, otra app puede limpiar el huérfano"
-    );
+    reconcile_known_sessions(&mut second, vec![second_id], &[first_id]);
 }
 
 #[test]
@@ -459,7 +494,10 @@ fn killing_a_session_removes_it_for_every_client() {
     let mut second = DaemonConn::try_connect(&daemon.dir, &token).expect("segunda app");
     assert_eq!(second.list(), vec![id], "las dos apps ven la misma sesión");
 
-    assert!(second.kill(id));
+    second
+        .attach(id)
+        .expect("adopción explícita antes de cerrar");
+    kill_known_session(&mut second, id);
     assert!(
         first.list().is_empty(),
         "matarla desde una app la saca para todas"
