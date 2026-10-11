@@ -503,4 +503,103 @@ mod tests {
         let mut command = std::process::Command::new("no-such-binary-cbf1f0");
         assert!(super::spawn_detached("missing", &mut command).is_err());
     }
+
+    struct FakeReaperChild {
+        id: &'static str,
+        ready: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        fail_wait: bool,
+        alive_observed: Option<std::sync::mpsc::Sender<()>>,
+        dropped: std::sync::mpsc::Sender<&'static str>,
+    }
+
+    impl Drop for FakeReaperChild {
+        fn drop(&mut self) {
+            let _ = self.dropped.send(self.id);
+        }
+    }
+
+    fn fake_reaper_status() -> std::process::ExitStatus {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(0)
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(0)
+        }
+    }
+
+    fn spawn_fake_reaper(
+        rx: std::sync::mpsc::Receiver<(String, FakeReaperChild)>,
+    ) -> (std::thread::JoinHandle<()>, std::sync::mpsc::Receiver<()>) {
+        let (stopped_tx, stopped_rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            super::reap_children(rx, |child| {
+                if child.fail_wait {
+                    Err(std::io::Error::other("fixture wait error"))
+                } else if child.ready.load(std::sync::atomic::Ordering::Acquire) {
+                    Ok(Some(fake_reaper_status()))
+                } else {
+                    if let Some(observed) = child.alive_observed.take() {
+                        let _ = observed.send(());
+                    }
+                    Ok(None)
+                }
+            });
+            let _ = stopped_tx.send(());
+        });
+        (handle, stopped_rx)
+    }
+
+    #[test]
+    fn reaper_collects_later_children_while_first_is_running() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{mpsc, Arc};
+        use std::time::Duration;
+
+        let (tx, rx) = mpsc::channel();
+        let (dropped_tx, dropped_rx) = mpsc::channel();
+        let ready = Arc::new(AtomicBool::new(false));
+        // Queue all children before starting the worker, so FIFO is explicit.
+        for (id, finished, fail_wait) in [
+            ("held", false, false),
+            ("finished", true, false),
+            ("failed-wait", false, true),
+        ] {
+            tx.send((
+                id.to_owned(),
+                FakeReaperChild {
+                    id,
+                    ready: if finished {
+                        Arc::new(AtomicBool::new(true))
+                    } else {
+                        ready.clone()
+                    },
+                    fail_wait,
+                    alive_observed: None,
+                    dropped: dropped_tx.clone(),
+                },
+            ))
+            .expect("queue fixture");
+        }
+        let (handle, stopped) = spawn_fake_reaper(rx);
+        let later = dropped_rx.recv_timeout(Duration::from_secs(2));
+        let failed = dropped_rx.recv_timeout(Duration::from_secs(2));
+        let held_was_preserved = dropped_rx.try_recv().is_err();
+        ready.store(true, Ordering::Release);
+        drop(tx);
+        let held = dropped_rx.recv_timeout(Duration::from_secs(2));
+        let terminated = stopped.recv_timeout(Duration::from_secs(2));
+        // Join only after a bounded completion acknowledgement.
+        if terminated.is_ok() {
+            handle.join().expect("worker");
+        }
+        assert_eq!(later, Ok("finished"));
+        assert_eq!(failed, Ok("failed-wait"));
+        assert!(held_was_preserved, "the running child was dropped");
+        assert_eq!(held, Ok("held"));
+        assert!(terminated.is_ok(), "worker did not stop after reaping");
+    }
 }
