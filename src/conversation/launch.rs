@@ -87,6 +87,22 @@ pub fn append_config(
     config: &McpConfig,
     executable: &Path,
 ) -> Result<()> {
+    append_config_with_profile(
+        command,
+        provider,
+        config,
+        executable,
+        crate::utils::app_paths::get()?.isolated_root.as_deref(),
+    )
+}
+
+pub(super) fn append_config_with_profile(
+    command: &mut Command,
+    provider: AgentProvider,
+    config: &McpConfig,
+    executable: &Path,
+    profile: Option<&Path>,
+) -> Result<()> {
     match provider {
         AgentProvider::ClaudeCode => {
             command.arg("--mcp-config").arg(&config.path);
@@ -108,6 +124,14 @@ pub fn append_config(
                 "mcp_servers.terminal_canvas_chat.env.TC_CHAT_AUTH_FILE={}",
                 serde_json::to_string(config.auth_path.to_str().context("Ruta MCP no UTF-8")?)?
             ));
+            // Codex filters inherited MCP environment variables. Pin the same
+            // isolated application profile that the Claude config already carries.
+            if let Some(profile) = profile {
+                command.arg("-c").arg(format!(
+                    "mcp_servers.terminal_canvas_chat.env.TERMINAL_CANVAS_HOME={}",
+                    serde_json::to_string(profile.to_str().context("Perfil MCP no UTF-8")?)?
+                ));
+            }
         }
         _ => anyhow::bail!("El proveedor requiere importar la configuración MCP manualmente"),
     }

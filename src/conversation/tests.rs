@@ -609,7 +609,18 @@ fn native_launch_arguments_are_structured_and_do_not_override_other_mcp_servers(
     )
     .unwrap();
     let args: Vec<_> = codex.get_args().map(|arg| arg.to_str().unwrap()).collect();
-    assert_eq!(args.len(), 6);
+    assert_eq!(
+        args.len(),
+        if crate::utils::app_paths::get()
+            .unwrap()
+            .isolated_root
+            .is_some()
+        {
+            8
+        } else {
+            6
+        }
+    );
     let options = args
         .chunks(2)
         .map(|pair| pair[1])
@@ -623,6 +634,43 @@ fn native_launch_arguments_are_structured_and_do_not_override_other_mcp_servers(
     assert_eq!(
         value["mcp_servers"]["terminal_canvas_chat"]["env"]["TC_CHAT_AUTH_FILE"].as_str(),
         config.auth_path.to_str()
+    );
+}
+
+#[test]
+fn isolated_codex_config_preserves_the_profile_when_inherited_env_is_filtered() {
+    let config = launch::McpConfig {
+        path: "C:/profile with spaces/servers.json".into(),
+        auth_path: "C:/profile with spaces/credential.json".into(),
+    };
+    let profile = std::path::Path::new("C:/profile with spaces/ñandú");
+    let mut command = std::process::Command::new("unused");
+    launch::append_config_with_profile(
+        &mut command,
+        crate::orchestration::AgentProvider::CodexCli,
+        &config,
+        std::path::Path::new("C:/app/terminal.exe"),
+        Some(profile),
+    )
+    .unwrap();
+    let args: Vec<_> = command
+        .get_args()
+        .map(|arg| arg.to_str().unwrap())
+        .collect();
+    let options = args
+        .chunks_exact(2)
+        .map(|pair| {
+            assert_eq!(pair[0], "-c");
+            pair[1]
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let config: toml::Value = toml::from_str(&options).unwrap();
+    let env = &config["mcp_servers"]["terminal_canvas_chat"]["env"];
+    assert_eq!(env["TERMINAL_CANVAS_HOME"].as_str(), profile.to_str());
+    assert_eq!(
+        env["TC_CHAT_AUTH_FILE"].as_str(),
+        Some("C:/profile with spaces/credential.json")
     );
 }
 
