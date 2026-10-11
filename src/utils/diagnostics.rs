@@ -878,4 +878,62 @@ mod source_quality_tests {
             "invalid-format"
         );
     }
+
+    #[test]
+    fn diagnostic_reads_bound_advertised_size_and_growth_before_accepting_any_prefix() {
+        let mut huge = Cursor::new(b"unread".to_vec());
+        assert_eq!(
+            read_from_regular(&mut huge, u64::MAX, false, 16),
+            DiagnosticRead::Omitted(DiagnosticIssue::Oversize)
+        );
+        assert_eq!(huge.position(), 0, "metadata rejection must not read");
+        let valid = b"{\"v\":1}";
+        let mut growing = Cursor::new([valid.as_slice(), b" extra-private"].concat());
+        assert_eq!(
+            read_from_regular(&mut growing, valid.len() as u64, false, valid.len() as u64),
+            DiagnosticRead::Omitted(DiagnosticIssue::Oversize)
+        );
+        assert_eq!(
+            growing.position(),
+            valid.len() as u64 + 1,
+            "only the sentinel byte may be consumed"
+        );
+        let unicode = "é".as_bytes().to_vec();
+        let mut exact = Cursor::new(unicode.clone());
+        assert_eq!(
+            read_from_regular(&mut exact, 2, false, 2),
+            DiagnosticRead::Included {
+                bytes: unicode,
+                truncated: false
+            }
+        );
+    }
+
+    struct InterruptedThenFailure {
+        bytes: Cursor<Vec<u8>>,
+        interrupted: bool,
+        fail_at_eof: bool,
+    }
+
+    impl Read for InterruptedThenFailure {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            if !self.interrupted {
+                self.interrupted = true;
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            if self.fail_at_eof && self.bytes.position() == self.bytes.get_ref().len() as u64 {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "private-path-and-error-text",
+                ));
+            }
+            self.bytes.read(output)
+        }
+    }
+
+    impl Seek for InterruptedThenFailure {
+        fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+            self.bytes.seek(position)
+        }
+    }
 }
