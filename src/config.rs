@@ -738,6 +738,7 @@ mod private_config_security_tests {
 #[cfg(test)]
 mod config_recovery_tests {
     use super::*;
+    use std::io;
     use std::path::{Path, PathBuf};
 
     struct TempDirectory(PathBuf);
@@ -772,6 +773,14 @@ mod config_recovery_tests {
                 (entry, bytes)
             })
             .collect()
+    }
+
+    fn read_error(candidate: ConfigCandidate) -> ConfigLoadIssue {
+        candidate_issue(
+            candidate,
+            ConfigLoadOperation::Read,
+            ConfigLoadIssueKind::Io(io::ErrorKind::PermissionDenied),
+        )
     }
 
     #[test]
@@ -819,5 +828,25 @@ mod config_recovery_tests {
             .status
             .write_permission()
             .is_err());
+    }
+
+    #[test]
+    fn unreadable_candidates_never_fall_through_to_older_valid_backups() {
+        for blocked in [ConfigCandidate::Primary, ConfigCandidate::Backup(0)] {
+            let mut calls = Vec::new();
+            let report = load_candidates_with(Path::new("config.toml"), |_, candidate| {
+                calls.push(candidate);
+                if candidate == blocked {
+                    Err(read_error(candidate))
+                } else if candidate == ConfigCandidate::Primary {
+                    Ok(Some(b"[broken".to_vec()))
+                } else {
+                    Ok(Some(b"[terminal]\nfont_size = 27.0\n".to_vec()))
+                }
+            });
+            assert_eq!(report, ConfigLoadReport::Failed(read_error(blocked)));
+            assert_eq!(calls.last(), Some(&blocked));
+            assert!(!calls.contains(&ConfigCandidate::Backup(1)));
+        }
     }
 }
