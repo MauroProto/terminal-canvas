@@ -714,3 +714,56 @@ mod tests {
 #[cfg(test)]
 #[path = "preferences_worker/tests.rs"]
 mod recovery_tests;
+
+#[cfg(test)]
+mod config_authority_tests {
+    use super::*;
+    use crate::config::{
+        AppConfig, ConfigCandidate, ConfigLoadIssue, ConfigLoadIssueKind, ConfigLoadOperation,
+        ConfigRuntimeStatus,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn blocked() -> ConfigRuntimeStatus {
+        ConfigRuntimeStatus::Blocked(ConfigLoadIssue {
+            candidate: Some(ConfigCandidate::Primary),
+            operation: ConfigLoadOperation::Read,
+            kind: ConfigLoadIssueKind::Io(std::io::ErrorKind::PermissionDenied),
+        })
+    }
+
+    fn no_thread_worker(calls: Arc<AtomicUsize>) -> PreferencesWorker {
+        PreferencesWorker::with_spawner(
+            |_| panic!("fixture must not execute I/O"),
+            move |_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+            },
+        )
+    }
+
+    #[test]
+    fn blocked_settings_reject_before_submit_without_becoming_failed_payloads() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut worker = no_thread_worker(Arc::clone(&calls));
+        assert!(worker
+            .save_settings_with_status(AppConfig::default(), blocked())
+            .is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(worker.pending.is_empty());
+        assert!(worker.active.is_none());
+        assert!(worker.failed_active.is_none());
+        assert!(worker.settings_write_error.is_none());
+        assert!(worker.completions.is_empty());
+        assert!(!worker.settings_pending());
+        assert!(!worker.busy());
+        assert!(worker.warning().is_none());
+
+        assert!(worker
+            .save_settings_with_status(AppConfig::default(), ConfigRuntimeStatus::Missing)
+            .is_ok());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(worker.settings_pending());
+        assert!(worker.settings_write_error.is_some());
+    }
+}
