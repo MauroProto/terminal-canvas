@@ -1634,6 +1634,22 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_idle_shutdown_keeps_connection_and_adoption_guards() {
+        let mut state = DaemonState::new();
+        let client = Uuid::new_v4();
+        state.client_connected(client);
+        let now = Instant::now();
+        assert!(!state.should_shutdown_with_request(now + ADOPTION_TIMEOUT * 2, false));
+        state.client_disconnected(client, now);
+        assert!(!state.should_shutdown_with_request(now, false));
+        assert!(state.should_shutdown_with_request(now + ADOPTION_TIMEOUT, false));
+        let session = spawn_one(&mut state);
+        assert!(!state.should_shutdown_with_request(now + ADOPTION_TIMEOUT * 2, false));
+        assert!(!state.should_shutdown_with_request(now + ADOPTION_TIMEOUT * 2, true));
+        assert!(state.session(session).unwrap().alive);
+    }
+
+    #[test]
     fn spawning_registers_the_session() {
         let mut state = DaemonState::new();
         let id = spawn_one(&mut state);
