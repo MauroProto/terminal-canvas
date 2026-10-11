@@ -40,6 +40,8 @@ mod file_viewer_ui;
 mod memory_ui;
 mod notify_policy;
 mod onboarding;
+#[cfg(test)]
+mod online_ui_tests;
 mod orchestration_ui;
 mod perf;
 mod persistence_worker;
@@ -1681,13 +1683,18 @@ impl TerminalApp {
     /// al PTY. Toda superficie modal vive acá para que briefs, invites y
     /// passphrases nunca se escriban también en el shell detrás del diálogo.
     fn terminal_input_is_routable(&self) -> bool {
+        self.terminal_surface_input_is_routable()
+            && !matches!(self.collab.mode(), CollabMode::Guest)
+    }
+
+    /// Local and guest terminals share the same keyboard ownership rules.
+    fn terminal_surface_input_is_routable(&self) -> bool {
         !(self.modal_input_is_active()
             || (self.file_viewer.is_some()
                 && self
                     .ctx
                     .as_ref()
-                    .is_some_and(file_viewer_selection::viewer_keyboard_input_is_active))
-            || matches!(self.collab.mode(), CollabMode::Guest))
+                    .is_some_and(file_viewer_selection::viewer_keyboard_input_is_active)))
     }
 
     fn modal_input_is_active(&self) -> bool {

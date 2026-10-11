@@ -247,7 +247,10 @@ impl TerminalApp {
         let guest_focused_panel = self.collab.guest_view().focused_panel;
         let guest_id = self.collab.guest_view().my_guest_id;
         let scroll_offsets = self.collab.guest_view().scroll_offsets.clone();
-        let canvas_input = handle_canvas_input(ui, &mut self.viewport, canvas_rect, false, false);
+        let route_input =
+            self.terminal_surface_input_is_routable() && ctx.input(|input| input.raw.focused);
+        let canvas_input = route_input
+            .then(|| handle_canvas_input(ui, &mut self.viewport, canvas_rect, false, false));
 
         if let Some(snapshot) = guest_snapshot {
             if let Some(action) = draw_remote_workspace(
@@ -260,10 +263,14 @@ impl TerminalApp {
                 guest_id,
                 &scroll_offsets,
             ) {
-                match action {
-                    RemotePanelAction::Focus(panel_id) => self.collab.focus_remote_panel(panel_id),
-                    RemotePanelAction::RequestControl(panel_id) => {
-                        self.collab.request_control(panel_id)
+                if route_input {
+                    match action {
+                        RemotePanelAction::Focus(panel_id) => {
+                            self.collab.focus_remote_panel(panel_id)
+                        }
+                        RemotePanelAction::RequestControl(panel_id) => {
+                            self.collab.request_control(panel_id)
+                        }
                     }
                 }
             }
@@ -274,7 +281,8 @@ impl TerminalApp {
 
             let (smooth_scroll_delta, zoom_delta, modifiers) =
                 ctx.input(|i| (i.smooth_scroll_delta, i.zoom_delta(), i.modifiers));
-            if smooth_scroll_delta.y != 0.0
+            if route_input
+                && smooth_scroll_delta.y != 0.0
                 && !panel_zoom_gesture_active(smooth_scroll_delta, zoom_delta, modifiers)
             {
                 if let Some(panel_id) = guest_focused_panel {
@@ -307,11 +315,7 @@ impl TerminalApp {
                     .find(|panel| panel.panel_id == panel_id)
                     .and_then(|panel| panel.controller)
                     == guest_id;
-                if controlled_by_me
-                    && !self.command_palette.open
-                    && !self.join_session_open
-                    && !self.share_workspace_open
-                {
+                if controlled_by_me && route_input {
                     let events = collect_guest_terminal_input(ctx);
                     if !events.is_empty() {
                         self.collab.send_guest_input(panel_id, events);
@@ -328,7 +332,7 @@ impl TerminalApp {
             );
         }
 
-        if canvas_input.navigating {
+        if canvas_input.is_some_and(|input| input.navigating) {
             ui.ctx().request_repaint();
         }
     }
