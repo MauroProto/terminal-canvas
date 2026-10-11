@@ -3470,3 +3470,45 @@ fn current_layout_ack_clears_its_warning_and_allows_a_new_failure_notice() {
         "a new failed-save episode is visible"
     );
 }
+
+#[test]
+fn layout_save_ack_preserves_read_and_lease_pauses_and_cannot_restart_writes() {
+    let read_error =
+        super::initial_persistence_state(crate::state::persistence::StateLoadResult::ReadError {
+            path: "controlled-profile/layout.json".into(),
+            error: "controlled oversized layout".to_owned(),
+        })
+        .1
+        .unwrap();
+    let lease_error = "Otra instancia de TerminalCanvas tomó el guardado; esta ventana dejó de escribir para proteger tus proyectos".to_owned();
+    for reason in [read_error, lease_error] {
+        let ctx = egui::Context::default();
+        let mut app = detached_test_app_with_panel(&ctx);
+        app.persistence_worker =
+            super::persistence_worker::PersistenceWorker::with_state_processor_for_tests(|_| {
+                panic!("a paused app must not submit a layout write")
+            });
+        app.persistence_warning = Some(reason.clone());
+        assert!(!app.persistence_writes_enabled);
+        let current = app.snapshot_state();
+        apply_layout_save_result(
+            &mut app,
+            current.clone(),
+            Err(anyhow::anyhow!("controlled layout save failure")),
+        );
+        let labels = layout_save_warning_labels(&app, &ctx, 0.0);
+        assert!(labels.contains("No se pudo guardar el layout"));
+        assert!(labels.contains("Guardado de layout e historial desactivado"));
+        // A previously accepted write can finish after a read/lease pause.
+        apply_layout_save_result(&mut app, current, Ok(()));
+        assert!(app.layout_save_warning.is_none());
+        assert_eq!(app.persistence_warning.as_deref(), Some(reason.as_str()));
+        assert!(!app.persistence_writes_enabled);
+        assert!(!app.ensure_persistence_ownership());
+        app.maybe_persist_state(&ctx);
+        assert!(!app.persistence_worker.state_in_flight());
+        let labels = layout_save_warning_labels(&app, &ctx, 1.0);
+        assert!(labels.contains("Guardado de layout e historial desactivado"));
+        assert!(!labels.contains("No se pudo guardar el layout"));
+    }
+}
