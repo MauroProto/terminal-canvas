@@ -699,6 +699,113 @@ fn generated_mcp_config_uses_a_private_credential_file_and_revokes_old_token() {
 }
 
 #[test]
+fn credential_rotation_fences_calls_authenticated_before_the_effect_transaction() {
+    let directory = TestDirectory::new();
+    let path = directory.path().join("rotation.sqlite3");
+    let mut store = ConversationStore::open(&path).unwrap();
+    let a = thread(Uuid::new_v4());
+    let b = thread(a.workspace_id);
+    store.register(&a).unwrap();
+    store.register(&b).unwrap();
+    store.link_pair(a.id, b.id, true).unwrap();
+    connect(&store, b.id);
+    let original = store.issue_credential(a.id).unwrap();
+    store.renew_bridge(Uuid::new_v4(), a.id, &original).unwrap();
+    let admitted = store.authenticate(a.id, &original).unwrap();
+    let message = store
+        .record(
+            admitted,
+            Uuid::new_v4(),
+            a.id,
+            MessageRole::Assistant,
+            "Antes",
+            "test",
+        )
+        .unwrap();
+    let outgoing = store.send(admitted, &request(&a, &b)).unwrap();
+    let incoming = store.send(Caller::User, &request(&b, &a)).unwrap();
+    store
+        .claim(incoming.id, a.binding_id.unwrap())
+        .unwrap()
+        .unwrap();
+    store.delivery_result(incoming.id, Ok(())).unwrap();
+    let previous_a = store.history(Caller::User, a.id, 0).unwrap();
+    let previous_b = store.history(Caller::User, b.id, 0).unwrap();
+
+    // Another MCP/config connection commits rotation between authentication
+    // and BEGIN IMMEDIATE in the already admitted request.
+    let other_connection = ConversationStore::open(&path).unwrap();
+    let renewed = other_connection.issue_credential(a.id).unwrap();
+    other_connection
+        .renew_bridge(Uuid::new_v4(), a.id, &renewed)
+        .unwrap();
+    let rejected_message = Uuid::new_v4();
+    let rejected_send = request(&a, &b);
+    assert!(store
+        .record(
+            admitted,
+            rejected_message,
+            a.id,
+            MessageRole::Assistant,
+            "Después",
+            "test"
+        )
+        .is_err());
+    assert!(store.send(admitted, &rejected_send).is_err());
+    assert!(store.cancel(admitted, outgoing.id).is_err());
+    assert!(store
+        .reply(admitted, incoming.id, "Respuesta obsoleta")
+        .is_err());
+    assert!(store.set_available(admitted, true).is_err());
+    assert!(store.message(admitted, message.id).is_err());
+    assert!(store.history(admitted, a.id, 0).is_err());
+    assert!(store.list(admitted, a.workspace_id, None).is_err());
+    assert!(store.snapshot(admitted, a.workspace_id).is_err());
+    assert!(store.transfer(admitted, incoming.id).is_err());
+    assert_eq!(store.history(Caller::User, a.id, 0).unwrap(), previous_a);
+    assert_eq!(store.history(Caller::User, b.id, 0).unwrap(), previous_b);
+    assert!(store
+        .message(Caller::User, rejected_message)
+        .unwrap()
+        .is_none());
+    assert!(store
+        .transfer(Caller::User, rejected_send.operation_id)
+        .is_err());
+    assert_eq!(
+        store.transfer(Caller::User, outgoing.id).unwrap().state,
+        TransferState::Pending
+    );
+    assert_eq!(
+        store.transfer(Caller::User, incoming.id).unwrap().state,
+        TransferState::InputQueued
+    );
+    assert_eq!(store.bridge_availability(a.id).unwrap(), None);
+
+    let current = store.authenticate(a.id, &renewed).unwrap();
+    assert_eq!(current.agent_id(), Some(a.id));
+    store
+        .record(
+            current,
+            rejected_message,
+            a.id,
+            MessageRole::Assistant,
+            "Después",
+            "test",
+        )
+        .unwrap();
+    store.send(current, &rejected_send).unwrap();
+    store.cancel(current, outgoing.id).unwrap();
+    store.set_available(current, true).unwrap();
+    assert_eq!(
+        store
+            .reply(current, incoming.id, "Respuesta actual")
+            .unwrap()
+            .state,
+        TransferState::Completed
+    );
+    assert_eq!(store.bridge_availability(a.id).unwrap(), Some(true));
+}
+#[test]
 fn queue_capacity_and_message_id_conflicts_leave_no_partial_history() {
     let (mut store, a, b) = fixture();
     let id = Uuid::new_v4();
