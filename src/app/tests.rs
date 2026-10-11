@@ -3595,3 +3595,107 @@ fn existing_autosave_retry_clears_a_layout_warning_only_after_successful_worker_
     assert!(app.layout_save_warning.is_none());
     assert_eq!(app.persisted_state.as_ref(), Some(&current));
 }
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug)]
+struct FileDropPathFixture(std::path::PathBuf);
+
+#[cfg(not(target_arch = "wasm32"))]
+impl egui::DroppedFile for FileDropPathFixture {
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+
+    fn bytes(&self) -> Result<Vec<u8>, String> {
+        panic!("dropping a path must not read its file")
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn file_drop_output(
+    app: &mut super::TerminalApp,
+    ctx: &egui::Context,
+    paths: &[&str],
+    pointer: egui::Pos2,
+) -> (Option<usize>, Vec<String>) {
+    let dropped_files = paths
+        .iter()
+        .map(|path| {
+            std::sync::Arc::new(FileDropPathFixture(std::path::PathBuf::from(path)))
+                as egui::DroppedFileHandle
+        })
+        .collect();
+    let canvas = Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0));
+    ctx.begin_pass(RawInput {
+        screen_rect: Some(canvas),
+        dropped_files,
+        ..Default::default()
+    });
+    let hit = app.handle_file_drop(ctx, Some(pointer), canvas);
+    let output = ctx.end_pass();
+    let copied = output
+        .platform_output
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            egui::OutputCommand::CopyText(text) => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    output.drop_without_applying_deltas();
+    (hit, copied)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn file_drop_with_control_characters_rejects_the_whole_drop_visibly() {
+    let ctx = egui::Context::default();
+    let mut app = detached_test_app_with_panel(&ctx);
+    app.viewport = Viewport::default();
+    let paths = [
+        "/drop/line\nbreak.txt",
+        "/drop/carriage\rreturn.txt",
+        "/drop/tab\tname.txt",
+        "/drop/escape\x1bname.txt",
+        "/drop/delete\x7fname.txt",
+        "/drop/next\u{0085}line.txt",
+        "/drop/csi\u{009b}name.txt",
+    ];
+    for path in paths {
+        app.toasts = Default::default();
+        let (hit, copied) =
+            file_drop_output(&mut app, &ctx, &["/drop/valid.txt", path], pos2(50.0, 50.0));
+        assert_eq!(hit, Some(0));
+        assert!(
+            copied.is_empty(),
+            "a rejected drop must not copy a partial list"
+        );
+        // El toast de éxito anterior también era visible en un panel detached.
+        // Exigir el mensaje de rechazo real hace que la fixture falle sin el guard.
+        for pass in 0..2 {
+            let mut output = ctx.run_ui(
+                RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0))),
+                    ..Default::default()
+                },
+                |ui| app.show_toasts(ui.ctx()),
+            );
+            if pass == 1 {
+                assert!(
+                    output.shapes.iter().any(|shape| match &shape.shape {
+                        egui::epaint::Shape::Text(text) => text.galley.text().contains(
+                            "La ruta contiene caracteres de control y no se puede pegar en la terminal.",
+                        ),
+                        _ => false,
+                    }),
+                    "the actual rejection must be drawn instead of the old success toast"
+                );
+            }
+            output.textures_delta.clear();
+            output.drop_without_applying_deltas();
+        }
+        assert!(app.ws().all_runtime_session_ids().is_empty());
+        let CanvasPanel::Terminal(panel) = &app.ws().panels[0];
+        assert!(!panel.runtime_session_attached());
+    }
+}
