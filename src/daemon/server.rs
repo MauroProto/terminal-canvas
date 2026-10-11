@@ -1607,6 +1607,33 @@ mod tests {
     }
 
     #[test]
+    fn pending_idle_shutdown_waits_for_a_new_session_then_remains_requested() {
+        let mut state = DaemonState::new();
+        let first_client = Uuid::new_v4();
+        state.client_connected(first_client);
+        let now = Instant::now();
+        assert!(state.should_shutdown_with_request(now, true));
+        let second_client = Uuid::new_v4();
+        state.client_connected(second_client);
+        let response = super::handle_request_for_client(
+            &mut state,
+            Request::Spawn {
+                spec: WireSpec::default(),
+                id: None,
+            },
+            None,
+            second_client,
+        );
+        let Response::Spawned { id } = response else {
+            panic!("expected registered fake session");
+        };
+        assert!(!state.should_shutdown_with_request(now + ADOPTION_TIMEOUT, true));
+        assert!(state.session(id).unwrap().alive);
+        assert!(state.kill(id));
+        assert!(state.should_shutdown_with_request(now + ADOPTION_TIMEOUT, true));
+    }
+
+    #[test]
     fn spawning_registers_the_session() {
         let mut state = DaemonState::new();
         let id = spawn_one(&mut state);
