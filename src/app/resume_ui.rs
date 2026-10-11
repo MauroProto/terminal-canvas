@@ -668,4 +668,29 @@ mod resume_identity_tests {
             Some("claude --model sonnet --continue")
         );
     }
+
+    #[test]
+    fn failed_replacement_never_commits_the_selected_identity() {
+        let mut panel = panel_with_old_identity();
+        let resume = ResumePlan::exact(
+            AgentProvider::ClaudeCode,
+            "claude --model sonnet",
+            "chosen-B",
+        )
+        .expect("selected identity");
+        // The existing failure path already clears the old ID; this is no rollback test.
+        assert!(!replace_and_remember_resume_session(
+            &mut panel,
+            resume.exact_session_id,
+            |panel| {
+                panel.set_agent_session_id(None);
+                false
+            },
+        ));
+        assert_eq!(panel.agent_session_id(), None);
+        assert_eq!(panel.agent_command(), Some("claude --model sonnet"));
+        let saved = panel.to_saved();
+        assert_eq!(saved.agent_session_id, None);
+        assert!(saved.leaf_agent_session_ids.is_empty());
+    }
 }
