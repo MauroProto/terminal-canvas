@@ -3408,3 +3408,32 @@ fn repeated_layout_save_errors_do_not_repeat_toasts_but_changed_reasons_do() {
         Some("controlled backup is not a regular file"),
     );
 }
+
+#[test]
+fn older_layout_ack_does_not_clear_a_warning_or_confirm_newer_ui_changes() {
+    use std::time::{Duration, Instant};
+
+    let ctx = egui::Context::default();
+    let mut app = detached_test_app_with_panel(&ctx);
+    let older = app.snapshot_state();
+    app.sidebar_visible = !app.sidebar_visible;
+    let current = app.snapshot_state();
+    apply_layout_save_result(
+        &mut app,
+        current.clone(),
+        Err(anyhow::anyhow!("controlled layout save failure")),
+    );
+    app.autosave = crate::state::persistence::AutosaveController::new(Duration::ZERO);
+    apply_layout_save_result(&mut app, older.clone(), Ok(()));
+    assert_eq!(app.persisted_state.as_ref(), Some(&older));
+    assert_ne!(app.persisted_state.as_ref(), Some(&current));
+    assert_eq!(
+        app.layout_save_warning.as_deref(),
+        Some("controlled layout save failure"),
+    );
+    assert_eq!(
+        app.autosave
+            .should_persist(&current, app.persisted_state.as_ref(), Instant::now(),),
+        crate::state::persistence::AutosaveDecision::SaveNow,
+    );
+}
