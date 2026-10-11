@@ -252,6 +252,12 @@ pub fn recover_remote(
             ))
         }
     };
+    let key = remote_binding_key(spec).map_err(|error| {
+        recovery_error(
+            endpoint,
+            RemoteRecoveryError::protected(id, error.to_string()),
+        )
+    })?;
     let mut birth = intent == RemoteSpawnIntent::NewBirth;
     let operation = || -> anyhow::Result<RemoteSpawnResult> {
         let mut writer = stream.try_clone()?;
@@ -277,27 +283,40 @@ pub fn recover_remote(
             existing
         } else {
             birth = true;
-            if !capabilities.permits_hook_birth() {
-                anyhow::bail!(RemoteRecoveryError::birth_rejected(id,
-                    "La creación remota requiere actualizar el daemon para confirmar idempotencia y cancelación por UUID."));
-            }
-            let runtime = crate::hook_runtime::process_runtime()
-                .ok_or_else(|| anyhow::anyhow!("hook endpoint unavailable"))?;
-            anyhow::ensure!(
-                runtime.owner == endpoint.client_id,
-                "remote endpoint owner mismatch"
-            );
-            let key =
-                spec_key(spec).ok_or_else(|| anyhow::anyhow!("new birth target incomplete"))?;
-            let claim = runtime.authorize_birth(key, id)?;
             let mut wire = wire_spec_from(spec, cols, rows);
-            wire.hook_generation = claim.generation;
+            if let Some(key) = key {
+                if !capabilities.permits_hook_birth() {
+                    anyhow::bail!(RemoteRecoveryError::birth_rejected(id,
+                        "La creación remota requiere actualizar el daemon para confirmar idempotencia y cancelación por UUID."));
+                }
+                let runtime = crate::hook_runtime::process_runtime()
+                    .ok_or_else(|| anyhow::anyhow!("hook endpoint unavailable"))?;
+                anyhow::ensure!(
+                    runtime.owner == endpoint.client_id,
+                    "remote endpoint owner mismatch"
+                );
+                wire.hook_generation = runtime.authorize_birth(key, id)?.generation;
+            } else {
+                // Compatibility callers have no workspace/panel/leaf or memory hooks.
+                // They still require authenticated, idempotent UUID creation.
+                anyhow::ensure!(
+                    capabilities.permits_birth(),
+                    "daemon lacks idempotent creation"
+                );
+            }
+
             spawn_then_snapshot(&mut writer, &mut reader, wire, id)?
         };
-        let runtime = crate::hook_runtime::process_runtime()
-            .ok_or_else(|| anyhow::anyhow!("hook endpoint unavailable"))?;
-        let key = spec_key(spec).ok_or_else(|| anyhow::anyhow!("attachment target incomplete"))?;
-        runtime.attach(key, evidence, spec.hook_legacy_root)?;
+        if let Some(key) = key {
+            let runtime = crate::hook_runtime::process_runtime()
+                .ok_or_else(|| anyhow::anyhow!("hook endpoint unavailable"))?;
+            runtime.attach(key, evidence, spec.hook_legacy_root)?;
+        } else {
+            anyhow::ensure!(
+                evidence.generation.is_none() && evidence.target.is_none(),
+                "an unscoped client cannot adopt managed hook authority"
+            );
+        }
         let mut handle = PtyHandle::attach_remote(
             id,
             stream.try_clone()?,
@@ -320,7 +339,9 @@ pub fn recover_remote(
     };
     let result = operation();
     result.map_err(|error| {
-        let refusal = if let Some(typed) = error.downcast_ref::<RemoteRecoveryError>() {
+        let refusal = if key.is_none() && birth {
+            RemoteRecoveryError::birth_pending(id, error.to_string(), false)
+        } else if let Some(typed) = error.downcast_ref::<RemoteRecoveryError>() {
             typed.clone()
         } else if birth {
             RemoteRecoveryError::birth_pending(id, error.to_string(), capabilities.permits_birth())
@@ -870,4 +891,43 @@ fn spec_key(spec: &crate::runtime::SessionSpec) -> Option<crate::hook_authority:
         panel: spec.panel_id?,
         leaf: spec.leaf_id?,
     })
+}
+
+/// Missing one identity component is a protected error, never an unscoped fallback.
+fn remote_binding_key(
+    spec: &crate::runtime::SessionSpec,
+) -> anyhow::Result<Option<crate::hook_authority::LeafKey>> {
+    if spec.workspace_id.is_none()
+        && spec.panel_id.is_none()
+        && spec.leaf_id.is_none()
+        && spec.memory_task_id.is_none()
+        && !spec.hook_legacy_root
+    {
+        return Ok(None);
+    }
+    spec_key(spec)
+        .map(Some)
+        .ok_or_else(|| anyhow::anyhow!("managed remote target incomplete"))
+}
+
+#[cfg(test)]
+mod remote_binding_contract_fixtures {
+    use super::*;
+    #[test]
+    fn only_a_completely_unscoped_spec_uses_compatibility_creation() {
+        let mut spec = crate::runtime::SessionSpec::default();
+        assert_eq!(remote_binding_key(&spec).unwrap(), None);
+        spec.panel_id = Some(Uuid::new_v4());
+        assert!(remote_binding_key(&spec).is_err());
+        spec.workspace_id = Some(Uuid::new_v4());
+        assert!(remote_binding_key(&spec).is_err());
+        spec.leaf_id = Some(Uuid::new_v4());
+        assert_eq!(remote_binding_key(&spec).unwrap(), spec_key(&spec));
+        spec = crate::runtime::SessionSpec::default();
+        spec.memory_task_id = Some(Uuid::new_v4());
+        assert!(remote_binding_key(&spec).is_err());
+        spec = crate::runtime::SessionSpec::default();
+        spec.hook_legacy_root = true;
+        assert!(remote_binding_key(&spec).is_err());
+    }
 }
