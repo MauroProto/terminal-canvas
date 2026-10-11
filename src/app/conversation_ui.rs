@@ -669,14 +669,14 @@ mod tests {
             row.binding_id = Some(Uuid::new_v4());
             if command == "codex" {
                 target_handle = panel.leaf_session_handle(row.id);
-                panel.split_focused(
+                assert!(panel.split_focused_with_fixture_alias_ack(
                     crate::terminal::split_tree::Axis::Horizontal,
                     Arc::clone(&manager),
                     None,
-                    Some(app.workspaces[0].id),
+                    app.workspaces[0].id,
                     80,
                     24,
-                );
+                ));
                 assert_ne!(panel.focused_leaf_id(), row.id);
             }
             descriptors.push(row);

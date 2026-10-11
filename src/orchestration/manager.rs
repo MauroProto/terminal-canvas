@@ -2841,6 +2841,8 @@ mod tests {
             minimized: false,
             agent_status: None,
         };
+        // Production binds the exact birth before applying its observations.
+        orchestrator.bind_panel_hook_claim(workspace_id, panel_id, observation.hook_claim);
         orchestrator.apply_observations(vec![observation.clone()]);
         let epoch = chrono::DateTime::from_timestamp(0, 0).unwrap();
         orchestrator.state.sessions[0].last_activity_at = epoch;
@@ -2927,7 +2929,7 @@ mod tests {
         );
         assert_eq!(orchestrator.snapshot(), baseline);
         let epoch = baseline.sessions[0].last_activity_at;
-        let workspace_id = uuid::Uuid::new_v4();
+        let workspace_id = observation.workspace_id;
         let runtime_id = Some(uuid::Uuid::new_v4());
         let cwd = Some(PathBuf::from("observed-directory"));
         orchestrator.ensure_panel_session(
@@ -2952,6 +2954,39 @@ mod tests {
             "Renamed terminal",
         );
         assert_eq!(orchestrator.snapshot(), changed);
+    }
+
+    #[test]
+    fn reused_panel_uuid_in_another_workspace_creates_an_independent_session_record() {
+        let (mut orchestrator, observation, _) = activity_fixture(false);
+        let original = orchestrator.snapshot().sessions[0].clone();
+        let foreign_workspace = uuid::Uuid::new_v4();
+        let foreign_runtime = Some(uuid::Uuid::new_v4());
+        let id = orchestrator.ensure_panel_session(
+            foreign_workspace,
+            None,
+            observation.panel_id,
+            foreign_runtime,
+            "foreign terminal",
+        );
+        assert_ne!(id, original.session_id);
+        let snapshot = orchestrator.snapshot();
+        assert_eq!(snapshot.sessions.len(), 2);
+        assert_eq!(snapshot.sessions[0], original);
+        assert_eq!(snapshot.sessions[1].workspace_id, foreign_workspace);
+        assert_eq!(snapshot.sessions[1].runtime_session_id, foreign_runtime);
+        assert!(snapshot.sessions[1].task_id.is_none());
+        assert_eq!(
+            orchestrator.ensure_panel_session(
+                foreign_workspace,
+                None,
+                observation.panel_id,
+                foreign_runtime,
+                "foreign terminal",
+            ),
+            id
+        );
+        assert_eq!(orchestrator.snapshot(), snapshot);
     }
 
     #[test]

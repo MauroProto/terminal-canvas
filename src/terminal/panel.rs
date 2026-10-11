@@ -3683,6 +3683,32 @@ impl TerminalPanel {
     }
 
     #[cfg(test)]
+    pub(crate) fn split_focused_with_fixture_alias_ack(
+        &mut self,
+        axis: crate::terminal::split_tree::Axis,
+        manager: Arc<Mutex<PtyManager>>,
+        cwd: Option<&Path>,
+        workspace: Uuid,
+        cols: u16,
+        rows: u16,
+    ) -> bool {
+        self.pending_hook_mutation = Some(PendingHookMutation {
+            snapshot: self.hook_mutation_snapshot(workspace),
+            fence: self.fixture_alias_fence(workspace),
+            kind: HookMutationKind::Split {
+                axis,
+                manager,
+                cwd: cwd.map(Path::to_path_buf),
+                workspace,
+                cols,
+                rows,
+            },
+        });
+        self.poll_pending_hook_mutation();
+        self.hook_mutation_error.is_none()
+    }
+
+    #[cfg(test)]
     fn close_focused_leaf_with_fixture_alias_ack(&mut self) -> bool {
         let workspace = self.workspace_id.unwrap();
         self.pending_hook_mutation = Some(PendingHookMutation {
