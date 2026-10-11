@@ -10,9 +10,10 @@ use std::path::{Path, PathBuf};
 
 use uuid::Uuid;
 
-/// Tope por panel. El scrollback se recorta desde el principio (se conservan
+/// Hasta 4 MiB por hoja, para conservar el historial de 10.000 líneas por
+/// defecto también después de un checkpoint. Se recorta desde el principio (se conservan
 /// las últimas líneas, que son las que el usuario quiere ver).
-pub const MAX_PERSISTED_BYTES: usize = 256 * 1024;
+pub const MAX_PERSISTED_BYTES: usize = 4 * 1024 * 1024;
 const CHECKPOINT_MAGIC: &[u8] = b"TC-SCROLLBACK\x00\x02";
 const SNAPSHOT_MAGIC: &[u8] = b"TC-SCROLLBACK\x00\x03";
 /// Semantic snapshots include full rows and terminal state. Bound their size
@@ -517,12 +518,12 @@ mod tests {
     }
 
     #[test]
-    fn semantic_checkpoint_preserves_cursor_bytes_and_exceeds_text_budget_safely() {
+    fn semantic_checkpoint_preserves_cursor_bytes_at_the_size_boundary() {
         let dir = temp_dir("raw-snapshot");
         let panel = Uuid::new_v4();
         let snapshot = format!(
             "\x1bc{}\r\n\x1b[1;2H\x1b[?1049h",
-            "x".repeat(MAX_PERSISTED_BYTES + 20)
+            "x".repeat(super::MAX_SNAPSHOT_CHECKPOINT_BYTES - 64)
         );
         super::save_leaf_snapshot_versioned(&dir, panel, None, 7, &snapshot).unwrap();
         let (generation, loaded) =
@@ -542,6 +543,29 @@ mod tests {
                 .0,
             Some(7)
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn versioned_checkpoint_keeps_large_default_history_through_reopen() {
+        let dir = temp_dir("large-retained-history");
+        let panel = Uuid::new_v4();
+        let leaf = Uuid::new_v4();
+        let row = "x".repeat(79) + "\n";
+        let text = format!("START_OF_HISTORY\n{}END_OF_HISTORY\n", row.repeat(6600));
+        assert!(text.len() > 512 * 1024);
+        assert!(text.len() < MAX_PERSISTED_BYTES);
+        super::save_leaf_scrollback_versioned(&dir, panel, Some(leaf), 13, &text).unwrap();
+        let (generation, loaded) =
+            super::try_load_leaf_scrollback_checkpoint(&dir, panel, Some(leaf))
+                .unwrap()
+                .unwrap();
+        assert_eq!(generation, Some(13));
+        assert_eq!(loaded, text);
+        let history = super::try_load_leaf_session(&dir, panel, Some(leaf)).unwrap();
+        assert_eq!(history.generation, 13);
+        assert_eq!(history.checkpoint, super::replay_body(&text));
+        assert!(history.frames.is_empty());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
