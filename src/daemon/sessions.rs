@@ -21,6 +21,15 @@ use crate::runtime::{
 };
 use crate::terminal::pty::PtyHandle;
 
+// Snapshot bytes, sequence, liveness, output readiness and bound host identity.
+type ExistingSnapshot = (
+    Vec<u8>,
+    u64,
+    bool,
+    bool,
+    crate::hook_authority::HostEvidence,
+);
+
 /// Datos para abrir conexiones nuevas al daemon.
 #[derive(Debug, Clone)]
 pub struct DaemonEndpoint {
@@ -97,15 +106,7 @@ fn existing_snapshot(
     writer: &mut impl Write,
     reader: &mut impl BufRead,
     id: Uuid,
-) -> anyhow::Result<
-    Option<(
-        Vec<u8>,
-        u64,
-        bool,
-        bool,
-        crate::hook_authority::HostEvidence,
-    )>,
-> {
+) -> anyhow::Result<Option<ExistingSnapshot>> {
     let result = (|| -> anyhow::Result<_> {
         match request(writer, reader, &Request::Attach { id })? {
             Response::Attached {
