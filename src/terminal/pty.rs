@@ -296,6 +296,9 @@ pub enum RecoverySnapshot<R> {
     Unavailable,
 }
 
+/// Raw output plus alternate-screen state and an optional primary snapshot.
+pub type PtyOutputUpdate = (Vec<u8>, bool, Option<String>);
+
 impl PtyHandle {
     /// Runs the production read/retention and child-wait boundaries with injected
     /// endpoints. It creates no OS child, socket, PTY or graphical surface.
@@ -1595,6 +1598,7 @@ impl PtyHandle {
     pub(crate) fn hook_local_owner(&self) -> Option<Uuid> {
         self.hook_local_owner
     }
+    #[cfg(all(unix, feature = "daemon"))]
     pub(crate) fn set_hook_host_evidence(&mut self, evidence: crate::hook_authority::HostEvidence) {
         self.hook_evidence = evidence;
     }
@@ -1749,7 +1753,7 @@ impl PtyHandle {
         max_bytes: usize,
         was_alternate: bool,
         export: impl FnOnce(&mut Term<EventProxy>) -> Result<String, E>,
-    ) -> Result<Option<(Vec<u8>, bool, Option<String>)>, E> {
+    ) -> Result<Option<PtyOutputUpdate>, E> {
         if self.retirement_log_owned.load(Ordering::Acquire)
             || self.restoring_history.load(Ordering::Acquire)
             || self.history_restore_failed.load(Ordering::Acquire)

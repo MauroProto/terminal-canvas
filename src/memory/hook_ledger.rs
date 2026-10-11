@@ -104,8 +104,10 @@ pub(super) fn migrate_v3(tx: &Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
+type StoredClaimRow = (i64, Option<String>, String, Option<String>, String, bool);
+
 pub(super) fn load_claim(tx: &Transaction<'_>, key: LeafKey) -> Result<Option<Claim>> {
-    let raw: Option<(i64, Option<String>, String, Option<String>, String, bool)> = tx.query_row(
+    let raw: Option<StoredClaimRow> = tx.query_row(
         "SELECT epoch,owner_id,runtime_id,generation,phase,require_binding FROM tc_hook_leaf_authority
          WHERE workspace_id=?1 AND panel_id=?2 AND leaf_id=?3",
         params![key.workspace.to_string(), key.panel.to_string(), key.leaf.to_string()],

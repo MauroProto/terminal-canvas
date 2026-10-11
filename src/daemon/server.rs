@@ -19,6 +19,8 @@ use super::protocol::{
 use crate::runtime::{RuntimeScheduler, SharedPtyHandle};
 use crate::terminal::pty::{HookIdentity, PtyHandle};
 
+type AttachBoundary = (Vec<u8>, Vec<(u64, Vec<u8>)>);
+
 /// Cuánto espera el daemon sin ninguna app conectada antes de apagarse si
 /// además no le quedan sesiones (adoption timeout).
 pub const ADOPTION_TIMEOUT: Duration = Duration::from_secs(120);
@@ -265,7 +267,7 @@ impl DaemonSession {
         id: Uuid,
         line_limit: usize,
         now: Instant,
-    ) -> Result<(Vec<u8>, Vec<(u64, Vec<u8>)>), SnapshotFailureKind> {
+    ) -> Result<AttachBoundary, SnapshotFailureKind> {
         if let Some(repair) = self.live_repair.filter(|_| !self.repair_retry_due(now)) {
             return Err(repair.kind);
         }

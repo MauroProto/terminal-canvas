@@ -513,7 +513,7 @@ impl Drop for RemoteQueue {
 
 fn remote_worker(shared: SharedRemoteQueue, spawn: AsyncRemoteSpawner, close: RemoteCloser) {
     enum Work {
-        Attach(RemoteJob),
+        Attach(Box<RemoteJob>),
         Close(Arc<RemoteLease>),
     }
     let mut prefer_attach = false;
@@ -546,7 +546,7 @@ fn remote_worker(shared: SharedRemoteQueue, spawn: AsyncRemoteSpawner, close: Re
                         .ready_bytes
                         .saturating_sub(remote_spec_bytes(&job.spec).unwrap_or(0));
                     prefer_attach = false;
-                    break Work::Attach(job);
+                    break Work::Attach(Box::new(job));
                 }
                 if let Some(lease) = closing {
                     prefer_attach = true;
@@ -613,7 +613,7 @@ fn remote_worker(shared: SharedRemoteQueue, spawn: AsyncRemoteSpawner, close: Re
                         std::time::Instant::now() + REMOTE_CLOSE_RETRY;
                 }
             }
-            Work::Attach(job) => perform_remote_job(job, &spawn),
+            Work::Attach(job) => perform_remote_job(*job, &spawn),
         }
     }
 }
