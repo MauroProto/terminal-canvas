@@ -1490,6 +1490,32 @@ mod tests {
     }
 
     #[test]
+    fn failed_pty_creation_returns_the_original_error_without_registering() {
+        let mut state = DaemonState::new();
+        let desired = Uuid::new_v4();
+        let failure = std::io::Error::new(std::io::ErrorKind::NotFound, "injected missing shell");
+        let result = state.spawn_with_pty_in_history_dir_using(
+            WireSpec::default(),
+            Some(desired),
+            None,
+            |id, spec, history| {
+                assert_eq!(id, desired);
+                assert_eq!(spec, &WireSpec::default());
+                assert!(history.checkpoint.is_empty());
+                assert!(history.frames.is_empty());
+                Err(anyhow::Error::new(failure))
+            },
+        );
+        let error = result.unwrap_err();
+        let original = error.downcast_ref::<std::io::Error>().unwrap();
+        assert_eq!(original.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(original.to_string(), "injected missing shell");
+        assert!(state.session_ids().is_empty());
+        assert!(state.session_claimants.is_empty());
+        assert_eq!(state.subscriber_count(), 0);
+    }
+
+    #[test]
     fn spawning_registers_the_session() {
         let mut state = DaemonState::new();
         let id = spawn_one(&mut state);
