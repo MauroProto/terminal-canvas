@@ -4169,4 +4169,47 @@ mod workspace_close_focus_tests {
             .any(|panel| panel.id == panel_id.to_string() && panel.focused));
         assert_no_runtime_sessions(&app);
     }
+
+    #[test]
+    fn confirming_close_before_active_workspace_keeps_its_terminal_focus() {
+        let ctx = egui::Context::default();
+        let (mut app, panel_id) = focused_app(&ctx);
+        let active_id = app.ws().id;
+        let background = Workspace::new("Background to close", None);
+        let background_id = background.id;
+        app.workspaces.insert(0, background);
+        app.active_ws = 1;
+        assert!(!app.persistence_writes_enabled);
+        assert_no_runtime_sessions(&app);
+
+        press_canvas(&mut app, &ctx, pos2(180.0, 80.0));
+        assert_eq!(
+            app.ws().focused_panel().map(|panel| panel.id()),
+            Some(panel_id)
+        );
+        app.handle_sidebar_responses(
+            vec![SidebarResponse::RequestCloseWorkspace(background_id)],
+            &ctx,
+            canvas_rect(),
+        );
+        // Apply the existing confirmation branch, without simulating a modal button.
+        let confirmed = app.closing_workspace.take().expect("pending close");
+        app.close_workspace_confirmed(confirmed);
+
+        assert_eq!(app.closing_workspace, None);
+        assert_eq!(app.active_ws, 0);
+        assert_eq!(app.workspaces.len(), 1);
+        assert_eq!(app.ws().id, active_id);
+        assert_eq!(
+            app.ws().focused_panel().map(|panel| panel.id()),
+            Some(panel_id)
+        );
+        let saved = app.snapshot_state();
+        assert_eq!(saved.workspaces[saved.active_ws].id, active_id.to_string());
+        assert!(saved.workspaces[saved.active_ws]
+            .panels
+            .iter()
+            .any(|panel| panel.id == panel_id.to_string() && panel.focused));
+        assert_no_runtime_sessions(&app);
+    }
 }
