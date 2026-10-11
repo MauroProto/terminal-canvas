@@ -153,66 +153,57 @@ fn read_session_title(path: &Path) -> Option<String> {
 
 /// Título de una conversación a partir de sus registros JSONL.
 ///
-/// Se prefiere el `ai-title` que genera el propio agente; si no hay, cae a la
-/// primera consigna del usuario. Sólo se parsea la línea si antes pasó un
-/// chequeo de subcadena, porque parsear JSON de un archivo de megabytes línea
-/// por línea sería mucho más caro que buscar un literal.
+/// Se prefiere el título del agente y luego la primera consigna. El filtro
+/// barato descarta otros tipos antes de parsear JSON; serde conserva Unicode,
+/// escapes, espacios alrededor de los separadores y bloques de texto.
 pub fn session_title_from_lines<I>(lines: I) -> Option<String>
 where
     I: IntoIterator<Item = String>,
 {
-    let mut first_prompt: Option<String> = None;
+    let mut first_prompt = None;
     for line in lines {
-        if line.contains("\"ai-title\"") {
-            if let Some(title) = json_string_field(&line, "aiTitle") {
-                let title = clean_title(&title);
-                if !title.is_empty() {
-                    return Some(title);
-                }
-            }
+        if !line.contains("\"ai-title\"") && (first_prompt.is_some() || !line.contains("\"user\""))
+        {
+            continue;
         }
-        if first_prompt.is_none() && line.contains("\"type\":\"user\"") {
-            if let Some(text) = json_string_field(&line, "content") {
-                let text = clean_title(&text);
-                if !text.is_empty() {
-                    first_prompt = Some(text);
+        let Ok(record) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        match record.get("type").and_then(serde_json::Value::as_str) {
+            Some("ai-title") => {
+                if let Some(title) = record.get("aiTitle").and_then(serde_json::Value::as_str) {
+                    let title = clean_title(title);
+                    if !title.is_empty() {
+                        return Some(title);
+                    }
                 }
             }
+            Some("user") if first_prompt.is_none() => {
+                let content = record
+                    .get("message")
+                    .and_then(|message| message.get("content"))
+                    .or_else(|| record.get("content"));
+                let text = match content {
+                    Some(serde_json::Value::String(text)) => text.clone(),
+                    Some(serde_json::Value::Array(blocks)) => blocks
+                        .iter()
+                        .filter(|block| {
+                            block.get("type").and_then(serde_json::Value::as_str) == Some("text")
+                        })
+                        .filter_map(|block| block.get("text").and_then(serde_json::Value::as_str))
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    _ => continue,
+                };
+                let title = clean_title(&text);
+                if !title.is_empty() {
+                    first_prompt = Some(title);
+                }
+            }
+            _ => {}
         }
     }
     first_prompt
-}
-
-/// Extrae `"<field>":"<valor>"` de una línea JSON sin construir el documento
-/// entero. Devuelve `None` si el campo no está o el valor no es una cadena.
-fn json_string_field(line: &str, field: &str) -> Option<String> {
-    let needle = format!("\"{field}\":");
-    let start = line.find(&needle)? + needle.len();
-    let rest = line[start..].trim_start();
-    let mut chars = rest.char_indices();
-    if chars.next()?.1 != '"' {
-        return None;
-    }
-    let mut value = String::new();
-    let mut escaped = false;
-    for (_, ch) in chars {
-        if escaped {
-            // Sólo los escapes que aparecen en texto plano; el resto se copia.
-            value.push(match ch {
-                'n' => '\n',
-                't' => '\t',
-                other => other,
-            });
-            escaped = false;
-            continue;
-        }
-        match ch {
-            '\\' => escaped = true,
-            '"' => return Some(value),
-            other => value.push(other),
-        }
-    }
-    None
 }
 
 /// Deja el título en una línea y acotado, para que entre en una lista.
@@ -230,10 +221,7 @@ fn clean_title(raw: &str) -> String {
 mod tests {
     use std::path::Path;
 
-    use super::{
-        clean_title, json_string_field, sanitize_session_id, session_title_from_lines,
-        slug_variants,
-    };
+    use super::{clean_title, sanitize_session_id, session_title_from_lines, slug_variants};
 
     #[test]
     fn slug_replaces_separators_with_dashes() {
@@ -342,22 +330,39 @@ mod tests {
     }
 
     #[test]
-    fn field_extraction_handles_escaped_quotes() {
-        let line = r#"{"aiTitle":"dijo \"hola\" y se fue"}"#;
+    fn json_titles_preserve_unicode_and_escaped_quotes_with_spaced_separators() {
+        let line =
+            r#"{ "type" : "ai-title", "aiTitle" : "\u00f1and\u00fa \"hola\" \ud83d\ude80" }"#;
         assert_eq!(
-            json_string_field(line, "aiTitle").as_deref(),
-            Some("dijo \"hola\" y se fue")
+            session_title_from_lines([line.to_owned()]).as_deref(),
+            Some("ñandú \"hola\" 🚀")
         );
     }
 
     #[test]
-    fn field_extraction_returns_none_for_a_missing_field() {
-        assert_eq!(json_string_field(r#"{"otro":"x"}"#, "aiTitle"), None);
+    fn structured_user_messages_skip_images_and_keep_text_blocks() {
+        let lines = [
+            r#"{"type":"assistant","message":{"content":"user"},"aiTitle":"ai-title"}"#.to_owned(),
+            r#"{ "type" : "user", "content": "metadata decoy", "message": { "content": [{"type":"image","text":"private metadata"},{"type":"text","text":"Primer\nmensaje"},{"type":"text","text":"con Unicode: \u00e1"}] } }"#.to_owned(),
+        ];
+        assert_eq!(
+            session_title_from_lines(lines).as_deref(),
+            Some("Primer mensaje con Unicode: á")
+        );
     }
 
     #[test]
-    fn field_extraction_returns_none_when_the_value_is_not_a_string() {
-        assert_eq!(json_string_field(r#"{"aiTitle":42}"#, "aiTitle"), None);
+    fn malformed_titles_and_non_string_content_do_not_replace_a_valid_prompt() {
+        let lines = [
+            r#"{"type":"user","message":{"content":42}}"#.to_owned(),
+            r#"{"type":"user","message":{"content":"Conservar este título"}}"#.to_owned(),
+            r#"{"type":"ai-title","aiTitle":42}"#.to_owned(),
+            r#"{"type":"ai-title","aiTitle":"malformed""#.to_owned(),
+        ];
+        assert_eq!(
+            session_title_from_lines(lines).as_deref(),
+            Some("Conservar este título")
+        );
     }
 
     #[test]
