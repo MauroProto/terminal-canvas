@@ -77,6 +77,11 @@ require the existing platform CI and the additional evidence below.
 
 ## Subsequent work and required evidence
 
+Cross-provider messaging and context continuity are a product priority. The
+selected-excerpt feature and the implementation boundaries for durable linked
+conversations are described in
+[PROVIDER-CONTINUITY.md](PROVIDER-CONTINUITY.md).
+
 1. Integrate and verify the existing typed configuration-recovery proposal,
    preserving its origin and reviewed behavior. Keep the existing diagnostic
    collection report and explicit layout-save acknowledgement behavior.
