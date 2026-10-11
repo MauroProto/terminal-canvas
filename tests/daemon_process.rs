@@ -785,24 +785,25 @@ fn several_real_ptys_finish_parallel_output_bursts() {
 
                 let deadline = Instant::now() + Duration::from_secs(30);
                 let mut output = Vec::new();
+                let mut completed_markers = 0;
                 while Instant::now() < deadline {
                     match daemon_response::read_before(&mut reader, deadline).unwrap_or_else(|error| {
                         panic!(
                             "session {index}: {error}; bytes={}, markers={}, payload={}, head={:?}, tail={:?}",
                             output.len(),
-                            output.windows(marker.len()).filter(|window| *window == marker.as_bytes()).count(),
+                            completed_markers,
                             daemon_response::longest_printed_run(&output, 'x'),
                             String::from_utf8_lossy(&output[..output.len().min(128)]),
                             String::from_utf8_lossy(&output[output.len().saturating_sub(128)..]),
                         )
                     }) {
                         Response::Output { id: got, data, .. } if got == id => {
+                            let previous_len = output.len();
                             output.extend_from_slice(&data);
-                            if output
-                                .windows(marker.len())
-                                .filter(|window| *window == marker.as_bytes())
-                                .count()
-                                >= 2
+                            completed_markers += daemon_response::newly_completed_matches(
+                                &output, previous_len, marker.as_bytes(),
+                            );
+                            if completed_markers >= 2
                                 && output.len() >= OUTPUT_BYTES
                                 && daemon_response::longest_printed_run(&output, 'x') >= OUTPUT_BYTES
                             {
@@ -813,11 +814,7 @@ fn several_real_ptys_finish_parallel_output_bursts() {
                     }
                 }
                 assert!(
-                    output
-                        .windows(marker.len())
-                        .filter(|window| *window == marker.as_bytes())
-                        .count()
-                        >= 2,
+                    completed_markers >= 2,
                     "la sesión {index} no terminó su burst ({} bytes)",
                     output.len()
                 );

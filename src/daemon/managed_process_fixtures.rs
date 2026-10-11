@@ -272,24 +272,30 @@ fn real_managed_birth_transfer_and_close_confirm_native_wait_eof_and_durable_out
     let deadline = Instant::now() + Duration::from_secs(20);
     let end = format!("{marker}:END");
     let mut output = Vec::new();
+    let mut completed_markers = 0;
     loop {
         if let Response::Output {
             id: actual, data, ..
         } = first.next()
         {
             assert_eq!(actual, id);
+            let previous_len = output.len();
             output.extend_from_slice(&data);
+            let start = previous_len.saturating_sub(end.len() - 1);
+            completed_markers += output[start..]
+                .windows(end.len())
+                .filter(|window| *window == end.as_bytes())
+                .count();
         }
         assert!(
             output.len() < 2 * 1024 * 1024,
             "fixture output remains bounded"
         );
-        if output
-            .windows(end.len())
-            .filter(|s| *s == end.as_bytes())
-            .count()
-            == 2
-        {
+        assert!(
+            completed_markers <= 2,
+            "unexpected duplicate terminal marker"
+        );
+        if completed_markers == 2 {
             break;
         }
         assert!(Instant::now() < deadline, "managed payload did not finish");

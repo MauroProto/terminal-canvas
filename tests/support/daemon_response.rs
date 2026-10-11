@@ -92,6 +92,18 @@ pub fn read_before(reader: &mut BufReader<UnixStream>, deadline: Instant) -> io:
     }
 }
 
+/// Count only markers completed by the new suffix, including split markers.
+/// Previously completed windows cannot be counted again, even for overlap.
+pub fn newly_completed_matches(bytes: &[u8], previous_len: usize, marker: &[u8]) -> usize {
+    assert!(!marker.is_empty());
+    assert!(previous_len <= bytes.len());
+    let start = previous_len.saturating_sub(marker.len() - 1);
+    bytes[start..]
+        .windows(marker.len())
+        .filter(|window| *window == marker)
+        .count()
+}
+
 /// Measure real printed payload, excluding OSC title/cwd/status frames that
 /// the daemon may insert between PTY chunks. Metadata cannot supply bytes.
 pub fn longest_printed_run(bytes: &[u8], needle: char) -> usize {
@@ -130,6 +142,33 @@ mod tests {
     use super::*;
     use mi_terminal::daemon::protocol::encode_line;
     use std::io::Write;
+
+    #[test]
+    fn streamed_markers_survive_every_split_without_recounting_old_matches() {
+        let bytes = b"echo marker-EN_D payload marker-END more marker-END marker-EN";
+        for chunk_size in 1..=bytes.len() {
+            let mut output = Vec::new();
+            let mut matches = 0;
+            for chunk in bytes.chunks(chunk_size) {
+                let previous_len = output.len();
+                output.extend_from_slice(chunk);
+                matches += newly_completed_matches(&output, previous_len, b"marker-END");
+            }
+            assert_eq!(matches, 2, "chunk size {chunk_size}");
+            assert_eq!(
+                newly_completed_matches(&output, output.len(), b"marker-END"),
+                0
+            );
+        }
+        let mut output = Vec::new();
+        let mut overlapping = 0;
+        for byte in b"aaaa" {
+            let previous_len = output.len();
+            output.push(*byte);
+            overlapping += newly_completed_matches(&output, previous_len, b"aa");
+        }
+        assert_eq!(overlapping, 3);
+    }
 
     #[test]
     fn osc_metadata_neither_breaks_nor_supplies_payload_bytes() {
