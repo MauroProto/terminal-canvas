@@ -439,7 +439,7 @@ mod resume_identity_tests {
     use egui::{pos2, vec2, Color32};
     use uuid::Uuid;
 
-    use super::{replace_and_remember_resume_session, ResumePlan};
+    use super::{replace_and_remember_resume_session, resume_plan_for_provider, ResumePlan};
     use crate::orchestration::AgentProvider;
     use crate::panel::CanvasPanel;
     use crate::runtime::PtyManager;
@@ -573,5 +573,58 @@ mod resume_identity_tests {
         let guard = manager.lock().expect("original detached manager");
         assert_eq!(guard.attached_session_count(), 0);
         assert_eq!(guard.detached_session_count(), 2);
+    }
+
+    #[test]
+    fn hook_identity_is_kept_only_by_a_valid_exact_resume_plan() {
+        for (provider, launch, expected) in [
+            (
+                AgentProvider::ClaudeCode,
+                "claude --model sonnet",
+                "claude --model sonnet --resume known-42",
+            ),
+            (
+                AgentProvider::CodexCli,
+                "codex --config x",
+                "codex --config x resume known-42",
+            ),
+            (
+                AgentProvider::GeminiCli,
+                "gemini --model pro",
+                "gemini --model pro --resume known-42",
+            ),
+            (
+                AgentProvider::OpenCode,
+                "opencode",
+                "opencode --session known-42",
+            ),
+            (
+                AgentProvider::Copilot,
+                "copilot",
+                "copilot --resume known-42",
+            ),
+        ] {
+            let plan = resume_plan_for_provider(provider, launch, Some("known-42"))
+                .expect("provider supports exact resume");
+            assert_eq!(plan.command, expected);
+            assert_eq!(plan.exact_session_id.as_deref(), Some("known-42"));
+        }
+        for invalid in ["", "-flag", "id with spaces", "id\nnext", "id;next"] {
+            assert!(ResumePlan::exact(AgentProvider::ClaudeCode, "claude", invalid).is_none());
+            let fallback =
+                resume_plan_for_provider(AgentProvider::ClaudeCode, "claude", Some(invalid))
+                    .expect("latest fallback");
+            assert_eq!(fallback.command, "claude --continue");
+            assert_eq!(fallback.exact_session_id, None);
+        }
+        assert!(
+            resume_plan_for_provider(AgentProvider::Aider, "aider", Some("known-42")).is_none()
+        );
+        let gemini_latest =
+            resume_plan_for_provider(AgentProvider::GeminiCli, "gemini", Some("latest"))
+                .expect("Gemini latest fallback");
+        assert_eq!(gemini_latest.command, "gemini --resume latest");
+        assert_eq!(gemini_latest.exact_session_id, None);
+        assert!(ResumePlan::exact(AgentProvider::GeminiCli, "gemini", "latest").is_none());
     }
 }
