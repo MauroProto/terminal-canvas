@@ -3728,3 +3728,16 @@ fn windows_file_drop_preserves_special_paths_as_data_without_attaching_a_termina
         );
     }
 }
+
+#[cfg(windows)]
+#[test]
+fn windows_file_drop_copies_multiple_paths_in_order_without_shell_quotes() {
+    let ctx = egui::Context::default();
+    let mut app = detached_test_app_with_panel(&ctx);
+    app.viewport = Viewport::default();
+    let paths = [r"C:\drop\first space.txt", r"C:\drop\second&file.txt"];
+    let (hit, copied) = file_drop_output(&mut app, &ctx, &paths, pos2(50.0, 50.0));
+    assert_eq!(hit, Some(0));
+    assert_eq!(copied, vec![paths.join("\n")]);
+    assert!(app.ws().all_runtime_session_ids().is_empty());
+}
