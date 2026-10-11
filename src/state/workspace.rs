@@ -1163,3 +1163,22 @@ mod tests {
         path
     }
 }
+
+#[cfg(test)]
+mod desktop_split_recovery_tests {
+    use super::Workspace;
+    use crate::canvas::config::{DEFAULT_DESKTOP_SPLIT, DESKTOP_SPLIT_MAX, DESKTOP_SPLIT_MIN};
+    use crate::state::WorkspaceState;
+
+    #[test]
+    fn workspace_json_round_trip_preserves_both_custom_dividers() {
+        let mut original = Workspace::new("Custom desktop", None);
+        original.split_x = 0.65;
+        original.split_y = 0.37;
+        let json = serde_json::to_vec(&original.to_saved()).unwrap();
+        let state: WorkspaceState = serde_json::from_slice(&json).unwrap();
+        let restored = Workspace::from_saved(state, &egui::Context::default());
+        assert_eq!(restored.split_x, original.split_x);
+        assert_eq!(restored.split_y, original.split_y);
+    }
+}
