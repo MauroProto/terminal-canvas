@@ -3765,6 +3765,10 @@ fn rename_dialog_input_for_test(key: egui::Key) -> egui::Event {
     }
 }
 
+fn rename_dialog_pending_focus_for_test(ctx: &egui::Context) -> Option<uuid::Uuid> {
+    ctx.data(|data| data.get_temp(egui::Id::new(super::dialogs::RENAME_FOCUS_PENDING_ID)))
+}
+
 fn rename_dialog_frame_for_test(
     ctx: &egui::Context,
     app: &mut super::TerminalApp,
@@ -3807,16 +3811,20 @@ fn rename_shortcut_focuses_title_before_the_next_text_event() {
         vec![rename_dialog_input_for_test(egui::Key::F2)],
     );
     assert_eq!(app.renaming_panel, Some(panel_id));
-    assert_eq!(
-        ctx.memory(|memory| memory.focused()),
-        Some(egui::Id::new(super::dialogs::RENAME_TITLE_ID))
-    );
+    assert_eq!(rename_dialog_pending_focus_for_test(&ctx), Some(panel_id));
+    assert!(ctx.memory(|memory| memory.focused()).is_none());
     assert!(!app.terminal_input_is_routable());
 
     rename_dialog_frame_for_test(
         &ctx,
         &mut app,
         vec![egui::Event::Text(" nombre".to_owned())],
+    );
+    // Deliver the first text directly in the next, interactive frame.
+    assert_eq!(rename_dialog_pending_focus_for_test(&ctx), None);
+    assert_eq!(
+        ctx.memory(|memory| memory.focused()),
+        Some(egui::Id::new(super::dialogs::RENAME_TITLE_ID))
     );
     assert!(app.rename_buf.ends_with(" nombre"));
     assert_eq!(app.ws().panels[0].title(), original);
