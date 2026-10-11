@@ -3882,6 +3882,11 @@ fn rename_from_palette_uses_one_enter_to_open_and_a_later_enter_to_save() {
     assert_eq!(app.renaming_panel, Some(panel_id));
     assert_eq!(app.ws().panels[0].title(), original);
     assert!(!ctx.input(|input| input.key_pressed(egui::Key::Enter)));
+    assert_eq!(rename_dialog_pending_focus_for_test(&ctx), Some(panel_id));
+    assert!(ctx.memory(|memory| memory.focused()).is_none());
+    // Follow the repaint scheduled by the real Area sizing pass.
+    rename_dialog_frame_for_test(&ctx, &mut app, Vec::new());
+    assert_eq!(rename_dialog_pending_focus_for_test(&ctx), None);
     assert_eq!(
         ctx.memory(|memory| memory.focused()),
         Some(egui::Id::new(super::dialogs::RENAME_TITLE_ID))
@@ -3894,6 +3899,7 @@ fn rename_from_palette_uses_one_enter_to_open_and_a_later_enter_to_save() {
         vec![rename_dialog_input_for_test(egui::Key::Enter)],
     );
     assert!(app.renaming_panel.is_none());
+    assert_eq!(rename_dialog_pending_focus_for_test(&ctx), None);
     assert_eq!(app.ws().panels[0].title(), "confirmed later");
     assert!(app.terminal_input_is_routable());
     assert!(app.ws().panels[0].runtime_session_id().is_none());
