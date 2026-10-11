@@ -11,6 +11,14 @@ use crate::memory::model::{
 use crate::memory::store::MemoryStore;
 use crate::memory::test_support::{clone_repo, init_git_repo, make_worktree, temp_dir};
 
+// These are current-writer fixture mutations. Legacy-writer denial remains
+// covered separately in hook_fixtures with an unconfigured old connection.
+fn fixture_connection(path: impl AsRef<std::path::Path>) -> anyhow::Result<rusqlite::Connection> {
+    let conn = rusqlite::Connection::open(path)?;
+    super::store::configure(&conn)?;
+    Ok(conn)
+}
+
 fn store_in(root: &std::path::Path) -> MemoryStore {
     MemoryStore::open(root.join("memory.db")).expect("store")
 }
@@ -25,7 +33,7 @@ fn search_and_context_bound_large_visible_histories() {
         .remember(RememberRequest::human(repo.clone(), "seed", "small"))
         .unwrap();
     let scope = seed.memory().scope_id.clone();
-    let mut conn = rusqlite::Connection::open(store.path()).unwrap();
+    let mut conn = fixture_connection(store.path()).unwrap();
     let tx = conn.transaction().unwrap();
     for index in 0..120 {
         tx.execute(
@@ -160,7 +168,7 @@ fn schema_v1_task_binding_keeps_history_after_upgrade() {
         })
         .unwrap();
     let old_orchestrator = uuid::Uuid::new_v4();
-    let conn = rusqlite::Connection::open(store.path()).unwrap();
+    let conn = fixture_connection(store.path()).unwrap();
     conn.execute(
         "UPDATE tasks SET orchestrator_task_id = ?1 WHERE id = ?2",
         rusqlite::params![old_orchestrator.to_string(), legacy.task_id],
@@ -182,13 +190,13 @@ fn schema_v1_task_binding_keeps_history_after_upgrade() {
         .latest_handoff(&repo, Some(uuid::Uuid::new_v4()))
         .unwrap()
         .is_none());
-    let version: i64 = rusqlite::Connection::open(upgraded.path())
+    let version: i64 = fixture_connection(upgraded.path())
         .unwrap()
         .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, 2);
+    assert_eq!(version, 3);
 }
 
 #[test]
@@ -217,7 +225,7 @@ fn linking_projects_with_the_same_explicit_task_preserves_both_handoffs() {
     let b = store.latest_handoff(&second, Some(task)).unwrap().unwrap();
     assert_eq!(a.task_id, b.task_id);
     assert_eq!(a.summary, "second handoff");
-    let retained: i64 = rusqlite::Connection::open(store.path())
+    let retained: i64 = fixture_connection(store.path())
         .unwrap()
         .query_row(
             "SELECT COUNT(*) FROM handoffs WHERE task_id = ?1",
@@ -448,7 +456,7 @@ fn revision_at_u32_max_fails_closed_without_mutating_the_memory() {
         .unwrap()
         .memory()
         .clone();
-    let conn = rusqlite::Connection::open(store.path()).unwrap();
+    let conn = fixture_connection(store.path()).unwrap();
     conn.execute(
         "UPDATE memories SET current_revision = ?1 WHERE id = ?2",
         rusqlite::params![u32::MAX, original.id],
@@ -638,7 +646,7 @@ fn context_resolution_persists_the_orchestrator_task_mapping() {
     let task_id = uuid::Uuid::new_v4();
 
     build_context_pack(&store, &repo, None, Some(task_id)).unwrap();
-    let conn = rusqlite::Connection::open(store.path()).unwrap();
+    let conn = fixture_connection(store.path()).unwrap();
     let stored: String = conn
         .query_row(
             "SELECT orchestrator_task_id FROM tasks WHERE orchestrator_task_id = ?1",
@@ -1027,7 +1035,7 @@ fn latest_handoff_breaks_same_second_ties_by_insertion_order() {
             ttl_secs: Some(3600),
         })
         .unwrap();
-    let conn = rusqlite::Connection::open(store.path()).unwrap();
+    let conn = fixture_connection(store.path()).unwrap();
     conn.execute("UPDATE handoffs SET created_at = 123", [])
         .unwrap();
     drop(conn);
@@ -1210,7 +1218,7 @@ fn future_memory_schema_is_refused() {
     let root = temp_dir();
     let db = root.join("memory.db");
     drop(MemoryStore::open(&db).unwrap());
-    let conn = rusqlite::Connection::open(&db).unwrap();
+    let conn = fixture_connection(&db).unwrap();
     conn.execute("INSERT INTO schema_migrations(version) VALUES (99)", [])
         .unwrap();
     drop(conn);
