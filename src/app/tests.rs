@@ -4061,3 +4061,112 @@ fn sidebar_rename_focuses_and_saves_the_inactive_workspace_owner() {
         .flat_map(|workspace| &workspace.panels)
         .all(|panel| panel.runtime_session_id().is_none()));
 }
+
+mod workspace_close_focus_tests {
+    use super::super::{FramePerfSnapshot, TerminalApp};
+    use super::detached_test_app_with_panel;
+    use crate::sidebar::SidebarResponse;
+    use crate::state::Workspace;
+    use egui::{pos2, vec2, Modifiers, RawInput, Rect};
+    use uuid::Uuid;
+
+    fn canvas_rect() -> Rect {
+        Rect::from_min_max(pos2(228.0, 0.0), pos2(1000.0, 660.0))
+    }
+
+    fn focused_app(ctx: &egui::Context) -> (TerminalApp, Uuid) {
+        let mut app = detached_test_app_with_panel(ctx);
+        let panel_id = app.ws().panels[0].id();
+        app.ws_mut().bring_to_front(panel_id);
+        (app, panel_id)
+    }
+
+    fn assert_no_runtime_sessions(app: &TerminalApp) {
+        for workspace in &app.workspaces {
+            assert!(workspace
+                .panels
+                .iter()
+                .all(|panel| panel.runtime_session_id().is_none()));
+            let manager = workspace.pty_manager();
+            let guard = manager.lock().expect("workspace manager");
+            assert_eq!(guard.attached_session_count(), 0);
+            assert_eq!(guard.detached_session_count(), 0);
+        }
+    }
+
+    fn press_canvas(app: &mut TerminalApp, ctx: &egui::Context, pos: egui::Pos2) {
+        let mut perf = FramePerfSnapshot::default();
+        ctx.run_ui(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1000.0, 700.0))),
+                focused: true,
+                events: vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: Modifiers::NONE,
+                    },
+                ],
+                ..Default::default()
+            },
+            |ui| app.show_desktop_canvas(ui, ctx, canvas_rect(), &mut perf),
+        )
+        .drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn sidebar_close_press_then_escape_keeps_active_terminal_focus() {
+        let ctx = egui::Context::default();
+        let (mut app, panel_id) = focused_app(&ctx);
+        let active_id = app.ws().id;
+        let background = Workspace::new("Background to keep", None);
+        let background_id = background.id;
+        app.workspaces.push(background);
+        assert_no_runtime_sessions(&app);
+
+        let outside = pos2(180.0, 80.0);
+        assert!(!canvas_rect().contains(outside));
+        press_canvas(&mut app, &ctx, outside);
+        assert_eq!(
+            app.ws().focused_panel().map(|panel| panel.id()),
+            Some(panel_id)
+        );
+        app.handle_sidebar_responses(
+            vec![SidebarResponse::RequestCloseWorkspace(background_id)],
+            &ctx,
+            canvas_rect(),
+        );
+        assert_eq!(app.closing_workspace, Some(background_id));
+        ctx.run_ui(
+            RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |_| app.show_close_workspace_dialog(&ctx),
+        )
+        .drop_without_applying_deltas();
+
+        assert_eq!(app.closing_workspace, None);
+        assert_eq!(app.workspaces.len(), 2);
+        assert_eq!(app.ws().id, active_id);
+        assert_eq!(
+            app.ws().focused_panel().map(|panel| panel.id()),
+            Some(panel_id)
+        );
+        let saved = app.snapshot_state();
+        assert_eq!(saved.workspaces[saved.active_ws].id, active_id.to_string());
+        assert!(saved.workspaces[saved.active_ws]
+            .panels
+            .iter()
+            .any(|panel| panel.id == panel_id.to_string() && panel.focused));
+        assert_no_runtime_sessions(&app);
+    }
+}
