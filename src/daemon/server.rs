@@ -321,6 +321,43 @@ impl DaemonState {
         desired_id: Option<Uuid>,
         history_dir: Option<&Path>,
     ) -> anyhow::Result<Uuid> {
+        self.spawn_with_pty_in_history_dir_using(
+            spec,
+            desired_id,
+            history_dir,
+            |id, spec, history| {
+                PtyHandle::spawn_with_history(
+                    spec.cwd.as_deref().map(Path::new),
+                    spec.cols.max(1),
+                    spec.rows.max(1),
+                    id,
+                    Arc::clone(scheduler),
+                    HookIdentity {
+                        memory_task_id: spec.memory_task_id,
+                        panel_id: spec.panel_id,
+                        workspace_id: spec.workspace_id,
+                        leaf_id: spec.leaf_id,
+                    },
+                    &history.checkpoint,
+                    &history.frames,
+                )
+            },
+        )
+    }
+
+    /// Register only a successfully created PTY. The per-call factory also
+    /// lets failure regressions exercise this boundary without a shell.
+    fn spawn_with_pty_in_history_dir_using(
+        &mut self,
+        spec: WireSpec,
+        desired_id: Option<Uuid>,
+        history_dir: Option<&Path>,
+        spawn_pty: impl FnOnce(
+            Uuid,
+            &WireSpec,
+            &crate::state::scrollback_store::LeafSessionHistory,
+        ) -> anyhow::Result<PtyHandle>,
+    ) -> anyhow::Result<Uuid> {
         // Validate before registering the session or opening a PTY. Starting
         // a fresh shell after a failed read would let its later autosave
         // replace history which neither the daemon nor the UI recovered.
@@ -334,46 +371,20 @@ impl DaemonState {
         };
         // Se respeta el id que propone el cliente para que el id de la app y
         // el del daemon coincidan; si ya está tomado, se genera uno nuevo.
-        let id = match desired_id.filter(|id| !self.sessions.contains_key(id)) {
-            Some(id) => {
-                self.insert_session(id, spec.clone());
-                id
-            }
-            None => self.spawn(spec.clone()),
-        };
-        let cwd = spec.cwd.as_deref().map(std::path::Path::new);
-        match PtyHandle::spawn_with_history(
-            cwd,
-            spec.cols.max(1),
-            spec.rows.max(1),
-            id,
-            Arc::clone(scheduler),
-            HookIdentity {
-                memory_task_id: spec.memory_task_id,
-                panel_id: spec.panel_id,
-                workspace_id: spec.workspace_id,
-                leaf_id: spec.leaf_id,
-            },
-            &history.checkpoint,
-            &history.frames,
-        ) {
-            Ok(handle) => {
-                if let Some(command) = spec.startup_command.as_deref().map(str::trim) {
-                    if !command.is_empty() {
-                        handle.write_all(format!("{command}\n").as_bytes());
-                    }
-                }
-                if let Some(session) = self.sessions.get_mut(&id) {
-                    session.handle = Some(Arc::new(Mutex::new(handle)));
-                }
-            }
-            Err(err) => {
-                log::warn!("no se pudo espawnear el PTY de {id}: {err}");
-                if let Some(session) = self.sessions.get_mut(&id) {
-                    session.alive = false;
-                }
+        let id = desired_id
+            .filter(|id| !self.sessions.contains_key(id))
+            .unwrap_or_else(Uuid::new_v4);
+        let handle = spawn_pty(id, &spec, &history).inspect_err(|err| {
+            log::warn!("no se pudo espawnear el PTY de {id}: {err}");
+        })?;
+        if let Some(command) = spec.startup_command.as_deref().map(str::trim) {
+            if !command.is_empty() {
+                handle.write_all(format!("{command}\n").as_bytes());
             }
         }
+        let mut session = DaemonSession::new(spec);
+        session.handle = Some(Arc::new(Mutex::new(handle)));
+        self.sessions.insert(id, session);
         Ok(id)
     }
 
