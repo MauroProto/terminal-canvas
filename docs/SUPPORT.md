@@ -38,6 +38,30 @@ No comprueba permisos de escritura ni el contenido de tus datos. Tampoco
 informa las rutas efectivas de memoria o historial definidas por overrides;
 revisá esas variables antes de preparar un respaldo.
 
+## Memoria al actualizar la aplicación
+
+La app actualiza una base de memoria de esquema 2 a 3 antes de iniciar
+terminales gestionadas. Primero guarda una copia nueva y verificada en
+`memory-backups/memory-v2-UUID.sqlite3`, junto a la base efectiva, y un
+recibo `.cutover.json`. La copia incluye las páginas de WAL; se comprueban
+la integridad y el contenido mientras SQLite mantiene bloqueado el cambio.
+Las memorias, revisiones y handoffs anteriores permanecen en la base nueva.
+Reabrir una base de esquema 3 no genera copias adicionales.
+
+Conservá la copia y el recibo si una actualización falla. El recibo se escribe
+antes del cambio y no confirma por sí solo que terminó: la versión de la base
+activa determina qué ocurrió. Un cliente viejo no puede seguir escribiendo
+en la base actualizada. Usá los helpers del mismo paquete que la app. Nunca
+reemplacés la base activa con la copia antigua: se perdería la identidad de
+sesiones registrada desde la actualización. Un esquema más nuevo o una base
+ilegible se conserva y requiere una versión compatible o resolver su lectura.
+
+Al cerrar una terminal local, el coordinador conserva su proceso y salida
+hasta verificar el cierre y guardar la cola final. Los registros de rescate
+están en `hook-retirement/UUID.mtlg`, junto a la base efectiva de memoria.
+Incluí esa carpeta al respaldar un fallo de cierre. No son memoria aprobada
+ni historial de un proveedor, y no deben compartirse sin revisar su contenido.
+
 ## Probar con un perfil aislado
 
 Para reproducir un problema sin abrir tus datos habituales, configurá

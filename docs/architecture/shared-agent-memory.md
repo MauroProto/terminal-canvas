@@ -24,6 +24,29 @@ reciben el contexto inicial cuando TerminalCanvas los lanza, pero la consulta
 dinámica requiere configuración manual hasta completar los adaptadores de la
 Fase 2. Esas piezas no deben presentarse como ya entregadas.
 
+### Identidad durable de sesiones y actualización del esquema
+
+El esquema 3 registra la identidad de cada hoja de terminal, runtime,
+generación, propietario y época de autorización. Reservar una generación
+no confirma que exista un proceso; la autorización de crear el proceso se
+consume una sola vez. La instalación comprueba la identidad real devuelta
+por el host. Los hooks retrasados, cierres de generaciones anteriores y
+publicaciones de un propietario reemplazado no pueden mutar la sesión nueva.
+
+Retirar una terminal local requiere primero guardar el prefijo pendiente,
+drenar el lector hasta EOF real, confirmar el cierre de entrada, proceso y
+master, y guardar la cola final. Un error de lectura, una espera fallida o
+la ausencia de un handle no conceden una confirmación de cierre. El daemon
+y el fallback local mantienen caminos distintos para conservar las sesiones
+remotas al desconectar una ventana.
+
+La app abre o actualiza la base al iniciar. El cambio de esquema 2 a 3 requiere
+una copia exclusiva verificada y una transacción con protección de escritores
+antiguos. La CLI genérica conserva el cambio explícito mediante el comando
+de upgrade; no hace un downgrade automático. Las copias y los recibos se
+conservan también ante un fallo parcial. Esto no agrega sincronización remota
+ni importación del historial privado de un proveedor.
+
 ### Contratos de persistencia y recuperación implementados
 
 La versión 2 del esquema migra de forma transaccional y conserva memorias,
