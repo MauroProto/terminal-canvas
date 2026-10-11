@@ -304,3 +304,13 @@ se rechaza la lista completa con un aviso visible. No se escribe una lista parci
 
 El portapapeles contiene rutas como texto, sin añadir comillas de shell. Esta
 conducta no detecta el intérprete activo ni valida un comando que se pegue luego.
+
+## Configuración que no se pudo cargar
+
+Si config.toml o sus backups no pueden leerse de forma completa y segura, la app usa ajustes de emergencia en memoria y muestra un aviso persistente de configuración sin cargar. Guardar ajustes y cerrar el onboarding no reemplazan esos archivos. Cancelar el diálogo conserva la protección; editar ajustes tampoco confirma una lectura correcta.
+
+Revisá el perfil indicado por la app y recuperá el archivo o corregí su acceso. Luego reiniciá la app para volver a leerlo. Esta versión requiere esa nueva carga al arrancar: resolver el permiso en el disco o pulsar «Reintentar guardado» no autoriza guardar ajustes de emergencia. El botón de reintento conserva su función para escrituras que ya habían sido aceptadas; no vuelve a leer configuración.
+
+El límite de un archivo de configuración completo es 4 MiB, separado del límite de layout y de los archivos incluidos en diagnostics. Solo un archivo TOML/UTF-8 leído completamente pero inválido permite probar el backup siguiente. Un error de acceso, privacidad, tipo de archivo o tamaño bloquea la carga sin aceptar un backup más viejo como prueba de que el principal era inválido. Si todos los candidatos están confirmados ausentes, el primer perfil sigue permitiendo configurar y guardar normalmente.
+
+El aviso contiene el candidato lógico y la categoría; no incluye el contenido TOML ni el token de integración. No compartas los archivos privados al pedir ayuda. Un directorio privado inválido, un enlace o un backup inseguro también puede impedir la carga aunque el principal sea válido; conservar la frontera privada exige revisar todo el ring.
