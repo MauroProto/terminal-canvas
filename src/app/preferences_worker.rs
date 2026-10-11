@@ -766,4 +766,35 @@ mod config_authority_tests {
         assert!(worker.settings_pending());
         assert!(worker.settings_write_error.is_some());
     }
+
+    #[test]
+    fn rejected_defaults_never_replace_an_already_accepted_retry_payload() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut worker = no_thread_worker(Arc::clone(&calls));
+        let known = AppConfig {
+            font_size: 23.0,
+            linear_token: Some("dummy-known-token".to_owned()),
+            ..Default::default()
+        };
+        assert!(worker
+            .save_settings_with_status(known.clone(), ConfigRuntimeStatus::Ready)
+            .is_ok());
+        let reason = worker.settings_write_error.as_ref().unwrap().reason.clone();
+        assert!(worker
+            .save_settings_with_status(AppConfig::default(), blocked())
+            .is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(worker.pending.len(), 1);
+        let Job::SaveSettings(pending) = worker.pending.front().unwrap().as_ref() else {
+            panic!("known save disappeared")
+        };
+        assert_eq!(pending, &known);
+        assert_eq!(worker.settings_write_error.as_ref().unwrap().reason, reason);
+        let Job::SaveSettings(retained) =
+            worker.settings_write_error.as_ref().unwrap().job.as_ref()
+        else {
+            panic!("known retry disappeared")
+        };
+        assert_eq!(retained, &known);
+    }
 }
