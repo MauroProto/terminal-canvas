@@ -373,14 +373,11 @@ impl TerminalApp {
         let Some(repo_root) = self.ws().cwd.clone() else {
             return;
         };
-        let spawned = std::process::Command::new("gh")
+        let mut command = std::process::Command::new("gh");
+        command
             .current_dir(&repo_root)
-            .args(["browse", &number.to_string()])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
-        if spawned.is_err() {
+            .args(["browse", &number.to_string()]);
+        if crate::utils::platform::spawn_detached("gh-browse", &mut command).is_err() {
             self.toast_error("No se pudo abrir con gh");
         }
     }
