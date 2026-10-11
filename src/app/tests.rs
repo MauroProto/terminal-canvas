@@ -3822,3 +3822,34 @@ fn rename_shortcut_focuses_title_before_the_next_text_event() {
     assert_eq!(app.ws().panels[0].title(), original);
     assert!(app.ws().panels[0].runtime_session_id().is_none());
 }
+
+#[test]
+fn rename_escape_cancels_even_with_enter_and_preserves_the_terminal_title() {
+    let ctx = egui::Context::default();
+    let mut app = detached_test_app_with_panel(&ctx);
+    let panel_id = app.ws().panels[0].id();
+    app.ws_mut().bring_to_front(panel_id);
+    let original = app.ws().panels[0].title().to_owned();
+
+    for include_enter in [false, true] {
+        rename_dialog_frame_for_test(
+            &ctx,
+            &mut app,
+            vec![rename_dialog_input_for_test(egui::Key::F2)],
+        );
+        app.rename_buf = "discarded draft".to_owned();
+        let mut events = vec![rename_dialog_input_for_test(egui::Key::Escape)];
+        if include_enter {
+            events.push(rename_dialog_input_for_test(egui::Key::Enter));
+        }
+        rename_dialog_frame_for_test(&ctx, &mut app, events);
+        assert!(app.renaming_panel.is_none());
+        assert_eq!(app.ws().panels[0].title(), original);
+        assert!(!ctx.input(|input| input.key_pressed(egui::Key::Escape)));
+        assert_ne!(
+            ctx.memory(|memory| memory.focused()),
+            Some(egui::Id::new(super::dialogs::RENAME_TITLE_ID))
+        );
+        assert!(app.terminal_input_is_routable());
+    }
+}
