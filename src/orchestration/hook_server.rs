@@ -95,6 +95,8 @@ pub struct HookQuery {
     pub panel: Option<String>,
     pub workspace: Option<String>,
     pub leaf: Option<String>,
+    pub runtime: Option<String>,
+    pub generation: Option<String>,
 }
 
 /// Construye el evento desde el payload crudo del provider. Puro y testeable:
@@ -341,9 +343,10 @@ pub fn format_design_capture(capture: &DesignCapture) -> String {
 #[derive(Clone)]
 struct HookState {
     token: String,
-    sender: Arc<Mutex<SyncSender<HookEvent>>>,
+    sender: Arc<Mutex<SyncSender<crate::hook_runtime::AcceptedHook>>>,
     design_sender: Arc<Mutex<SyncSender<DesignCapture>>>,
     design_dir: std::path::PathBuf,
+    runtime: Option<Arc<crate::hook_runtime::HookRuntime>>,
 }
 
 async fn hook_handler(
@@ -389,33 +392,82 @@ async fn hook_handler(
                 .and_then(|value| value.as_str())
         })
         .flatten();
-    // PermissionRequest/PreToolUse sólo alimentan el estado visual. No abrir
-    // SQLite ni ejecutar detección git en cada tool call si no hay trabajo de
-    // memoria en esa frontera.
-    let output = if boundary.injects_context() || boundary.records_handoff() {
-        let store = crate::memory::process_store();
-        crate::memory::respond_to_hook_scoped(
-            store.as_ref(),
-            boundary,
-            event_name,
-            event.cwd.as_deref(),
-            summary,
-            None,
-            event.workspace_id,
-        )
-    } else {
-        None
+    use crate::hook_authority::{QueryIdentity, RawHookIdentity};
+    let identity = match (RawHookIdentity {
+        workspace: query.workspace.as_deref(),
+        panel: query.panel.as_deref(),
+        leaf: query.leaf.as_deref(),
+        runtime: query.runtime.as_deref(),
+        generation: query.generation.as_deref(),
+
+        hook_generation: None,
+        hook_owner: None,
+    })
+    .classify()
+    {
+        Ok(identity) => identity,
+        Err(_) => return StatusCode::NO_CONTENT.into_response(),
     };
-    if let Ok(sender) = state.sender.lock() {
-        if let Err(err) = sender.try_send(event) {
-            match err {
-                TrySendError::Full(_) => log::warn!("cola de hooks llena; se descartó un evento"),
-                TrySendError::Disconnected(_) => {
-                    log::warn!("la UI dejó de consumir eventos de hooks")
-                }
-            }
+    let memory_boundary = boundary.injects_context() || boundary.records_handoff();
+    let output = if identity == QueryIdentity::UnscopedMemory {
+        // Global hooks outside Terminal Canvas keep their established memory
+        // semantics and never acquire a panel/UI target.
+        if memory_boundary {
+            let store = crate::memory::process_store();
+            crate::memory::respond_to_hook_scoped(
+                store.as_ref(),
+                boundary,
+                event_name,
+                event.cwd.as_deref(),
+                summary,
+                None,
+                None,
+            )
+        } else {
+            None
         }
-    }
+    } else {
+        let Some(runtime) = state.runtime.clone() else {
+            return StatusCode::NO_CONTENT.into_response();
+        };
+        let event_name = event_name.to_owned();
+        let summary = summary.map(str::to_owned);
+        let result = tokio::task::spawn_blocking(move || {
+            let ticket = runtime.admit(identity).ok()?;
+            // The real job owns the effects permit. Dropping the HTTP future
+            // cannot manufacture a cancellation ACK while this work continues.
+            let effects = ticket.begin_effects().ok()?;
+            let output = if memory_boundary {
+                crate::memory::respond_to_hook_owned(
+                    runtime.store().ok(),
+                    boundary,
+                    &event_name,
+                    event.cwd.as_deref(),
+                    summary.as_deref(),
+                    None,
+                    Some(effects.context().claim.key.workspace),
+                    effects.context(),
+                )
+            } else {
+                None
+            };
+            let key = effects.context().claim.key;
+            let mut event = event;
+            event.workspace_id = Some(key.workspace);
+            event.panel_id = Some(key.panel);
+            event.leaf_id = Some(key.leaf);
+            drop(effects);
+            Some((runtime, event, ticket, output))
+        })
+        .await;
+        let Ok(Some((runtime, event, ticket, output))) = result else {
+            return StatusCode::NO_CONTENT.into_response();
+        };
+        if let Ok(sender) = state.sender.lock() {
+            runtime.publish(event, ticket, sender.clone());
+        }
+        output
+    };
     match output {
         Some(body) => (StatusCode::OK, Json(body)).into_response(),
         None => StatusCode::NO_CONTENT.into_response(),
@@ -469,7 +521,7 @@ fn discard_capture_file(capture: &DesignCapture) {
 pub struct HookServer {
     url: String,
     token: String,
-    receiver: Receiver<HookEvent>,
+    receiver: Receiver<crate::hook_runtime::AcceptedHook>,
     design_receiver: Receiver<DesignCapture>,
     _thread: thread::JoinHandle<()>,
 }
@@ -484,8 +536,9 @@ impl HookServer {
         let url = format!("http://127.0.0.1:{port}");
         let token = Uuid::new_v4().simple().to_string();
 
-        let (sender, receiver) =
-            std::sync::mpsc::sync_channel::<HookEvent>(HOOK_EVENT_QUEUE_CAPACITY);
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<crate::hook_runtime::AcceptedHook>(
+            HOOK_EVENT_QUEUE_CAPACITY,
+        );
         let (design_sender, design_receiver) =
             std::sync::mpsc::sync_channel::<DesignCapture>(DESIGN_CAPTURE_QUEUE_CAPACITY);
         let design_dir = hooks_dir()
@@ -496,6 +549,7 @@ impl HookServer {
             sender: Arc::new(Mutex::new(sender)),
             design_sender: Arc::new(Mutex::new(design_sender)),
             design_dir,
+            runtime: crate::hook_runtime::process_runtime().cloned(),
         };
         let router = Router::new()
             .route("/hook/:provider", post(hook_handler))
@@ -558,7 +612,7 @@ impl HookServer {
     }
 
     /// Drena los eventos recibidos desde el último frame.
-    pub fn poll(&self) -> Vec<HookEvent> {
+    pub(crate) fn poll(&self) -> Vec<crate::hook_runtime::AcceptedHook> {
         let mut out = Vec::new();
         while let Ok(event) = self.receiver.try_recv() {
             out.push(event);
@@ -590,6 +644,8 @@ mod tests {
             panel: panel.map(str::to_owned),
             workspace: None,
             leaf: None,
+            runtime: None,
+            generation: None,
         }
     }
 
@@ -634,6 +690,8 @@ mod tests {
                 panel: Some(panel.to_string()),
                 workspace: None,
                 leaf: Some(leaf.to_string()),
+                runtime: None,
+                generation: None,
             },
         )
         .expect("evento válido");

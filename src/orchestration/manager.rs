@@ -5,6 +5,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::hook_authority::{Claim, ClaimPhase};
+
 use super::git::{git_repo_root, GitInspector, WorktreeCreateJob, WorktreeCreator};
 use super::matching::{
     event_matches_filters, inbox_matches_query, session_matches_query, task_matches_filters,
@@ -430,6 +432,8 @@ pub struct PanelRuntimeObservation {
     pub panel_id: Uuid,
     pub runtime_session_id: Option<Uuid>,
     pub workspace_id: Uuid,
+    /// Current focused leaf claim, refreshed by the runtime worker.
+    pub(crate) hook_claim: Option<Claim>,
     pub title: String,
     pub visible_text: String,
     pub alive: bool,
@@ -489,7 +493,10 @@ pub struct Orchestrator {
     pending_launches: HashMap<Uuid, AgentLaunchPlan>,
     /// Último estado reportado por un hook del agente, por panel (P2.12).
     /// Gana sobre OSC 9999 y sobre la heurística de texto mientras sea fresco.
-    hook_status: HashMap<Uuid, HookStatus>,
+    hook_status: HashMap<Claim, HookStatus>,
+    /// Binding belongs to a runtime birth, never just the reusable panel UUID.
+    session_hook_claims: HashMap<Uuid, Claim>,
+    session_birth_claims: HashMap<Uuid, Claim>,
     last_activity_revision: HashMap<Uuid, (Option<Uuid>, u64)>,
 }
 
@@ -540,37 +547,51 @@ impl Orchestrator {
             worktree_creator: WorktreeCreator::default(),
             pending_launches: HashMap::new(),
             hook_status: HashMap::new(),
+            session_hook_claims: HashMap::new(),
+            session_birth_claims: HashMap::new(),
             last_activity_revision: HashMap::new(),
         }
     }
 
-    /// Registra un evento de hook del agente (P2.12). El estado que implica
-    /// gana sobre OSC 9999 y la heurística durante `HOOK_FRESHNESS_SECS`.
-    pub fn apply_hook_event(&mut self, event: &super::HookEvent, alive: bool, now: DateTime<Utc>) {
-        let Some(panel_id) = event.panel_id else {
+    /// Called only inside an AcceptedHook publication scope. The full claim
+    /// was durably validated by the worker and remains leased until envelope Drop.
+    pub(crate) fn apply_claimed_hook_event(
+        &mut self,
+        claim: Claim,
+        event: &super::HookEvent,
+        alive: bool,
+        now: DateTime<Utc>,
+    ) {
+        if (!alive && event.kind != super::HookKind::Stop)
+            || claim.phase != ClaimPhase::Active
+            || claim.owner.is_none()
+            || event.workspace_id != Some(claim.key.workspace)
+            || event.panel_id != Some(claim.key.panel)
+            || event.leaf_id != Some(claim.key.leaf)
+        {
             return;
-        };
+        }
         let session_id = event.session_id.clone().or_else(|| {
             self.hook_status
-                .get(&panel_id)
+                .get(&claim)
                 .and_then(|previous| previous.session_id.clone())
         });
         self.hook_status.insert(
-            panel_id,
+            claim,
             HookStatus {
                 status: hook_agent_status(event.kind, alive),
                 at: now,
                 session_id,
             },
         );
-        // A silent tool/prompt hook is real activity even when it reports the
-        // same status and produces no PTY output. Date its arrival once.
-        if let Some(session) = self
-            .state
-            .sessions
-            .iter_mut()
-            .find(|session| session.panel_id == Some(panel_id))
-        {
+        // A hook from an unfocused split may update its own resume cache, but
+        // cannot date activity on the currently focused orchestration session.
+        if let Some(session) = self.state.sessions.iter_mut().find(|session| {
+            self.session_hook_claims.get(&session.session_id) == Some(&claim)
+                && session.workspace_id == claim.key.workspace
+                && session.runtime_session_id == Some(claim.runtime)
+        }) {
+            session.status = hook_agent_status(event.kind, alive);
             session.last_activity_at = now;
             if let Some(task_id) = session.task_id {
                 if let Some(task) = self.state.tasks.iter_mut().find(|task| task.id == task_id) {
@@ -580,17 +601,68 @@ impl Orchestrator {
         }
     }
 
-    /// Id de sesión que reportó el último hook de ese panel, para el resume
-    /// exacto (`--resume <id>` en vez de `--continue`).
-    pub fn hook_session_id(&self, panel_id: Uuid) -> Option<&str> {
+    pub(crate) fn bind_panel_hook_claim(
+        &mut self,
+        workspace_id: Uuid,
+        panel_id: Uuid,
+        claim: Option<Claim>,
+    ) {
+        let claim = claim.filter(|claim| {
+            claim.key.workspace == workspace_id
+                && claim.key.panel == panel_id
+                && claim.phase == ClaimPhase::Active
+                && claim.owner.is_some()
+        });
+        for session in self.state.sessions.iter_mut().filter(|session| {
+            session.workspace_id == workspace_id && session.panel_id == Some(panel_id)
+        }) {
+            let previous = self.session_hook_claims.remove(&session.session_id);
+            let current = claim.filter(|claim| session.runtime_session_id == Some(claim.runtime));
+            if let Some(current) = current {
+                self.session_hook_claims.insert(session.session_id, current);
+            }
+            if previous != current {
+                self.last_activity_revision.remove(&session.session_id);
+                // Summaries and status from a different leaf/birth are not
+                // evidence about the session now occupying this panel.
+                session.status = AgentStatus::Idle;
+                session.command_summary = None;
+                session.review_summary = ReviewSummary::default();
+            }
+        }
+    }
+
+    pub(crate) fn retain_hook_claims(&mut self, live: &HashSet<Claim>) {
+        self.hook_status.retain(|claim, _| live.contains(claim));
+        let stale_sessions = self
+            .session_hook_claims
+            .iter()
+            .filter_map(|(id, claim)| (!live.contains(claim)).then_some(*id))
+            .collect::<HashSet<_>>();
+        self.session_hook_claims
+            .retain(|_, claim| live.contains(claim));
+        self.last_activity_revision
+            .retain(|id, _| !stale_sessions.contains(id));
+        for session in self
+            .state
+            .sessions
+            .iter_mut()
+            .filter(|session| stale_sessions.contains(&session.session_id))
+        {
+            session.status = AgentStatus::Idle;
+            session.command_summary = None;
+            session.review_summary = ReviewSummary::default();
+        }
+    }
+
+    pub(crate) fn hook_session_id_for_claim(&self, claim: Claim) -> Option<&str> {
         self.hook_status
-            .get(&panel_id)
+            .get(&claim)
             .and_then(|hook| hook.session_id.as_deref())
     }
 
-    /// Estado autoritativo de hook para ese panel, si sigue fresco.
-    fn fresh_hook_status(&self, panel_id: Uuid, now: DateTime<Utc>) -> Option<AgentStatus> {
-        let hook = self.hook_status.get(&panel_id)?;
+    fn fresh_hook_status(&self, claim: Claim, now: DateTime<Utc>) -> Option<AgentStatus> {
+        let hook = self.hook_status.get(&claim)?;
         hook_is_fresh(hook.at, now).then_some(hook.status)
     }
 
@@ -671,6 +743,86 @@ impl Orchestrator {
         self.sync_task_states_from_dependencies();
     }
 
+    /// Production reconciliation binds by full claim. A successor cannot reuse
+    /// the previous orchestration UUID and inherit pending git/activity results.
+    pub(crate) fn ensure_claimed_panel_session(
+        &mut self,
+        workspace_id: Uuid,
+        cwd: Option<PathBuf>,
+        panel_id: Uuid,
+        runtime_session_id: Option<Uuid>,
+        title: &str,
+        claim: Option<Claim>,
+    ) -> Uuid {
+        let claim = claim.filter(|claim| {
+            claim.key.workspace == workspace_id
+                && claim.key.panel == panel_id
+                && Some(claim.runtime) == runtime_session_id
+                && claim.phase == ClaimPhase::Active
+                && claim.owner.is_some()
+        });
+        let known = claim.and_then(|current| {
+            self.session_birth_claims.iter().find_map(|(id, previous)| {
+                (*previous == current && self.session_hook_claims.get(id) == Some(&current))
+                    .then_some(*id)
+            })
+        });
+        let replaced = self
+            .state
+            .sessions
+            .iter()
+            .filter(|session| {
+                session.panel_id == Some(panel_id)
+                    && session.workspace_id == workspace_id
+                    && (known.is_some_and(|known| known != session.session_id)
+                        || session.runtime_session_id != runtime_session_id
+                        || claim.is_some_and(|current| {
+                            self.session_birth_claims
+                                .get(&session.session_id)
+                                .is_some_and(|previous| *previous != current)
+                        }))
+            })
+            .map(|session| session.session_id)
+            .collect::<Vec<_>>();
+        for replaced in replaced {
+            if let Some(session) = self
+                .state
+                .sessions
+                .iter_mut()
+                .find(|session| session.session_id == replaced)
+            {
+                session.panel_id = None;
+                if !self.session_hook_claims.contains_key(&replaced) {
+                    session.status = AgentStatus::Done;
+                }
+            }
+            // Keep a still-live unfocused leaf's exact record. Re-focusing it
+            // reuses that record, including its task and own activity tokens.
+            if !self.session_hook_claims.contains_key(&replaced) {
+                self.session_birth_claims.remove(&replaced);
+                self.last_activity_revision.remove(&replaced);
+                self.last_git_inspect_at.remove(&replaced);
+            }
+        }
+        if let Some(known) = known {
+            if let Some(session) = self
+                .state
+                .sessions
+                .iter_mut()
+                .find(|session| session.session_id == known)
+            {
+                session.panel_id = Some(panel_id);
+            }
+        }
+        let session_id =
+            self.ensure_panel_session(workspace_id, cwd, panel_id, runtime_session_id, title);
+        if let Some(claim) = claim {
+            self.session_birth_claims.insert(session_id, claim);
+        }
+        self.bind_panel_hook_claim(workspace_id, panel_id, claim);
+        session_id
+    }
+
     pub fn ensure_panel_session(
         &mut self,
         workspace_id: Uuid,
@@ -679,12 +831,9 @@ impl Orchestrator {
         runtime_session_id: Option<Uuid>,
         title: &str,
     ) -> Uuid {
-        if let Some(existing) = self
-            .state
-            .sessions
-            .iter_mut()
-            .find(|session| session.panel_id == Some(panel_id))
-        {
+        if let Some(existing) = self.state.sessions.iter_mut().find(|session| {
+            session.panel_id == Some(panel_id) && session.workspace_id == workspace_id
+        }) {
             let identity_changed = existing.runtime_session_id != runtime_session_id
                 || existing.workspace_id != workspace_id
                 || existing.label != title
@@ -736,6 +885,56 @@ impl Orchestrator {
         session_id
     }
 
+    pub(crate) fn prune_missing_claimed_panels(&mut self, live_panels: &HashSet<(Uuid, Uuid)>) {
+        let removed_sessions = self
+            .state
+            .sessions
+            .iter()
+            .filter_map(|session| {
+                let panel_id = session.panel_id?;
+                (!live_panels.contains(&(session.workspace_id, panel_id)))
+                    .then_some(session.session_id)
+            })
+            .collect::<HashSet<_>>();
+
+        self.state.sessions.retain(|session| {
+            session
+                .panel_id
+                .map(|panel_id| live_panels.contains(&(session.workspace_id, panel_id)))
+                .unwrap_or(true)
+        });
+        for task in &mut self.state.tasks {
+            let previous_members = task.session_ids.len();
+            task.session_ids
+                .retain(|session_id| !removed_sessions.contains(session_id));
+            if task.session_ids.len() != previous_members {
+                task.updated_at = Utc::now();
+            }
+        }
+        self.state.inbox.retain(|event| {
+            event
+                .session_id
+                .map(|id| !removed_sessions.contains(&id))
+                .unwrap_or(true)
+        });
+        self.last_git_inspect_at
+            .retain(|session_id, _| !removed_sessions.contains(session_id));
+        self.last_activity_revision
+            .retain(|session_id, _| !removed_sessions.contains(session_id));
+        self.session_hook_claims
+            .retain(|session_id, _| !removed_sessions.contains(session_id));
+        self.session_birth_claims
+            .retain(|session_id, _| !removed_sessions.contains(session_id));
+        let live_hook_panels = self
+            .state
+            .sessions
+            .iter()
+            .filter_map(|session| session.panel_id.map(|panel| (session.workspace_id, panel)))
+            .collect::<HashSet<_>>();
+        self.hook_status
+            .retain(|claim, _| live_hook_panels.contains(&(claim.key.workspace, claim.key.panel)));
+    }
+
     pub fn prune_missing_panels(&mut self, live_panel_ids: &HashSet<Uuid>) {
         let removed_sessions = self
             .state
@@ -771,6 +970,18 @@ impl Orchestrator {
             .retain(|session_id, _| !removed_sessions.contains(session_id));
         self.last_activity_revision
             .retain(|session_id, _| !removed_sessions.contains(session_id));
+        self.session_hook_claims
+            .retain(|session_id, _| !removed_sessions.contains(session_id));
+        self.session_birth_claims
+            .retain(|session_id, _| !removed_sessions.contains(session_id));
+        let live_hook_panels = self
+            .state
+            .sessions
+            .iter()
+            .filter_map(|session| session.panel_id.map(|panel| (session.workspace_id, panel)))
+            .collect::<HashSet<_>>();
+        self.hook_status
+            .retain(|claim, _| live_hook_panels.contains(&(claim.key.workspace, claim.key.panel)));
     }
 
     pub fn resolve_launch_repo(request: &AgentLaunchRequest) -> Option<PathBuf> {
@@ -1170,15 +1381,29 @@ impl Orchestrator {
         self.merge_finished_git_inspections();
         let observations_by_panel = observations
             .into_iter()
-            .map(|observation| (observation.panel_id, observation))
+            .map(|observation| {
+                (
+                    (observation.workspace_id, observation.panel_id),
+                    observation,
+                )
+            })
             .collect::<HashMap<_, _>>();
         // Los estados de hook frescos se resuelven antes del loop: adentro
         // `self.state.sessions` está prestado mutable (P2.12).
-        let fresh_hooks: HashMap<Uuid, AgentStatus> = observations_by_panel
-            .keys()
-            .filter_map(|panel_id| {
-                self.fresh_hook_status(*panel_id, now)
-                    .map(|status| (*panel_id, status))
+        let fresh_hooks: HashMap<Claim, AgentStatus> = observations_by_panel
+            .values()
+            .filter_map(|observation| {
+                let claim = observation.hook_claim?;
+                if claim.key.workspace != observation.workspace_id
+                    || claim.key.panel != observation.panel_id
+                    || Some(claim.runtime) != observation.runtime_session_id
+                    || !observation.alive
+                    || !observation.attached
+                {
+                    return None;
+                }
+                self.fresh_hook_status(claim, now)
+                    .map(|status| (claim, status))
             })
             .collect();
 
@@ -1186,9 +1411,13 @@ impl Orchestrator {
             let Some(panel_id) = session.panel_id else {
                 continue;
             };
-            let Some(observation) = observations_by_panel.get(&panel_id) else {
+            let Some(observation) = observations_by_panel.get(&(session.workspace_id, panel_id))
+            else {
                 continue;
             };
+            if observation.workspace_id != session.workspace_id {
+                continue;
+            }
             let previous_identity = (
                 session.workspace_id,
                 session.runtime_session_id,
@@ -1228,9 +1457,10 @@ impl Orchestrator {
             }
             // Precedencia de fuentes (P2.12): hook > OSC 9999 > heurística de
             // texto. Las dos primeras solo mientras sean frescas.
-            session.status = fresh_hooks
-                .get(&panel_id)
-                .copied()
+            session.status = observation
+                .hook_claim
+                .filter(|claim| self.session_hook_claims.get(&session.session_id) == Some(claim))
+                .and_then(|claim| fresh_hooks.get(&claim).copied())
                 .or_else(|| {
                     authoritative_agent_status(observation.agent_status.as_ref(), observation.alive)
                 })
@@ -2410,6 +2640,7 @@ mod tests {
         orchestrator.apply_observations(vec![PanelRuntimeObservation {
             panel_id,
             runtime_session_id: Some(uuid::Uuid::new_v4()),
+            hook_claim: None,
             workspace_id,
             title: "claude".to_owned(),
             // El texto visible diría Failed, pero el canal OSC 9999 manda.
@@ -2457,6 +2688,7 @@ mod tests {
         orchestrator.apply_observations(vec![PanelRuntimeObservation {
             panel_id,
             runtime_session_id: Some(uuid::Uuid::new_v4()),
+            hook_claim: None,
             workspace_id,
             title: "claude".to_owned(),
             visible_text: "Tests passed. Ready for review.".to_owned(),
@@ -2549,6 +2781,7 @@ mod tests {
         orchestrator.apply_observations(vec![PanelRuntimeObservation {
             panel_id,
             runtime_session_id: Some(uuid::Uuid::new_v4()),
+            hook_claim: None,
             workspace_id,
             title: "claude".to_owned(),
             visible_text: "mauro % claude\nTests passed. Ready for review.".to_owned(),
@@ -2595,6 +2828,7 @@ mod tests {
         let observation = PanelRuntimeObservation {
             panel_id,
             runtime_session_id,
+            hook_claim: Some(fixture_claim(panel_id, workspace_id, runtime_session_id)),
             workspace_id,
             title: "zsh".into(),
             visible_text: "user %".into(),
@@ -2635,7 +2869,7 @@ mod tests {
             crate::orchestration::HookKind::PreToolUse,
         );
         let arrival = Utc::now();
-        orchestrator.apply_hook_event(&event, true, arrival);
+        apply_fixture_hook(&mut orchestrator, &event, true, arrival);
         assert_eq!(orchestrator.state.sessions[0].last_activity_at, arrival);
         assert_eq!(orchestrator.state.tasks[0].updated_at, arrival);
         let baseline = orchestrator.snapshot();
@@ -2644,7 +2878,7 @@ mod tests {
             assert_eq!(orchestrator.snapshot(), baseline);
         }
         let next_arrival = arrival + chrono::Duration::milliseconds(1);
-        orchestrator.apply_hook_event(&event, true, next_arrival);
+        apply_fixture_hook(&mut orchestrator, &event, true, next_arrival);
         assert_eq!(
             orchestrator.state.sessions[0].last_activity_at,
             next_arrival
@@ -2876,6 +3110,7 @@ mod tests {
         let observation = PanelRuntimeObservation {
             panel_id,
             runtime_session_id: Some(uuid::Uuid::new_v4()),
+            hook_claim: None,
             workspace_id,
             title: "claude".to_owned(),
             visible_text: "mauro % claude".to_owned(),
@@ -2934,6 +3169,7 @@ mod tests {
         let base = PanelRuntimeObservation {
             panel_id,
             runtime_session_id: Some(uuid::Uuid::new_v4()),
+            hook_claim: None,
             workspace_id,
             title: "zsh".to_owned(),
             visible_text: String::new(),
@@ -3074,6 +3310,7 @@ mod tests {
         let observation = PanelRuntimeObservation {
             panel_id: uuid::Uuid::new_v4(),
             runtime_session_id: Some(uuid::Uuid::new_v4()),
+            hook_claim: None,
             workspace_id,
             title: "Claude Code".to_owned(),
             visible_text: "Running".to_owned(),
@@ -3159,7 +3396,8 @@ mod tests {
         );
         orchestrator.apply_observations(vec![PanelRuntimeObservation {
             panel_id,
-            runtime_session_id: None,
+            runtime_session_id: Some(panel_id),
+            hook_claim: Some(fixture_claim(panel_id, workspace_id, Some(panel_id))),
             workspace_id,
             title: "Claude Code — Build feature".to_owned(),
             visible_text: "Waiting for approval to run command".to_owned(),
@@ -3389,6 +3627,63 @@ mod tests {
         assert_eq!(P::detect("sample data"), None);
     }
 
+    fn fixture_claim(
+        panel_id: uuid::Uuid,
+        workspace_id: uuid::Uuid,
+        runtime: Option<uuid::Uuid>,
+    ) -> crate::hook_authority::Claim {
+        crate::hook_authority::Claim {
+            key: crate::hook_authority::LeafKey {
+                workspace: workspace_id,
+                panel: panel_id,
+                leaf: panel_id,
+            },
+            runtime: runtime.unwrap_or(panel_id),
+            generation: Some(runtime.unwrap_or(panel_id)),
+            epoch: 1,
+            owner: Some(workspace_id),
+            phase: crate::hook_authority::ClaimPhase::Active,
+            require_binding: true,
+        }
+    }
+
+    fn apply_fixture_hook(
+        orchestrator: &mut Orchestrator,
+        event: &crate::orchestration::HookEvent,
+        alive: bool,
+        at: chrono::DateTime<chrono::Utc>,
+    ) {
+        let Some(panel_id) = event.panel_id else {
+            return;
+        };
+        let session = orchestrator
+            .state
+            .sessions
+            .iter_mut()
+            .find(|session| session.panel_id == Some(panel_id));
+        let (workspace_id, runtime) = session
+            .as_ref()
+            .map(|session| (session.workspace_id, session.runtime_session_id))
+            .unwrap_or((uuid::Uuid::nil(), None));
+        let claim = fixture_claim(panel_id, workspace_id, runtime);
+        if let Some(session) = session {
+            session.runtime_session_id = Some(claim.runtime);
+        }
+        orchestrator.bind_panel_hook_claim(workspace_id, panel_id, Some(claim));
+        let mut canonical = event.clone();
+        canonical.workspace_id = Some(workspace_id);
+        canonical.leaf_id = Some(claim.key.leaf);
+        orchestrator.apply_claimed_hook_event(claim, &canonical, alive, at);
+    }
+
+    fn fixture_cached_session(orchestrator: &Orchestrator, panel: uuid::Uuid) -> Option<&str> {
+        let claim = *orchestrator
+            .hook_status
+            .keys()
+            .find(|claim| claim.key.panel == panel)?;
+        orchestrator.hook_session_id_for_claim(claim)
+    }
+
     fn hook_event(
         panel_id: uuid::Uuid,
         kind: crate::orchestration::HookKind,
@@ -3411,7 +3706,8 @@ mod tests {
     ) -> PanelRuntimeObservation {
         PanelRuntimeObservation {
             panel_id,
-            runtime_session_id: None,
+            runtime_session_id: Some(panel_id),
+            hook_claim: Some(fixture_claim(panel_id, workspace_id, Some(panel_id))),
             workspace_id,
             title: "Claude Code — Build feature".to_owned(),
             visible_text: text.to_owned(),
@@ -3474,7 +3770,8 @@ mod tests {
 
         // El texto visible dice "waiting for approval", pero el hook dice que
         // el usuario acaba de mandar un prompt: gana el hook.
-        orchestrator.apply_hook_event(
+        apply_fixture_hook(
+            &mut orchestrator,
             &hook_event(panel_id, crate::orchestration::HookKind::UserPromptSubmit),
             true,
             Utc::now(),
@@ -3501,7 +3798,8 @@ mod tests {
         orchestrator.ensure_panel_session(workspace_id, None, panel_id, None, "Claude Code");
 
         // Hook viejo (fuera de la ventana de 10 s): vuelve la heurística.
-        orchestrator.apply_hook_event(
+        apply_fixture_hook(
+            &mut orchestrator,
             &hook_event(panel_id, crate::orchestration::HookKind::UserPromptSubmit),
             true,
             Utc::now() - chrono::Duration::seconds(30),
@@ -3524,18 +3822,25 @@ mod tests {
     fn hooks_remember_the_session_id_for_exact_resume() {
         let mut orchestrator = Orchestrator::new();
         let panel_id = uuid::Uuid::new_v4();
-        orchestrator.apply_hook_event(
+        apply_fixture_hook(
+            &mut orchestrator,
             &hook_event(panel_id, crate::orchestration::HookKind::Stop),
             true,
             Utc::now(),
         );
-        assert_eq!(orchestrator.hook_session_id(panel_id), Some("sess-42"));
+        assert_eq!(
+            fixture_cached_session(&orchestrator, panel_id),
+            Some("sess-42")
+        );
 
         // Un hook posterior sin session_id no lo borra.
         let mut without = hook_event(panel_id, crate::orchestration::HookKind::PreToolUse);
         without.session_id = None;
-        orchestrator.apply_hook_event(&without, true, Utc::now());
-        assert_eq!(orchestrator.hook_session_id(panel_id), Some("sess-42"));
+        apply_fixture_hook(&mut orchestrator, &without, true, Utc::now());
+        assert_eq!(
+            fixture_cached_session(&orchestrator, panel_id),
+            Some("sess-42")
+        );
     }
 
     #[test]
@@ -3543,7 +3848,14 @@ mod tests {
         let mut orchestrator = Orchestrator::new();
         let mut event = hook_event(uuid::Uuid::new_v4(), crate::orchestration::HookKind::Stop);
         event.panel_id = None;
-        orchestrator.apply_hook_event(&event, true, Utc::now());
-        assert_eq!(orchestrator.hook_session_id(uuid::Uuid::new_v4()), None);
+        apply_fixture_hook(&mut orchestrator, &event, true, Utc::now());
+        assert_eq!(
+            fixture_cached_session(&orchestrator, uuid::Uuid::new_v4()),
+            None
+        );
     }
 }
+
+#[cfg(test)]
+#[path = "hook_cache_causal_fixtures.rs"]
+mod hook_cache_causal_fixtures;
