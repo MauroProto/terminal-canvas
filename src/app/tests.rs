@@ -3285,3 +3285,92 @@ fn invalid_history_artifacts_do_not_authorize_resetting_an_existing_log() {
     );
     std::fs::remove_dir_all(resolved_dir).unwrap();
 }
+
+fn layout_save_warning_labels(app: &super::TerminalApp, ctx: &egui::Context, time: f64) -> String {
+    fn gather(shape: &egui::epaint::Shape, clip: Rect, labels: &mut String) {
+        match shape {
+            egui::epaint::Shape::Text(text) if clip.intersects(shape.visual_bounding_rect()) => {
+                labels.push_str(text.galley.text());
+                labels.push('\n');
+            }
+            egui::epaint::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    gather(shape, clip, labels);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut output = ctx.run_ui(
+        RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 400.0))),
+            time: Some(time),
+            ..Default::default()
+        },
+        |ui| {
+            app.show_persistence_warning(ui);
+            app.show_layout_save_warning(ui);
+        },
+    );
+    let mut labels = String::new();
+    for shape in &output.shapes {
+        gather(&shape.shape, shape.clip_rect, &mut labels);
+    }
+    output.textures_delta.clear();
+    output.drop_without_applying_deltas();
+    labels
+}
+
+fn apply_layout_save_result(
+    app: &mut super::TerminalApp,
+    snapshot: crate::state::AppState,
+    result: anyhow::Result<()>,
+) {
+    let _ = app.apply_persistence_completions(
+        vec![super::persistence_worker::Completion::State { snapshot, result }],
+        None,
+    );
+}
+
+#[test]
+fn layout_save_failure_preserves_last_ack_and_stays_visible_without_toasts() {
+    use std::time::{Duration, Instant};
+
+    let ctx = egui::Context::default();
+    let mut app = detached_test_app_with_panel(&ctx);
+    app.persistence_writes_enabled = true;
+    let saved = app.snapshot_state();
+    app.persisted_state = Some(saved.clone());
+    app.sidebar_visible = !app.sidebar_visible;
+    let current = app.snapshot_state();
+    app.autosave = crate::state::persistence::AutosaveController::new(Duration::from_secs(3600));
+    app.autosave.mark_saved(
+        Instant::now()
+            .checked_sub(Duration::from_secs(7200))
+            .unwrap(),
+    );
+    apply_layout_save_result(
+        &mut app,
+        current.clone(),
+        Err(anyhow::anyhow!("controlled write denied").context("controlled layout path")),
+    );
+    assert_eq!(app.persisted_state.as_ref(), Some(&saved));
+    assert_eq!(
+        app.autosave
+            .should_persist(&current, app.persisted_state.as_ref(), Instant::now(),),
+        crate::state::persistence::AutosaveDecision::SaveNow,
+        "a failed save must not advance the autosave acknowledgement clock",
+    );
+    assert!(app.persistence_writes_enabled);
+    assert!(app.persistence_warning.is_none());
+    assert!(!app.toasts.is_empty());
+    app.toasts = Default::default();
+    for time in [0.0, 600.0] {
+        let labels = layout_save_warning_labels(&app, &ctx, time);
+        assert!(labels.contains("No se pudo guardar el layout"));
+        assert!(labels.contains("controlled layout path"));
+        assert!(labels.contains("controlled write denied"));
+        assert!(!labels.contains("Guardado de layout e historial desactivado"));
+    }
+}
