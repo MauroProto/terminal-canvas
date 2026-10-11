@@ -948,4 +948,38 @@ mod config_recovery_tests {
         );
         assert_eq!(input.calls, 3);
     }
+
+    #[test]
+    fn failed_authority_survives_edits_and_only_known_reports_allow_writes() {
+        let issue = read_error(ConfigCandidate::Primary);
+        let mut blocked = RuntimeConfigState::from_report(ConfigLoadReport::Failed(issue));
+        let edited = AppConfig {
+            font_size: 21.0,
+            linear_token: Some("dummy-private-value".to_owned()),
+            ..Default::default()
+        };
+        blocked.update(edited.clone());
+        assert_eq!(blocked.config, edited);
+        assert_eq!(
+            blocked.status.write_permission(),
+            Err(ConfigWriteBlocked(issue))
+        );
+        let message = blocked.status.write_permission().unwrap_err().to_string();
+        assert!(message.contains("reiniciá"));
+        assert!(!message.contains("dummy-private-value"));
+        assert!(RuntimeConfigState::from_report(ConfigLoadReport::Missing)
+            .status
+            .write_permission()
+            .is_ok());
+        assert!(RuntimeConfigState::from_report(ConfigLoadReport::Loaded {
+            config: edited,
+            source: ConfigCandidate::Backup(0)
+        })
+        .status
+        .write_permission()
+        .is_ok());
+        assert!(ConfigRuntimeStatus::Uninitialized
+            .write_permission()
+            .is_ok());
+    }
 }
