@@ -456,6 +456,8 @@ async fn finish_join(
         },
     );
 
+    // Send authoritative membership before the actionable join request.
+    broadcast_presence(session);
     if !auto_approved {
         if let Some(host_tx) = &session.host_tx {
             let request = JoinRequest {
@@ -666,26 +668,6 @@ async fn handle_socket(
                 if was_reconnected {
                     notify_host_reconnected(session);
                 }
-                // HTTP joins can precede the host socket or arrive during
-                // a disconnect. Presence alone lacks the device id needed
-                // for approval, so replay every still-pending request.
-                for (&guest_id, guest) in &session.guests {
-                    if !guest.approved
-                        && matches!(guest.connection_state, GuestConnectionState::Pending)
-                    {
-                        send_json(
-                            &tx,
-                            &BrokerControlMessage::JoinRequested {
-                                request: JoinRequest {
-                                    guest_id,
-                                    display_name: guest.display_name.clone(),
-                                    device_id: guest.device_id.clone(),
-                                    requested_at: guest.joined_at,
-                                },
-                            },
-                        );
-                    }
-                }
             }
             StreamAuth::Guest(guest_id) => {
                 let Some(guest) = session.guests.get_mut(&guest_id) else {
@@ -698,6 +680,28 @@ async fn handle_socket(
             }
         }
         broadcast_presence(session);
+        if matches!(auth, StreamAuth::Host) {
+            // HTTP joins can precede the host socket or arrive during
+            // a disconnect. Presence alone lacks the device id needed
+            // for approval, so replay every still-pending request.
+            for (&guest_id, guest) in &session.guests {
+                if !guest.approved
+                    && matches!(guest.connection_state, GuestConnectionState::Pending)
+                {
+                    send_json(
+                        &tx,
+                        &BrokerControlMessage::JoinRequested {
+                            request: JoinRequest {
+                                guest_id,
+                                display_name: guest.display_name.clone(),
+                                device_id: guest.device_id.clone(),
+                                requested_at: guest.joined_at,
+                            },
+                        },
+                    );
+                }
+            }
+        }
     }
 
     send_json(
@@ -1020,10 +1024,7 @@ async fn cleanup_expired_sessions(state: &BrokerState, now: Instant) {
                 }
             }
 
-            if guest_presence_changed {
-                broadcast_presence(session);
-            }
-
+            let previous_guest_count = session.guests.len();
             session.guests.retain(|_, guest| {
                 if matches!(guest.connection_state, GuestConnectionState::Denied) {
                     return guest
@@ -1047,6 +1048,9 @@ async fn cleanup_expired_sessions(state: &BrokerState, now: Instant) {
                 }
                 true
             });
+            if guest_presence_changed || session.guests.len() != previous_guest_count {
+                broadcast_presence(session);
+            }
 
             if session
                 .host_disconnected_at
@@ -1598,6 +1602,95 @@ mod tests {
             .await
             .expect("join response");
         assert_eq!(join_again.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn expired_join_updates_host_presence_and_rejects_a_late_approval() {
+        let state = open_state();
+        let app = build_router(state.clone());
+        let session = create_session(&app).await;
+        let (host_tx, mut host_rx) = mpsc::channel(OUTBOUND_QUEUE_CAPACITY);
+        {
+            let mut guard = state.inner.lock().await;
+            guard.sessions.get_mut(&session.session_id).unwrap().host_tx = Some(host_tx);
+        }
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/share-sessions/{}/join", session.session_id.0))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&JoinShareSessionRequest {
+                            display_name: "Pending guest".to_owned(),
+                            invite_secret: "invite-secret".to_owned(),
+                            device_id: "pending-device".to_owned(),
+                            passphrase: None,
+                        })
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let join: JoinShareSessionResponse = decode_json(response).await;
+        // The UI must know the guest is Pending before it can act on the request.
+        let Message::Text(text) = host_rx.try_recv().unwrap() else {
+            panic!("presence frame")
+        };
+        let BrokerControlMessage::Presence { guests } = serde_json::from_str(&text).unwrap() else {
+            panic!("presence first")
+        };
+        assert_eq!(guests.len(), 1);
+        assert_eq!(guests[0].id, join.guest_id);
+        assert_eq!(guests[0].connection_state, GuestConnectionState::Pending);
+        let Message::Text(text) = host_rx.try_recv().unwrap() else {
+            panic!("join frame")
+        };
+        assert!(matches!(
+            serde_json::from_str::<BrokerControlMessage>(&text).unwrap(),
+            BrokerControlMessage::JoinRequested { .. }
+        ));
+        let now = Instant::now();
+        {
+            let mut guard = state.inner.lock().await;
+            let record = guard.sessions.get_mut(&session.session_id).unwrap();
+            record.host_last_seen = now;
+            record.guests.get_mut(&join.guest_id).unwrap().last_seen =
+                now - PENDING_JOIN_TTL - Duration::from_secs(1);
+        }
+        cleanup_expired_sessions(&state, now).await;
+        let Message::Text(text) = host_rx.try_recv().expect("membership change after expiry")
+        else {
+            panic!("presence frame")
+        };
+        let BrokerControlMessage::Presence { guests } = serde_json::from_str(&text).unwrap() else {
+            panic!("updated presence")
+        };
+        assert!(guests.is_empty());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/v1/share-sessions/{}/approve",
+                        session.session_id.0
+                    ))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&JoinDecisionRequest {
+                            host_token: session.host_token,
+                            guest_id: join.guest_id,
+                        })
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
