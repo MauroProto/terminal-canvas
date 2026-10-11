@@ -655,6 +655,7 @@ impl Orchestrator {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn hook_session_id_for_claim(&self, claim: Claim) -> Option<&str> {
         self.hook_status
             .get(&claim)

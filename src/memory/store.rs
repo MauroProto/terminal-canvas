@@ -172,6 +172,7 @@ impl MemoryStore {
     /// Exact durable physical-close fence, including adopted legacy births.
     /// UUID absence alone is never evidence that an already consumed factory
     /// finished or that the host reaped an unregistered child.
+    #[cfg(any(unix, test))]
     pub(crate) fn hook_close_claim(
         &self,
         runtime: Uuid,
@@ -189,6 +190,7 @@ impl MemoryStore {
         })
     }
 
+    #[cfg(unix)]
     pub(crate) fn hook_birth_consumed(&self, claim: crate::hook_authority::Claim) -> Result<bool> {
         let generation = claim
             .generation
@@ -207,6 +209,7 @@ impl MemoryStore {
         self.with_immediate_tx(|tx| super::hook_ledger::resolve_context(tx, identity, owner))
     }
 
+    #[cfg(test)]
     pub(crate) fn hook_validate(
         &self,
         hook: &crate::hook_authority::OwnedHookContext,

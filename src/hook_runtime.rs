@@ -169,10 +169,9 @@ impl HookRuntime {
     }
     pub fn admit(&self, identity: QueryIdentity) -> Result<AdmissionTicket> {
         let context = self.store()?.hook_resolve(identity, self.owner)?;
-        Ok(self
-            .authority
+        self.authority
             .ticket(context)
-            .map_err(|_| anyhow!("managed hook denied"))?)
+            .map_err(|_| anyhow!("managed hook denied"))
     }
     pub fn publish(
         &self,
@@ -431,6 +430,7 @@ impl HookRuntime {
     /// Runs on the closer worker before any remote Kill/CloseBirth. Winning this
     /// exact owner/epoch CAS blocks adoption and Birth B until physical ACK and
     /// final Retire. A transferred endpoint cannot kill its former birth.
+    #[cfg(all(unix, feature = "daemon"))]
     pub fn prepare_physical_close(&self, runtime: Uuid) -> Result<()> {
         self.prepare_physical_close_inner(runtime, None)
     }
