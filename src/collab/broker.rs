@@ -104,7 +104,6 @@ struct SessionRecord {
 struct GuestRecord {
     token: String,
     display_name: String,
-    #[allow(dead_code)]
     device_id: String,
     joined_at: chrono::DateTime<chrono::Utc>,
     // Authorization survives transport changes. A reconnect never grants access.
@@ -667,6 +666,26 @@ async fn handle_socket(
                 if was_reconnected {
                     notify_host_reconnected(session);
                 }
+                // HTTP joins can precede the host socket or arrive during
+                // a disconnect. Presence alone lacks the device id needed
+                // for approval, so replay every still-pending request.
+                for (&guest_id, guest) in &session.guests {
+                    if !guest.approved
+                        && matches!(guest.connection_state, GuestConnectionState::Pending)
+                    {
+                        send_json(
+                            &tx,
+                            &BrokerControlMessage::JoinRequested {
+                                request: JoinRequest {
+                                    guest_id,
+                                    display_name: guest.display_name.clone(),
+                                    device_id: guest.device_id.clone(),
+                                    requested_at: guest.joined_at,
+                                },
+                            },
+                        );
+                    }
+                }
             }
             StreamAuth::Guest(guest_id) => {
                 let Some(guest) = session.guests.get_mut(&guest_id) else {
@@ -1209,6 +1228,147 @@ mod tests {
             .await
             .expect("create session response");
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn host_socket_replays_pending_joins_after_creation_and_reconnect() {
+        use tokio_tungstenite::tungstenite::Message as ClientMessage;
+
+        let state = open_state();
+        let app = build_router(state.clone());
+        let session = create_session(&app).await;
+        let mut guests = Vec::new();
+        // All requests arrive before there is a host WebSocket to notify.
+        for index in 0..3 {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/v1/share-sessions/{}/join", session.session_id.0))
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::to_vec(&JoinShareSessionRequest {
+                                display_name: format!("Guest {index}"),
+                                invite_secret: "invite-secret".to_owned(),
+                                device_id: format!("device-{index}"),
+                                passphrase: None,
+                            })
+                            .unwrap(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            guests.push(decode_json::<JoinShareSessionResponse>(response).await);
+        }
+        for (action, index) in [("approve", 1), ("deny", 2)] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!(
+                            "/v1/share-sessions/{}/{action}",
+                            session.session_id.0
+                        ))
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::to_vec(&JoinDecisionRequest {
+                                host_token: session.host_token.clone(),
+                                guest_id: guests[index].guest_id,
+                            })
+                            .unwrap(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        let requested_at = {
+            let guard = state.inner.lock().await;
+            let record = &guard.sessions[&session.session_id];
+            assert!(record.host_tx.is_none());
+            record.guests[&guests[0].guest_id].joined_at
+        };
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .unwrap();
+        });
+        let mut url = url::Url::parse(&format!(
+            "ws://{address}/v1/share-sessions/{}/stream",
+            session.session_id.0
+        ))
+        .unwrap();
+        url.query_pairs_mut()
+            .append_pair("token", &session.host_token)
+            .append_pair("role", "host");
+        for _ in 0..2 {
+            let (mut socket, _) = tokio::time::timeout(
+                Duration::from_secs(5),
+                tokio_tungstenite::connect_async(url.as_str()),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let requests = tokio::time::timeout(Duration::from_secs(5), async {
+                let mut requests = Vec::new();
+                loop {
+                    match socket.next().await.unwrap().unwrap() {
+                        ClientMessage::Text(text) => {
+                            match serde_json::from_str::<BrokerControlMessage>(&text).unwrap() {
+                                BrokerControlMessage::Connected {
+                                    role: SessionRole::Host,
+                                    ..
+                                } => break,
+                                BrokerControlMessage::JoinRequested { request } => {
+                                    requests.push(request)
+                                }
+                                BrokerControlMessage::Presence { .. } => {}
+                                other => panic!("unexpected host control message: {other:?}"),
+                            }
+                        }
+                        other => panic!("unexpected host frame: {other:?}"),
+                    }
+                }
+                requests
+            })
+            .await
+            .expect("pending join replay");
+            assert_eq!(
+                requests.len(),
+                1,
+                "approved and denied guests must not be replayed"
+            );
+            assert_eq!(requests[0].guest_id, guests[0].guest_id);
+            assert_eq!(requests[0].display_name, "Guest 0");
+            assert_eq!(requests[0].device_id, "device-0");
+            assert_eq!(requests[0].requested_at, requested_at);
+            {
+                let guard = state.inner.lock().await;
+                assert!(!guard.sessions[&session.session_id].guests[&guests[0].guest_id].approved);
+            }
+            socket.close(None).await.unwrap();
+        }
+        let _ = shutdown_tx.send(());
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]
