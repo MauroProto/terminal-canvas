@@ -276,3 +276,18 @@ alcanzarlos y Enter activarlos sin escribir esos eventos en el shell. Esc
 cierra el visor durante un reintento; un diálogo abierto conserva su propio
 Escape. Las acciones del visor quedan deshabilitadas al perder el foco de
 ventana o mientras hay una superficie modal activa.
+
+## Arrastrar rutas a una terminal
+
+En Windows, al soltar archivos sobre un panel, las rutas se copian al portapapeles
+en el mismo orden, una por línea. La app muestra «Rutas copiadas» y conserva la
+línea del terminal: revisá las comillas y el formato que espera el shell o el
+agente antes de pegarlas. La configuración del shell rige para terminales nuevos;
+un panel existente puede estar leyendo cmd, PowerShell, bash, WSL o un agente.
+
+En Unix se conserva el pegado de rutas con comillas POSIX. En todos los sistemas,
+si alguna ruta contiene un salto de línea, tabulación u otro carácter de control,
+se rechaza la lista completa con un aviso visible. No se escribe una lista parcial.
+
+El portapapeles contiene rutas como texto, sin añadir comillas de shell. Esta
+conducta no detecta el intérprete activo ni valida un comando que se pegue luego.
