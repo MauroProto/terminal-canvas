@@ -144,10 +144,7 @@ impl TerminalApp {
                     });
             });
 
-        if cancel {
-            self.settings_open = false;
-            self.settings_draft = None;
-        } else if save && self.apply_settings_draft() {
+        if cancel || (save && self.apply_settings_draft()) {
             self.settings_open = false;
             self.settings_draft = None;
         }
