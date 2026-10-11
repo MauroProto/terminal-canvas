@@ -409,7 +409,22 @@ impl TerminalApp {
         let ids = state.selected_ids();
         let workspace_id = state.workspace_id;
         let mut sent = 0usize;
-        let mut failed = Vec::new();
+        // Keep explicit selections in outcome accounting without submitting
+        // to destinations whose captured identity is no longer eligible.
+        let mut failed = state
+            .targets
+            .iter()
+            .filter(|target| target.selected && !state.eligible(target))
+            .map(|target| {
+                (
+                    target.panel_id,
+                    format!(
+                        "El destino {} cambió o ya no está disponible.",
+                        target.title
+                    ),
+                )
+            })
+            .collect::<Vec<_>>();
         for panel_id in ids {
             let result = self
                 .workspaces
