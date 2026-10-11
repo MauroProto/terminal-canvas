@@ -40,14 +40,23 @@ session, closed input channel, or poisoned terminal handle produces failure
 instead of an acknowledgement. Partial broadcast failures preserve the draft
 and deselect successful destinations, so retrying does not resend to them.
 
-This startup slot is volatile. It is not a durable FIFO of agent tasks and does
-not survive process loss. Persistent task queues require an operation journal
-and reconciliation before being presented as reliable workflow queues.
+This startup slot is volatile and does not survive process loss. The separate
+conversation journal persists transfer operations; it does not make the
+startup slot durable or establish exactly-once external execution.
 
 ## Integration boundaries
 
+The subsequent [conversation layer](PROVIDER-CONTINUITY.md) adds a separate
+durable journal and cross-provider MCP tools. It uses checked ready-only input,
+separate acceptance/result states, explicit links, per-chat credentials, live
+bridge leases, frozen previews, and conservative recovery of ambiguous delivery.
+The original startup prompt slot remains volatile; the new journal does not
+turn that slot into a durable task scheduler or add provider-native steering.
+
 Work was developed on `codex/t3-quality-integration`. Existing worktrees and
-shared history are not reset or rewritten. Configuration and directory-recovery
+shared history are not reset or rewritten. The conversation implementation
+builds on the locally integrated `7d130691b0e30e2c3e70432f7f5a22de256f7ae0`.
+Configuration and directory-recovery
 proposals, and the already integrated diagnostic and rename improvements,
 belong to other work streams and are preserved by this implementation.
 
@@ -59,7 +68,7 @@ whole copies. Existing test bodies remain; review fixtures add
 ## Verification scope
 
 Validation uses the pinned Rust 1.98 toolchain, the committed dependency lock,
-one Cargo job and one test thread. The final Windows run passed 89 selected
+one Cargo job and one test thread. The original delivery Windows run passed 89 selected
 library tests, with zero failures or ignored tests; 25 are new delivery
 regressions. The selected library tests cover prompt
 receipts, restored terminals, blocked/closed input, feedback and note versions,
@@ -68,6 +77,13 @@ acknowledgements and the shared rename regressions. Test fixtures use sink PTYs
 and controlled workers; the input-writer tests simulate blocked and failed
 writers through the real bounded input queue. They do not launch a native
 application or an installed provider.
+
+The subsequent conversation/MCP integration passed **112 selected library
+tests** on Windows, including persistence, scope/credentials, context budgets,
+delegation limits, native argument fixtures, an unfocused-leaf UI exchange,
+and shutdown with full queues. Its exact selection and remaining native-client
+validation boundaries are recorded in
+[PROVIDER-CONTINUITY.md](PROVIDER-CONTINUITY.md#verification).
 
 Formatting is checked with `cargo fmt --all -- --check`; all default targets
 are checked with `cargo clippy --all-targets --locked -- -D warnings`.
@@ -89,14 +105,16 @@ conversations are described in
    native conversation ID, and recovery grade.
 3. Introduce a user-owned Windows session host with versioned local IPC and
    process-generation checks. Distinguish UI reconnection from reboot recovery.
-4. Add durable operation IDs, receipts, and an execution outbox. Reconcile
-   ambiguous external outcomes; do not claim exactly-once execution.
+4. Extend the conversation journal's existing operation IDs and receipts with
+   a native execution outbox. Reconcile ambiguous external outcomes; do not
+   claim exactly-once execution.
 5. Implement provider capability contracts and actionable permission requests.
    Only expose actions whose installed provider actually supports them.
-6. Build persistent editable task queues on that operation model. Hold pending
-   tasks after restart; never infer agent readiness from terminal output alone.
-7. Connect memory and handoffs to versioned complete task exports. Show the
-   selected and omitted context and retain provenance.
+6. Extend persistent conversation queues with editing, priorities, and native
+   task lifecycle events. Keep restart review and explicit readiness; terminal
+   output heuristics do not establish authoritative agent availability.
+7. Extend the existing selected/omitted message snapshots with versioned complete
+   task exports, attachments, checkpoints, and scoped memory retrieval.
 8. Add execution-scoped diffs/checkpoints with owned-worktree restoration and
    separate outcomes for filesystem and provider rollback.
 9. Measure UI/service/provider resources separately, with bounded histories,

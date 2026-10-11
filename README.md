@@ -32,6 +32,9 @@ Native desktop workspace for terminals and coding agents.
   shell live, applied immediately and persisted to `config.toml`
 - Broadcast (`Ctrl+Shift+Enter`): send one command to many terminals at once, picking targets
   from a list (dead panels can't be selected)
+- [Conversations and context across providers](docs/PROVIDER-CONTINUITY.md): persistent
+  message records, explicit chat links, reviewed context transfers, and scoped MCP
+  messaging with recorded replies; new Claude/Codex launches receive the bridge
 - Export terminal output (`Ctrl+Shift+E`): dump the focused terminal's scrollback to a text
   file in your Downloads folder
 - Drag & drop files from the OS onto a terminal: their paths are typed shell-escaped
