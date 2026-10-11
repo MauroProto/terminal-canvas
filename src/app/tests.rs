@@ -3540,3 +3540,58 @@ fn layout_save_warning_clear_helper_requires_current_snapshot_without_ack_side_e
         "the helper only dismisses the notice; its caller must own a real ACK",
     );
 }
+
+#[test]
+fn existing_autosave_retry_clears_a_layout_warning_only_after_successful_worker_ack() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let ctx = egui::Context::default();
+    let mut app = detached_test_app_with_panel(&ctx);
+    let saved = app.snapshot_state();
+    app.persisted_state = Some(saved.clone());
+    app.sidebar_visible = !app.sidebar_visible;
+    let current = app.snapshot_state();
+    let writes = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&writes);
+    app.persistence_worker =
+        super::persistence_worker::PersistenceWorker::with_state_processor_for_tests(move |_| {
+            if observed.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err(anyhow::anyhow!("controlled disk full"))
+            } else {
+                Ok(())
+            }
+        });
+    app.persistence_writes_enabled = true;
+    assert!(!app.run_marker_active);
+    app.autosave = crate::state::persistence::AutosaveController::new(Duration::ZERO);
+    // This fixture exercises only layout; it never submits profile/history I/O.
+    app.scrollback_flush =
+        crate::state::persistence::PeriodicFlushController::new(Duration::from_secs(3600));
+    app.maybe_persist_state(&ctx);
+    let _ = app.drain_persistence_worker();
+    assert_eq!(writes.load(Ordering::SeqCst), 1);
+    assert_eq!(app.persisted_state.as_ref(), Some(&saved));
+    assert_eq!(
+        app.layout_save_warning.as_deref(),
+        Some("controlled disk full")
+    );
+    for time in [0.0, 600.0] {
+        assert!(
+            layout_save_warning_labels(&app, &ctx, time).contains("No se pudo guardar el layout")
+        );
+    }
+    assert_eq!(
+        writes.load(Ordering::SeqCst),
+        1,
+        "painting never retries a save"
+    );
+    assert!(!app.persistence_worker.state_in_flight());
+    // The existing autosave scheduler, not the notice, accepts the retry.
+    app.maybe_persist_state(&ctx);
+    let _ = app.drain_persistence_worker();
+    assert_eq!(writes.load(Ordering::SeqCst), 2);
+    assert!(app.layout_save_warning.is_none());
+    assert_eq!(app.persisted_state.as_ref(), Some(&current));
+}
