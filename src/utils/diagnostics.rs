@@ -1044,4 +1044,35 @@ mod source_quality_tests {
             .iter()
             .any(|entry| entry.name == "config.toml" || entry.name == "layout.json"));
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_diagnostic_sources_fail_without_a_peer_or_an_unbounded_join() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let dir = TempDirectory::new();
+        let path = dir.0.join("source.fifo");
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let _ = tx.send(read_diagnostic(&path, false, 32));
+        });
+        let outcome = match rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                drop(handle);
+                panic!("FIFO diagnostic read did not finish: {error}");
+            }
+        };
+        handle.join().unwrap();
+        assert_eq!(
+            outcome,
+            DiagnosticRead::Omitted(DiagnosticIssue::ReadError {
+                operation: "file-type",
+                kind: io::ErrorKind::InvalidInput
+            })
+        );
+    }
 }
