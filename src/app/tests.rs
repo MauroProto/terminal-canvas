@@ -3853,3 +3853,40 @@ fn rename_escape_cancels_even_with_enter_and_preserves_the_terminal_title() {
         assert!(app.terminal_input_is_routable());
     }
 }
+
+#[test]
+fn rename_from_palette_uses_one_enter_to_open_and_a_later_enter_to_save() {
+    let ctx = egui::Context::default();
+    let mut app = detached_test_app_with_panel(&ctx);
+    let panel_id = app.ws().panels[0].id();
+    app.ws_mut().bring_to_front(panel_id);
+    let original = app.ws().panels[0].title().to_owned();
+    app.command_palette.toggle();
+    app.command_palette.query = "Rename Terminal".to_owned();
+    rename_dialog_frame_for_test(&ctx, &mut app, Vec::new());
+
+    rename_dialog_frame_for_test(
+        &ctx,
+        &mut app,
+        vec![rename_dialog_input_for_test(egui::Key::Enter)],
+    );
+    assert!(!app.command_palette.open);
+    assert_eq!(app.renaming_panel, Some(panel_id));
+    assert_eq!(app.ws().panels[0].title(), original);
+    assert!(!ctx.input(|input| input.key_pressed(egui::Key::Enter)));
+    assert_eq!(
+        ctx.memory(|memory| memory.focused()),
+        Some(egui::Id::new(super::dialogs::RENAME_TITLE_ID))
+    );
+
+    app.rename_buf = "confirmed later".to_owned();
+    rename_dialog_frame_for_test(
+        &ctx,
+        &mut app,
+        vec![rename_dialog_input_for_test(egui::Key::Enter)],
+    );
+    assert!(app.renaming_panel.is_none());
+    assert_eq!(app.ws().panels[0].title(), "confirmed later");
+    assert!(app.terminal_input_is_routable());
+    assert!(app.ws().panels[0].runtime_session_id().is_none());
+}
