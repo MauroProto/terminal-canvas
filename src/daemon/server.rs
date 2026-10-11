@@ -1568,6 +1568,45 @@ mod tests {
     }
 
     #[test]
+    fn successful_pty_creation_registers_the_requested_identity_once() {
+        let mut state = DaemonState::new();
+        let desired = Uuid::new_v4();
+        let spec = WireSpec {
+            title: "fake terminal".to_owned(),
+            ..WireSpec::default()
+        };
+        let result = state.spawn_with_pty_in_history_dir_using(
+            spec.clone(),
+            Some(desired),
+            None,
+            |id, received, history| {
+                assert_eq!(id, desired);
+                assert_eq!(received, &spec);
+                assert!(history.checkpoint.is_empty());
+                assert!(history.frames.is_empty());
+                Ok(crate::terminal::pty::PtyHandle::for_persistence_tests(
+                    b"fake ready",
+                ))
+            },
+        );
+        assert_eq!(result.unwrap(), desired);
+        assert_eq!(state.session_ids(), vec![desired]);
+        let session = state.session(desired).unwrap();
+        assert_eq!(session.spec, spec);
+        assert!(session.alive);
+        assert!(session.handle.is_some());
+        assert!(state.session_claimants.is_empty());
+        let response = handle_request(&mut state, Request::Attach { id: desired }, None);
+        assert!(matches!(
+            response,
+            Response::Attached { id, snapshot, alive: true, .. }
+                if id == desired && snapshot.windows(b"fake ready".len())
+                    .any(|part| part == b"fake ready")
+        ));
+        assert_eq!(state.session_ids(), vec![desired]);
+    }
+
+    #[test]
     fn spawning_registers_the_session() {
         let mut state = DaemonState::new();
         let id = spawn_one(&mut state);
