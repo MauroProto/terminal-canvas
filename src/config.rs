@@ -94,51 +94,393 @@ struct TerminalSection {
     shell: Option<String>,
 }
 
-static RUNTIME_CONFIG: RwLock<Option<AppConfig>> = RwLock::new(None);
+/// Complete configuration files are bounded independently of layout and support ZIP limits.
+pub const MAX_CONFIG_FILE_BYTES: usize = 4 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigCandidate {
+    Primary,
+    Backup(usize),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigLoadOperation {
+    ProfilePath,
+    Privacy,
+    Open,
+    Metadata,
+    Read,
+    Parse,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigLoadIssueKind {
+    NoProfilePath,
+    Io(std::io::ErrorKind),
+    NotRegular,
+    TooLarge,
+    InvalidUtf8,
+    InvalidToml,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConfigLoadIssue {
+    pub candidate: Option<ConfigCandidate>,
+    pub operation: ConfigLoadOperation,
+    pub kind: ConfigLoadIssueKind,
+}
+
+impl std::fmt::Display for ConfigLoadIssue {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let source = match self.candidate {
+            Some(ConfigCandidate::Primary) => "config.toml".to_owned(),
+            Some(ConfigCandidate::Backup(slot)) => format!("backup {slot}"),
+            None => "perfil de configuración".to_owned(),
+        };
+        let category = match self.kind {
+            ConfigLoadIssueKind::NoProfilePath => "ruta de perfil no disponible",
+            ConfigLoadIssueKind::Io(_) => "error de acceso al archivo",
+            ConfigLoadIssueKind::NotRegular => "archivo no regular o enlace",
+            ConfigLoadIssueKind::TooLarge => "archivo supera el límite de 4 MiB",
+            ConfigLoadIssueKind::InvalidUtf8 => "contenido UTF-8 inválido",
+            ConfigLoadIssueKind::InvalidToml => "contenido TOML inválido",
+        };
+        write!(formatter, "{source}: {category}")
+    }
+}
+
+/// The report records provenance separately from the effective runtime value.
+/// Parser errors and raw TOML are deliberately excluded from the issue.
+#[derive(Clone, PartialEq)]
+pub enum ConfigLoadReport {
+    Missing,
+    Loaded {
+        config: AppConfig,
+        source: ConfigCandidate,
+    },
+    Failed(ConfigLoadIssue),
+}
+
+impl std::fmt::Debug for ConfigLoadReport {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Missing => formatter.write_str("Missing"),
+            Self::Loaded { source, .. } => formatter
+                .debug_struct("Loaded")
+                .field("source", source)
+                .finish_non_exhaustive(),
+            Self::Failed(issue) => formatter.debug_tuple("Failed").field(issue).finish(),
+        }
+    }
+}
+
+impl ConfigLoadReport {
+    pub fn effective_config(&self) -> AppConfig {
+        match self {
+            Self::Loaded { config, .. } => config.clone(),
+            Self::Missing | Self::Failed(_) => AppConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigRuntimeStatus {
+    /// Compatibility for explicit callers that do not construct the native app.
+    Uninitialized,
+    Ready,
+    Missing,
+    Blocked(ConfigLoadIssue),
+}
+
+impl ConfigRuntimeStatus {
+    pub fn write_permission(self) -> Result<(), ConfigWriteBlocked> {
+        match self {
+            Self::Blocked(issue) => Err(ConfigWriteBlocked(issue)),
+            Self::Uninitialized | Self::Ready | Self::Missing => Ok(()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConfigWriteBlocked(pub ConfigLoadIssue);
+
+impl std::fmt::Display for ConfigWriteBlocked {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "Configuración sin cargar: {}. Recuperá el archivo y reiniciá la app para volver a leerlo; todavía no se guardó ningún cambio.", self.0)
+    }
+}
+
+impl std::error::Error for ConfigWriteBlocked {}
+
+/// Pure state: tests can exercise permission without mutating the profile global.
+#[derive(Clone)]
+struct RuntimeConfigState {
+    config: AppConfig,
+    status: ConfigRuntimeStatus,
+}
+
+impl RuntimeConfigState {
+    fn from_report(report: ConfigLoadReport) -> Self {
+        let status = match &report {
+            ConfigLoadReport::Missing => ConfigRuntimeStatus::Missing,
+            ConfigLoadReport::Loaded { .. } => ConfigRuntimeStatus::Ready,
+            ConfigLoadReport::Failed(issue) => ConfigRuntimeStatus::Blocked(*issue),
+        };
+        Self {
+            config: report.effective_config(),
+            status,
+        }
+    }
+
+    fn known(config: AppConfig) -> Self {
+        Self {
+            config,
+            status: ConfigRuntimeStatus::Ready,
+        }
+    }
+
+    fn update(&mut self, config: AppConfig) {
+        self.config = config;
+        // Editing a fallback never establishes that the file was loaded.
+    }
+}
+
+static RUNTIME_CONFIG: RwLock<Option<RuntimeConfigState>> = RwLock::new(None);
 
 pub fn config_file_path() -> Option<PathBuf> {
     Some(crate::utils::app_paths::config_dir()?.join("config.toml"))
 }
 
-/// Carga la config desde disco, resolviendo ausentes/inválidos a defaults.
+/// Compatibility wrapper; production startup consumes the typed report.
 pub fn load() -> AppConfig {
-    let Some(path) = config_file_path() else {
-        return AppConfig::default();
-    };
-    if let Err(error) = crate::state::durable_write::protect_private_state(&path) {
-        log::warn!("config privacy check failed; configuration not loaded: {error}");
-        return AppConfig::default();
-    }
-    load_from_path(&path)
+    effective_load(load_result())
 }
 
-/// Carga la config desde un path específico (testeable).
-///
-/// Carga durable: si el principal no parsea (crash a mitad de escritura), se
-/// prueba el ring de backups slot por slot antes de caer a defaults.
+pub fn load_result() -> ConfigLoadReport {
+    let Some(path) = config_file_path() else {
+        return ConfigLoadReport::Failed(ConfigLoadIssue {
+            candidate: None,
+            operation: ConfigLoadOperation::ProfilePath,
+            kind: ConfigLoadIssueKind::NoProfilePath,
+        });
+    };
+    load_result_from_path(&path)
+}
+
+/// Explicit path wrapper for legacy callers and fixtures.
 pub fn load_from_path(path: &std::path::Path) -> AppConfig {
-    let mut config = AppConfig::default();
-    let parsed = crate::state::durable_write::load_first_valid(path, |bytes| {
-        let raw = std::str::from_utf8(bytes).ok()?;
-        toml::from_str::<ConfigFile>(raw).ok()
-    });
-    match parsed {
-        Some(file) => {
-            apply_terminal_section(&mut config, file.terminal);
-            if let Some(token) = file.integrations.linear_token {
-                let token = token.trim().to_owned();
-                config.linear_token = if token.is_empty() { None } else { Some(token) };
-            }
-            if let Some(dismissed) = file.onboarding.dismissed {
-                config.onboarding_dismissed = dismissed;
-            }
-        }
-        None if path.exists() => {
-            log::warn!("config.toml inválido (ni backups parsean): se usan defaults");
-        }
-        None => {}
+    effective_load(load_result_from_path(path))
+}
+
+fn effective_load(report: ConfigLoadReport) -> AppConfig {
+    if let ConfigLoadReport::Failed(issue) = &report {
+        log::warn!("configuration not loaded: {issue}");
     }
-    config
+    report.effective_config()
+}
+
+pub fn load_result_from_path(path: &std::path::Path) -> ConfigLoadReport {
+    if let Err(error) = crate::state::durable_write::protect_private_state(path) {
+        return ConfigLoadReport::Failed(ConfigLoadIssue {
+            candidate: None,
+            operation: ConfigLoadOperation::Privacy,
+            kind: ConfigLoadIssueKind::Io(error.kind()),
+        });
+    }
+    load_candidates_with(path, read_config_candidate)
+}
+
+fn load_candidates_with(
+    path: &std::path::Path,
+    mut read: impl FnMut(&std::path::Path, ConfigCandidate) -> Result<Option<Vec<u8>>, ConfigLoadIssue>,
+) -> ConfigLoadReport {
+    let mut invalid = None;
+    let candidates = std::iter::once((path.to_path_buf(), ConfigCandidate::Primary)).chain(
+        (0..crate::state::durable_write::BACKUP_SLOTS).map(|slot| {
+            (
+                crate::state::durable_write::backup_path(path, slot),
+                ConfigCandidate::Backup(slot),
+            )
+        }),
+    );
+    for (candidate_path, candidate) in candidates {
+        let bytes = match read(&candidate_path, candidate) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => continue,
+            Err(issue) => return ConfigLoadReport::Failed(issue),
+        };
+        let raw = match std::str::from_utf8(&bytes) {
+            Ok(raw) => raw,
+            Err(_) => {
+                invalid = Some(ConfigLoadIssue {
+                    candidate: Some(candidate),
+                    operation: ConfigLoadOperation::Parse,
+                    kind: ConfigLoadIssueKind::InvalidUtf8,
+                });
+                continue;
+            }
+        };
+        let file = match toml::from_str::<ConfigFile>(raw) {
+            Ok(file) => file,
+            Err(_) => {
+                invalid = Some(ConfigLoadIssue {
+                    candidate: Some(candidate),
+                    operation: ConfigLoadOperation::Parse,
+                    kind: ConfigLoadIssueKind::InvalidToml,
+                });
+                continue;
+            }
+        };
+        let mut config = AppConfig::default();
+        apply_terminal_section(&mut config, file.terminal);
+        if let Some(token) = file.integrations.linear_token {
+            let token = token.trim().to_owned();
+            config.linear_token = if token.is_empty() { None } else { Some(token) };
+        }
+        if let Some(dismissed) = file.onboarding.dismissed {
+            config.onboarding_dismissed = dismissed;
+        }
+        return ConfigLoadReport::Loaded {
+            config,
+            source: candidate,
+        };
+    }
+    match invalid {
+        Some(issue) => ConfigLoadReport::Failed(issue),
+        None => ConfigLoadReport::Missing,
+    }
+}
+
+fn candidate_issue(
+    candidate: ConfigCandidate,
+    operation: ConfigLoadOperation,
+    kind: ConfigLoadIssueKind,
+) -> ConfigLoadIssue {
+    ConfigLoadIssue {
+        candidate: Some(candidate),
+        operation,
+        kind,
+    }
+}
+
+fn retry_interrupted<T>(mut operation: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+    loop {
+        match operation() {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            result => return result,
+        }
+    }
+}
+
+fn read_config_candidate(
+    path: &std::path::Path,
+    candidate: ConfigCandidate,
+) -> Result<Option<Vec<u8>>, ConfigLoadIssue> {
+    // Also reject links before opening on platforms without O_NOFOLLOW.
+    match retry_interrupted(|| std::fs::symlink_metadata(path)) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(candidate_issue(
+                candidate,
+                ConfigLoadOperation::Open,
+                ConfigLoadIssueKind::NotRegular,
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(candidate_issue(
+                candidate,
+                ConfigLoadOperation::Metadata,
+                ConfigLoadIssueKind::Io(error.kind()),
+            ));
+        }
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let mut file = match retry_interrupted(|| options.open(path)) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return match retry_interrupted(|| std::fs::symlink_metadata(path)) {
+                Err(confirm) if confirm.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(confirm) => Err(candidate_issue(
+                    candidate,
+                    ConfigLoadOperation::Metadata,
+                    ConfigLoadIssueKind::Io(confirm.kind()),
+                )),
+                Ok(_) => Err(candidate_issue(
+                    candidate,
+                    ConfigLoadOperation::Open,
+                    ConfigLoadIssueKind::Io(error.kind()),
+                )),
+            };
+        }
+        Err(error) => {
+            return Err(candidate_issue(
+                candidate,
+                ConfigLoadOperation::Open,
+                ConfigLoadIssueKind::Io(error.kind()),
+            ));
+        }
+    };
+    let metadata = retry_interrupted(|| file.metadata()).map_err(|error| {
+        candidate_issue(
+            candidate,
+            ConfigLoadOperation::Metadata,
+            ConfigLoadIssueKind::Io(error.kind()),
+        )
+    })?;
+    if !metadata.is_file() {
+        return Err(candidate_issue(
+            candidate,
+            ConfigLoadOperation::Metadata,
+            ConfigLoadIssueKind::NotRegular,
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.nlink() != 1 {
+            return Err(candidate_issue(
+                candidate,
+                ConfigLoadOperation::Metadata,
+                ConfigLoadIssueKind::NotRegular,
+            ));
+        }
+    }
+    read_config_bytes(&mut file, metadata.len(), MAX_CONFIG_FILE_BYTES)
+        .map(Some)
+        .map_err(|kind| candidate_issue(candidate, ConfigLoadOperation::Read, kind))
+}
+
+fn read_config_bytes(
+    reader: &mut impl std::io::Read,
+    advertised_len: u64,
+    limit: usize,
+) -> Result<Vec<u8>, ConfigLoadIssueKind> {
+    let sentinel = limit.checked_add(1).ok_or(ConfigLoadIssueKind::TooLarge)?;
+    if advertised_len > limit as u64 {
+        return Err(ConfigLoadIssueKind::TooLarge);
+    }
+    let mut bytes = Vec::with_capacity((advertised_len as usize).min(8192));
+    let mut chunk = [0u8; 8192];
+    while bytes.len() < sentinel {
+        let remaining = (sentinel - bytes.len()).min(chunk.len());
+        let read = retry_interrupted(|| reader.read(&mut chunk[..remaining]))
+            .map_err(|error| ConfigLoadIssueKind::Io(error.kind()))?;
+        if read == 0 {
+            return Ok(bytes);
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+        if bytes.len() > limit {
+            return Err(ConfigLoadIssueKind::TooLarge);
+        }
+    }
+    Err(ConfigLoadIssueKind::TooLarge)
 }
 
 fn apply_terminal_section(config: &mut AppConfig, terminal: TerminalSection) {
@@ -166,41 +508,88 @@ fn apply_terminal_section(config: &mut AppConfig, terminal: TerminalSection) {
     }
 }
 
-/// Instala la config runtime (arranque). Solo la primera llamada importa.
-pub fn install_runtime_config(config: AppConfig) {
+/// Installs the effective value and its provenance together at startup.
+pub fn install_runtime_config_load(report: ConfigLoadReport) {
     let mut guard = RUNTIME_CONFIG.write().unwrap_or_else(|p| p.into_inner());
     if guard.is_none() {
-        *guard = Some(config);
+        *guard = Some(RuntimeConfigState::from_report(report));
     }
 }
 
-/// Reemplaza la config runtime en vivo (desde el diálogo de configuración).
-pub fn update_runtime_config(config: AppConfig) {
+/// Compatibility for explicit known snapshots; a later call never heals a blocked load.
+pub fn install_runtime_config(config: AppConfig) {
     let mut guard = RUNTIME_CONFIG.write().unwrap_or_else(|p| p.into_inner());
-    *guard = Some(config);
+    if guard.is_none() {
+        *guard = Some(RuntimeConfigState::known(config));
+    }
 }
 
-/// Config vigente; si nadie instaló nada (tests, arranque raro) devuelve
-/// defaults.
+/// Updates RAM without granting authority to overwrite an unread configuration.
+pub fn update_runtime_config(config: AppConfig) {
+    let mut guard = RUNTIME_CONFIG.write().unwrap_or_else(|p| p.into_inner());
+    match guard.as_mut() {
+        Some(state) => state.update(config),
+        None => *guard = Some(RuntimeConfigState::known(config)),
+    }
+}
+
 pub fn runtime_config() -> AppConfig {
     RUNTIME_CONFIG
         .read()
         .unwrap_or_else(|p| p.into_inner())
-        .clone()
+        .as_ref()
+        .map(|state| state.config.clone())
         .unwrap_or_default()
 }
 
-/// Persiste la config vigente a `config.toml`. Best-effort: devuelve Err si
-/// no se pudo escribir.
+pub fn runtime_config_status() -> ConfigRuntimeStatus {
+    RUNTIME_CONFIG
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_ref()
+        .map(|state| state.status)
+        .unwrap_or(ConfigRuntimeStatus::Uninitialized)
+}
+
+pub fn ensure_config_write_allowed() -> Result<(), ConfigWriteBlocked> {
+    runtime_config_status().write_permission()
+}
+
+/// Persist only an explicit snapshot whose profile load is known.
+/// The short state lock is released before serialization or filesystem I/O.
 pub fn save(config: &AppConfig) -> anyhow::Result<()> {
+    ensure_config_write_allowed()?;
     let path = config_file_path().ok_or_else(|| anyhow::anyhow!("No config dir"))?;
     save_to_path(config, &path)
 }
 
-/// Guarda la config en un path específico (testeable).
+/// Explicit destinations remain independent of the runtime profile global.
 pub fn save_to_path(config: &AppConfig, path: &std::path::Path) -> anyhow::Result<()> {
+    save_to_path_with_limit(config, path, MAX_CONFIG_FILE_BYTES)
+}
+
+fn save_to_path_with_limit(
+    config: &AppConfig,
+    path: &std::path::Path,
+    limit: usize,
+) -> anyhow::Result<()> {
+    let raw = serialize_config_with_limit(config, limit)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
+    }
+    crate::state::durable_write::write_private_durable(path, raw.as_bytes())?;
+    Ok(())
+}
+
+fn serialize_config_with_limit(config: &AppConfig, limit: usize) -> anyhow::Result<String> {
+    let string_bytes = config
+        .shell
+        .as_ref()
+        .map_or(0, String::len)
+        .checked_add(config.linear_token.as_ref().map_or(0, String::len))
+        .ok_or_else(|| anyhow::anyhow!("config.toml supera el límite de bytes"))?;
+    if string_bytes > limit {
+        anyhow::bail!("config.toml supera el límite de bytes");
     }
     let file = ConfigFile {
         terminal: TerminalSection {
@@ -220,8 +609,10 @@ pub fn save_to_path(config: &AppConfig, path: &std::path::Path) -> anyhow::Resul
         },
     };
     let raw = toml::to_string_pretty(&file)?;
-    crate::state::durable_write::write_private_durable(path, raw.as_bytes())?;
-    Ok(())
+    if raw.len() > limit {
+        anyhow::bail!("config.toml supera el límite de bytes");
+    }
+    Ok(raw)
 }
 
 #[cfg(test)]

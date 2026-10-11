@@ -94,7 +94,11 @@ fn main() -> Result<()> {
 }
 
 fn install_config() {
-    let config = config::load();
+    let report = config::load_result();
+    if let config::ConfigLoadReport::Failed(issue) = &report {
+        log::warn!("configuration remains read-only until a successful new startup load: {issue}");
+    }
+    let config = report.effective_config();
     if let Some(path) = config::config_file_path() {
         log::info!("config: {}", path.display());
     }
@@ -107,7 +111,7 @@ fn install_config() {
         config.shell,
     );
     terminal::metrics::install_base_font_size(config.font_size);
-    config::install_runtime_config(config);
+    config::install_runtime_config_load(report);
 }
 
 fn log_terminal_backends() {
