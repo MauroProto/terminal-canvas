@@ -1764,3 +1764,22 @@ mod bounded_layout_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod desktop_split_persistence_tests {
+    use super::WorkspaceDesktopState;
+    use crate::canvas::config::DEFAULT_DESKTOP_SPLIT;
+
+    #[test]
+    fn old_desktop_json_and_default_keep_centered_dividers() {
+        let old: WorkspaceDesktopState =
+            serde_json::from_str(r#"{"next_z":7,"next_color":2}"#).unwrap();
+        assert_eq!(old.next_z, 7);
+        assert_eq!(old.next_color, 2);
+        assert_eq!(old.split_x, DEFAULT_DESKTOP_SPLIT);
+        assert_eq!(old.split_y, DEFAULT_DESKTOP_SPLIT);
+        let default = WorkspaceDesktopState::default();
+        assert_eq!(default.split_x, DEFAULT_DESKTOP_SPLIT);
+        assert_eq!(default.split_y, DEFAULT_DESKTOP_SPLIT);
+    }
+}
