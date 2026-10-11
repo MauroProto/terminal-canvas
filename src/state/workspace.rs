@@ -1181,4 +1181,29 @@ mod desktop_split_recovery_tests {
         assert_eq!(restored.split_x, original.split_x);
         assert_eq!(restored.split_y, original.split_y);
     }
+
+    #[test]
+    fn saving_and_restoring_sanitize_dividers_before_geometry_or_json() {
+        let mut workspace = Workspace::new("Invalid desktop", None);
+        workspace.split_x = f32::NAN;
+        workspace.split_y = f32::INFINITY;
+        let safe = workspace.to_saved();
+        assert_eq!(safe.desktop.split_x, DEFAULT_DESKTOP_SPLIT);
+        assert_eq!(safe.desktop.split_y, DEFAULT_DESKTOP_SPLIT);
+        serde_json::to_vec(&safe).unwrap();
+
+        let mut outside = safe;
+        outside.desktop.split_x = -2.0;
+        outside.desktop.split_y = 2.0;
+        let restored = Workspace::from_saved(outside, &egui::Context::default());
+        assert_eq!(restored.split_x, DESKTOP_SPLIT_MIN);
+        assert_eq!(restored.split_y, DESKTOP_SPLIT_MAX);
+
+        let mut non_finite = restored.to_saved();
+        non_finite.desktop.split_x = f32::NEG_INFINITY;
+        non_finite.desktop.split_y = f32::NAN;
+        let restored = Workspace::from_saved(non_finite, &egui::Context::default());
+        assert_eq!(restored.split_x, DEFAULT_DESKTOP_SPLIT);
+        assert_eq!(restored.split_y, DEFAULT_DESKTOP_SPLIT);
+    }
 }
