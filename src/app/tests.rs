@@ -3918,3 +3918,85 @@ fn rename_title_focus_is_not_requested_again_after_tab_navigation() {
     assert_eq!(ctx.memory(|memory| memory.focused()), after_tab);
     assert_eq!(app.renaming_panel, Some(panel_id));
 }
+
+#[test]
+fn sidebar_rename_focuses_and_saves_the_inactive_workspace_owner() {
+    let ctx = egui::Context::default();
+    let mut app = detached_test_app_with_panel(&ctx);
+    let inactive_panel = app.workspaces[0].panels.pop().unwrap();
+    let inactive_panel_id = inactive_panel.id();
+    assert!(inactive_panel.runtime_session_id().is_none());
+    let mut inactive_workspace = Workspace::new("Inactive rename target", None);
+    inactive_workspace.panels.push(inactive_panel);
+    inactive_workspace.rename_panel(inactive_panel_id, "inactive title".to_owned());
+    let inactive_workspace_id = inactive_workspace.id;
+    app.workspaces.push(inactive_workspace);
+    app.workspaces[0].add_restored_terminal(TerminalPanel::new(
+        pos2(0.0, 0.0),
+        vec2(300.0, 200.0),
+        Color32::WHITE,
+        1,
+    ));
+    let active_panel_id = app.workspaces[0].panels[0].id();
+    app.workspaces[0].rename_panel(active_panel_id, "active title".to_owned());
+    app.ws_mut().bring_to_front(active_panel_id);
+    let active_workspace_id = app.ws().id;
+    let active_index = app.active_ws;
+    app.rename_buf = "stale previous draft".to_owned();
+
+    // Exercise the actual sidebar response handler and real rename field,
+    // without drawing a native sidebar or sending any terminal input.
+    let mut output = ctx.run_ui(
+        RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 600.0))),
+            focused: true,
+            events: vec![rename_dialog_input_for_test(egui::Key::Enter)],
+            ..Default::default()
+        },
+        |ui| {
+            app.handle_sidebar_responses(
+                vec![crate::sidebar::SidebarResponse::RenamePanel(
+                    inactive_panel_id,
+                )],
+                ui.ctx(),
+                ui.available_rect_before_wrap(),
+            );
+            app.show_rename_dialog(ui.ctx());
+        },
+    );
+    output.textures_delta.clear();
+    output.drop_without_applying_deltas();
+
+    assert_eq!(app.renaming_panel, Some(inactive_panel_id));
+    assert_eq!(app.rename_buf, "inactive title");
+    assert_eq!(app.active_ws, active_index);
+    assert_eq!(app.ws().id, active_workspace_id);
+    assert_eq!(app.workspaces[1].id, inactive_workspace_id);
+    assert_eq!(
+        ctx.memory(|memory| memory.focused()),
+        Some(egui::Id::new(super::dialogs::RENAME_TITLE_ID))
+    );
+    assert!(!ctx.input(|input| input.key_pressed(egui::Key::Enter)));
+    assert!(!app.terminal_input_is_routable());
+
+    rename_dialog_frame_for_test(&ctx, &mut app, vec![egui::Event::Text(" nuevo".to_owned())]);
+    assert_eq!(app.rename_buf, "inactive title nuevo");
+    assert_eq!(app.workspaces[1].panels[0].title(), "inactive title");
+    rename_dialog_frame_for_test(
+        &ctx,
+        &mut app,
+        vec![rename_dialog_input_for_test(egui::Key::Enter)],
+    );
+    assert!(app.renaming_panel.is_none());
+    assert_eq!(app.workspaces[1].panels[0].title(), "inactive title nuevo");
+    assert_eq!(app.workspaces[0].panels[0].title(), "active title");
+    assert_eq!(app.active_ws, active_index);
+    assert_eq!(app.ws().id, active_workspace_id);
+    assert_eq!(app.workspaces[1].id, inactive_workspace_id);
+    assert!(app.terminal_input_is_routable());
+    assert!(app
+        .workspaces
+        .iter()
+        .flat_map(|workspace| &workspace.panels)
+        .all(|panel| panel.runtime_session_id().is_none()));
+}
