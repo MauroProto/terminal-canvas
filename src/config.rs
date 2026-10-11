@@ -1059,4 +1059,35 @@ mod config_recovery_tests {
         ));
         assert_eq!(std::fs::read(target).unwrap(), b"");
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsafe_backup_preserves_a_valid_primary_and_blocks_authority() {
+        use std::os::unix::fs::symlink;
+        let dir = TempDirectory::new();
+        let path = dir.path();
+        std::fs::write(&path, "[terminal]\nfont_size = 18.0\n").unwrap();
+        let target = dir.0.join("outside");
+        std::fs::write(&target, "").unwrap();
+        let backup = crate::state::durable_write::backup_path(&path, 0);
+        symlink(&target, &backup).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let report = load_result_from_path(&path);
+        assert!(matches!(
+            report,
+            ConfigLoadReport::Failed(ConfigLoadIssue {
+                operation: ConfigLoadOperation::Privacy,
+                ..
+            })
+        ));
+        assert!(RuntimeConfigState::from_report(report)
+            .status
+            .write_permission()
+            .is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(std::fs::symlink_metadata(backup)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
 }
