@@ -48,6 +48,10 @@ jobs:
 
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
+        with:
+          # Retain dependency compilation even when a new GUI/test regression
+          # fails. Workspace code is rebuilt and all checks still determine exit.
+          cache-on-failure: true
 
       - name: Install Linux font dependencies
         if: runner.os == 'Linux'
