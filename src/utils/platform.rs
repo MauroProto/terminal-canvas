@@ -643,4 +643,16 @@ mod tests {
         assert_eq!(held, Ok("held"));
         assert!(terminated.is_ok(), "worker did not drain on disconnect");
     }
+
+    #[test]
+    fn reaper_stops_when_disconnected_without_children() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        drop(tx);
+        let (handle, stopped) = spawn_fake_reaper(rx);
+        let terminated = stopped.recv_timeout(std::time::Duration::from_secs(2));
+        if terminated.is_ok() {
+            handle.join().expect("worker");
+        }
+        assert!(terminated.is_ok(), "idle worker did not stop");
+    }
 }
