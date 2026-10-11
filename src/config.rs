@@ -738,7 +738,7 @@ mod private_config_security_tests {
 #[cfg(test)]
 mod config_recovery_tests {
     use super::*;
-    use std::io;
+    use std::io::{self, Read};
     use std::path::{Path, PathBuf};
 
     struct TempDirectory(PathBuf);
@@ -848,5 +848,68 @@ mod config_recovery_tests {
             assert_eq!(calls.last(), Some(&blocked));
             assert!(!calls.contains(&ConfigCandidate::Backup(1)));
         }
+    }
+
+    struct FaultReader<'a> {
+        bytes: &'a [u8],
+        error_after_bytes: bool,
+        interrupt_once: bool,
+        calls: usize,
+        requested: usize,
+    }
+
+    impl Read for FaultReader<'_> {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            self.calls += 1;
+            self.requested += output.len();
+            if std::mem::take(&mut self.interrupt_once) {
+                return Err(io::Error::from(io::ErrorKind::Interrupted));
+            }
+            if self.bytes.is_empty() {
+                return if self.error_after_bytes {
+                    Err(io::Error::from(io::ErrorKind::PermissionDenied))
+                } else {
+                    Ok(0)
+                };
+            }
+            let read = self.bytes.len().min(output.len());
+            output[..read].copy_from_slice(&self.bytes[..read]);
+            self.bytes = &self.bytes[read..];
+            Ok(read)
+        }
+    }
+
+    fn reader(bytes: &[u8]) -> FaultReader<'_> {
+        FaultReader {
+            bytes,
+            error_after_bytes: false,
+            interrupt_once: false,
+            calls: 0,
+            requested: 0,
+        }
+    }
+
+    #[test]
+    fn full_toml_prefix_followed_by_read_error_is_never_accepted() {
+        let valid = b"[terminal]\nfont_size = 24.0\n";
+        assert!(toml::from_str::<ConfigFile>(std::str::from_utf8(valid).unwrap()).is_ok());
+        let mut input = reader(valid);
+        input.error_after_bytes = true;
+        let mut calls = Vec::new();
+        let report = load_candidates_with(Path::new("config.toml"), |_, candidate| {
+            calls.push(candidate);
+            read_config_bytes(&mut input, valid.len() as u64, 128)
+                .map(Some)
+                .map_err(|kind| candidate_issue(candidate, ConfigLoadOperation::Read, kind))
+        });
+        assert_eq!(calls, [ConfigCandidate::Primary]);
+        assert!(matches!(
+            report,
+            ConfigLoadReport::Failed(ConfigLoadIssue {
+                kind: ConfigLoadIssueKind::Io(io::ErrorKind::PermissionDenied),
+                ..
+            })
+        ));
+        assert!(input.calls >= 2);
     }
 }
