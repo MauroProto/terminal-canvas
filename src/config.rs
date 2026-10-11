@@ -1025,4 +1025,38 @@ mod config_recovery_tests {
         assert_eq!(std::fs::read(path.join("keep")).unwrap(), b"private");
         assert_eq!(std::fs::read(backup).unwrap(), b"");
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_load_rejects_links_and_hardlinks_without_reading_targets() {
+        use std::os::unix::fs::symlink;
+        for dangling in [false, true] {
+            let dir = TempDirectory::new();
+            let path = dir.path();
+            let target = dir.0.join("outside");
+            if !dangling {
+                std::fs::write(&target, b"").unwrap();
+            }
+            symlink(&target, &path).unwrap();
+            assert!(matches!(
+                load_result_from_path(&path),
+                ConfigLoadReport::Failed(_)
+            ));
+            assert!(std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            assert_eq!(target.exists(), !dangling);
+        }
+        let dir = TempDirectory::new();
+        let path = dir.path();
+        let target = dir.0.join("outside");
+        std::fs::write(&target, b"").unwrap();
+        std::fs::hard_link(&target, &path).unwrap();
+        assert!(matches!(
+            load_result_from_path(&path),
+            ConfigLoadReport::Failed(_)
+        ));
+        assert_eq!(std::fs::read(target).unwrap(), b"");
+    }
 }
