@@ -35,6 +35,11 @@ fn is_secret_key(key: &str) -> bool {
 /// Redacta los valores sensibles de un TOML, conservando la estructura para
 /// que el archivo siga siendo legible y parseable.
 pub fn redact_config(toml: &str) -> String {
+    redact_config_checked(toml)
+        .unwrap_or_else(|| "# Configuration omitted: invalid TOML.\n".to_owned())
+}
+
+fn redact_config_checked(toml: &str) -> Option<String> {
     fn redact(value: &mut toml::Value) {
         match value {
             toml::Value::Table(table) => {
@@ -52,11 +57,9 @@ pub fn redact_config(toml: &str) -> String {
     }
     // A malformed file cannot be safely redacted line by line: quoted keys,
     // inline tables and multiline strings can carry secrets across lines.
-    let Ok(mut value) = toml::from_str::<toml::Value>(toml) else {
-        return "# Configuration omitted: invalid TOML.\n".to_owned();
-    };
+    let mut value = toml::from_str::<toml::Value>(toml).ok()?;
     redact(&mut value);
-    toml::to_string_pretty(&value).unwrap_or_default()
+    toml::to_string_pretty(&value).ok()
 }
 
 /// Hash corto y estable de un texto, para reemplazar nombres sin perder la
@@ -78,6 +81,15 @@ pub fn anonymize_layout(json: &str) -> String {
     };
     anonymize_value(&mut value);
     serde_json::to_string_pretty(&value).unwrap_or_default()
+}
+
+fn anonymize_layout_checked(json: &str) -> Option<String> {
+    let mut value = serde_json::from_str::<serde_json::Value>(json).ok()?;
+    if !value.is_object() {
+        return None;
+    }
+    anonymize_value(&mut value);
+    serde_json::to_string_pretty(&value).ok()
 }
 
 fn anonymize_value(value: &mut serde_json::Value) {
@@ -160,6 +172,22 @@ pub fn collect_entries(
     panic_path: &Path,
     version: &str,
 ) -> Vec<DiagnosticEntry> {
+    collect_entries_with_limit(
+        data_dir,
+        config_path,
+        panic_path,
+        version,
+        MAX_DIAGNOSTIC_BYTES,
+    )
+}
+
+fn collect_entries_with_limit(
+    data_dir: &Path,
+    config_path: &Path,
+    panic_path: &Path,
+    version: &str,
+    limit: u64,
+) -> Vec<DiagnosticEntry> {
     let mut entries = vec![DiagnosticEntry {
         name: "version.txt".to_owned(),
         contents: format!(
@@ -168,58 +196,243 @@ pub fn collect_entries(
             std::env::consts::ARCH
         ),
     }];
-
-    let read = |path: &Path, tail: bool| read_bounded(path, tail).ok();
-    if let Some(panic_log) = read(panic_path, true) {
-        entries.push(DiagnosticEntry {
-            name: "panic.log".to_owned(),
-            contents: panic_log,
-        });
+    let mut sources = Vec::new();
+    for (name, path, kind) in [
+        ("panic.log", panic_path.to_path_buf(), SourceKind::Log),
+        ("runs.log", data_dir.join("runs.log"), SourceKind::Log),
+        ("config.toml", config_path.to_path_buf(), SourceKind::Config),
+        (
+            "layout.json",
+            data_dir.join("layout.json"),
+            SourceKind::Layout,
+        ),
+    ] {
+        let outcome = read_diagnostic(&path, matches!(kind, SourceKind::Log), limit);
+        match outcome {
+            DiagnosticRead::Included { bytes, truncated } => {
+                let prepared = match kind {
+                    SourceKind::Log => {
+                        let (text, lossy_utf8) = log_text(&bytes, truncated);
+                        Some((text, lossy_utf8))
+                    }
+                    SourceKind::Config | SourceKind::Layout => {
+                        std::str::from_utf8(&bytes).ok().and_then(|text| {
+                            let sanitized = match kind {
+                                SourceKind::Config => redact_config_checked(text),
+                                SourceKind::Layout => anonymize_layout_checked(text),
+                                SourceKind::Log => unreachable!(),
+                            };
+                            sanitized.map(|text| (text, false))
+                        })
+                    }
+                };
+                if let Some((contents, lossy_utf8)) = prepared {
+                    sources.push(serde_json::json!({
+                        "file": name, "status": "included", "truncated": truncated,
+                        "lossy_utf8": lossy_utf8,
+                    }));
+                    entries.push(DiagnosticEntry {
+                        name: name.to_owned(),
+                        contents,
+                    });
+                } else {
+                    sources.push(omission_report(name, DiagnosticIssue::InvalidFormat));
+                }
+            }
+            DiagnosticRead::Omitted(issue) => sources.push(omission_report(name, issue)),
+        }
     }
-    if let Some(runs) = read(&data_dir.join("runs.log"), true) {
-        entries.push(DiagnosticEntry {
-            name: "runs.log".to_owned(),
-            contents: runs,
-        });
-    }
-    if let Some(config) = read(config_path, false) {
-        entries.push(DiagnosticEntry {
-            name: "config.toml".to_owned(),
-            contents: redact_config(&config),
-        });
-    }
-    if let Some(layout) = read(&data_dir.join("layout.json"), false) {
-        entries.push(DiagnosticEntry {
-            name: "layout.json".to_owned(),
-            contents: anonymize_layout(&layout),
-        });
-    }
+    // Missing optional files are normal, but remain visible to the recipient.
+    // Only logical filenames and safe codes appear here, never paths/error text.
+    let report = serde_json::json!({
+        "schema_version": 1,
+        "source_byte_limit": limit,
+        "optional_missing_is_an_error": false,
+        "sources": sources,
+        "note": "Omitted sources are absent from the ZIP. Included logs can contain private error text; review them before sharing.",
+    });
+    entries.push(DiagnosticEntry {
+        name: "collection-report.json".to_owned(),
+        contents: format!("{report:#}\n"),
+    });
     entries
+}
+
+#[derive(Clone, Copy)]
+enum SourceKind {
+    Log,
+    Config,
+    Layout,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiagnosticIssue {
+    Missing,
+    ReadError {
+        operation: &'static str,
+        kind: std::io::ErrorKind,
+    },
+    Oversize,
+    InvalidFormat,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum DiagnosticRead {
+    Included { bytes: Vec<u8>, truncated: bool },
+    Omitted(DiagnosticIssue),
+}
+
+fn omission_report(name: &str, issue: DiagnosticIssue) -> serde_json::Value {
+    let (reason, operation, io_kind) = match issue {
+        DiagnosticIssue::Missing => ("missing", None, None),
+        DiagnosticIssue::ReadError { operation, kind } => {
+            ("read-error", Some(operation), Some(format!("{kind:?}")))
+        }
+        DiagnosticIssue::Oversize => ("oversize", None, None),
+        DiagnosticIssue::InvalidFormat => ("invalid-format", None, None),
+    };
+    serde_json::json!({
+        "file": name, "status": "omitted", "reason": reason,
+        "operation": operation, "io_kind": io_kind,
+    })
 }
 
 const MAX_DIAGNOSTIC_BYTES: u64 = 4 * 1024 * 1024;
 
-fn read_bounded(path: &Path, tail: bool) -> std::io::Result<String> {
-    let mut file = std::fs::File::open(path)?;
-    let size = file.metadata()?.len();
-    let truncated = size > MAX_DIAGNOSTIC_BYTES;
+fn open_regular_source(path: &Path) -> Result<Option<std::fs::File>, DiagnosticIssue> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // A FIFO with no writer must never block the single export worker.
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return match std::fs::symlink_metadata(path) {
+                Err(status) if status.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(status) => Err(DiagnosticIssue::ReadError {
+                    operation: "path-status",
+                    kind: status.kind(),
+                }),
+                Ok(_) => Err(DiagnosticIssue::ReadError {
+                    operation: "open",
+                    kind: error.kind(),
+                }),
+            };
+        }
+        Err(error) => {
+            return Err(DiagnosticIssue::ReadError {
+                operation: "open",
+                kind: error.kind(),
+            })
+        }
+    };
+    let metadata = file
+        .metadata()
+        .map_err(|error| DiagnosticIssue::ReadError {
+            operation: "metadata",
+            kind: error.kind(),
+        })?;
+    if !metadata.is_file() {
+        return Err(DiagnosticIssue::ReadError {
+            operation: "file-type",
+            kind: std::io::ErrorKind::InvalidInput,
+        });
+    }
+    Ok(Some(file))
+}
+
+fn read_diagnostic(path: &Path, tail: bool, limit: u64) -> DiagnosticRead {
+    let mut file = match open_regular_source(path) {
+        Ok(Some(file)) => file,
+        Ok(None) => return DiagnosticRead::Omitted(DiagnosticIssue::Missing),
+        Err(issue) => return DiagnosticRead::Omitted(issue),
+    };
+    let metadata = match file.metadata() {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            return DiagnosticRead::Omitted(DiagnosticIssue::ReadError {
+                operation: "metadata",
+                kind: error.kind(),
+            })
+        }
+    };
+    read_from_regular(&mut file, metadata.len(), tail, limit)
+}
+
+fn read_from_regular<R: Read + Seek>(
+    reader: &mut R,
+    advertised_size: u64,
+    tail: bool,
+    limit: u64,
+) -> DiagnosticRead {
+    let Some(sentinel) = limit.checked_add(1) else {
+        return DiagnosticRead::Omitted(DiagnosticIssue::ReadError {
+            operation: "limit",
+            kind: std::io::ErrorKind::InvalidInput,
+        });
+    };
+    let truncated = advertised_size > limit;
     if truncated && !tail {
-        return Ok("# File omitted: exceeds diagnostic size limit.\n".to_owned());
+        return DiagnosticRead::Omitted(DiagnosticIssue::Oversize);
     }
-    if truncated {
-        file.seek(SeekFrom::End(-(MAX_DIAGNOSTIC_BYTES as i64)))?;
+    if let Some(Err(error)) =
+        truncated.then(|| reader.seek(SeekFrom::Start(advertised_size - limit)))
+    {
+        return DiagnosticRead::Omitted(DiagnosticIssue::ReadError {
+            operation: "seek",
+            kind: error.kind(),
+        });
     }
+    // A known large log exports only its captured tail window. For a source
+    // thought to fit, the sentinel detects growth and rejects every prefix.
     let mut bytes = Vec::new();
-    file.take(MAX_DIAGNOSTIC_BYTES).read_to_end(&mut bytes)?;
-    let text = String::from_utf8_lossy(&bytes);
-    if truncated {
-        // Skip the first partial record, including a potentially split UTF-8 codepoint.
-        Ok(format!(
-            "[Earlier log entries omitted]\n{}",
-            text.split_once('\n').map_or("", |(_, rest)| rest)
-        ))
+    let bound = if truncated { limit } else { sentinel };
+    if let Err(error) = reader.take(bound).read_to_end(&mut bytes) {
+        return DiagnosticRead::Omitted(DiagnosticIssue::ReadError {
+            operation: "read",
+            kind: error.kind(),
+        });
+    }
+    if bytes.len() as u64 > limit {
+        return DiagnosticRead::Omitted(DiagnosticIssue::Oversize);
+    }
+    DiagnosticRead::Included { bytes, truncated }
+}
+
+fn log_text(bytes: &[u8], truncated: bool) -> (String, bool) {
+    let bytes = if truncated {
+        // Drop the first partial record before decoding, including split UTF-8.
+        bytes
+            .iter()
+            .position(|&byte| byte == b'\n')
+            .map_or(&[][..], |end| &bytes[end + 1..])
     } else {
-        Ok(text.into_owned())
+        bytes
+    };
+    let text = String::from_utf8_lossy(bytes);
+    let lossy_utf8 = matches!(text, std::borrow::Cow::Owned(_));
+    let contents = if truncated {
+        format!("[Earlier log entries omitted]\n{text}")
+    } else {
+        text.into_owned()
+    };
+    (contents, lossy_utf8)
+}
+
+// Preserve the existing log-tail fixture's small private helper contract.
+#[cfg(test)]
+fn read_bounded(path: &Path, tail: bool) -> std::io::Result<String> {
+    match read_diagnostic(path, tail, MAX_DIAGNOSTIC_BYTES) {
+        DiagnosticRead::Included { bytes, truncated } => Ok(log_text(&bytes, truncated).0),
+        DiagnosticRead::Omitted(DiagnosticIssue::Missing) => {
+            Err(std::io::ErrorKind::NotFound.into())
+        }
+        DiagnosticRead::Omitted(DiagnosticIssue::ReadError { kind, .. }) => Err(kind.into()),
+        DiagnosticRead::Omitted(_) => Err(std::io::ErrorKind::InvalidData.into()),
     }
 }
 
