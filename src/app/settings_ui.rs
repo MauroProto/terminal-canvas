@@ -348,3 +348,26 @@ mod tests {
         assert!(SettingsDraft::from_config(&config).shell.is_empty());
     }
 }
+
+#[cfg(test)]
+mod known_snapshot_tests {
+    use super::*;
+    #[test]
+    fn draft_keeps_unedited_token_and_onboarding_from_the_same_snapshot() {
+        let known = AppConfig {
+            font_size: 18.0,
+            linear_token: Some("dummy-known-token".to_owned()),
+            onboarding_dismissed: true,
+            ..Default::default()
+        };
+        let mut draft = SettingsDraft::from_config(&known);
+        draft.font_size = 23.0;
+        draft.shell = " /bin/fish ".to_owned();
+        let snapshot = draft.to_config_with_current(&known);
+        assert_eq!(snapshot.font_size, 23.0);
+        assert_eq!(snapshot.shell.as_deref(), Some("/bin/fish"));
+        assert_eq!(snapshot.linear_token, known.linear_token);
+        assert!(snapshot.onboarding_dismissed);
+        assert_eq!(known.font_size, 18.0);
+    }
+}
