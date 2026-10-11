@@ -103,6 +103,8 @@ pub struct DaemonSession {
     last_input_error: Option<String>,
     live_repair: Option<LiveRepairPending>,
     output_ready: bool,
+    // A real unscoped PTY still needs a durable destination. This is not hook identity.
+    history_panel: Option<Uuid>,
     retirement_requested: bool,
     retirement_captured: bool,
     retirement_draining: bool,
@@ -134,6 +136,7 @@ impl DaemonSession {
     }
 
     fn new(spec: WireSpec) -> Self {
+        let history_panel = spec.panel_id;
         Self {
             spec,
             snapshot: Vec::new(),
@@ -147,6 +150,7 @@ impl DaemonSession {
             last_input_error: None,
             live_repair: None,
             output_ready: false,
+            history_panel,
             retirement_requested: false,
             retirement_captured: false,
             retirement_draining: false,
@@ -454,14 +458,10 @@ impl DaemonState {
         scheduler: &Arc<Mutex<RuntimeScheduler>>,
         desired_id: Option<Uuid>,
     ) -> anyhow::Result<Uuid> {
-        let history_dir = spec
-            .panel_id
-            .map(|_| {
-                crate::state::scrollback_store::scrollback_dir()
-                    .ok_or_else(|| anyhow::anyhow!("no se pudo resolver el historial del daemon"))
-            })
-            .transpose()?;
-        self.spawn_with_pty_in_history_dir(spec, scheduler, desired_id, history_dir.as_deref())
+        let history_dir = crate::state::scrollback_store::scrollback_dir()
+            .ok_or_else(|| anyhow::anyhow!("no se pudo resolver el historial del daemon"))?;
+
+        self.spawn_with_pty_in_history_dir(spec, scheduler, desired_id, Some(&history_dir))
     }
 
     fn spawn_with_pty_in_history_dir(
@@ -526,7 +526,8 @@ impl DaemonState {
         // Validate before registering the session or opening a PTY. Starting
         // a fresh shell after a failed read would let its later autosave
         // replace history which neither the daemon nor the UI recovered.
-        let history = match spec.panel_id {
+        let history_panel = spec.panel_id.or_else(|| history_dir.map(|_| id));
+        let history = match history_panel {
             Some(panel_id) => crate::state::scrollback_store::try_load_leaf_session(
                 history_dir.ok_or_else(|| anyhow::anyhow!("falta el directorio de historial"))?,
                 panel_id,
@@ -544,6 +545,7 @@ impl DaemonState {
             }
         }
         let mut session = DaemonSession::new(spec);
+        session.history_panel = history_panel;
         handle.set_daemon_durable_pressure(0);
         session.handle = Some(Arc::new(Mutex::new(handle)));
         self.sessions.insert(id, session);
@@ -766,7 +768,7 @@ impl DaemonState {
             if !session.scrollback_dirty {
                 continue;
             }
-            let Some(panel_id) = session.spec.panel_id else {
+            let Some(panel_id) = session.history_panel else {
                 continue;
             };
             if session.live_repair.is_some() && !session.repair_retry_due(now) {
@@ -855,7 +857,7 @@ impl DaemonState {
         self.sessions
             .iter()
             .filter_map(|(session_id, session)| {
-                let panel_id = session.spec.panel_id?;
+                let panel_id = session.history_panel?;
                 if session.persist_pending.is_empty() {
                     return None;
                 }
@@ -941,7 +943,7 @@ impl DaemonState {
             match pty.take_retirement_prefix(
                 &mut session.persist_pending,
                 &mut session.persist_seq,
-                session.spec.panel_id.is_some(),
+                session.history_panel.is_some(),
             ) {
                 Ok(true) => session.retirement_captured = true,
                 Ok(false) | Err(_) => return,
@@ -968,7 +970,7 @@ impl DaemonState {
             pty.take_retirement_tail(
                 &mut session.persist_pending,
                 &mut session.persist_seq,
-                session.spec.panel_id.is_some()
+                session.history_panel.is_some()
             ),
             Ok(true)
         ) {
@@ -1456,6 +1458,18 @@ fn handle_request_for_client(
                     };
                 }
             }
+            // A scoped birth must carry a preauthorized nonce even when the
+            // client bypasses the app API. PtyHandle consumes/rechecks it atomically.
+            if host_target_from_spec(&spec).is_some()
+                && (id.is_none() || spec.hook_generation.is_none() || state.hook_store.is_none())
+            {
+                return match id {
+                    Some(id) => birth_rejected_response(id),
+                    None => Response::Error {
+                        message: "managed birth requires a reserved UUID and generation".to_owned(),
+                    },
+                };
+            }
             let id = match scheduler {
                 Some(scheduler) => match state.spawn_with_pty(spec, scheduler, id) {
                     Ok(id) => id,
@@ -1896,9 +1910,12 @@ fn serve_connection(
                                 version: PROTOCOL_VERSION,
                                 birth_idempotent: true,
                                 birth_cancel_safe: true,
-                                // Enabled only by the composed V3 physical
-                                // child.wait + EOF + final-tail ACK producer.
-                                hook_birth_authority: false,
+                                // Never advertise ledger fencing when SQLite is unavailable.
+                                // Killed is emitted only after child.wait, EOF and durable tail ACK.
+                                hook_birth_authority: state
+                                    .lock()
+                                    .ok()
+                                    .is_some_and(|state| state.hook_store.is_some()),
                             },
                         );
                     } else {
@@ -4195,4 +4212,97 @@ fn host_close_fenced(
                 && claim.key.panel == target.panel_id
                 && claim.key.leaf == target.leaf_id
         })
+}
+
+#[cfg(test)]
+mod unscoped_durable_destination_fixtures {
+    use super::*;
+
+    #[test]
+    fn a_raw_scoped_spawn_without_ledger_authority_never_enters_the_pty_factory() {
+        let mut state = DaemonState::new();
+        let id = Uuid::new_v4();
+        let spec = WireSpec {
+            workspace_id: Some(Uuid::new_v4()),
+            panel_id: Some(Uuid::new_v4()),
+            leaf_id: Some(Uuid::new_v4()),
+            hook_generation: Some(Uuid::new_v4()),
+            ..WireSpec::default()
+        };
+        let scheduler = Arc::new(Mutex::new(RuntimeScheduler::new()));
+        let response = handle_request_for_client(
+            &mut state,
+            Request::Spawn { id: Some(id), spec },
+            Some(&scheduler),
+            Uuid::new_v4(),
+        );
+        assert_eq!(
+            super::super::protocol::birth_rejected_from_response(&response),
+            Some(id)
+        );
+        assert!(state.sessions.is_empty());
+        assert!(state.session_claimants.is_empty());
+        assert!(state.birth_tombstones.is_empty());
+    }
+
+    #[test]
+    fn unscoped_ptys_have_distinct_destinations_and_only_real_writes_release_pressure() {
+        let dir = std::env::temp_dir().join(format!("tc-daemon-unscoped-{}", Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let blocked = dir.join("blocked");
+        std::fs::write(&blocked, b"not a directory").unwrap();
+        let mut state = DaemonState::new();
+        let ids = [Uuid::new_v4(), Uuid::new_v4()];
+        let output = vec![b'x'; 2 * crate::terminal::flow_control::HIGH_WATER];
+        for id in ids {
+            state
+                .spawn_with_pty_in_history_dir_using(
+                    WireSpec::default(),
+                    Some(id),
+                    Some(&dir),
+                    |_, _, history| {
+                        assert!(history.checkpoint.is_empty() && history.frames.is_empty());
+                        Ok(PtyHandle::for_persistence_tests(&output))
+                    },
+                )
+                .unwrap();
+        }
+        state.pump_output();
+        for id in ids {
+            let session = state.session(id).unwrap();
+            assert_eq!(session.spec.panel_id, None);
+            assert_eq!(host_target_from_spec(&session.spec), None);
+            assert_eq!(session.history_panel, Some(id));
+            assert!(session.persist_pending.len() >= output.len());
+        }
+        let (ack, _) =
+            persist_incremental_targets_in_dir(&blocked, state.incremental_scrollback_targets());
+        assert!(
+            ack.is_empty(),
+            "failed writes cannot release durable pressure"
+        );
+        for id in ids {
+            assert!(!state.session(id).unwrap().persist_pending.is_empty());
+        }
+        let (ack, _) =
+            persist_incremental_targets_in_dir(&dir, state.incremental_scrollback_targets());
+        assert_eq!(ack.len(), ids.len());
+        for (id, bytes) in ack {
+            state.session_mut(id).unwrap().acknowledge_persisted(bytes);
+        }
+        for id in ids {
+            assert!(state.session(id).unwrap().persist_pending.is_empty());
+            let history =
+                crate::state::scrollback_store::try_load_leaf_session(&dir, id, None).unwrap();
+            let restored: Vec<u8> = history
+                .frames
+                .iter()
+                .filter(|f| f.kind == crate::state::scrollback_log::FrameKind::Output)
+                .flat_map(|f| f.payload.iter().copied())
+                .collect();
+            assert_eq!(restored, output);
+        }
+        assert!(state.incremental_scrollback_targets().is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }
