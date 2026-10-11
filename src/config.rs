@@ -1090,4 +1090,28 @@ mod config_recovery_tests {
             .file_type()
             .is_symlink());
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_configuration_load_finishes_without_a_writer() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let dir = TempDirectory::new();
+        let path = dir.path();
+        let raw = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: raw is a live NUL-terminated CString for this call.
+        // mkfifo reads the pathname synchronously and does not retain its pointer.
+        let created = unsafe { libc::mkfifo(raw.as_ptr(), 0o600) };
+        assert_eq!(created, 0);
+        let (sender, receiver) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            sender.send(load_result_from_path(&path)).unwrap();
+        });
+        let result = receiver
+            .recv_timeout(Duration::from_secs(3))
+            .expect("FIFO load waited for a writer");
+        worker.join().unwrap();
+        assert!(matches!(result, ConfigLoadReport::Failed(_)));
+    }
 }
