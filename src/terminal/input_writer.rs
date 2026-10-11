@@ -101,6 +101,23 @@ impl InputWriter {
         self.shared.0.lock().ok()?.error.clone()
     }
 
+    /// Inspect availability without allocating input or waiting for an OS write.
+    pub fn check_open(&self) -> io::Result<()> {
+        let state = self
+            .shared
+            .0
+            .lock()
+            .map_err(|_| io::Error::other("input queue poisoned"))?;
+        if state.closed || state.finishing {
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "El canal de entrada del terminal está cerrado.",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
     pub fn record_error(&self, message: String) {
         if let Ok(mut state) = self.shared.0.lock() {
             state.error = Some(message);

@@ -7,6 +7,7 @@ use uuid::Uuid;
 use crate::terminal::input::{agent_prompt_bytes, paste_bytes, sanitize_agent_prompt};
 use crate::terminal::pty::PtyHandle;
 
+use super::DeferredPrompt;
 use super::SessionSpec;
 
 pub type SharedPtyHandle = Arc<Mutex<PtyHandle>>;
@@ -110,6 +111,10 @@ struct PendingStartupInput {
     input: String,
     /// None means readiness was already observed; capacity retries need no output.
     baseline_render_revision: Option<u64>,
+    completion: Option<(
+        std::sync::mpsc::Sender<std::io::Result<()>>,
+        Arc<std::sync::atomic::AtomicBool>,
+    )>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -542,6 +547,7 @@ impl PtyManager {
                 session.pending_startup_input = Some(PendingStartupInput {
                     input,
                     baseline_render_revision: Some(baseline_render_revision),
+                    completion: None,
                 });
             } else if let Ok(handle) = handle.lock() {
                 if let Err(error) = write_startup_input(&handle, &input) {
@@ -549,6 +555,7 @@ impl PtyManager {
                         session.pending_startup_input = Some(PendingStartupInput {
                             input,
                             baseline_render_revision: None,
+                            completion: None,
                         });
                     } else {
                         handle.record_input_error(format!(
@@ -658,34 +665,105 @@ impl PtyManager {
     /// render revision avanza (el TUI renderizó algo), para no inyectar en un
     /// agente que todavía está arrancando.
     pub fn queue_prompt(&mut self, session_id: Uuid, text: &str) {
-        let Some(session) = self.sessions.get_mut(&session_id) else {
-            return;
-        };
-        let Some(handle) = session.handle.as_ref() else {
-            return;
-        };
+        match self.queue_prompt_tracked(session_id, text) {
+            Ok(receipt) => receipt.detach(),
+            Err(error) => log::warn!("No se pudo encolar el prompt: {error}"),
+        }
+    }
+
+    /// Enqueue into a live terminal without overtaking startup or deferred input.
+    pub fn submit_prompt(&mut self, session_id: Uuid, text: &str) -> std::io::Result<()> {
+        use std::io::{Error, ErrorKind};
+        if text.trim().is_empty() {
+            return Err(Error::new(ErrorKind::InvalidInput, "El prompt está vacío."));
+        }
+        if !prompt_fits_input_budget(text.trim()) {
+            return Err(Error::new(ErrorKind::InvalidInput, OVERSIZED_PROMPT_ERROR));
+        }
+        let session = self.sessions.get(&session_id).ok_or_else(|| {
+            Error::new(ErrorKind::NotFound, "La sesión del terminal ya no existe.")
+        })?;
+        if session.pending_startup_input.is_some() || session.pending_prompt.is_some() {
+            return Err(Error::new(
+                ErrorKind::WouldBlock,
+                "El terminal todavía tiene un prompt pendiente; esperá antes de enviar otro.",
+            ));
+        }
+        let handle = session
+            .handle
+            .as_ref()
+            .ok_or_else(|| Error::new(ErrorKind::NotConnected, "El terminal no está conectado."))?;
+        let pty = handle
+            .lock()
+            .map_err(|_| Error::other("No se pudo acceder al terminal."))?;
+        if !pty.alive() {
+            return Err(Error::new(ErrorKind::BrokenPipe, "El terminal terminó."));
+        }
+        write_prompt_input(&pty, text)
+    }
+
+    /// A bounded startup slot, with observable acceptance and no replacement.
+    /// This is volatile transport deferral, not a persistent agent-work queue.
+    pub fn queue_prompt_tracked(
+        &mut self,
+        session_id: Uuid,
+        text: &str,
+    ) -> std::io::Result<DeferredPrompt> {
+        use std::io::{Error, ErrorKind};
+        let session = self.sessions.get_mut(&session_id).ok_or_else(|| {
+            Error::new(ErrorKind::NotFound, "La sesión del terminal ya no existe.")
+        })?;
+        let handle = session
+            .handle
+            .as_ref()
+            .ok_or_else(|| Error::new(ErrorKind::NotConnected, "El terminal no está conectado."))?;
+        if text.trim().is_empty() {
+            return Err(Error::new(ErrorKind::InvalidInput, "El prompt está vacío."));
+        }
+        if session.pending_prompt.is_some() {
+            return Err(Error::new(
+                ErrorKind::WouldBlock,
+                "Hay otro prompt pendiente; esperá a que el terminal lo acepte.",
+            ));
+        }
         if !prompt_fits_input_budget(text.trim()) {
             if let Ok(handle) = handle.lock() {
                 handle.record_input_error(OVERSIZED_PROMPT_ERROR.to_owned());
             }
-            return;
+            return Err(Error::new(ErrorKind::InvalidInput, OVERSIZED_PROMPT_ERROR));
         }
-        let baseline = handle
+        let pty = handle
             .lock()
-            .ok()
-            .map(|handle| handle.render_revision())
-            .unwrap_or(0);
+            .map_err(|_| Error::other("No se pudo acceder al estado del terminal."))?;
+        if !pty.alive() {
+            return Err(Error::new(ErrorKind::BrokenPipe, "El terminal terminó."));
+        }
+        let baseline = pty.render_revision();
+        pty.check_input_open()?;
+        let (completion, receipt) = DeferredPrompt::channel();
+        let cancellation = receipt.cancellation_token();
         session.pending_prompt = Some(PendingStartupInput {
             input: text.trim().to_owned(),
             baseline_render_revision: Some(baseline),
+            completion: Some((completion, cancellation)),
         });
+        Ok(receipt)
     }
 
     /// Progress input without consuming scheduler events for hidden workspaces.
     pub fn flush_pending_inputs(&mut self) {
         for session in self.sessions.values_mut() {
+            if session.pending_prompt.as_ref().is_some_and(|pending| {
+                pending.completion.as_ref().is_some_and(|(_, cancelled)| {
+                    cancelled.load(std::sync::atomic::Ordering::Acquire)
+                })
+            }) {
+                session.pending_prompt = None;
+            }
             Self::flush_one_pending(session, true);
-            Self::flush_one_pending(session, false);
+            if session.pending_startup_input.is_none() {
+                Self::flush_one_pending(session, false);
+            }
         }
     }
 
@@ -712,6 +790,16 @@ impl PtyManager {
         // Hold a single lock across the readiness check and the write so
         // the handle cannot change state between the two.
         let Ok(handle) = handle.lock() else {
+            if let Some((completion, _)) = pending.completion.take() {
+                let _ = completion.send(Err(std::io::Error::other(
+                    "No se pudo acceder al terminal pendiente.",
+                )));
+            }
+            if is_startup {
+                session.pending_startup_input = None;
+            } else {
+                session.pending_prompt = None;
+            }
             return;
         };
         let result = if !handle.alive() {
@@ -719,6 +807,8 @@ impl PtyManager {
                 std::io::ErrorKind::BrokenPipe,
                 "El terminal terminó antes de recibir el prompt.",
             ))
+        } else if let Err(error) = handle.check_input_open() {
+            Err(error)
         } else {
             pending.try_send(handle.render_revision(), |input| {
                 if is_startup {
@@ -733,9 +823,12 @@ impl PtyManager {
             // duplicate a partial prompt. UI updates retry after the queue drains.
             return;
         }
-        if let Err(error) = result {
+        if let Err(error) = &result {
             handle.record_input_error(format!("No se pudo enviar el prompt pendiente: {error}"));
             log::warn!("No se pudo enviar el prompt pendiente: {error}");
+        }
+        if let Some((completion, _)) = pending.completion.take() {
+            let _ = completion.send(result.map(|_| ()));
         }
         if is_startup {
             session.pending_startup_input = None;
@@ -776,6 +869,7 @@ mod tests {
         let pending = PendingStartupInput {
             input: "prompt".to_owned(),
             baseline_render_revision: Some(4),
+            completion: None,
         };
 
         assert!(!pending.is_ready(4));
@@ -787,6 +881,7 @@ mod tests {
         let mut pending = PendingStartupInput {
             input: "prompt".to_owned(),
             baseline_render_revision: None,
+            completion: None,
         };
         assert!(!pending
             .try_send(0, |_| Err(std::io::ErrorKind::WouldBlock.into()))
@@ -806,6 +901,7 @@ mod tests {
         let mut pending = PendingStartupInput {
             input: "prompt".to_owned(),
             baseline_render_revision: Some(4),
+            completion: None,
         };
         assert!(!pending.try_send(4, |_| panic!("not ready")).unwrap());
         assert_eq!(
@@ -841,6 +937,189 @@ mod tests {
         // revision del PTY), no debe paniquear ni adjuntar.
         manager.queue_prompt(session_id, "hello");
         assert!(!manager.is_attached(session_id));
+    }
+
+    fn prompt_delivery_fixture() -> (PtyManager, Uuid, super::SharedPtyHandle) {
+        let mut manager = PtyManager::new_for_tests();
+        let id = manager.create_detached(SessionSpec::default());
+        let handle = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::terminal::pty::PtyHandle::for_persistence_tests(b""),
+        ));
+        manager.sessions.get_mut(&id).unwrap().handle = Some(std::sync::Arc::clone(&handle));
+        (manager, id, handle)
+    }
+
+    #[test]
+    fn prompt_delivery_rejects_missing_and_detached_destinations() {
+        let mut manager = PtyManager::new_for_tests();
+        assert!(
+            matches!(manager.queue_prompt_tracked(Uuid::new_v4(), "feedback"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+        );
+        let id = manager.create_detached(SessionSpec::default());
+        assert!(matches!(manager.queue_prompt_tracked(id, "feedback"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotConnected));
+        assert!(!manager.is_attached(id));
+    }
+
+    #[test]
+    fn prompt_delivery_does_not_replace_or_overtake_an_existing_prompt() {
+        let (mut manager, id, handle) = prompt_delivery_fixture();
+        let first = manager
+            .queue_prompt_tracked(id, "original feedback")
+            .unwrap();
+        assert!(matches!(manager.queue_prompt_tracked(id, "replacement"),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock));
+        assert_eq!(
+            manager
+                .submit_prompt(id, "overtaking input")
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert_eq!(
+            manager.sessions[&id].pending_prompt.as_ref().unwrap().input,
+            "original feedback"
+        );
+        manager.flush_pending_inputs();
+        assert!(first.poll().is_none());
+        handle.lock().unwrap().mark_render_dirty();
+        manager.flush_pending_inputs();
+        assert!(first.poll().unwrap().is_ok());
+        assert!(!manager.has_pending_inputs());
+        assert_eq!(handle.lock().unwrap().activity_revision(), 1);
+    }
+
+    #[test]
+    fn prompt_delivery_closing_input_returns_failure_without_acknowledgement() {
+        let (mut manager, id, handle) = prompt_delivery_fixture();
+        let receipt = manager.queue_prompt_tracked(id, "feedback").unwrap();
+        let pty = handle.lock().unwrap();
+        pty.close_input_for_prompt_tests();
+        drop(pty);
+        manager.flush_pending_inputs();
+        assert_eq!(
+            receipt.poll().unwrap().unwrap_err().kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+        assert!(!manager.has_pending_inputs());
+        assert_eq!(handle.lock().unwrap().activity_revision(), 0);
+        assert!(
+            matches!(manager.queue_prompt_tracked(id, "deferred feedback"),
+            Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe)
+        );
+        assert_eq!(
+            manager
+                .submit_prompt(id, "direct feedback")
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+    }
+
+    #[test]
+    fn prompt_delivery_dropping_the_receipt_cancels_unaccepted_input() {
+        let (mut manager, id, handle) = prompt_delivery_fixture();
+        let receipt = manager
+            .queue_prompt_tracked(id, "cancelled feedback")
+            .unwrap();
+        drop(receipt);
+        handle.lock().unwrap().mark_render_dirty();
+        manager.flush_pending_inputs();
+        assert!(!manager.has_pending_inputs());
+        assert_eq!(handle.lock().unwrap().activity_revision(), 0);
+        assert!(manager.submit_prompt(id, "new feedback").is_ok());
+    }
+
+    #[test]
+    fn prompt_delivery_does_not_pass_the_startup_readiness_gate() {
+        let (mut manager, id, handle) = prompt_delivery_fixture();
+        manager.sessions.get_mut(&id).unwrap().pending_startup_input = Some(PendingStartupInput {
+            input: "startup brief".to_owned(),
+            baseline_render_revision: Some(100),
+            completion: None,
+        });
+        let receipt = manager.queue_prompt_tracked(id, "review feedback").unwrap();
+        handle.lock().unwrap().mark_render_dirty();
+        manager.flush_pending_inputs();
+        assert!(receipt.poll().is_none());
+        assert_eq!(handle.lock().unwrap().activity_revision(), 0);
+        assert_eq!(
+            manager
+                .submit_prompt(id, "another prompt")
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn prompt_delivery_cancellation_frees_the_slot_during_blocked_startup() {
+        let (mut manager, id, handle) = prompt_delivery_fixture();
+        manager.sessions.get_mut(&id).unwrap().pending_startup_input = Some(PendingStartupInput {
+            input: "startup brief".to_owned(),
+            baseline_render_revision: Some(100),
+            completion: None,
+        });
+        let receipt = manager
+            .queue_prompt_tracked(id, "cancelled feedback")
+            .unwrap();
+        drop(receipt);
+        manager.flush_pending_inputs();
+        assert!(manager.sessions[&id].pending_startup_input.is_some());
+        assert!(manager.sessions[&id].pending_prompt.is_none());
+        let replacement = manager.queue_prompt_tracked(id, "new feedback").unwrap();
+        manager.flush_pending_inputs();
+        assert!(replacement.poll().is_none());
+        assert_eq!(handle.lock().unwrap().activity_revision(), 0);
+    }
+
+    #[test]
+    fn prompt_delivery_poisoned_handle_resolves_instead_of_waiting_forever() {
+        let (mut manager, id, handle) = prompt_delivery_fixture();
+        let receipt = manager.queue_prompt_tracked(id, "review feedback").unwrap();
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = handle.lock().unwrap();
+            panic!("synthetic terminal-state failure");
+        });
+        manager.flush_pending_inputs();
+        assert_eq!(
+            receipt.poll().unwrap().unwrap_err().kind(),
+            std::io::ErrorKind::Other
+        );
+        assert!(!manager.has_pending_inputs());
+    }
+
+    #[test]
+    fn prompt_delivery_closing_the_session_resolves_the_pending_receipt() {
+        let (mut manager, id, _handle) = prompt_delivery_fixture();
+        let receipt = manager.queue_prompt_tracked(id, "feedback").unwrap();
+        manager.close(id);
+        assert_eq!(
+            receipt.poll().unwrap().unwrap_err().kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+    }
+
+    #[test]
+    fn prompt_delivery_rejects_empty_and_oversized_text_without_a_pending_slot() {
+        let (mut manager, id, handle) = prompt_delivery_fixture();
+        assert!(matches!(manager.queue_prompt_tracked(id, " \n "),
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidInput));
+        let oversized = "x".repeat(crate::terminal::pty::MAX_INPUT_BYTES + 1);
+        assert!(matches!(manager.queue_prompt_tracked(id, &oversized),
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidInput));
+        assert_eq!(
+            manager.submit_prompt(id, &oversized).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        let escaped = "\u{1b}".repeat(crate::terminal::pty::MAX_INPUT_BYTES / 4);
+        assert_eq!(
+            manager.submit_prompt(id, &escaped).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        assert!(!manager.has_pending_inputs());
+        assert_eq!(handle.lock().unwrap().activity_revision(), 0);
     }
 
     #[test]

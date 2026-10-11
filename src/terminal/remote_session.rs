@@ -137,6 +137,13 @@ impl RemoteLink {
             Err(error) => Some(error.to_string()),
         }
     }
+
+    pub fn check_input_open(&self) -> std::io::Result<()> {
+        self.control
+            .as_ref()
+            .map_err(|error| std::io::Error::other(error.to_string()))?
+            .check_open()
+    }
 }
 
 /// `Write` que enmarca lo que la app escribe como `Request::Write` NDJSON.

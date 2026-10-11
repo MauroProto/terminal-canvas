@@ -28,6 +28,13 @@ enum TerminalWriter {
 }
 
 impl TerminalWriter {
+    fn check_open(&self) -> std::io::Result<()> {
+        match self {
+            Self::Local(writer) => writer.check_open(),
+            #[cfg(all(unix, feature = "daemon"))]
+            Self::Remote(link) => link.check_input_open(),
+        }
+    }
     fn enqueue(&self, bytes: &[u8]) -> std::io::Result<()> {
         match self {
             Self::Local(writer) => writer.enqueue(bytes),
@@ -294,6 +301,11 @@ impl PtyHandle {
             output,
         ));
         self.activity_revision.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn close_input_for_prompt_tests(&self) {
+        self.writer.close();
     }
 
     #[cfg(test)]
@@ -912,6 +924,10 @@ impl PtyHandle {
             self.activity_revision.fetch_add(1, Ordering::Relaxed);
         }
         Ok(())
+    }
+
+    pub(crate) fn check_input_open(&self) -> std::io::Result<()> {
+        self.writer.check_open()
     }
 
     pub fn activity_revision(&self) -> u64 {

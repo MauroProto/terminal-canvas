@@ -1,3 +1,4 @@
+mod prompt_delivery;
 mod pty_manager;
 #[allow(dead_code)]
 mod registry;
@@ -8,6 +9,7 @@ mod session;
 #[allow(dead_code)]
 mod workspace;
 
+pub use prompt_delivery::{DeferredPrompt, PromptSubmission};
 #[allow(unused_imports)]
 pub use pty_manager::{
     drain_order, PtyManager, RuntimeScheduler, RuntimeSessionUpdate, SharedPtyHandle,
