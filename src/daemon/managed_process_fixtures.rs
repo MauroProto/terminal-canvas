@@ -345,9 +345,13 @@ fn real_managed_birth_transfer_and_close_confirm_native_wait_eof_and_durable_out
         second.request(&Request::List),
         Response::Sessions { ids: vec![id] }
     );
+    // Physical closure invalidates all output subscriptions. Its durable ACK
+    // must travel over a separate authenticated control connection for B.
+    let (mut control, control_caps) = WireClient::connect(&daemon, &token, owner_b);
+    assert!(control_caps.permits_hook_birth());
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        let response = second.request(&Request::CloseBirth { id });
+        let response = control.request(&Request::CloseBirth { id });
         if response == (Response::Killed { id }) {
             break;
         }
@@ -363,7 +367,7 @@ fn real_managed_birth_transfer_and_close_confirm_native_wait_eof_and_durable_out
         "Killed must follow actual native process reaping"
     );
     assert_eq!(
-        second.request(&Request::List),
+        control.request(&Request::List),
         Response::Sessions { ids: Vec::new() }
     );
     assert_eq!(
