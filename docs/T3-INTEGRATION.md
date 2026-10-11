@@ -3,6 +3,7 @@
 Reference: pingdotgg/t3code at
 `5f7294d452a5c6d6e0b7bd2c992478f830fbe212`.
 Initial TerminalCanvas base: `c7b989e18a61fbbcadf9dcf7e382ac55128340ef`.
+Shared changes included through: `ea6923257adc2af8542e4d2691ee5f7e20af09ad`.
 
 This work adapts patterns to the existing Rust terminal/canvas application.
 It does not replace the terminal UI or change online/invitation behavior.
@@ -26,8 +27,10 @@ it to overtake existing input.
 
 The review updates only the submitted draft/note versions. A newer draft,
 edited note, or note added while delivery was pending remains pending.
-Closing the review drops its receipt and cancels a prompt that has not started
-being accepted. Already accepted input cannot be recalled. Legacy
+Closing or replacing the review first applies available receipts. Graceful
+shutdown applies them before draining the existing preference-save barrier.
+Closing the review then drops its receipt and cancels a prompt that has not
+started being accepted. Already accepted input cannot be recalled. Legacy
 fire-and-forget APIs explicitly preserve their old lifetime and are not
 confirmation APIs for new UI flows.
 
@@ -43,8 +46,8 @@ and reconciliation before being presented as reliable workflow queues.
 
 ## Integration boundaries
 
-Work is isolated on `codex/t3-quality-integration`. Existing worktrees and the
-main checkout are not reset or rewritten. Configuration and directory-recovery
+Work was developed on `codex/t3-quality-integration`. Existing worktrees and
+shared history are not reset or rewritten. Configuration and directory-recovery
 proposals, and the already integrated diagnostic and rename improvements,
 belong to other work streams and are preserved by this implementation.
 
@@ -52,6 +55,25 @@ When combining changes, merge the narrow call-site changes in `src/app.rs` and
 the new review state field into existing work. Do not replace those files with
 whole copies. Existing test bodies remain; review fixtures add
 `pending_delivery: None` and share their empty-workspace constructor.
+
+## Verification scope
+
+Validation uses the pinned Rust 1.98 toolchain, the committed dependency lock,
+one Cargo job and one test thread. The final Windows run passed 89 selected
+library tests, with zero failures or ignored tests; 25 are new delivery
+regressions. The selected library tests cover prompt
+receipts, restored terminals, blocked/closed input, feedback and note versions,
+broadcast retries, preferences, note persistence, shutdown, layout-save
+acknowledgements and the shared rename regressions. Test fixtures use sink PTYs
+and controlled workers; the input-writer tests simulate blocked and failed
+writers through the real bounded input queue. They do not launch a native
+application or an installed provider.
+
+Formatting is checked with `cargo fmt --all -- --check`; all default targets
+are checked with `cargo clippy --all-targets --locked -- -D warnings`.
+This Windows validation does not establish Unix daemon behavior, installed
+package behavior, process-loss durability, or application performance. Those
+require the existing platform CI and the additional evidence below.
 
 ## Subsequent work and required evidence
 
