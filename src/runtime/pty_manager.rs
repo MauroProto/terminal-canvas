@@ -1104,6 +1104,74 @@ mod tests {
     }
 
     #[test]
+    fn prompt_delivery_missing_handle_resolves_receipt_without_losing_startup() {
+        for blocked_startup in [false, true] {
+            let (mut manager, id, handle) = prompt_delivery_fixture();
+            if blocked_startup {
+                manager.sessions.get_mut(&id).unwrap().pending_startup_input =
+                    Some(PendingStartupInput {
+                        input: "startup brief".to_owned(),
+                        baseline_render_revision: Some(100),
+                        completion: None,
+                    });
+            }
+            let first = manager
+                .queue_prompt_tracked(id, "original feedback")
+                .unwrap();
+            assert!(matches!(manager.queue_prompt_tracked(id, "replacement"),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock));
+            assert_eq!(
+                manager.sessions[&id].pending_prompt.as_ref().unwrap().input,
+                "original feedback"
+            );
+            manager.sessions.get_mut(&id).unwrap().handle = None;
+            manager.flush_pending_inputs();
+
+            assert_eq!(
+                first.poll().unwrap().unwrap_err().kind(),
+                std::io::ErrorKind::NotConnected
+            );
+            assert!(manager.sessions.contains_key(&id));
+            assert!(!manager.is_attached(id));
+            assert!(manager.sessions[&id].pending_prompt.is_none());
+            assert_eq!(
+                manager.sessions[&id].pending_startup_input.is_some(),
+                blocked_startup
+            );
+            assert_eq!(manager.has_pending_inputs(), blocked_startup);
+            assert_eq!(handle.lock().unwrap().activity_revision(), 0);
+            assert!(
+                matches!(manager.queue_prompt_tracked(id, "still disconnected"),
+                Err(error) if error.kind() == std::io::ErrorKind::NotConnected)
+            );
+            if blocked_startup {
+                assert_eq!(
+                    manager.sessions[&id]
+                        .pending_startup_input
+                        .as_ref()
+                        .unwrap()
+                        .input,
+                    "startup brief"
+                );
+            }
+
+            manager.sessions.get_mut(&id).unwrap().handle = Some(std::sync::Arc::clone(&handle));
+            let replacement = manager
+                .queue_prompt_tracked(id, "new explicit prompt")
+                .unwrap();
+            handle.lock().unwrap().mark_render_dirty();
+            manager.flush_pending_inputs();
+            if blocked_startup {
+                assert!(replacement.poll().is_none());
+                assert_eq!(handle.lock().unwrap().activity_revision(), 0);
+            } else {
+                assert!(replacement.poll().unwrap().is_ok());
+                assert_eq!(handle.lock().unwrap().activity_revision(), 1);
+            }
+        }
+    }
+
+    #[test]
     fn prompt_delivery_closing_the_session_resolves_the_pending_receipt() {
         let (mut manager, id, _handle) = prompt_delivery_fixture();
         let receipt = manager.queue_prompt_tracked(id, "feedback").unwrap();
