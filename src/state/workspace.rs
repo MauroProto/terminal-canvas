@@ -563,13 +563,44 @@ impl Workspace {
     /// Inyecta un prompt/feedback en el panel indicado (si existe y es un
     /// terminal). Usado por el code review para devolverle notas al agente.
     pub fn send_prompt_to_panel(&mut self, panel_id: Uuid, text: &str) -> bool {
-        match self.panel_mut(panel_id) {
-            Some(panel) => {
-                panel.send_prompt(text);
+        match self.submit_prompt_to_panel(panel_id, text) {
+            Ok(crate::runtime::PromptSubmission::Deferred(receipt)) => {
+                receipt.detach();
                 true
             }
-            None => false,
+            Ok(crate::runtime::PromptSubmission::InputQueued) => true,
+            Err(_) => false,
         }
+    }
+
+    /// Success establishes queue acceptance or a deferred receipt, not execution.
+    pub fn submit_prompt_to_panel(
+        &mut self,
+        panel_id: Uuid,
+        text: &str,
+    ) -> std::io::Result<crate::runtime::PromptSubmission> {
+        let panel = self.panel_mut(panel_id).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "El panel del terminal ya no existe.",
+            )
+        })?;
+        panel.submit_prompt(text)
+    }
+
+    pub fn submit_prompt_to_ready_panel(
+        &mut self,
+        panel_id: Uuid,
+        text: &str,
+    ) -> std::io::Result<()> {
+        self.panel_mut(panel_id)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "El panel del terminal ya no existe.",
+                )
+            })?
+            .submit_prompt_ready(text)
     }
 
     pub fn panel_pair_mut(

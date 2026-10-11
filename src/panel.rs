@@ -394,6 +394,21 @@ impl WorkspacePanel {
         }
     }
 
+    pub fn submit_prompt(
+        &mut self,
+        text: &str,
+    ) -> std::io::Result<crate::runtime::PromptSubmission> {
+        match self {
+            Self::Terminal(panel) => panel.submit_prompt(text),
+        }
+    }
+
+    pub fn submit_prompt_ready(&mut self, text: &str) -> std::io::Result<()> {
+        match self {
+            Self::Terminal(panel) => panel.submit_prompt_ready(text),
+        }
+    }
+
     pub fn replace_focused_session(
         &mut self,
         pty_manager: Arc<Mutex<crate::runtime::PtyManager>>,

@@ -38,9 +38,9 @@ use crate::state::PanelState;
 #[cfg(feature = "ghostty-vt")]
 use crate::terminal::backend::TerminalBackendKind;
 use crate::terminal::input::{
-    agent_prompt_bytes, clipboard_event_fallback_bytes, is_paste_shortcut, key_to_bytes,
-    mouse_click_sgr_sequence, mouse_motion_sgr_sequence, paste_bytes, should_copy_selection,
-    wheel_action, InputMode, ScrollAccumulator, WheelAction,
+    clipboard_event_fallback_bytes, is_paste_shortcut, key_to_bytes, mouse_click_sgr_sequence,
+    mouse_motion_sgr_sequence, paste_bytes, should_copy_selection, wheel_action, InputMode,
+    ScrollAccumulator, WheelAction,
 };
 use crate::terminal::layout::{
     cell_side_from_position, grid_metrics, grid_padding, grid_point_from_position,
@@ -1512,22 +1512,54 @@ impl TerminalPanel {
     }
 
     pub fn send_prompt(&mut self, text: &str) {
-        if text.trim().is_empty() {
-            return;
+        match self.submit_prompt(text) {
+            Ok(crate::runtime::PromptSubmission::Deferred(receipt)) => receipt.detach(),
+            Ok(crate::runtime::PromptSubmission::InputQueued) => {}
+            Err(error) => log::warn!("No se pudo enviar el prompt: {error}"),
         }
-        let Some(session) = self.focused_session_mut() else {
-            return;
-        };
+    }
+
+    /// Broadcast/capture must not start a detached terminal as a side effect.
+    pub fn submit_prompt_ready(&mut self, text: &str) -> std::io::Result<()> {
+        self.focused_session_mut()
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "La hoja del terminal ya no existe.",
+                )
+            })?
+            .submit_prompt(text)
+    }
+
+    pub fn submit_prompt(
+        &mut self,
+        text: &str,
+    ) -> std::io::Result<crate::runtime::PromptSubmission> {
+        use crate::runtime::PromptSubmission;
+        use std::io::{Error, ErrorKind};
+        if text.trim().is_empty() {
+            return Err(Error::new(ErrorKind::InvalidInput, "El prompt está vacío."));
+        }
+        let session = self
+            .focused_session_mut()
+            .ok_or_else(|| Error::new(ErrorKind::NotFound, "La hoja del terminal ya no existe."))?;
         let was_attached = session.is_attached();
-        session.ensure_attached();
+        if !session.ensure_attached() {
+            return Err(Error::new(
+                ErrorKind::NotConnected,
+                session
+                    .spawn_error()
+                    .unwrap_or("No se pudo conectar el terminal.")
+                    .to_owned(),
+            ));
+        }
         if was_attached {
-            // Ya está corriendo: inyectá directo.
-            let mode = session.input_mode();
-            let bytes = agent_prompt_bytes(text, &mode);
-            let _ = self.with_pty(|pty| pty.write_all(&bytes));
+            session.submit_prompt(text)?;
+            Ok(PromptSubmission::InputQueued)
         } else {
-            // Recién spawneado: diferí hasta que renderice.
-            session.queue_prompt(text);
+            session
+                .queue_prompt_tracked(text)
+                .map(PromptSubmission::Deferred)
         }
     }
 

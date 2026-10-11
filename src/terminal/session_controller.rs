@@ -201,6 +201,39 @@ impl SessionController {
         }
     }
 
+    pub fn queue_prompt_tracked(
+        &self,
+        text: &str,
+    ) -> std::io::Result<crate::runtime::DeferredPrompt> {
+        use std::io::{Error, ErrorKind};
+        let manager = self
+            .pty_manager
+            .as_ref()
+            .ok_or_else(|| Error::new(ErrorKind::NotConnected, "El terminal no está conectado."))?;
+        let session_id = self.session_id.ok_or_else(|| {
+            Error::new(ErrorKind::NotFound, "La sesión del terminal ya no existe.")
+        })?;
+        let mut manager = manager
+            .lock()
+            .map_err(|_| Error::other("No se pudo acceder al gestor de terminales."))?;
+        manager.queue_prompt_tracked(session_id, text)
+    }
+
+    pub fn submit_prompt(&self, text: &str) -> std::io::Result<()> {
+        use std::io::{Error, ErrorKind};
+        let manager = self
+            .pty_manager
+            .as_ref()
+            .ok_or_else(|| Error::new(ErrorKind::NotConnected, "El terminal no está conectado."))?;
+        let session_id = self.session_id.ok_or_else(|| {
+            Error::new(ErrorKind::NotFound, "La sesión del terminal ya no existe.")
+        })?;
+        let mut manager = manager
+            .lock()
+            .map_err(|_| Error::other("No se pudo acceder al gestor de terminales."))?;
+        manager.submit_prompt(session_id, text)
+    }
+
     pub fn title_snapshot(&self) -> Option<String> {
         let manager = self.pty_manager.as_ref()?;
         let session_id = self.session_id?;
