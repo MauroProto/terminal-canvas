@@ -1254,16 +1254,28 @@ impl TerminalPanel {
         });
     }
 
-    pub fn apply_remote_input_events(&mut self, events: &[TerminalInputEvent]) {
-        if events.is_empty() {
-            return;
+    pub fn apply_remote_input_events(
+        &mut self,
+        target: Option<&crate::collab::SharedTerminalTarget>,
+        events: &[TerminalInputEvent],
+    ) -> bool {
+        // Messages already in flight must never move to another split or a
+        // replacement process. Old peers without identities support one leaf.
+        let matches_target = match target {
+            Some(target) => *target == self.remote_input_target(),
+            None => self.leaf_count() == 1,
+        };
+        if !matches_target || events.is_empty() {
+            return false;
         }
-
         let Some(session) = self.focused_session_mut() else {
             log::error!("Cannot apply remote input to an unknown focused leaf");
-            return;
+            return false;
         };
         session.ensure_attached();
+        if !session.is_attached() {
+            return false;
+        }
         let mode = session.input_mode();
         for event in events {
             match event {
@@ -1288,6 +1300,7 @@ impl TerminalPanel {
                 }
             }
         }
+        true
     }
 
     pub fn handle_scroll(

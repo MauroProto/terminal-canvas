@@ -208,7 +208,16 @@ impl TerminalApp {
                             );
                             continue;
                         }
-                        self.workspaces[index].apply_remote_input(input.terminal_id, &input.events);
+                        if !self.workspaces[index].apply_remote_input(
+                            input.terminal_id,
+                            input.target.as_ref(),
+                            &input.events,
+                        ) {
+                            self.collab.revoke_control(
+                                input.terminal_id,
+                                "El terminal cambió. Actualizá la sesión antes de pedir control.",
+                            );
+                        }
                     }
                 }
             }

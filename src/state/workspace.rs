@@ -721,12 +721,16 @@ impl Workspace {
             .collect()
     }
 
-    pub fn apply_remote_input(&mut self, panel_id: Uuid, events: &[TerminalInputEvent]) -> bool {
+    pub fn apply_remote_input(
+        &mut self,
+        panel_id: Uuid,
+        target: Option<&crate::collab::SharedTerminalTarget>,
+        events: &[TerminalInputEvent],
+    ) -> bool {
         let Some(panel) = self.panels.iter_mut().find(|panel| panel.id() == panel_id) else {
             return false;
         };
-        panel.apply_remote_input_events(events);
-        true
+        panel.apply_remote_input_events(target, events)
     }
 
     pub fn shared_panel_snapshots(&self) -> Vec<SharedPanelSnapshot> {

@@ -67,7 +67,10 @@ fn test_snapshot() -> SharedWorkspaceSnapshot {
         guests: Vec::new(),
         terminal_controls: Vec::new(),
         panels: vec![SharedPanelSnapshot {
-            input_target: None,
+            input_target: Some(crate::collab::SharedTerminalTarget {
+                leaf_id: Uuid::from_u128(3),
+                runtime_session_id: Some(Uuid::from_u128(4)),
+            }),
             panel_id: Uuid::from_u128(2),
             title: "Remote test terminal".into(),
             position: [0.0, 0.0],
@@ -216,6 +219,7 @@ fn online_guest_dialog_text_never_reaches_the_real_host_transport() {
             );
             let crate::collab::CollabEvent::RemoteInput { guest_id, input } = &events[0];
             assert_eq!(*guest_id, id);
+            assert_eq!(input.target, test_snapshot().panels[0].input_target);
             assert_eq!(
                 input.events,
                 vec![TerminalInputEvent::Text("PUBLIC-TERMINAL-INPUT".into())]

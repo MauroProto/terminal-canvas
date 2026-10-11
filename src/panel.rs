@@ -282,9 +282,13 @@ impl WorkspacePanel {
         }
     }
 
-    pub fn apply_remote_input_events(&mut self, events: &[TerminalInputEvent]) {
+    pub fn apply_remote_input_events(
+        &mut self,
+        target: Option<&crate::collab::SharedTerminalTarget>,
+        events: &[TerminalInputEvent],
+    ) -> bool {
         match self {
-            Self::Terminal(panel) => panel.apply_remote_input_events(events),
+            Self::Terminal(panel) => panel.apply_remote_input_events(target, events),
         }
     }
 

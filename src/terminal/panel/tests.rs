@@ -700,3 +700,70 @@ fn branch_badge_never_overlaps_the_title_for_any_title_width() {
     }
     assert!(drawn > 0, "the badge should fit for at least some widths");
 }
+
+#[test]
+fn online_input_stays_bound_to_the_displayed_leaf_and_runtime() {
+    use crate::collab::TerminalInputEvent;
+    use crate::terminal::split_tree::Axis;
+    use std::sync::{Arc, Mutex};
+    let (mut panel, root) = panel_with_in_memory_history();
+    panel.set_share_scope(PanelShareScope::Controllable);
+    let old_target = panel.shared_snapshot().input_target.unwrap();
+    let root_revision = root.lock().unwrap().activity_revision();
+    let manager = Arc::new(Mutex::new(crate::runtime::PtyManager::new_for_tests()));
+    manager
+        .lock()
+        .unwrap()
+        .set_remote_spawner(Box::new(|_, _, _, _, _| {
+            Ok((
+                uuid::Uuid::new_v4(),
+                crate::terminal::pty::PtyHandle::for_persistence_tests(b"RIGHT-LEAF\r\n"),
+            ))
+        }));
+    panel.split_focused_after_alias_ack(Axis::Horizontal, manager.clone(), None, None, 80, 24);
+    let snapshot = panel.shared_snapshot();
+    assert!(snapshot.visible_text.contains("RIGHT-LEAF"));
+    let target = snapshot.input_target.unwrap();
+    assert_ne!(target.leaf_id, old_target.leaf_id);
+    let right = panel.leaf_session_handle(target.leaf_id).unwrap();
+    let revision = right.lock().unwrap().activity_revision();
+    let input = vec![TerminalInputEvent::Text("REMOTE".into())];
+    assert!(!panel.apply_remote_input_events(Some(&old_target), &input));
+    assert!(
+        !panel.apply_remote_input_events(None, &input),
+        "a legacy guest cannot ambiguously control a split"
+    );
+    assert_eq!(root.lock().unwrap().activity_revision(), root_revision);
+    assert_eq!(right.lock().unwrap().activity_revision(), revision);
+    assert!(panel.apply_remote_input_events(Some(&target), &input));
+    assert!(right.lock().unwrap().activity_revision() > revision);
+    assert_eq!(root.lock().unwrap().activity_revision(), root_revision);
+
+    assert!(panel.replace_focused_session_after_alias_ack(
+        manager,
+        None,
+        uuid::Uuid::new_v4(),
+        "codex resume --last".into(),
+        "codex".into()
+    ));
+    let replacement = panel.remote_input_target();
+    assert_eq!(replacement.leaf_id, target.leaf_id);
+    assert_ne!(replacement.runtime_session_id, target.runtime_session_id);
+    let handle = panel.leaf_session_handle(replacement.leaf_id).unwrap();
+    let before = handle.lock().unwrap().activity_revision();
+    assert!(!panel.apply_remote_input_events(Some(&target), &input));
+    assert_eq!(handle.lock().unwrap().activity_revision(), before);
+    assert!(panel.apply_remote_input_events(Some(&replacement), &input));
+    assert!(handle.lock().unwrap().activity_revision() > before);
+}
+
+#[test]
+fn online_legacy_input_still_works_for_a_single_leaf() {
+    let (mut panel, handle) = panel_with_in_memory_history();
+    let before = handle.lock().unwrap().activity_revision();
+    assert!(panel.apply_remote_input_events(
+        None,
+        &[crate::collab::TerminalInputEvent::Text("LEGACY".into())]
+    ));
+    assert!(handle.lock().unwrap().activity_revision() > before);
+}
