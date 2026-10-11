@@ -248,57 +248,6 @@ fn looks_like_url(token: &str) -> bool {
         && token.chars().count() >= 8
 }
 
-#[cfg(test)]
-mod url_tests {
-    use super::{looks_like_url, url_at_cell};
-
-    #[test]
-    fn url_validation_requires_scheme_or_www() {
-        assert!(looks_like_url("https://example.com/path"));
-        assert!(looks_like_url("http://localhost:8080"));
-        assert!(looks_like_url("www.example.com"));
-        assert!(!looks_like_url("example.com"));
-        assert!(!looks_like_url("notaurl"));
-        assert!(!looks_like_url("http://"));
-    }
-
-    fn term_with(text: &str) -> alacritty_terminal::term::Term<crate::terminal::pty::EventProxy> {
-        use alacritty_terminal::term::test::TermSize;
-        use alacritty_terminal::term::{Config as TermConfig, Term};
-        use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
-        let (tx, _rx) = std::sync::mpsc::channel();
-        let mut term = Term::new(
-            TermConfig::default(),
-            &TermSize::new(60, 5),
-            crate::terminal::pty::EventProxy::new(tx),
-        );
-        let mut processor = Processor::<StdSyncHandler>::new();
-        processor.advance(&mut term, text.as_bytes());
-        term
-    }
-
-    #[test]
-    fn url_at_cell_extracts_url_under_cursor() {
-        let term = term_with("visit https://example.com/page now");
-        // "visit " ocupa cols 0-5; la URL arranca en col 6.
-        let url = url_at_cell(&term, 0, 10);
-        assert_eq!(url.as_deref(), Some("https://example.com/page"));
-    }
-
-    #[test]
-    fn url_at_cell_returns_none_for_plain_text() {
-        let term = term_with("hello world no links here");
-        assert_eq!(url_at_cell(&term, 0, 3), None);
-    }
-
-    #[test]
-    fn url_at_cell_strips_trailing_punctuation() {
-        let term = term_with("see https://example.com/a.");
-        let url = url_at_cell(&term, 0, 8);
-        assert_eq!(url.as_deref(), Some("https://example.com/a"));
-    }
-}
-
 impl TerminalPanel {
     pub fn orchestration_observation(&self, workspace_id: Uuid) -> PanelRuntimeObservation {
         let mut visible_text = String::new();
@@ -421,5 +370,56 @@ impl TerminalPanel {
             }
         }
         Some(alive)
+    }
+}
+
+#[cfg(test)]
+mod url_tests {
+    use super::{looks_like_url, url_at_cell};
+
+    #[test]
+    fn url_validation_requires_scheme_or_www() {
+        assert!(looks_like_url("https://example.com/path"));
+        assert!(looks_like_url("http://localhost:8080"));
+        assert!(looks_like_url("www.example.com"));
+        assert!(!looks_like_url("example.com"));
+        assert!(!looks_like_url("notaurl"));
+        assert!(!looks_like_url("http://"));
+    }
+
+    fn term_with(text: &str) -> alacritty_terminal::term::Term<crate::terminal::pty::EventProxy> {
+        use alacritty_terminal::term::test::TermSize;
+        use alacritty_terminal::term::{Config as TermConfig, Term};
+        use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut term = Term::new(
+            TermConfig::default(),
+            &TermSize::new(60, 5),
+            crate::terminal::pty::EventProxy::new(tx),
+        );
+        let mut processor = Processor::<StdSyncHandler>::new();
+        processor.advance(&mut term, text.as_bytes());
+        term
+    }
+
+    #[test]
+    fn url_at_cell_extracts_url_under_cursor() {
+        let term = term_with("visit https://example.com/page now");
+        // "visit " ocupa cols 0-5; la URL arranca en col 6.
+        let url = url_at_cell(&term, 0, 10);
+        assert_eq!(url.as_deref(), Some("https://example.com/page"));
+    }
+
+    #[test]
+    fn url_at_cell_returns_none_for_plain_text() {
+        let term = term_with("hello world no links here");
+        assert_eq!(url_at_cell(&term, 0, 3), None);
+    }
+
+    #[test]
+    fn url_at_cell_strips_trailing_punctuation() {
+        let term = term_with("see https://example.com/a.");
+        let url = url_at_cell(&term, 0, 8);
+        assert_eq!(url.as_deref(), Some("https://example.com/a"));
     }
 }

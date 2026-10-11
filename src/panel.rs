@@ -402,25 +402,6 @@ impl WorkspacePanel {
         panel.take_hook_mutation_error()
     }
 
-    #[cfg(test)]
-    pub(crate) fn replace_focused_session_with_fixture_alias_ack(
-        &mut self,
-        manager: Arc<Mutex<crate::runtime::PtyManager>>,
-        cwd: Option<&std::path::Path>,
-        workspace: Uuid,
-        startup_command: String,
-        agent_command: String,
-    ) -> bool {
-        let Self::Terminal(panel) = self;
-        panel.replace_focused_session_with_fixture_alias_ack(
-            manager,
-            cwd,
-            workspace,
-            startup_command,
-            agent_command,
-        )
-    }
-
     pub fn shared_snapshot(&self) -> SharedPanelSnapshot {
         match self {
             Self::Terminal(panel) => panel.shared_snapshot(),

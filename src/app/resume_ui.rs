@@ -400,7 +400,7 @@ fn replace_and_remember_resume_session(
     #[cfg(test)]
     {
         panel.set_agent_session_id_for_leaf(leaf_id, exact_session_id);
-        return true;
+        true
     }
     #[cfg(not(test))]
     false
