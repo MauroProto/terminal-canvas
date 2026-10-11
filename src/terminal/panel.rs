@@ -18,6 +18,9 @@ use egui::{
 };
 use uuid::Uuid;
 
+use crate::hook_authority::{Claim, ClaimPhase, LeafKey};
+use crate::hook_runtime::{AliasFence, AliasStatus};
+
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
@@ -221,6 +224,8 @@ pub struct TerminalPanel {
     /// Evita reinyectar dos veces una hoja mientras el resto del split sigue
     /// detached y la app reintenta la restauración pendiente.
     restored_history_leaves: HashSet<crate::terminal::split_tree::LeafId>,
+    pending_hook_mutation: Option<PendingHookMutation>,
+    hook_mutation_error: Option<String>,
 }
 
 /// Estado multi-hoja validado antes de crear controladores de sesión.
@@ -443,6 +448,8 @@ impl TerminalPanel {
             last_mouse_cell: None,
             search: None,
             restored_history_leaves: HashSet::new(),
+            pending_hook_mutation: None,
+            hook_mutation_error: None,
         };
         this.focused_leaf = this.root_leaf;
         this
@@ -524,6 +531,13 @@ impl TerminalPanel {
             Some(restored_leaves.root_leaf),
             Some(workspace_id),
         );
+        // UI proves only that this is a restored single root. The ledger's
+        // sticky closure policy and the host's exact target remain authoritative.
+        root_spec.hook_legacy_root = saved.split_tree.is_none()
+            && restored_leaves.split_tree.is_none()
+            && restored_leaves
+                .runtime_session_ids
+                .contains_key(&restored_leaves.root_leaf);
         root_spec.memory_task_id = panel
             .leaf_memory_task_ids
             .get(&restored_leaves.root_leaf)
@@ -601,6 +615,7 @@ impl TerminalPanel {
     /// Suelta la sesión (no mata la del daemon): es lo que corre al dropear el
     /// panel, incluido el cierre de la app.
     fn close_runtime_session(&mut self) {
+        self.pending_hook_mutation = None;
         self.session.close();
         for session in self.leaf_sessions.values_mut() {
             session.close();
@@ -610,6 +625,7 @@ impl TerminalPanel {
     /// Cierra el panel **para siempre** (lo cerró el usuario): mata también la
     /// sesión del daemon y las de todas las hojas.
     pub fn close_for_good(&mut self) {
+        self.pending_hook_mutation = None;
         self.session.close_for_good();
         for session in self.leaf_sessions.values_mut() {
             session.close_for_good();
@@ -823,7 +839,7 @@ impl TerminalPanel {
 
     /// Divide la hoja enfocada en `axis`. Espawnea una sesión nueva para la
     /// hoja resultante y le da el foco.
-    pub fn split_focused(
+    fn split_focused_after_alias_ack(
         &mut self,
         axis: crate::terminal::split_tree::Axis,
         pty_manager: Arc<Mutex<PtyManager>>,
@@ -870,7 +886,7 @@ impl TerminalPanel {
 
     /// Cierra la hoja enfocada. Si era la única, el panel queda sin splits.
     /// Devuelve `true` si el panel entero debe cerrarse (se vació).
-    pub fn close_focused_leaf(&mut self) -> bool {
+    fn close_focused_leaf_after_alias_ack(&mut self) -> bool {
         let Some(mut tree) = self.split_tree.take() else {
             // Sin splits: cerrar el panel completo lo decide quien llama.
             return true;
@@ -1152,52 +1168,6 @@ impl TerminalPanel {
             if let Some(activity_label) = infer_activity_label(&self.title, &self.shell_title, "") {
                 self.activity_label = Some(activity_label);
             }
-        }
-    }
-
-    pub fn orchestration_observation(&self, workspace_id: Uuid) -> PanelRuntimeObservation {
-        let mut visible_text = String::new();
-        let mut agent_status = None;
-        let mut activity_revision = None;
-        let mut text_snapshot_available = false;
-        let attached = self.runtime_session_attached();
-        let recent_output = self
-            .with_pty(|pty| {
-                if let Ok(term) = pty.term.try_lock() {
-                    visible_text = visible_text_snapshot(&term, 16, 180);
-                    text_snapshot_available = true;
-                }
-                agent_status = pty.agent_status_snapshot();
-                activity_revision = Some(pty.activity_revision());
-                pty.output_elapsed() <= Duration::from_secs(4)
-            })
-            .unwrap_or(false);
-
-        PanelRuntimeObservation {
-            panel_id: self.id,
-            runtime_session_id: self.focused_runtime_session_id(),
-            workspace_id,
-            title: self.title.clone(),
-            visible_text: if self.minimized || !attached {
-                String::new()
-            } else {
-                visible_text
-            },
-            alive: self.is_alive(),
-            recent_output: if self.minimized || !attached {
-                false
-            } else {
-                recent_output
-            },
-            activity_revision,
-            text_snapshot_available: text_snapshot_available && attached && !self.minimized,
-            attached,
-            minimized: self.minimized,
-            agent_status: if self.minimized || !attached {
-                None
-            } else {
-                agent_status
-            },
         }
     }
 
@@ -1726,7 +1696,7 @@ impl TerminalPanel {
     /// Sustituye la sesión enfocada por un shell nuevo que ejecuta un comando
     /// de reanudación. El proceso anterior se cierra explícitamente; escribir
     /// el comando con `send_prompt` lo mandaría al TUI como texto de chat.
-    pub fn replace_focused_session(
+    fn replace_focused_session_after_alias_ack(
         &mut self,
         pty_manager: Arc<Mutex<PtyManager>>,
         cwd: Option<&Path>,
@@ -3341,7 +3311,7 @@ mod persistence_tests {
             Arc::clone(&manager),
         );
 
-        assert!(!panel.close_focused_leaf());
+        assert!(!panel.close_focused_leaf_with_fixture_alias_ack());
 
         assert_eq!(panel.leaf_count(), 1);
         assert_eq!(panel.root_leaf_id(), survivor_leaf);
@@ -3432,3 +3402,323 @@ fn draw_search_highlight(
         line = Line(line.0 + 1);
     }
 }
+
+// Prepared addition to terminal/panel.rs. The worker owns durable closure and
+// runtime birth authorization. UI only holds a deferred structural intention.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HookMutationSnapshot {
+    key: LeafKey,
+    root_runtime: Option<Uuid>,
+    focused_leaf: Uuid,
+    focused_runtime: Option<Uuid>,
+    root_claim: Option<Claim>,
+    focused_claim: Option<Claim>,
+}
+
+enum HookMutationKind {
+    Split {
+        axis: crate::terminal::split_tree::Axis,
+        manager: Arc<Mutex<PtyManager>>,
+        cwd: Option<PathBuf>,
+        workspace: Uuid,
+        cols: u16,
+        rows: u16,
+    },
+    CloseLeaf,
+    Replace {
+        manager: Arc<Mutex<PtyManager>>,
+        cwd: Option<PathBuf>,
+        workspace: Uuid,
+        startup_command: String,
+        agent_command: String,
+        resume_session_id: Option<Option<String>>,
+    },
+}
+
+struct PendingHookMutation {
+    snapshot: HookMutationSnapshot,
+    fence: AliasFence,
+    kind: HookMutationKind,
+}
+
+impl TerminalPanel {
+    pub(crate) fn has_pending_hook_mutation(&self) -> bool {
+        self.pending_hook_mutation.is_some()
+    }
+
+    fn hook_mutation_snapshot(&self, workspace: Uuid) -> HookMutationSnapshot {
+        HookMutationSnapshot {
+            key: LeafKey {
+                workspace,
+                panel: self.id,
+                leaf: self.root_leaf,
+            },
+            root_runtime: self.runtime_session_id(),
+            focused_leaf: self.focused_leaf,
+            focused_runtime: self.focused_runtime_session_id(),
+            root_claim: self.hook_claim_for_leaf(self.root_leaf),
+            focused_claim: self.focused_hook_claim(),
+        }
+    }
+
+    fn queue_hook_mutation(&mut self, workspace: Uuid, kind: HookMutationKind) -> bool {
+        // A repeated click cannot replace or erase an earlier pending guard.
+        if self.pending_hook_mutation.is_some()
+            || self
+                .workspace_id
+                .is_some_and(|current| current != workspace)
+        {
+            return false;
+        }
+        let snapshot = self.hook_mutation_snapshot(workspace);
+        let fence = self.session.request_close_alias(snapshot.key).or_else(|| {
+            crate::hook_runtime::process_runtime()
+                .map(|runtime| runtime.request_close_alias(snapshot.key))
+        });
+        let Some(fence) = fence else {
+            log::warn!("Cannot mutate terminal layout without a durable alias worker");
+            self.hook_mutation_error = Some("No se pudo guardar el cambio del terminal.".into());
+            return false;
+        };
+        if fence.status() == AliasStatus::Failed {
+            self.hook_mutation_error = Some("No se pudo guardar el cambio del terminal.".into());
+            return false;
+        }
+        self.pending_hook_mutation = Some(PendingHookMutation {
+            snapshot,
+            fence,
+            kind,
+        });
+        true
+    }
+
+    pub fn split_focused(
+        &mut self,
+        axis: crate::terminal::split_tree::Axis,
+        manager: Arc<Mutex<PtyManager>>,
+        cwd: Option<&Path>,
+        workspace: Option<Uuid>,
+        cols: u16,
+        rows: u16,
+    ) {
+        let Some(workspace) = self.workspace_id.or(workspace) else {
+            return;
+        };
+        self.queue_hook_mutation(
+            workspace,
+            HookMutationKind::Split {
+                axis,
+                manager,
+                cwd: cwd.map(Path::to_path_buf),
+                workspace,
+                cols,
+                rows,
+            },
+        );
+    }
+
+    /// Closing a root can promote a different leaf into its legacy alias slot.
+    /// Keep the current tree intact until the sticky closure has a durable ACK.
+    pub fn close_focused_leaf(&mut self) -> bool {
+        let Some(workspace) = self.workspace_id else {
+            return false;
+        };
+        self.queue_hook_mutation(workspace, HookMutationKind::CloseLeaf);
+        // Workspace::poll_pending_hook_mutations handles a whole-panel close
+        // when the acknowledged intention is actually consumed.
+        false
+    }
+
+    /// True means accepted; the replacement itself waits for the durable fence.
+    pub fn replace_focused_session(
+        &mut self,
+        manager: Arc<Mutex<PtyManager>>,
+        cwd: Option<&Path>,
+        workspace: Uuid,
+        startup_command: String,
+        agent_command: String,
+    ) -> bool {
+        self.queue_hook_mutation(
+            workspace,
+            HookMutationKind::Replace {
+                manager,
+                cwd: cwd.map(Path::to_path_buf),
+                workspace,
+                startup_command,
+                agent_command,
+                resume_session_id: None,
+            },
+        )
+    }
+
+    /// Keep an exact resume ID on the accepted intention. The old controller
+    /// and its saved metadata must remain unchanged before alias ACK.
+    pub(crate) fn stage_replacement_resume_id(
+        &mut self,
+        leaf: Uuid,
+        session_id: Option<String>,
+    ) -> bool {
+        let Some(pending) = self.pending_hook_mutation.as_mut() else {
+            return false;
+        };
+        if pending.snapshot.focused_leaf != leaf {
+            return false;
+        }
+        let HookMutationKind::Replace {
+            resume_session_id, ..
+        } = &mut pending.kind
+        else {
+            return false;
+        };
+        *resume_session_id = Some(session_id);
+        true
+    }
+
+    /// Returns true only when an acknowledged close consumed the last leaf.
+    pub(crate) fn poll_pending_hook_mutation(&mut self) -> bool {
+        let Some(pending) = self.pending_hook_mutation.take() else {
+            return false;
+        };
+        if self.hook_mutation_snapshot(pending.snapshot.key.workspace) != pending.snapshot {
+            // A retired/replaced/root-promoted target must never consume an old
+            // ACK. The durable alias tombstone stays closed when this is dropped.
+            log::warn!("Discarding terminal mutation whose leaf/runtime identity changed");
+            self.hook_mutation_error =
+                Some("La sesión cambió antes de completar la operación.".into());
+            return false;
+        }
+        match pending.fence.status() {
+            AliasStatus::Pending => {
+                self.pending_hook_mutation = Some(pending);
+                false
+            }
+            AliasStatus::Failed => {
+                log::warn!("Terminal mutation blocked: alias closure was not durably acknowledged");
+                self.hook_mutation_error =
+                    Some("No se pudo guardar el cambio del terminal.".into());
+                false
+            }
+            AliasStatus::Acknowledged => match pending.kind {
+                HookMutationKind::Split {
+                    axis,
+                    manager,
+                    cwd,
+                    workspace,
+                    cols,
+                    rows,
+                } => {
+                    self.split_focused_after_alias_ack(
+                        axis,
+                        manager,
+                        cwd.as_deref(),
+                        Some(workspace),
+                        cols,
+                        rows,
+                    );
+                    false
+                }
+                HookMutationKind::CloseLeaf => self.close_focused_leaf_after_alias_ack(),
+                HookMutationKind::Replace {
+                    manager,
+                    cwd,
+                    workspace,
+                    startup_command,
+                    agent_command,
+                    resume_session_id,
+                } => {
+                    if !self.replace_focused_session_after_alias_ack(
+                        manager,
+                        cwd.as_deref(),
+                        workspace,
+                        startup_command,
+                        agent_command,
+                    ) {
+                        log::warn!("Acknowledged terminal replacement could not start");
+                        self.hook_mutation_error =
+                            Some("No se pudo iniciar la conversación reanudada.".into());
+                    } else if let Some(session_id) = resume_session_id {
+                        self.set_agent_session_id_for_leaf(
+                            pending.snapshot.focused_leaf,
+                            session_id,
+                        );
+                    }
+                    false
+                }
+            },
+        }
+    }
+
+    pub(crate) fn take_hook_mutation_error(&mut self) -> Option<String> {
+        self.hook_mutation_error.take()
+    }
+
+    /// Headless regression fixtures use a real, committed temporary ledger
+    /// closure and then call the same deferred consumer as production.
+    #[cfg(test)]
+    fn fixture_alias_fence(&self, workspace: Uuid) -> AliasFence {
+        use crate::memory::hook_ledger::LedgerIntent;
+        let key = self.hook_mutation_snapshot(workspace).key;
+        let path =
+            std::env::temp_dir().join(format!("tc-ui-ack-regression-{}.sqlite", Uuid::new_v4()));
+        let store = crate::memory::MemoryStore::open(&path).unwrap();
+        store
+            .hook_transition(
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                &LedgerIntent::CloseLegacyAlias {
+                    workspace: key.workspace,
+                    panel: key.panel,
+                    expected_epoch: None,
+                    root: key.leaf,
+                },
+            )
+            .unwrap();
+        let fence = AliasFence::from_closed_ledger_for_fixture(&store, key).unwrap();
+        drop(store);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(PathBuf::from(format!("{}-wal", path.display())));
+        let _ = std::fs::remove_file(PathBuf::from(format!("{}-shm", path.display())));
+        fence
+    }
+
+    #[cfg(test)]
+    fn close_focused_leaf_with_fixture_alias_ack(&mut self) -> bool {
+        let workspace = self.workspace_id.unwrap();
+        self.pending_hook_mutation = Some(PendingHookMutation {
+            snapshot: self.hook_mutation_snapshot(workspace),
+            fence: self.fixture_alias_fence(workspace),
+            kind: HookMutationKind::CloseLeaf,
+        });
+        self.poll_pending_hook_mutation()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_focused_session_with_fixture_alias_ack(
+        &mut self,
+        manager: Arc<Mutex<PtyManager>>,
+        cwd: Option<&Path>,
+        workspace: Uuid,
+        startup_command: String,
+        agent_command: String,
+    ) -> bool {
+        self.pending_hook_mutation = Some(PendingHookMutation {
+            snapshot: self.hook_mutation_snapshot(workspace),
+            fence: self.fixture_alias_fence(workspace),
+            kind: HookMutationKind::Replace {
+                manager,
+                cwd: cwd.map(Path::to_path_buf),
+                workspace,
+                startup_command,
+                agent_command,
+                resume_session_id: None,
+            },
+        });
+        self.poll_pending_hook_mutation();
+        self.hook_mutation_error.is_none()
+    }
+}
+
+#[cfg(test)]
+#[path = "panel/hook_mutation_causal_fixtures.rs"]
+mod hook_mutation_causal_fixtures;

@@ -365,6 +365,30 @@ impl Workspace {
         }
     }
 
+    pub(crate) fn has_pending_hook_mutations(&self) -> bool {
+        self.panels
+            .iter()
+            .any(CanvasPanel::has_pending_hook_mutation)
+    }
+
+    /// Drained for every workspace, including those not currently rendered.
+    pub(crate) fn poll_pending_hook_mutations(&mut self) -> Vec<String> {
+        let mut close = Vec::new();
+        let mut errors = Vec::new();
+        for panel in &mut self.panels {
+            if panel.poll_pending_hook_mutation() {
+                close.push(panel.id());
+            }
+            if let Some(error) = panel.take_hook_mutation_error() {
+                errors.push(format!("{}: {error}", panel.title()));
+            }
+        }
+        for panel_id in close {
+            self.close_panel(panel_id);
+        }
+        errors
+    }
+
     pub fn focus_next_leaf(&mut self) {
         if let Some(panel) = self.focused_panel_mut() {
             panel.focus_next_leaf();

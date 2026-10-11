@@ -262,6 +262,20 @@ impl TerminalApp {
         #[cfg(all(unix, feature = "daemon"))]
         let daemon_endpoint = daemon.endpoint();
 
+        let hook_server = if side_effects {
+            #[cfg(all(unix, feature = "daemon"))]
+            let owner = daemon_endpoint
+                .as_ref()
+                .map(|e| e.client_id)
+                .unwrap_or_else(Uuid::new_v4);
+            #[cfg(not(all(unix, feature = "daemon")))]
+            let owner = Uuid::new_v4();
+            crate::hook_runtime::bootstrap(owner);
+            start_hook_server()
+        } else {
+            None
+        };
+
         let mut app = if let Some(mut saved) = loaded_state {
             crate::state::persistence::normalize_saved_state(&mut saved);
             let collab = CollabManager::new();
@@ -339,7 +353,7 @@ impl TerminalApp {
                 notification_gate: notify_policy::NotificationGate::new(
                     notify_policy::NOTIFICATION_COOLDOWN,
                 ),
-                hook_server: side_effects.then(start_hook_server).flatten(),
+                hook_server,
                 gh_client: Default::default(),
                 linear_client: Default::default(),
                 agent_detector: crate::orchestration::AgentDetector::start(),
@@ -450,7 +464,7 @@ impl TerminalApp {
                 notification_gate: notify_policy::NotificationGate::new(
                     notify_policy::NOTIFICATION_COOLDOWN,
                 ),
-                hook_server: side_effects.then(start_hook_server).flatten(),
+                hook_server,
                 gh_client: Default::default(),
                 linear_client: Default::default(),
                 agent_detector: crate::orchestration::AgentDetector::start(),
@@ -2700,13 +2714,26 @@ fn install_daemon_spawner_on(
     workspace: &Workspace,
     endpoint: &crate::daemon::sessions::DaemonEndpoint,
 ) {
-    let endpoint = endpoint.clone();
+    let spawn_endpoint = endpoint.clone();
+    let close_endpoint = endpoint.clone();
     if let Ok(mut manager) = workspace.pty_manager().lock() {
-        manager.set_remote_spawner(Box::new(move |spec, cols, rows, scheduler, desired_id| {
-            crate::daemon::sessions::spawn_remote(
-                &endpoint, spec, cols, rows, scheduler, desired_id,
-            )
-        }));
+        manager.set_remote_backend(
+            endpoint.client_id,
+            std::sync::Arc::new(move |spec, cols, rows, scheduler, id, intent| {
+                crate::daemon::sessions::recover_remote(
+                    &spawn_endpoint,
+                    spec,
+                    cols,
+                    rows,
+                    scheduler,
+                    id,
+                    intent,
+                )
+            }),
+            std::sync::Arc::new(move |id, intent| {
+                crate::daemon::sessions::close_remote(&close_endpoint, id, intent)
+            }),
+        );
     }
 }
 

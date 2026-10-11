@@ -127,20 +127,46 @@ pub(super) struct LaunchAgentDraft {
 
 impl TerminalApp {
     pub(super) fn reconcile_orchestration(&mut self) {
+        let mutation_errors = self
+            .workspaces
+            .iter_mut()
+            .flat_map(Workspace::poll_pending_hook_mutations)
+            .collect::<Vec<_>>();
+        for error in mutation_errors {
+            self.toast_error(error);
+        }
+        let live_claims = self
+            .workspaces
+            .iter()
+            .flat_map(|workspace| workspace.panels.iter())
+            .flat_map(|panel| panel.all_hook_claims())
+            .collect();
+        self.orchestrator.retain_hook_claims(&live_claims);
+        let live_panels = self
+            .workspaces
+            .iter()
+            .flat_map(|workspace| {
+                workspace
+                    .panels
+                    .iter()
+                    .map(|panel| (workspace.id, panel.id()))
+            })
+            .collect();
         let mut live_panel_ids = HashSet::new();
         for workspace in &self.workspaces {
             for panel in &workspace.panels {
                 live_panel_ids.insert(panel.id());
-                self.orchestrator.ensure_panel_session(
+                self.orchestrator.ensure_claimed_panel_session(
                     workspace.id,
                     workspace.cwd.clone(),
                     panel.id(),
                     panel.focused_runtime_session_id(),
                     panel.title(),
+                    panel.focused_hook_claim(),
                 );
             }
         }
-        self.orchestrator.prune_missing_panels(&live_panel_ids);
+        self.orchestrator.prune_missing_claimed_panels(&live_panels);
         self.prune_panel_keyed_state(&live_panel_ids);
     }
 
@@ -258,37 +284,41 @@ impl TerminalApp {
             return;
         }
         let now = chrono::Utc::now();
-        for event in events {
-            // El hook dice de qué panel viene; si ese panel ya no existe, se
-            // descarta (hook viejo de una sesión cerrada).
-            let Some(panel_id) = event.panel_id else {
+        let mut published = false;
+        for accepted in events {
+            let Ok(claim) = accepted.begin_publication() else {
                 continue;
             };
-            let Some(alive) = self
+            let event = &accepted.event;
+            if event.workspace_id != Some(claim.key.workspace)
+                || event.panel_id != Some(claim.key.panel)
+                || event.leaf_id != Some(claim.key.leaf)
+            {
+                continue;
+            }
+            let Some(workspace) = self
                 .workspaces
-                .iter()
-                .flat_map(|workspace| workspace.panels.iter())
-                .find(|panel| panel.id() == panel_id)
-                .map(|panel| panel.is_alive())
+                .iter_mut()
+                .find(|workspace| workspace.id == claim.key.workspace)
             else {
                 continue;
             };
-            // El id de sesión que trae el hook se guarda en el panel: con eso
-            // el próximo arranque reanuda la conversación exacta (P2.12, T3).
-            if let Some(session_id) = event.session_id.clone() {
-                for workspace in &mut self.workspaces {
-                    for panel in &mut workspace.panels {
-                        if panel.id() == panel_id {
-                            // Hooks previos a la identidad multi-hoja no
-                            // mandaban `leaf`; su metadata pertenecía a la
-                            // sesión raíz del panel.
-                            let leaf_id = event.leaf_id.unwrap_or_else(|| panel.root_leaf_id());
-                            panel.set_agent_session_id_for_leaf(leaf_id, Some(session_id.clone()));
-                        }
-                    }
-                }
-            }
-            self.orchestrator.apply_hook_event(&event, alive, now);
+            let Some(panel) = workspace.panel_mut(claim.key.panel) else {
+                continue;
+            };
+            let Some(alive) =
+                panel.publish_hook_session_id(claim, event.session_id.clone(), event.kind)
+            else {
+                continue;
+            };
+            self.orchestrator
+                .apply_claimed_hook_event(claim, event, alive, now);
+            published = true;
+            // accepted remains alive across BOTH the T3 setter and cache/activity
+            // publication. Drop releases the worker's real consumption lease.
+        }
+        if !published {
+            return;
         }
         self.repaint_policy.note_runtime_event();
     }
@@ -469,11 +499,24 @@ impl TerminalApp {
     }
 
     pub(super) fn maybe_refresh_orchestration(&mut self) {
+        let pending = self
+            .workspaces
+            .iter()
+            .any(Workspace::has_pending_hook_mutations);
+        if pending {
+            if let Some(ctx) = self.ctx.as_ref() {
+                ctx.request_repaint_after(Duration::from_millis(50));
+            }
+        }
         if self.panel_gesture.is_some() {
             return;
         }
-        if self.last_orchestration_refresh.elapsed() >= ORCHESTRATION_REFRESH_INTERVAL {
+        let refresh_due =
+            self.last_orchestration_refresh.elapsed() >= ORCHESTRATION_REFRESH_INTERVAL;
+        if pending || refresh_due {
             self.reconcile_orchestration();
+        }
+        if refresh_due {
             let started_at = Instant::now();
             self.refresh_orchestration();
             self.last_orchestration_scan_duration = started_at.elapsed();

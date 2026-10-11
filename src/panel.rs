@@ -358,6 +358,69 @@ impl WorkspacePanel {
         }
     }
 
+    pub(crate) fn focused_hook_claim(&self) -> Option<crate::hook_authority::Claim> {
+        let Self::Terminal(panel) = self;
+        panel.focused_hook_claim()
+    }
+
+    pub(crate) fn all_hook_claims(&self) -> Vec<crate::hook_authority::Claim> {
+        let Self::Terminal(panel) = self;
+        panel.all_hook_claims()
+    }
+
+    pub(crate) fn publish_hook_session_id(
+        &mut self,
+        claim: crate::hook_authority::Claim,
+        session_id: Option<String>,
+        kind: crate::orchestration::HookKind,
+    ) -> Option<bool> {
+        let Self::Terminal(panel) = self;
+        panel.publish_hook_session_id(claim, session_id, kind)
+    }
+
+    pub(crate) fn stage_replacement_resume_id(
+        &mut self,
+        leaf: Uuid,
+        session_id: Option<String>,
+    ) -> bool {
+        let Self::Terminal(panel) = self;
+        panel.stage_replacement_resume_id(leaf, session_id)
+    }
+
+    pub(crate) fn has_pending_hook_mutation(&self) -> bool {
+        let Self::Terminal(panel) = self;
+        panel.has_pending_hook_mutation()
+    }
+
+    pub(crate) fn poll_pending_hook_mutation(&mut self) -> bool {
+        let Self::Terminal(panel) = self;
+        panel.poll_pending_hook_mutation()
+    }
+
+    pub(crate) fn take_hook_mutation_error(&mut self) -> Option<String> {
+        let Self::Terminal(panel) = self;
+        panel.take_hook_mutation_error()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_focused_session_with_fixture_alias_ack(
+        &mut self,
+        manager: Arc<Mutex<crate::runtime::PtyManager>>,
+        cwd: Option<&std::path::Path>,
+        workspace: Uuid,
+        startup_command: String,
+        agent_command: String,
+    ) -> bool {
+        let Self::Terminal(panel) = self;
+        panel.replace_focused_session_with_fixture_alias_ack(
+            manager,
+            cwd,
+            workspace,
+            startup_command,
+            agent_command,
+        )
+    }
+
     pub fn shared_snapshot(&self) -> SharedPanelSnapshot {
         match self {
             Self::Terminal(panel) => panel.shared_snapshot(),

@@ -298,3 +298,128 @@ mod url_tests {
         assert_eq!(url.as_deref(), Some("https://example.com/a"));
     }
 }
+
+impl TerminalPanel {
+    pub fn orchestration_observation(&self, workspace_id: Uuid) -> PanelRuntimeObservation {
+        let mut visible_text = String::new();
+        let mut agent_status = None;
+        let mut activity_revision = None;
+        let mut text_snapshot_available = false;
+        let attached = self.runtime_session_attached();
+        let recent_output = self
+            .with_pty(|pty| {
+                if let Ok(term) = pty.term.try_lock() {
+                    visible_text = visible_text_snapshot(&term, 16, 180);
+                    text_snapshot_available = true;
+                }
+                agent_status = pty.agent_status_snapshot();
+                activity_revision = Some(pty.activity_revision());
+                pty.output_elapsed() <= Duration::from_secs(4)
+            })
+            .unwrap_or(false);
+
+        PanelRuntimeObservation {
+            panel_id: self.id,
+            runtime_session_id: self.focused_runtime_session_id(),
+            workspace_id,
+            hook_claim: self.focused_hook_claim(),
+            title: self.title.clone(),
+            visible_text: if self.minimized || !attached {
+                String::new()
+            } else {
+                visible_text
+            },
+            alive: self.leaf_is_alive(self.focused_leaf),
+            recent_output: if self.minimized || !attached {
+                false
+            } else {
+                recent_output
+            },
+            activity_revision,
+            text_snapshot_available: text_snapshot_available && attached && !self.minimized,
+            attached,
+            minimized: self.minimized,
+            agent_status: if self.minimized || !attached {
+                None
+            } else {
+                agent_status
+            },
+        }
+    }
+
+    pub(crate) fn hook_claim_for_leaf(&self, leaf: Uuid) -> Option<Claim> {
+        if !self.active_leaf_ids().contains(&leaf) {
+            return None;
+        }
+        let session = self.leaf_session(leaf)?;
+        let claim = session.hook_claim()?;
+        (claim.key
+            == LeafKey {
+                workspace: self.workspace_id?,
+                panel: self.id,
+                leaf,
+            }
+            && Some(claim.runtime) == session.runtime_session_id()
+            && claim.phase == ClaimPhase::Active
+            && claim.owner.is_some())
+        .then_some(claim)
+    }
+
+    pub(crate) fn focused_hook_claim(&self) -> Option<Claim> {
+        self.hook_claim_for_leaf(self.focused_leaf)
+    }
+
+    pub(crate) fn all_hook_claims(&self) -> Vec<Claim> {
+        self.active_leaf_ids()
+            .into_iter()
+            .filter_map(|leaf| self.hook_claim_for_leaf(leaf))
+            .collect()
+    }
+
+    pub(crate) fn leaf_is_alive(&self, leaf: Uuid) -> bool {
+        self.active_leaf_ids().contains(&leaf)
+            && self
+                .leaf_session(leaf)
+                .is_some_and(SessionController::is_alive)
+    }
+
+    /// Shared actual publication boundary: an ended owned Stop can finish its
+    /// own record, while all other kinds need the exact leaf to remain alive.
+    pub(crate) fn hook_publication_liveness(
+        current: Option<Claim>,
+        claim: Claim,
+        alive: bool,
+        kind: crate::orchestration::HookKind,
+    ) -> Option<bool> {
+        if current != Some(claim)
+            || claim.phase != ClaimPhase::Active
+            || claim.owner.is_none()
+            || (!alive && kind != crate::orchestration::HookKind::Stop)
+        {
+            return None;
+        }
+        Some(alive)
+    }
+
+    /// The envelope retains its durable lease through this exact target check
+    /// and the subsequent cache/activity publication. Metadata needs a live leaf.
+    pub(crate) fn publish_hook_session_id(
+        &mut self,
+        claim: Claim,
+        session_id: Option<String>,
+        kind: crate::orchestration::HookKind,
+    ) -> Option<bool> {
+        let alive = Self::hook_publication_liveness(
+            self.hook_claim_for_leaf(claim.key.leaf),
+            claim,
+            self.leaf_is_alive(claim.key.leaf),
+            kind,
+        )?;
+        if alive {
+            if let Some(session_id) = session_id {
+                self.set_agent_session_id_for_leaf(claim.key.leaf, Some(session_id));
+            }
+        }
+        Some(alive)
+    }
+}
