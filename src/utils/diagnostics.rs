@@ -1075,4 +1075,34 @@ mod source_quality_tests {
             })
         );
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn diagnostic_regular_links_work_but_present_dangling_links_are_not_missing() {
+        use std::os::unix::fs::symlink;
+        let dir = TempDirectory::new();
+        let target = dir.0.join("target");
+        let link = dir.0.join("link");
+        std::fs::write(&target, b"retained").unwrap();
+        symlink(&target, &link).unwrap();
+        assert_eq!(
+            read_diagnostic(&link, false, 32),
+            DiagnosticRead::Included {
+                bytes: b"retained".to_vec(),
+                truncated: false
+            }
+        );
+        std::fs::remove_file(&target).unwrap();
+        assert_eq!(
+            read_diagnostic(&link, false, 32),
+            DiagnosticRead::Omitted(DiagnosticIssue::ReadError {
+                operation: "open",
+                kind: io::ErrorKind::NotFound
+            })
+        );
+        assert_eq!(
+            read_diagnostic(&dir.0.join("absent"), false, 32),
+            DiagnosticRead::Omitted(DiagnosticIssue::Missing)
+        );
+    }
 }
