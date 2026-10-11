@@ -96,8 +96,16 @@ fn fixture_server(
             Ok(()) => {}
             // The response and TLS alert were flushed above. A peer that has
             // already closed can make this cleanup-only shutdown return
-            // ENOTCONN; client-side certificate/status assertions remain strict.
-            Err(error) if error.kind() == std::io::ErrorKind::NotConnected => return,
+            // ENOTCONN on Unix or WSAECONNRESET on Windows. The complete response
+            // body and pinned-certificate assertions remain strict at the client.
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotConnected | std::io::ErrorKind::ConnectionReset
+                ) =>
+            {
+                return;
+            }
             Err(error) => panic!("fixture write shutdown: {error}"),
         }
         // Allow the peer to consume the response and close. Cleanup is bounded
