@@ -6,6 +6,12 @@ es el daemon local de terminales Unix.
 
 ## Layout e historial
 
+Cada hoja conserva hasta 4 MiB de historial en su checkpoint, además del límite
+de líneas configurado para el terminal. El guardado y la reapertura usan el
+mismo presupuesto para conservar salidas extensas dentro de esos límites.
+Si el historial los supera, se conservan las últimas líneas completas. Para
+guardar una salida mayor, exportala antes de cerrar la terminal.
+
 - Un `layout.json` ausente permite crear un perfil. Un error de lectura de un
   candidato existente detiene el loader y desactiva las escrituras de layout e
   historial por la UI, incluso si hay un backup legible. No se puede asumir que

@@ -40,7 +40,7 @@ Para no planear en el aire: esto ya existe en terminalcanvas (38 commits recient
 | Área | Estado nuestro |
 |---|---|
 | Paneles de terminal en canvas | Sí: flotantes, snap, minimizar, taskbar |
-| Scrollback persistente | Básico: texto plano por panel, 256 KB, replay con marcador |
+| Scrollback persistente | Historial ANSI por hoja, hasta 4 MiB, replay con marcador |
 | Resume de agentes | Sí: sesión exacta de Claude desde `Ctrl+Shift+R`; latest nativo para Claude/Codex/Gemini/OpenCode/Copilot; restore exacto cuando hay id de hook |
 | Code review con diff | Sí: parser unified diff, UI virtualizada, feedback al agente (texto libre, no por línea) |
 | Worktrees | Crear/listar/borrar (borrado en worker) |
@@ -123,7 +123,7 @@ renderizamos nativo con wgpu, y ya hicimos el run-batching de glifos.
   presupuesto de 64 KB/turno para no congelar la UI.
 - Regla citada textual: *"un prefijo stale es mejor que un agujero indetectable"*.
 
-**Qué tenemos.** Texto plano por panel (256 KB), guardado en autosave (2 s) y
+**Qué tenemos.** Historial ANSI por hoja (hasta 4 MiB), guardado en autosave (2 s) y
 al salir, replay con CRLF + separador. Funciona, pero: pierde colores/estilos,
 pierde el estado del cursor y los modos, y reescribe el archivo entero cada vez.
 
