@@ -658,7 +658,9 @@ fn isolated_codex_config_preserves_the_profile_when_inherited_env_is_filtered() 
         .map(|arg| arg.to_str().unwrap())
         .collect();
     let options = args
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             assert_eq!(pair[0], "-c");
             pair[1]

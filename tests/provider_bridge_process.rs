@@ -55,7 +55,7 @@ fn bridge_command(provider: AgentProvider, config: &launch::McpConfig) -> Comman
         AgentProvider::CodexCli => {
             assert_eq!(args.len() % 2, 0);
             let mut overrides = BTreeMap::new();
-            for pair in args.chunks_exact(2) {
+            for pair in args.as_chunks::<2>().0 {
                 assert_eq!(pair[0], "-c");
                 let (key, value) = pair[1].split_once('=').unwrap();
                 overrides.insert(
