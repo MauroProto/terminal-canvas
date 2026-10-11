@@ -1054,7 +1054,10 @@ mod source_quality_tests {
         let dir = TempDirectory::new();
         let path = dir.0.join("source.fifo");
         let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
-        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        // SAFETY: c_path is a live, NUL-terminated CString, so its pointer is valid
+        // for the synchronous mkfifo call.
+        let fifo_result = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(fifo_result, 0);
         let (tx, rx) = mpsc::channel();
         let handle = std::thread::spawn(move || {
             let _ = tx.send(read_diagnostic(&path, false, 32));
