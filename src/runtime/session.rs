@@ -19,6 +19,7 @@ pub struct SessionSpec {
     /// Explicit orchestration task identity, retained across process restarts.
     /// Ordinary shells fall back to their stable leaf identity.
     pub memory_task_id: Option<Uuid>,
+    pub hook_legacy_root: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,6 +49,7 @@ impl Default for SessionSpec {
             workspace_id: None,
             leaf_id: None,
             memory_task_id: None,
+            hook_legacy_root: false,
         }
     }
 }

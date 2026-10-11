@@ -12,8 +12,9 @@ mod workspace;
 pub use prompt_delivery::{DeferredPrompt, PromptSubmission};
 #[allow(unused_imports)]
 pub use pty_manager::{
-    drain_order, PtyManager, RuntimeScheduler, RuntimeSessionUpdate, SharedPtyHandle,
-    SharedRuntimeScheduler, UiUpdateBatch,
+    drain_order, AsyncRemoteSpawner, PtyManager, RemoteCloseIntent, RemoteCloser,
+    RemoteRecoveryError, RemoteSpawnIntent, RemoteSpawnResult, RuntimeScheduler,
+    RuntimeSessionUpdate, SharedPtyHandle, SharedRuntimeScheduler, UiUpdateBatch,
 };
 #[allow(unused_imports)]
 pub use registry::{RuntimeRegistry, RuntimeSnapshot};

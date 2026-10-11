@@ -17,6 +17,8 @@ struct State {
 #[derive(Clone)]
 pub(crate) struct InputWriter {
     shared: Arc<(Mutex<State>, Condvar)>,
+    finished: Arc<std::sync::atomic::AtomicBool>,
+    _thread: Arc<std::thread::JoinHandle<()>>,
 }
 
 impl Drop for InputWriter {
@@ -40,29 +42,25 @@ impl InputWriter {
     pub fn new(mut writer: Box<dyn Write + Send>) -> io::Result<Self> {
         let shared = Arc::new((Mutex::new(State::default()), Condvar::new()));
         let worker = Arc::clone(&shared);
-        std::thread::Builder::new().name("terminal-input".to_owned()).spawn(move || {
-            loop {
-                let (state, ready) = &*worker;
-                let mut guard = state.lock().unwrap_or_else(|error| error.into_inner());
-                while guard.pending.is_empty() && !guard.closed && !guard.finishing {
-                    guard = ready.wait(guard).unwrap_or_else(|error| error.into_inner());
-                }
-                if guard.closed || (guard.finishing && guard.pending.is_empty()) { return; }
-                let bytes = guard.pending.pop_front().expect("pending input");
-                drop(guard);
-                let result = writer.write_all(&bytes).and_then(|()| writer.flush());
-                let mut guard = state.lock().unwrap_or_else(|error| error.into_inner());
-                guard.buffered = guard.buffered.saturating_sub(bytes.len());
-                if let Err(error) = result {
-                    guard.error = Some(format!("Error de entrada: {error}. Parte del texto puede no haber llegado al proceso."));
-                    guard.pending.clear();
-                    guard.buffered = 0;
-                    guard.closed = true;
-                    return;
-                }
-            }
-        })?;
-        Ok(Self { shared })
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let finished_for_worker = Arc::clone(&finished);
+        let thread = std::thread::Builder::new()
+            .name("terminal-input".to_owned())
+            .spawn(move || {
+                run_input_worker(&mut *writer, &worker);
+                // A close receipt must cover dropping the actual OS writer too.
+                drop(writer);
+                finished_for_worker.store(true, std::sync::atomic::Ordering::Release);
+            })?;
+        Ok(Self {
+            shared,
+            finished,
+            _thread: Arc::new(thread),
+        })
+    }
+
+    pub fn finished(&self) -> bool {
+        self.finished.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Either accepts the complete input or rejects it visibly. The budget
@@ -145,8 +143,8 @@ impl InputWriter {
         Ok(())
     }
 
-    /// Never joins a writer blocked in an OS call. The owning PTY/socket is
-    /// closed separately, which unblocks that call and lets the worker exit.
+    /// Cancel queued input and a nonblocking writer's next retry. Ordinary
+    /// blocking writers still rely on their owning endpoint closing separately.
     pub fn close(&self) {
         if let Ok(mut state) = self.shared.0.lock() {
             state.closed = true;
@@ -154,12 +152,223 @@ impl InputWriter {
             state.buffered = 0;
         }
         self.shared.1.notify_all();
+        #[cfg(windows)]
+        if !self.finished() {
+            use std::os::windows::io::AsRawHandle;
+            #[link(name = "kernel32")]
+            extern "system" {
+                fn CancelSynchronousIo(thread: *mut std::ffi::c_void) -> i32;
+            }
+            // Retry on subsequent close calls if the worker has not admitted IO yet.
+            unsafe {
+                CancelSynchronousIo(self._thread.as_raw_handle());
+            }
+        }
+    }
+}
+
+fn retry_input(shared: &Arc<(Mutex<State>, Condvar)>) -> bool {
+    let guard = shared.0.lock().unwrap_or_else(|error| error.into_inner());
+    if guard.closed {
+        return false;
+    }
+    let (guard, _) = shared
+        .1
+        .wait_timeout(guard, std::time::Duration::from_millis(20))
+        .unwrap_or_else(|error| error.into_inner());
+    !guard.closed
+}
+
+fn write_input_batch(
+    writer: &mut dyn Write,
+    bytes: &[u8],
+    shared: &Arc<(Mutex<State>, Condvar)>,
+) -> io::Result<bool> {
+    let mut offset = 0;
+    while offset < bytes.len() {
+        if shared
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .closed
+        {
+            return Ok(false);
+        }
+        match writer.write(&bytes[offset..]) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(written) => offset += written,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) =>
+            {
+                if !retry_input(shared) {
+                    return Ok(false);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    loop {
+        if shared
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .closed
+        {
+            return Ok(false);
+        }
+        match writer.flush() {
+            Ok(()) => return Ok(true),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) =>
+            {
+                if !retry_input(shared) {
+                    return Ok(false);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn run_input_worker(writer: &mut dyn Write, worker: &Arc<(Mutex<State>, Condvar)>) {
+    loop {
+        let (state, ready) = worker.as_ref();
+        let mut guard = state.lock().unwrap_or_else(|error| error.into_inner());
+        while guard.pending.is_empty() && !guard.closed && !guard.finishing {
+            guard = ready.wait(guard).unwrap_or_else(|error| error.into_inner());
+        }
+        if guard.closed || (guard.finishing && guard.pending.is_empty()) {
+            return;
+        }
+        let bytes = guard.pending.pop_front().expect("pending input");
+        drop(guard);
+        let result = write_input_batch(writer, &bytes, worker);
+        let mut guard = state.lock().unwrap_or_else(|error| error.into_inner());
+        guard.buffered = guard.buffered.saturating_sub(bytes.len());
+        if let Err(error) = result {
+            guard.error = Some(format!(
+                "Error de entrada: {error}. Parte del texto puede no haber llegado al proceso."
+            ));
+            guard.pending.clear();
+            guard.buffered = 0;
+            guard.closed = true;
+            return;
+        }
+        if matches!(result, Ok(false)) {
+            return;
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partial_write_retry_keeps_offset_and_close_waits_for_real_writer_drop() {
+        struct PartialWriter {
+            calls: std::sync::mpsc::Sender<Vec<u8>>,
+            dropped: std::sync::mpsc::Sender<()>,
+            attempt: usize,
+        }
+        impl Write for PartialWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.calls.send(bytes.to_vec()).unwrap();
+                self.attempt += 1;
+                match self.attempt {
+                    1 => Ok(2),
+                    2 => Err(io::ErrorKind::WouldBlock.into()),
+                    3 => Err(io::ErrorKind::Interrupted.into()),
+                    _ => Ok(bytes.len()),
+                }
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        impl Drop for PartialWriter {
+            fn drop(&mut self) {
+                self.dropped.send(()).unwrap();
+            }
+        }
+        let (calls_tx, calls_rx) = std::sync::mpsc::channel();
+        let (drop_tx, drop_rx) = std::sync::mpsc::channel();
+        let writer = InputWriter::new(Box::new(PartialWriter {
+            calls: calls_tx,
+            dropped: drop_tx,
+            attempt: 0,
+        }))
+        .unwrap();
+        writer.enqueue(b"abcdef").unwrap();
+        let calls: Vec<_> = (0..4)
+            .map(|_| {
+                calls_rx
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(
+            calls,
+            [
+                b"abcdef".to_vec(),
+                b"cdef".to_vec(),
+                b"cdef".to_vec(),
+                b"cdef".to_vec()
+            ]
+        );
+        writer.close();
+        drop_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !writer.finished() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn close_cancels_would_block_retry_without_resending_partial_prefix() {
+        struct Backpressured(std::sync::mpsc::Sender<Vec<u8>>, usize);
+        impl Write for Backpressured {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.send(bytes.to_vec()).unwrap();
+                self.1 += 1;
+                if self.1 == 1 {
+                    Ok(2)
+                } else {
+                    Err(io::ErrorKind::WouldBlock.into())
+                }
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let writer = InputWriter::new(Box::new(Backpressured(tx, 0))).unwrap();
+        writer.enqueue(b"abcdef").unwrap();
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap(),
+            b"abcdef"
+        );
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap(),
+            b"cdef"
+        );
+        writer.close();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !writer.finished() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert!(rx.try_iter().all(|bytes| bytes == b"cdef"));
+    }
     struct BlockedWriter {
         entered: std::sync::mpsc::Sender<()>,
         release: std::sync::mpsc::Receiver<()>,

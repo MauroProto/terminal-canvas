@@ -82,6 +82,8 @@ pub struct PtyManager {
     /// harness de tests que montan este archivo por `#[path]` no necesitan
     /// arrastrar todo el árbol del daemon.
     remote_spawner: Option<RemoteSpawner>,
+    remote_async: Option<RemoteQueue>,
+    local_backend: bool,
 }
 
 /// Crea una sesión fuera del proceso y devuelve su id y su handle.
@@ -97,6 +99,813 @@ pub type RemoteSpawner = Box<
         + Sync,
 >;
 
+/// A protected recovery refusal always carries the identity that must survive.
+#[derive(Clone)]
+pub struct RemoteRecoveryError {
+    pub session_id: Uuid,
+    pub safe_local_fallback: bool,
+    pub message: String,
+    pub closer: Option<RemoteCloser>,
+    pub retry_intent: RemoteSpawnIntent,
+    pub retryable: bool,
+    pub may_close: bool,
+}
+
+impl std::fmt::Debug for RemoteRecoveryError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RemoteRecoveryError")
+            .field("session_id", &self.session_id)
+            .field("safe_local_fallback", &self.safe_local_fallback)
+            .field("message", &self.message)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RemoteRecoveryError {
+    pub fn protected(session_id: Uuid, message: impl Into<String>) -> Self {
+        Self {
+            session_id,
+            safe_local_fallback: false,
+            message: message.into(),
+            closer: None,
+            retry_intent: RemoteSpawnIntent::AdoptExisting,
+            retryable: true,
+            may_close: true,
+        }
+    }
+
+    pub fn birth_pending(session_id: Uuid, message: impl Into<String>, idempotent: bool) -> Self {
+        let mut error = Self::protected(session_id, message);
+        error.retry_intent = RemoteSpawnIntent::NewBirth;
+        error.retryable = idempotent;
+        error.may_close = idempotent;
+        error
+    }
+
+    pub fn birth_rejected(session_id: Uuid, message: impl Into<String>) -> Self {
+        let mut error = Self::birth_pending(session_id, message, false);
+        error.retryable = false;
+        error.may_close = false;
+        error
+    }
+
+    pub fn with_closer(mut self, closer: RemoteCloser) -> Self {
+        self.closer = Some(closer);
+        self
+    }
+
+    pub fn before_creation(session_id: Uuid, message: impl Into<String>) -> Self {
+        Self {
+            session_id,
+            safe_local_fallback: true,
+            message: message.into(),
+            closer: None,
+            retry_intent: RemoteSpawnIntent::NewBirth,
+            retryable: true,
+            may_close: false,
+        }
+    }
+}
+
+impl std::fmt::Display for RemoteRecoveryError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for RemoteRecoveryError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteSpawnIntent {
+    NewBirth,
+    AdoptExisting,
+}
+
+pub struct RemoteSpawnResult {
+    pub session_id: Uuid,
+    pub handle: PtyHandle,
+    pub output_ready: bool,
+    pub owned_birth: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteCloseIntent {
+    OwnedBirth,
+    AdoptExisting,
+}
+
+pub type AsyncRemoteSpawner = Arc<
+    dyn Fn(
+            &SessionSpec,
+            u16,
+            u16,
+            SharedRuntimeScheduler,
+            Uuid,
+            RemoteSpawnIntent,
+        ) -> anyhow::Result<RemoteSpawnResult>
+        + Send
+        + Sync,
+>;
+pub type RemoteCloser = Arc<dyn Fn(Uuid, RemoteCloseIntent) -> anyhow::Result<()> + Send + Sync>;
+
+const REMOTE_QUEUE_CAPACITY: usize = 32;
+const REMOTE_QUEUE_BYTES: usize = 8 * 1024 * 1024;
+const REMOTE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+const REMOTE_CLOSE_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
+const REMOTE_DETACHED: u8 = 1;
+const REMOTE_CLOSED: u8 = 2;
+
+struct RemoteLease {
+    id: Uuid,
+    generation: Uuid,
+    retired: std::sync::atomic::AtomicU8,
+    pending: std::sync::atomic::AtomicBool,
+    local_only: std::sync::atomic::AtomicBool,
+    local_retiring: Mutex<Option<SharedPtyHandle>>,
+    may_close: std::sync::atomic::AtomicBool,
+    attempted: std::sync::atomic::AtomicBool,
+    may_have_spawned: std::sync::atomic::AtomicBool,
+    local_birth_admission: std::sync::atomic::AtomicU8,
+    birth: std::sync::atomic::AtomicBool,
+    dimensions: Mutex<(u16, u16)>,
+    applied_dimensions: Mutex<Option<(u16, u16)>>,
+    completion: Mutex<Option<RemoteCompletion>>,
+    cleanup_after: Mutex<std::time::Instant>,
+}
+
+impl RemoteLease {
+    fn new(id: Uuid, cols: u16, rows: u16) -> Arc<Self> {
+        Arc::new(Self {
+            id,
+            generation: Uuid::new_v4(),
+            retired: std::sync::atomic::AtomicU8::new(0),
+            pending: std::sync::atomic::AtomicBool::new(false),
+            local_only: std::sync::atomic::AtomicBool::new(false),
+            local_retiring: Mutex::new(None),
+            may_close: std::sync::atomic::AtomicBool::new(true),
+            attempted: std::sync::atomic::AtomicBool::new(false),
+            may_have_spawned: std::sync::atomic::AtomicBool::new(false),
+            local_birth_admission: std::sync::atomic::AtomicU8::new(0),
+            birth: std::sync::atomic::AtomicBool::new(false),
+            dimensions: Mutex::new((cols.max(1), rows.max(1))),
+            applied_dimensions: Mutex::new(None),
+            completion: Mutex::new(None),
+            cleanup_after: Mutex::new(std::time::Instant::now()),
+        })
+    }
+
+    fn close_local_birth_admissions(&self) {
+        // bit0 = already-admitted factory; bit1 = permanently closed.
+        self.local_birth_admission
+            .fetch_or(2, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    fn admit_local_birth(&self) -> bool {
+        if self.retirement() != 0 {
+            return false;
+        }
+        self.local_birth_admission
+            .compare_exchange(
+                0,
+                1,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn finish_local_birth(&self) {
+        self.local_birth_admission
+            .fetch_and(!1, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    fn close_intent(&self) -> RemoteCloseIntent {
+        if self.birth.load(std::sync::atomic::Ordering::Acquire) {
+            RemoteCloseIntent::OwnedBirth
+        } else {
+            RemoteCloseIntent::AdoptExisting
+        }
+    }
+
+    fn cleanup_eligible(&self) -> bool {
+        self.may_close.load(std::sync::atomic::Ordering::Acquire)
+            || !self.attempted.load(std::sync::atomic::Ordering::Acquire)
+            || self.local_only.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn retirement(&self) -> u8 {
+        self.retired.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+struct RemoteCompletion {
+    result: anyhow::Result<RemoteSpawnResult>,
+    dimensions: (u16, u16),
+}
+
+type CleanupBarrier = Vec<(Uuid, std::sync::Weak<RemoteLease>)>;
+static REMOTE_CLEANUP_BARRIER: std::sync::OnceLock<Mutex<CleanupBarrier>> =
+    std::sync::OnceLock::new();
+
+fn cleanup_pending(backend: Uuid, id: Uuid) -> bool {
+    let mut barrier = REMOTE_CLEANUP_BARRIER
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    barrier.retain(|(_, lease)| lease.strong_count() > 0);
+    barrier.iter().any(|(owner, lease)| {
+        *owner == backend
+            && lease
+                .upgrade()
+                .is_some_and(|lease| lease.id == id && lease.retirement() == REMOTE_CLOSED)
+    })
+}
+
+fn remote_spec_bytes(spec: &SessionSpec) -> Option<usize> {
+    let wire = spec
+        .title
+        .len()
+        .checked_add(spec.cwd.as_ref().map_or(0, |path| path.as_os_str().len()))?
+        .checked_add(spec.startup_command.as_ref().map_or(0, String::len))?;
+    let input = spec.startup_input.as_ref().map_or(0, String::len);
+    // Wire text can expand sixfold in JSON; prompts are not part of WireSpec.
+    if wire > 512 * 1024 || input > crate::terminal::pty::MAX_INPUT_BYTES {
+        return None;
+    }
+    wire.checked_add(input)
+}
+
+struct RemoteJob {
+    lease: Arc<RemoteLease>,
+    spec: SessionSpec,
+    scheduler: SharedRuntimeScheduler,
+    intent: RemoteSpawnIntent,
+    prepared: Option<RemoteSpawnResult>,
+    attached_resize: Option<SharedPtyHandle>,
+}
+
+#[derive(Default)]
+struct RemoteQueueState {
+    ready: std::collections::VecDeque<RemoteJob>,
+    ready_bytes: usize,
+    leases: Vec<Arc<RemoteLease>>,
+    stopping: bool,
+}
+
+type SharedRemoteQueue = Arc<(Mutex<RemoteQueueState>, std::sync::Condvar)>;
+
+struct RemoteQueue {
+    state: SharedRemoteQueue,
+    backend_id: Uuid,
+    spawn: AsyncRemoteSpawner,
+    close: RemoteCloser,
+    started: bool,
+}
+
+impl RemoteQueue {
+    fn new(backend_id: Uuid, spawn: AsyncRemoteSpawner, close: RemoteCloser) -> Self {
+        Self {
+            state: Arc::new((
+                Mutex::new(RemoteQueueState::default()),
+                std::sync::Condvar::new(),
+            )),
+            backend_id,
+            spawn,
+            close,
+            started: false,
+        }
+    }
+
+    fn register(&mut self, lease: Arc<RemoteLease>) {
+        let mut state = self
+            .state
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if !state.leases.iter().any(|old| Arc::ptr_eq(old, &lease)) {
+            state.leases.push(lease);
+        }
+    }
+
+    fn ensure_started(&mut self) -> anyhow::Result<()> {
+        if !self.started {
+            let state = Arc::clone(&self.state);
+            let spawn = Arc::clone(&self.spawn);
+            let close = Arc::clone(&self.close);
+            std::thread::Builder::new()
+                .name("remote-recovery".to_owned())
+                .spawn(move || remote_worker(state, spawn, close))?;
+            self.started = true;
+        }
+        Ok(())
+    }
+
+    fn submit(&mut self, job: RemoteJob) -> anyhow::Result<()> {
+        self.ensure_started()?;
+        let mut state = self
+            .state
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let bytes = remote_spec_bytes(&job.spec).ok_or_else(|| {
+            RemoteRecoveryError::birth_rejected(
+                job.lease.id,
+                "La configuración de la sesión supera el límite permitido.",
+            )
+        })?;
+        if cleanup_pending(self.backend_id, job.lease.id) {
+            anyhow::bail!(RemoteRecoveryError::protected(
+                job.lease.id,
+                "Esperando la confirmación del cierre anterior."
+            ));
+        }
+        if state.stopping
+            || state.ready.len() >= REMOTE_QUEUE_CAPACITY
+            || state.ready_bytes.saturating_add(bytes) > REMOTE_QUEUE_BYTES
+        {
+            anyhow::bail!(RemoteRecoveryError::protected(
+                job.lease.id,
+                "La recuperación está ocupada; se reintentará."
+            ));
+        }
+        if job.lease.retirement() != 0
+            || job
+                .lease
+                .pending
+                .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            anyhow::bail!(RemoteRecoveryError::protected(
+                job.lease.id,
+                "La recuperación de esta sesión ya está pendiente."
+            ));
+        }
+        state.ready_bytes += bytes;
+        state.ready.push_back(job);
+        self.state.1.notify_one();
+        Ok(())
+    }
+
+    fn has_cleanup(&self) -> bool {
+        let state = self
+            .state
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state
+            .leases
+            .iter()
+            .any(|lease| lease.retirement() == REMOTE_CLOSED && lease.cleanup_eligible())
+    }
+
+    fn retire(&mut self, lease: &Arc<RemoteLease>, kill: bool) {
+        // Publication and retirement share the completion boundary. Drop any
+        // ready handle before a potentially long cleanup retry can retain it.
+        let completion = {
+            let mut completion = lease
+                .completion
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            lease.retired.store(
+                if kill { REMOTE_CLOSED } else { REMOTE_DETACHED },
+                std::sync::atomic::Ordering::Release,
+            );
+            lease.close_local_birth_admissions();
+            completion.take()
+        };
+        if let Some(completion) = completion {
+            retain_local_completion(lease, completion);
+        }
+        if kill {
+            REMOTE_CLEANUP_BARRIER
+                .get_or_init(|| Mutex::new(Vec::new()))
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push((self.backend_id, Arc::downgrade(lease)));
+        }
+        if kill {
+            let _ = self.ensure_started();
+        }
+        self.state.1.notify_one();
+    }
+}
+
+impl Drop for RemoteQueue {
+    fn drop(&mut self) {
+        let mut state = self
+            .state
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.stopping = true;
+        for lease in &state.leases {
+            lease.close_local_birth_admissions();
+            let _ = lease.retired.compare_exchange(
+                0,
+                REMOTE_DETACHED,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            );
+        }
+        self.state.1.notify_one();
+    }
+}
+
+fn remote_worker(shared: SharedRemoteQueue, spawn: AsyncRemoteSpawner, close: RemoteCloser) {
+    enum Work {
+        Attach(RemoteJob),
+        Close(Arc<RemoteLease>),
+    }
+    let mut prefer_attach = false;
+    loop {
+        let work = {
+            let mut state = shared.0.lock().unwrap_or_else(|error| error.into_inner());
+            loop {
+                state.leases.retain(|lease| {
+                    lease.retirement() != REMOTE_DETACHED
+                        || lease.pending.load(std::sync::atomic::Ordering::Acquire)
+                });
+                let now = std::time::Instant::now();
+                let closing = state
+                    .leases
+                    .iter()
+                    .find(|lease| {
+                        lease.retirement() == REMOTE_CLOSED
+                            && lease.cleanup_eligible()
+                            && !lease.pending.load(std::sync::atomic::Ordering::Acquire)
+                            && *lease
+                                .cleanup_after
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner())
+                                <= now
+                    })
+                    .cloned();
+                if !state.ready.is_empty() && (prefer_attach || closing.is_none()) {
+                    let job = state.ready.pop_front().expect("ready queue was checked");
+                    state.ready_bytes = state
+                        .ready_bytes
+                        .saturating_sub(remote_spec_bytes(&job.spec).unwrap_or(0));
+                    prefer_attach = false;
+                    break Work::Attach(job);
+                }
+                if let Some(lease) = closing {
+                    prefer_attach = true;
+                    break Work::Close(lease);
+                }
+                let delay = state
+                    .leases
+                    .iter()
+                    .filter(|lease| {
+                        lease.retirement() == REMOTE_CLOSED
+                            && lease.cleanup_eligible()
+                            && !lease.pending.load(std::sync::atomic::Ordering::Acquire)
+                    })
+                    .filter_map(|lease| {
+                        lease
+                            .cleanup_after
+                            .lock()
+                            .ok()
+                            .map(|due| due.saturating_duration_since(now))
+                    })
+                    .min();
+                // Retired cleanups outlive a dropped workspace/backend. They
+                // continue with bounded retry I/O while this process is alive.
+                if state.stopping && delay.is_none() {
+                    return;
+                }
+                state = if let Some(delay) = delay {
+                    shared
+                        .1
+                        .wait_timeout(state, delay)
+                        .unwrap_or_else(|error| error.into_inner())
+                        .0
+                } else {
+                    shared
+                        .1
+                        .wait(state)
+                        .unwrap_or_else(|error| error.into_inner())
+                };
+            }
+        };
+        match work {
+            Work::Close(lease) => {
+                let local_only = lease.local_only.load(std::sync::atomic::Ordering::Acquire)
+                    || !lease.attempted.load(std::sync::atomic::Ordering::Acquire);
+                let result = if local_only {
+                    handoff_local_retirement(&lease)
+                } else {
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        close(lease.id, lease.close_intent())
+                    }))
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("La limpieza remota falló.")))
+                };
+                if result.is_ok() {
+                    lease
+                        .retired
+                        .store(REMOTE_DETACHED, std::sync::atomic::Ordering::Release);
+                    let mut state = shared.0.lock().unwrap_or_else(|error| error.into_inner());
+                    state.leases.retain(|old| !Arc::ptr_eq(old, &lease));
+                } else {
+                    *lease
+                        .cleanup_after
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner()) =
+                        std::time::Instant::now() + REMOTE_CLOSE_RETRY;
+                }
+            }
+            Work::Attach(job) => perform_remote_job(job, &spawn),
+        }
+    }
+}
+
+fn normalize_birth_uncertainty(
+    lease: &RemoteLease,
+    result: &mut anyhow::Result<RemoteSpawnResult>,
+) {
+    let already_uncertain = lease
+        .may_have_spawned
+        .load(std::sync::atomic::Ordering::Acquire);
+    if let Err(error) = result {
+        let mut typed = error
+            .downcast_ref::<RemoteRecoveryError>()
+            .cloned()
+            .unwrap_or_else(|| {
+                RemoteRecoveryError::birth_pending(lease.id, error.to_string(), true)
+            });
+        if already_uncertain {
+            typed.safe_local_fallback = false;
+            typed.retry_intent = RemoteSpawnIntent::NewBirth;
+            typed.may_close |= lease.may_close.load(std::sync::atomic::Ordering::Acquire);
+        }
+        if typed.retry_intent == RemoteSpawnIntent::NewBirth
+            && !typed.safe_local_fallback
+            && (typed.retryable || typed.may_close)
+        {
+            lease
+                .may_have_spawned
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        *error = typed.into();
+    } else if result.as_ref().is_ok_and(|value| value.owned_birth) {
+        lease
+            .may_have_spawned
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+fn perform_remote_job(job: RemoteJob, spawn: &AsyncRemoteSpawner) {
+    perform_remote_job_with_fallback(job, spawn, &spawn_local_handle)
+}
+
+fn perform_remote_job_with_fallback(
+    mut job: RemoteJob,
+    spawn: &AsyncRemoteSpawner,
+    local_factory: &impl Fn(
+        &SessionSpec,
+        u16,
+        u16,
+        Uuid,
+        SharedRuntimeScheduler,
+    ) -> anyhow::Result<PtyHandle>,
+) {
+    if job.lease.retirement() != 0 {
+        job.lease
+            .pending
+            .store(false, std::sync::atomic::Ordering::Release);
+        return;
+    }
+    let (cols, rows) = *job
+        .lease
+        .dimensions
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if let Some(handle) = job.attached_resize.take() {
+        if job.lease.retirement() == 0 {
+            if let Ok(mut handle) = handle.lock() {
+                handle.resize(cols, rows);
+                *job.lease
+                    .applied_dimensions
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()) = Some((cols, rows));
+            }
+        }
+        job.lease
+            .pending
+            .store(false, std::sync::atomic::Ordering::Release);
+        if let Ok(mut scheduler) = job.scheduler.lock() {
+            scheduler.record_render(job.lease.id);
+        }
+        return;
+    }
+    let mut result = if let Some(prepared) = job.prepared.take() {
+        Ok(prepared)
+    } else {
+        job.lease
+            .attempted
+            .store(true, std::sync::atomic::Ordering::Release);
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            spawn(
+                &job.spec,
+                cols,
+                rows,
+                Arc::clone(&job.scheduler),
+                job.lease.id,
+                job.intent,
+            )
+        }))
+        .unwrap_or_else(|_| {
+            Err(RemoteRecoveryError::birth_pending(
+                job.lease.id,
+                "La recuperación remota falló después de una admisión potencial.",
+                true,
+            )
+            .into())
+        })
+    };
+    normalize_birth_uncertainty(&job.lease, &mut result);
+    if result
+        .as_ref()
+        .err()
+        .and_then(|error| error.downcast_ref::<RemoteRecoveryError>())
+        .is_some_and(|error| job.intent == RemoteSpawnIntent::NewBirth && error.safe_local_fallback)
+    {
+        let mut local_started = false;
+        if job.lease.admit_local_birth() {
+            // Close closes this admission atomically; a factory admitted first
+            // stays pending until it returns and its result is dropped/published.
+            if job.lease.retirement() == 0 {
+                local_started = true;
+                job.lease
+                    .local_only
+                    .store(true, std::sync::atomic::Ordering::Release);
+                result = local_factory(
+                    &job.spec,
+                    cols,
+                    rows,
+                    job.lease.id,
+                    Arc::clone(&job.scheduler),
+                )
+                .map(|handle| RemoteSpawnResult {
+                    session_id: job.lease.id,
+                    output_ready: handle.activity_revision() > 0,
+                    owned_birth: false,
+                    handle,
+                });
+            }
+            job.lease.finish_local_birth();
+        }
+        if !local_started {
+            // A canceled KnownNotCreated attempt needs no remote close ACK.
+            job.lease
+                .attempted
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
+    }
+    if result
+        .as_ref()
+        .is_ok_and(|result| result.session_id != job.lease.id)
+    {
+        result = Err(RemoteRecoveryError::birth_pending(
+            job.lease.id,
+            "El daemon devolvió una identidad distinta tras una admisión potencial.",
+            true,
+        )
+        .into());
+        normalize_birth_uncertainty(&job.lease, &mut result);
+    }
+    if let Some(error) = result
+        .as_ref()
+        .err()
+        .and_then(|error| error.downcast_ref::<RemoteRecoveryError>())
+    {
+        job.lease
+            .may_close
+            .store(error.may_close, std::sync::atomic::Ordering::Release);
+        if error.retry_intent == RemoteSpawnIntent::NewBirth {
+            job.lease
+                .birth
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+    let dimensions = *job
+        .lease
+        .dimensions
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if let Ok(result) = &mut result {
+        job.lease
+            .birth
+            .store(result.owned_birth, std::sync::atomic::Ordering::Release);
+        job.lease.local_only.store(
+            !result.handle.is_remote(),
+            std::sync::atomic::Ordering::Release,
+        );
+        job.lease
+            .may_close
+            .store(true, std::sync::atomic::Ordering::Release);
+        result.handle.resize(dimensions.0, dimensions.1);
+        *job.lease
+            .applied_dimensions
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(dimensions);
+    }
+    {
+        let mut completion = job
+            .lease
+            .completion
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if job.lease.retirement() == 0 {
+            *completion = Some(RemoteCompletion { result, dimensions });
+            if let Ok(mut scheduler) = job.scheduler.lock() {
+                scheduler.record_render(job.lease.id);
+            }
+        } else {
+            retain_local_completion(&job.lease, RemoteCompletion { result, dimensions });
+        }
+    }
+    job.lease
+        .pending
+        .store(false, std::sync::atomic::Ordering::Release);
+}
+
+fn retain_local_completion(lease: &RemoteLease, completion: RemoteCompletion) {
+    if let Ok(result) = completion.result {
+        if !result.handle.is_remote() {
+            lease
+                .local_only
+                .store(true, std::sync::atomic::Ordering::Release);
+            *lease
+                .local_retiring
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(Mutex::new(result.handle)));
+            lease
+                .retired
+                .store(REMOTE_CLOSED, std::sync::atomic::Ordering::Release);
+        }
+    }
+}
+fn handoff_local_retirement(lease: &RemoteLease) -> anyhow::Result<()> {
+    let mut retained = lease
+        .local_retiring
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(handle) = retained.as_ref() {
+        crate::hook_runtime::process_runtime()
+            .ok_or_else(|| anyhow::anyhow!("local authority unavailable"))?
+            .request_local_close(Arc::clone(handle))?;
+        retained.take(); // worker now owns the handle until aggregate final ACK.
+    }
+    Ok(())
+}
+
+fn spawn_local_handle(
+    spec: &SessionSpec,
+    cols: u16,
+    rows: u16,
+    id: Uuid,
+    scheduler: SharedRuntimeScheduler,
+) -> anyhow::Result<PtyHandle> {
+    let handle = PtyHandle::spawn(
+        spec.cwd.as_deref(),
+        cols,
+        rows,
+        id,
+        scheduler,
+        crate::terminal::pty::HookIdentity {
+            panel_id: spec.panel_id,
+            workspace_id: spec.workspace_id,
+            leaf_id: spec.leaf_id,
+            memory_task_id: spec.memory_task_id,
+            hook_generation: None,
+            hook_owner: None,
+        },
+    )?;
+    if let Some(command) = spec
+        .startup_command
+        .as_deref()
+        .map(str::trim)
+        .filter(|command| !command.is_empty())
+    {
+        if let Err(error) = handle.try_write_all(format!("{command}\n").as_bytes()) {
+            if let Some(runtime) = crate::hook_runtime::process_runtime() {
+                runtime.request_local_close_from_factory(Arc::new(Mutex::new(handle)));
+            }
+            return Err(error.into());
+        }
+    }
+    Ok(handle)
+}
+
+struct RemoteRecoveryState {
+    lease: Arc<RemoteLease>,
+    next_retry: std::time::Instant,
+    fresh: bool,
+    retryable: bool,
+    startup_delivered: bool,
+    error: Option<String>,
+}
+
 struct ManagedSession {
     spec: SessionSpec,
     handle: Option<SharedPtyHandle>,
@@ -105,9 +914,12 @@ struct ManagedSession {
     /// Prompt interactivo (feedback del code review) diferido hasta que el
     /// TUI renderice algo; solo se usa cuando el panel se acaba de spawnear.
     pending_prompt: Option<PendingStartupInput>,
+    remote_recovery: Option<RemoteRecoveryState>,
+    legacy_closer: Option<RemoteCloser>,
 }
 
 struct PendingStartupInput {
+    defer_until_remote_publication: bool,
     input: String,
     /// None means readiness was already observed; capacity retries need no output.
     baseline_render_revision: Option<u64>,
@@ -134,6 +946,8 @@ impl ManagedSession {
             detached_alive: true,
             pending_startup_input: None,
             pending_prompt: None,
+            remote_recovery: None,
+            legacy_closer: None,
         }
     }
 
@@ -322,11 +1136,39 @@ impl RuntimeScheduler {
 
 impl PtyManager {
     pub fn new() -> Self {
-        Self {
+        let mut manager = Self {
             sessions: HashMap::new(),
             scheduler: Arc::new(Mutex::new(RuntimeScheduler::new())),
             remote_spawner: None,
+            remote_async: None,
+            local_backend: false,
+        };
+        if let Some(runtime) = crate::hook_runtime::process_runtime() {
+            manager.set_remote_backend(
+                runtime.owner,
+                Arc::new(|spec, cols, rows, scheduler, id, _intent| {
+                    spawn_local_handle(spec, cols, rows, id, scheduler).map(|handle| {
+                        RemoteSpawnResult {
+                            session_id: id,
+                            output_ready: handle.activity_revision() > 0,
+                            owned_birth: false,
+                            handle,
+                        }
+                    })
+                }),
+                Arc::new(|_id, _intent| {
+                    if crate::hook_runtime::process_runtime()
+                        .is_some_and(|runtime| runtime.local_close_completed(_id))
+                    {
+                        Ok(())
+                    } else {
+                        Err(anyhow::anyhow!("Local aggregate closure still pending."))
+                    }
+                }),
+            );
+            manager.local_backend = true;
         }
+        manager
     }
 
     #[allow(dead_code)]
@@ -345,19 +1187,362 @@ impl PtyManager {
         let session_id = existing
             .filter(|id| !self.sessions.contains_key(id))
             .unwrap_or_else(Uuid::new_v4);
-        self.sessions
-            .insert(session_id, ManagedSession::detached(spec));
+        let mut session = ManagedSession::detached(spec);
+        if let Some(queue) = self.remote_async.as_mut() {
+            let lease = RemoteLease::new(session_id, 80, 24);
+            queue.register(Arc::clone(&lease));
+            session.remote_recovery = Some(RemoteRecoveryState {
+                lease,
+                next_retry: std::time::Instant::now(),
+                fresh: false,
+                retryable: true,
+                startup_delivered: true,
+                error: None,
+            });
+        }
+        self.sessions.insert(session_id, session);
         session_id
     }
 
     /// Instala el creador de sesiones fuera del proceso (P3.15, T3).
     pub fn set_remote_spawner(&mut self, spawner: RemoteSpawner) {
+        self.remote_async = None;
+        for session in self.sessions.values_mut() {
+            session.remote_recovery = None;
+        }
         self.remote_spawner = Some(spawner);
+    }
+
+    /// Production recovery runs outside the UI; the synchronous setter stays
+    /// available for existing callers and in-memory harnesses.
+    pub fn set_remote_backend(
+        &mut self,
+        backend_id: Uuid,
+        spawner: AsyncRemoteSpawner,
+        closer: RemoteCloser,
+    ) {
+        // Bootstrap installs this override before the first worker is started.
+        if self.local_backend && self.remote_async.as_ref().is_some_and(|q| !q.started) {
+            self.remote_async = None;
+            self.local_backend = false;
+        }
+        if let Some(queue) = self.remote_async.as_ref() {
+            if queue.backend_id != backend_id {
+                log::warn!("El backend remoto activo conserva su propietario original.");
+            }
+            return;
+        }
+        self.remote_spawner = None;
+        let mut queue = RemoteQueue::new(backend_id, spawner, closer);
+        for (id, session) in &mut self.sessions {
+            let local_only = session
+                .handle
+                .as_ref()
+                .and_then(|handle| handle.lock().ok())
+                .is_some_and(|handle| !handle.is_remote());
+            if !local_only {
+                let lease = RemoteLease::new(*id, 80, 24);
+                queue.register(Arc::clone(&lease));
+                session.remote_recovery = Some(RemoteRecoveryState {
+                    lease,
+                    next_retry: std::time::Instant::now(),
+                    fresh: false,
+                    retryable: true,
+                    startup_delivered: true,
+                    error: None,
+                });
+            }
+        }
+        self.remote_async = Some(queue);
+    }
+
+    /// Preserve the proposed identity before any asynchronous Spawn can run.
+    pub fn spawn_pending(
+        &mut self,
+        mut spec: SessionSpec,
+        cwd: Option<&Path>,
+        cols: u16,
+        rows: u16,
+    ) -> anyhow::Result<Uuid> {
+        if self.remote_async.is_none() {
+            return self.spawn(spec, cwd, cols, rows);
+        }
+        spec.cwd = spec.cwd.or_else(|| cwd.map(Path::to_path_buf));
+        let id = self.create_detached(spec);
+        if let Some(recovery) = self
+            .sessions
+            .get_mut(&id)
+            .and_then(|session| session.remote_recovery.as_mut())
+        {
+            recovery.fresh = true;
+            recovery
+                .lease
+                .birth
+                .store(true, std::sync::atomic::Ordering::Release);
+            recovery
+                .lease
+                .may_close
+                .store(false, std::sync::atomic::Ordering::Release);
+            recovery.startup_delivered = false;
+        }
+        let _ = self.queue_remote_recovery(id, cols, rows, std::time::Instant::now());
+        Ok(id)
+    }
+
+    pub fn set_desired_grid_size(&mut self, id: Uuid, cols: u16, rows: u16) {
+        if let Some(recovery) = self
+            .sessions
+            .get(&id)
+            .and_then(|session| session.remote_recovery.as_ref())
+        {
+            *recovery
+                .lease
+                .dimensions
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = (cols.max(1), rows.max(1));
+        }
+        self.queue_attached_resize(id);
+    }
+
+    fn queue_attached_resize(&mut self, id: Uuid) {
+        let Some(session) = self.sessions.get(&id) else {
+            return;
+        };
+        let (Some(recovery), Some(handle)) = (&session.remote_recovery, &session.handle) else {
+            return;
+        };
+        if recovery.lease.retirement() != 0
+            || recovery
+                .lease
+                .pending
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return;
+        }
+        let desired = *recovery
+            .lease
+            .dimensions
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let applied = *recovery
+            .lease
+            .applied_dimensions
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if applied == Some(desired) {
+            return;
+        }
+        let job = RemoteJob {
+            lease: Arc::clone(&recovery.lease),
+            spec: session.spec.clone(),
+            scheduler: Arc::clone(&self.scheduler),
+            intent: RemoteSpawnIntent::AdoptExisting,
+            prepared: None,
+            attached_resize: Some(Arc::clone(handle)),
+        };
+        if let Some(queue) = self.remote_async.as_mut() {
+            let _ = queue.submit(job);
+        }
+    }
+
+    pub fn recovery_error(&self, id: Uuid) -> Option<&str> {
+        self.sessions
+            .get(&id)?
+            .remote_recovery
+            .as_ref()?
+            .error
+            .as_deref()
+    }
+
+    fn queue_remote_recovery(
+        &mut self,
+        id: Uuid,
+        cols: u16,
+        rows: u16,
+        now: std::time::Instant,
+    ) -> anyhow::Result<()> {
+        let session = self
+            .sessions
+            .get_mut(&id)
+            .ok_or_else(|| anyhow::anyhow!("Runtime session not found"))?;
+        let recovery = session
+            .remote_recovery
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("Remote recovery is unavailable"))?;
+        *recovery
+            .lease
+            .dimensions
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = (cols.max(1), rows.max(1));
+        if recovery.lease.retirement() != 0 {
+            anyhow::bail!("La sesión se está cerrando.");
+        }
+        if !recovery.retryable {
+            anyhow::bail!(RemoteRecoveryError::birth_rejected(
+                id,
+                recovery
+                    .error
+                    .as_deref()
+                    .unwrap_or("La recuperación requiere actualizar el daemon.")
+            ));
+        }
+        if remote_spec_bytes(&session.spec).is_none() {
+            recovery.retryable = false;
+            recovery.error =
+                Some("La configuración de la sesión supera el límite permitido.".to_owned());
+            anyhow::bail!(RemoteRecoveryError::birth_rejected(
+                id,
+                recovery.error.as_deref().unwrap()
+            ));
+        }
+        if recovery
+            .lease
+            .pending
+            .load(std::sync::atomic::Ordering::Acquire)
+            || recovery
+                .lease
+                .completion
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_some()
+            || now < recovery.next_retry
+        {
+            return Ok(());
+        }
+        let job = RemoteJob {
+            lease: Arc::clone(&recovery.lease),
+            spec: session.spec.clone(),
+            scheduler: Arc::clone(&self.scheduler),
+            intent: if recovery.fresh {
+                RemoteSpawnIntent::NewBirth
+            } else {
+                RemoteSpawnIntent::AdoptExisting
+            },
+            prepared: None,
+            attached_resize: None,
+        };
+        let queue = self
+            .remote_async
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("Remote worker is unavailable"))?;
+        match queue.submit(job) {
+            Ok(()) => {
+                recovery.error = Some("Recuperando la sesión remota…".to_owned());
+                Ok(())
+            }
+            Err(error) => {
+                recovery.error = Some(error.to_string());
+                recovery.next_retry = now + REMOTE_RETRY_DELAY;
+                Err(error)
+            }
+        }
+    }
+
+    fn collect_remote_completions(&mut self) {
+        let now = std::time::Instant::now();
+        let mut completions = Vec::new();
+        for (id, session) in &self.sessions {
+            if let Some(recovery) = &session.remote_recovery {
+                if let Ok(mut completion) = recovery.lease.completion.try_lock() {
+                    if let Some(completion) = completion.take() {
+                        completions.push((*id, recovery.lease.generation, completion));
+                    }
+                }
+            }
+        }
+        for (id, generation, completion) in completions {
+            let Some(session) = self.sessions.get_mut(&id) else {
+                continue;
+            };
+            let Some(recovery) = session.remote_recovery.as_mut() else {
+                continue;
+            };
+            if recovery.lease.generation != generation || recovery.lease.retirement() != 0 {
+                continue;
+            }
+            match completion.result {
+                Ok(result) if result.session_id == id => {
+                    recovery.fresh = false;
+                    let desired = *recovery
+                        .lease
+                        .dimensions
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    if desired != completion.dimensions {
+                        // Re-apply the latest dimensions on the worker before
+                        // exposing a handle. No socket resize runs under UI lock.
+                        let job = RemoteJob {
+                            lease: Arc::clone(&recovery.lease),
+                            spec: session.spec.clone(),
+                            scheduler: Arc::clone(&self.scheduler),
+                            intent: RemoteSpawnIntent::AdoptExisting,
+                            prepared: Some(result),
+                            attached_resize: None,
+                        };
+                        if let Some(queue) = self.remote_async.as_mut() {
+                            if let Err(error) = queue.submit(job) {
+                                recovery.error = Some(error.to_string());
+                                recovery.next_retry = now + REMOTE_RETRY_DELAY;
+                            }
+                        }
+                        continue;
+                    }
+                    let startup = !recovery.startup_delivered;
+                    recovery.startup_delivered = true;
+                    recovery.error = None;
+                    let ready = result.output_ready;
+                    let handle = Arc::new(Mutex::new(result.handle));
+                    if let Some(runtime) = crate::hook_runtime::process_runtime() {
+                        let _ = runtime.observe_local(&handle);
+                    }
+                    if startup {
+                        Self::configure_startup_input(session, &handle);
+                        if ready {
+                            if let Some(pending) = session.pending_startup_input.as_mut() {
+                                pending.baseline_render_revision = None;
+                            }
+                        }
+                    }
+                    for pending in [
+                        &mut session.pending_startup_input,
+                        &mut session.pending_prompt,
+                    ]
+                    .into_iter()
+                    .filter_map(Option::as_mut)
+                    {
+                        pending.defer_until_remote_publication = false;
+                        if ready {
+                            pending.baseline_render_revision = None;
+                        } else if pending.baseline_render_revision.is_some() {
+                            pending.baseline_render_revision =
+                                handle.lock().ok().map(|handle| handle.render_revision());
+                        }
+                    }
+                    session.handle = Some(handle);
+                    session.detached_alive = false;
+                }
+                Ok(_) => {
+                    recovery.error =
+                        Some("La sesión remota devolvió una identidad distinta.".to_owned());
+                    recovery.retryable = false;
+                }
+                Err(error) => {
+                    if let Some(typed) = error.downcast_ref::<RemoteRecoveryError>() {
+                        recovery.fresh = typed.retry_intent == RemoteSpawnIntent::NewBirth;
+                        recovery.retryable = typed.retryable;
+                    } else {
+                        recovery.retryable = false;
+                    }
+                    recovery.error = Some(error.to_string());
+                    recovery.next_retry = now + REMOTE_RETRY_DELAY;
+                }
+            }
+        }
     }
 
     /// ¿Las sesiones nuevas se crean fuera del proceso?
     pub fn hosts_out_of_process(&self) -> bool {
-        self.remote_spawner.is_some()
+        self.remote_spawner.is_some() || self.remote_async.is_some()
     }
 
     pub fn spawn(
@@ -367,6 +1552,10 @@ impl PtyManager {
         cols: u16,
         rows: u16,
     ) -> anyhow::Result<Uuid> {
+        if self.remote_async.is_some() {
+            return self.spawn_pending(spec, cwd, cols, rows);
+        }
+        let proposed_id = Uuid::new_v4();
         // Con el daemon adoptado el PTY se crea allá: cerrar la app no lo mata.
         if let Some(spawner) = self.remote_spawner.as_ref() {
             let mut spec_with_cwd = spec.clone();
@@ -390,13 +1579,43 @@ impl PtyManager {
                     return Ok(session_id);
                 }
                 Err(err) => {
-                    // Fallback in-process: mejor un terminal que muere con la
-                    // app que ningún terminal.
+                    let typed = err.downcast_ref::<RemoteRecoveryError>();
+                    if !typed.is_some_and(|error| error.safe_local_fallback) {
+                        let session_id = typed.map_or(proposed_id, |error| error.session_id);
+                        let mut managed = ManagedSession::detached(spec_with_cwd);
+                        managed.legacy_closer = typed.and_then(|error| error.closer.clone());
+                        let lease = RemoteLease::new(session_id, cols, rows);
+                        lease
+                            .attempted
+                            .store(true, std::sync::atomic::Ordering::Release);
+                        lease.birth.store(
+                            typed.is_some_and(|error| {
+                                error.retry_intent == RemoteSpawnIntent::NewBirth
+                            }),
+                            std::sync::atomic::Ordering::Release,
+                        );
+                        lease.may_close.store(
+                            typed.is_some_and(|error| error.may_close),
+                            std::sync::atomic::Ordering::Release,
+                        );
+                        managed.remote_recovery = Some(RemoteRecoveryState {
+                            lease,
+                            next_retry: std::time::Instant::now() + REMOTE_RETRY_DELAY,
+                            fresh: typed.is_some_and(|error| {
+                                error.retry_intent == RemoteSpawnIntent::NewBirth
+                            }),
+                            retryable: typed.is_some_and(|error| error.retryable),
+                            startup_delivered: false,
+                            error: Some(err.to_string()),
+                        });
+                        self.sessions.insert(session_id, managed);
+                        return Ok(session_id);
+                    }
                     log::warn!("el daemon no pudo hostear la sesión ({err}); se usa in-process");
                 }
             }
         }
-        let session_id = Uuid::new_v4();
+        let session_id = proposed_id;
         let detached_spec = SessionSpec {
             title: spec.title.clone(),
             cwd: spec.cwd.clone().or_else(|| cwd.map(Path::to_path_buf)),
@@ -409,13 +1628,22 @@ impl PtyManager {
             workspace_id: spec.workspace_id,
             leaf_id: spec.leaf_id,
             memory_task_id: spec.memory_task_id,
+            hook_legacy_root: false,
         };
-        self.sessions
-            .insert(session_id, ManagedSession::detached(detached_spec));
-        if let Err(err) = self.attach_detached(session_id, cols, rows) {
-            self.sessions.remove(&session_id);
-            return Err(err);
-        }
+        // This is the sole local fallback; it must not invoke the remote callback again.
+        let handle = spawn_local_handle(
+            &detached_spec,
+            cols,
+            rows,
+            session_id,
+            Arc::clone(&self.scheduler),
+        )?;
+        let mut managed = ManagedSession::detached(detached_spec);
+        let shared = Arc::new(Mutex::new(handle));
+        Self::configure_startup_input(&mut managed, &shared);
+        managed.handle = Some(shared);
+        managed.detached_alive = false;
+        self.sessions.insert(session_id, managed);
         Ok(session_id)
     }
 
@@ -425,6 +1653,29 @@ impl PtyManager {
         cols: u16,
         rows: u16,
     ) -> anyhow::Result<()> {
+        self.collect_remote_completions();
+        if self.remote_async.is_some() {
+            let session = self
+                .sessions
+                .get_mut(&session_id)
+                .ok_or_else(|| anyhow::anyhow!("Runtime session not found"))?;
+            if let Some(handle) = session.handle.as_ref() {
+                if let Ok(pty) = handle.lock() {
+                    if pty.alive() || !pty.is_remote() || pty.remote_session_exited() {
+                        return Ok(());
+                    }
+                } else {
+                    anyhow::bail!("PTY handle lock poisoned");
+                }
+                session.handle = None;
+            }
+            self.queue_remote_recovery(session_id, cols, rows, std::time::Instant::now())?;
+            anyhow::bail!(RemoteRecoveryError::protected(
+                session_id,
+                self.recovery_error(session_id)
+                    .unwrap_or("La sesión remota sigue pendiente.")
+            ));
+        }
         let Some(session) = self.sessions.get_mut(&session_id) else {
             anyhow::bail!("Runtime session not found");
         };
@@ -450,7 +1701,23 @@ impl PtyManager {
         // Con daemon adoptado, una sesión detached se engancha **allá** con su
         // mismo id (P3.15, T3): es el camino que toman los paneles restaurados,
         // y sin esto se atacheaban in-process aunque el daemon estuviera vivo.
-        let remote = self.remote_spawner.as_ref().and_then(|spawner| {
+        let handle = if let Some(spawner) = self.remote_spawner.as_ref() {
+            // A known identity never degrades to a second local PTY.
+            if let Some(recovery) = session.remote_recovery.as_ref() {
+                if recovery.fresh || !recovery.retryable {
+                    anyhow::bail!(RemoteRecoveryError::birth_rejected(session_id,
+                        "La recuperación de este nacimiento requiere un backend con intent explícito."));
+                }
+                if std::time::Instant::now() < recovery.next_retry {
+                    anyhow::bail!(RemoteRecoveryError::protected(
+                        session_id,
+                        recovery
+                            .error
+                            .as_deref()
+                            .unwrap_or("La sesión sigue pendiente.")
+                    ));
+                }
+            }
             match spawner(
                 &spec,
                 cols,
@@ -458,53 +1725,45 @@ impl PtyManager {
                 Arc::clone(&self.scheduler),
                 Some(session_id),
             ) {
-                Ok((id, handle)) if id == session_id => Some(handle),
-                Ok((id, _)) => {
-                    // El daemon dio otro id: no se puede mapear panel ↔ sesión,
-                    // así que se cae a in-process en vez de perder el panel.
-                    log::warn!("el daemon devolvió {id} en vez de {session_id}");
-                    None
-                }
-                Err(err) => {
-                    log::warn!("el daemon no pudo enganchar {session_id} ({err})");
-                    None
-                }
-            }
-        });
-
-        let (handle, was_remote) = match remote {
-            Some(handle) => (handle, true),
-            None => (
-                PtyHandle::spawn(
-                    spec.cwd.as_deref(),
-                    cols,
-                    rows,
+                Ok((id, handle)) if id == session_id => handle,
+                Ok(_) => anyhow::bail!(RemoteRecoveryError::protected(
                     session_id,
-                    Arc::clone(&self.scheduler),
-                    crate::terminal::pty::HookIdentity {
-                        panel_id: spec.panel_id,
-                        workspace_id: spec.workspace_id,
-                        leaf_id: spec.leaf_id,
-                        memory_task_id: spec.memory_task_id,
-                    },
-                )?,
-                false,
-            ),
-        };
-        // El daemon ya corrió el startup_command al crear la sesión: repetirlo
-        // acá lanzaría el agente dos veces.
-        if !was_remote {
-            if let Some(command) = spec
-                .startup_command
-                .as_deref()
-                .map(str::trim)
-                .filter(|command| !command.is_empty())
-            {
-                handle.try_write_all(format!("{command}\n").as_bytes())?;
+                    "El daemon devolvió una identidad distinta."
+                )),
+                Err(error) => {
+                    if let Some(protected) = error.downcast_ref::<RemoteRecoveryError>() {
+                        session.legacy_closer = protected.closer.clone();
+                    }
+                    let startup_delivered = session
+                        .remote_recovery
+                        .as_ref()
+                        .is_none_or(|recovery| recovery.startup_delivered);
+                    session.remote_recovery = Some(RemoteRecoveryState {
+                        lease: RemoteLease::new(session_id, cols, rows),
+                        next_retry: std::time::Instant::now() + REMOTE_RETRY_DELAY,
+                        fresh: false,
+                        retryable: true,
+                        startup_delivered,
+                        error: Some(error.to_string()),
+                    });
+                    return Err(error);
+                }
             }
-        }
+        } else {
+            spawn_local_handle(&spec, cols, rows, session_id, Arc::clone(&self.scheduler))?
+        };
+        let startup = session
+            .remote_recovery
+            .as_ref()
+            .is_none_or(|recovery| !recovery.startup_delivered);
         let shared_handle = Arc::new(Mutex::new(handle));
-        Self::configure_startup_input(session, &shared_handle);
+        if startup {
+            Self::configure_startup_input(session, &shared_handle);
+        }
+        if let Some(recovery) = session.remote_recovery.as_mut() {
+            recovery.startup_delivered = true;
+            recovery.error = None;
+        }
         session.handle = Some(shared_handle);
         session.detached_alive = false;
         Ok(())
@@ -548,6 +1807,7 @@ impl PtyManager {
                     input,
                     baseline_render_revision: Some(baseline_render_revision),
                     completion: None,
+                    defer_until_remote_publication: false,
                 });
             } else if let Ok(handle) = handle.lock() {
                 if let Err(error) = write_startup_input(&handle, &input) {
@@ -556,6 +1816,7 @@ impl PtyManager {
                             input,
                             baseline_render_revision: None,
                             completion: None,
+                            defer_until_remote_publication: false,
                         });
                     } else {
                         handle.record_input_error(format!(
@@ -568,6 +1829,9 @@ impl PtyManager {
         }
     }
 
+    pub(crate) fn spec(&self, id: Uuid) -> Option<&SessionSpec> {
+        Some(&self.sessions.get(&id)?.spec)
+    }
     pub fn handle(&self, session_id: Uuid) -> Option<SharedPtyHandle> {
         self.sessions
             .get(&session_id)
@@ -641,15 +1905,109 @@ impl PtyManager {
     /// este es el camino que corre también al cerrar la app, y matar acá sería
     /// exactamente lo contrario de lo que el daemon promete (P3.15).
     pub fn close(&mut self, session_id: Uuid) -> bool {
-        self.sessions.remove(&session_id).is_some()
+        if let Some(runtime) = crate::hook_runtime::process_runtime() {
+            let remote = self
+                .sessions
+                .get(&session_id)
+                .and_then(|s| s.handle.as_ref())
+                .and_then(|h| h.lock().ok())
+                .map(|h| h.is_remote());
+            if remote == Some(true) || (remote.is_none() && !self.local_backend) {
+                runtime.release_endpoint(session_id);
+            } else {
+                runtime.begin_close(session_id, true);
+            }
+        }
+        let Some(session) = self.sessions.remove(&session_id) else {
+            return false;
+        };
+        if let (Some(queue), Some(recovery)) =
+            (self.remote_async.as_mut(), session.remote_recovery.as_ref())
+        {
+            let local = session
+                .handle
+                .as_ref()
+                .is_some_and(|h| h.lock().ok().is_some_and(|p| !p.is_remote()));
+            if local {
+                *recovery
+                    .lease
+                    .local_retiring
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = session.handle.as_ref().cloned();
+                recovery
+                    .lease
+                    .local_only
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+            queue.retire(&recovery.lease, local || self.local_backend);
+        }
+        true
     }
 
     /// Cierra la sesión **para siempre**: la suelta y, si vive en el daemon,
     /// la mata. Es el camino del usuario cerrando un panel.
     pub fn close_and_kill_remote(&mut self, session_id: Uuid) -> bool {
+        if let Some(runtime) = crate::hook_runtime::process_runtime() {
+            runtime.begin_close(session_id, true);
+        }
         let Some(session) = self.sessions.remove(&session_id) else {
             return false;
         };
+        if let (Some(queue), Some(recovery)) =
+            (self.remote_async.as_mut(), session.remote_recovery.as_ref())
+        {
+            let local_only = session
+                .handle
+                .as_ref()
+                .and_then(|handle| handle.lock().ok())
+                .is_some_and(|handle| !handle.is_remote());
+            if !local_only
+                && !recovery.retryable
+                && !recovery
+                    .lease
+                    .may_close
+                    .load(std::sync::atomic::Ordering::Acquire)
+            {
+                log::warn!("No se confirmó el cierre de {session_id}: el daemon legacy no puede resolver un nacimiento ambiguo.");
+                self.sessions.insert(session_id, session);
+                return false;
+            }
+            if local_only {
+                *recovery
+                    .lease
+                    .local_retiring
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = session.handle.as_ref().cloned();
+                recovery
+                    .lease
+                    .local_only
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+            queue.retire(&recovery.lease, true);
+            return true;
+        }
+        if let Some(closer) = session.legacy_closer.as_ref() {
+            // This compatibility API is synchronous; production uses RemoteQueue.
+            let intent = session
+                .remote_recovery
+                .as_ref()
+                .map_or(RemoteCloseIntent::AdoptExisting, |recovery| {
+                    recovery.lease.close_intent()
+                });
+            if let Err(error) = closer(session_id, intent) {
+                log::warn!("No se confirmó el cierre de {session_id}: {error}");
+                self.sessions.insert(session_id, session);
+                return false;
+            }
+            return true;
+        }
+        if session.handle.is_none() && self.remote_spawner.is_some() {
+            log::warn!(
+                "No se confirmó el cierre de {session_id}: el creador legacy no ofrece un closer."
+            );
+            self.sessions.insert(session_id, session);
+            return false;
+        }
         #[cfg(not(all(unix, feature = "daemon")))]
         let _ = session;
         #[cfg(all(unix, feature = "daemon"))]
@@ -713,10 +2071,21 @@ impl PtyManager {
         let session = self.sessions.get_mut(&session_id).ok_or_else(|| {
             Error::new(ErrorKind::NotFound, "La sesión del terminal ya no existe.")
         })?;
-        let handle = session
-            .handle
-            .as_ref()
-            .ok_or_else(|| Error::new(ErrorKind::NotConnected, "El terminal no está conectado."))?;
+        let handle = session.handle.as_ref();
+        let recoverable = session.remote_recovery.as_ref().is_some_and(|recovery| {
+            recovery.lease.retirement() == 0
+                && (recovery.retryable
+                    || recovery
+                        .lease
+                        .pending
+                        .load(std::sync::atomic::Ordering::Acquire))
+        });
+        if handle.is_none() && !recoverable {
+            return Err(Error::new(
+                ErrorKind::NotConnected,
+                "El terminal no está conectado.",
+            ));
+        }
         if text.trim().is_empty() {
             return Err(Error::new(ErrorKind::InvalidInput, "El prompt está vacío."));
         }
@@ -727,31 +2096,77 @@ impl PtyManager {
             ));
         }
         if !prompt_fits_input_budget(text.trim()) {
-            if let Ok(handle) = handle.lock() {
+            if let Some(handle) = handle.and_then(|handle| handle.lock().ok()) {
                 handle.record_input_error(OVERSIZED_PROMPT_ERROR.to_owned());
             }
             return Err(Error::new(ErrorKind::InvalidInput, OVERSIZED_PROMPT_ERROR));
         }
-        let pty = handle
-            .lock()
-            .map_err(|_| Error::other("No se pudo acceder al estado del terminal."))?;
-        if !pty.alive() {
-            return Err(Error::new(ErrorKind::BrokenPipe, "El terminal terminó."));
-        }
-        let baseline = pty.render_revision();
-        pty.check_input_open()?;
+        let baseline = if let Some(handle) = handle {
+            let pty = handle
+                .lock()
+                .map_err(|_| Error::other("No se pudo acceder al estado del terminal."))?;
+            if !pty.alive() && !(pty.is_remote() && !pty.remote_session_exited() && recoverable) {
+                return Err(Error::new(ErrorKind::BrokenPipe, "El terminal terminó."));
+            }
+            if pty.alive() {
+                pty.check_input_open()?;
+            }
+            Some(pty.render_revision())
+        } else {
+            Some(u64::MAX)
+        };
         let (completion, receipt) = DeferredPrompt::channel();
         let cancellation = receipt.cancellation_token();
         session.pending_prompt = Some(PendingStartupInput {
             input: text.trim().to_owned(),
-            baseline_render_revision: Some(baseline),
+            baseline_render_revision: baseline,
             completion: Some((completion, cancellation)),
+            defer_until_remote_publication: handle.is_none() && recoverable,
         });
         Ok(receipt)
     }
 
     /// Progress input without consuming scheduler events for hidden workspaces.
     pub fn flush_pending_inputs(&mut self) {
+        self.collect_remote_completions();
+        if let Some(queue) = self.remote_async.as_mut() {
+            if queue.has_cleanup() {
+                let _ = queue.ensure_started();
+            }
+        }
+        if self.remote_async.is_some() {
+            let mut retry = Vec::new();
+            for (id, session) in &mut self.sessions {
+                let disconnected = session
+                    .handle
+                    .as_ref()
+                    .and_then(|handle| handle.try_lock().ok())
+                    .is_some_and(|handle| {
+                        !handle.alive() && handle.is_remote() && !handle.remote_session_exited()
+                    });
+                if disconnected {
+                    session.handle = None;
+                }
+                if session.handle.is_none() {
+                    if let Some(recovery) = session.remote_recovery.as_ref() {
+                        let dimensions = *recovery
+                            .lease
+                            .dimensions
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner());
+                        retry.push((*id, dimensions));
+                    }
+                }
+            }
+            let now = std::time::Instant::now();
+            for (id, (cols, rows)) in retry {
+                let _ = self.queue_remote_recovery(id, cols, rows, now);
+            }
+        }
+        let attached: Vec<_> = self.sessions.keys().copied().collect();
+        for id in attached {
+            self.queue_attached_resize(id);
+        }
         for session in self.sessions.values_mut() {
             if session.pending_prompt.as_ref().is_some_and(|pending| {
                 pending.completion.as_ref().is_some_and(|(_, cancelled)| {
@@ -768,17 +2183,41 @@ impl PtyManager {
     }
 
     pub fn has_pending_inputs(&self) -> bool {
-        self.sessions.values().any(|session| {
-            session.pending_startup_input.is_some() || session.pending_prompt.is_some()
-        })
+        self.remote_async
+            .as_ref()
+            .is_some_and(RemoteQueue::has_cleanup)
+            || self.sessions.values().any(|session| {
+                session.pending_startup_input.is_some()
+                    || session.pending_prompt.is_some()
+                    || (session
+                        .remote_recovery
+                        .as_ref()
+                        .is_some_and(|recovery| recovery.retryable)
+                        && !session.is_attached())
+            })
     }
 
     /// Flushea `pending_startup_input` (is_startup=true) o `pending_prompt`
     /// (false) si el handle está listo. Conserva el prompt si la cola está llena.
     fn flush_one_pending(session: &mut ManagedSession, is_startup: bool) {
         let Some(handle) = session.handle.as_ref() else {
-            // Preserve startup input for reconnect, but resolve the tracked
-            // prompt even when that startup slot would block its own flush.
+            let waiting_for_first_publication = session
+                .pending_prompt
+                .as_ref()
+                .is_some_and(|pending| pending.defer_until_remote_publication)
+                && session.remote_recovery.as_ref().is_some_and(|recovery| {
+                    recovery.lease.retirement() == 0
+                        && (recovery.retryable
+                            || recovery
+                                .lease
+                                .pending
+                                .load(std::sync::atomic::Ordering::Acquire))
+                });
+            if waiting_for_first_publication {
+                return;
+            }
+            // T3 P2: a lost retained handle resolves tracked feedback before
+            // blocked startup can hide it. Untracked startup stays preserved.
             if let Some((completion, _)) = session
                 .pending_prompt
                 .as_mut()
@@ -800,6 +2239,7 @@ impl PtyManager {
         let Some(pending) = pending_ref else {
             return;
         };
+
         // Hold a single lock across the readiness check and the write so
         // the handle cannot change state between the two.
         let Ok(handle) = handle.lock() else {
@@ -816,6 +2256,15 @@ impl PtyManager {
             return;
         };
         let result = if !handle.alive() {
+            if handle.is_remote()
+                && !handle.remote_session_exited()
+                && session
+                    .remote_recovery
+                    .as_ref()
+                    .is_some_and(|recovery| recovery.lease.retirement() == 0)
+            {
+                return;
+            }
             Err(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
                 "El terminal terminó antes de recibir el prompt.",
@@ -883,6 +2332,7 @@ mod tests {
             input: "prompt".to_owned(),
             baseline_render_revision: Some(4),
             completion: None,
+            defer_until_remote_publication: false,
         };
 
         assert!(!pending.is_ready(4));
@@ -895,6 +2345,7 @@ mod tests {
             input: "prompt".to_owned(),
             baseline_render_revision: None,
             completion: None,
+            defer_until_remote_publication: false,
         };
         assert!(!pending
             .try_send(0, |_| Err(std::io::ErrorKind::WouldBlock.into()))
@@ -915,6 +2366,7 @@ mod tests {
             input: "prompt".to_owned(),
             baseline_render_revision: Some(4),
             completion: None,
+            defer_until_remote_publication: false,
         };
         assert!(!pending.try_send(4, |_| panic!("not ready")).unwrap());
         assert_eq!(
@@ -1051,6 +2503,7 @@ mod tests {
             input: "startup brief".to_owned(),
             baseline_render_revision: Some(100),
             completion: None,
+            defer_until_remote_publication: false,
         });
         let receipt = manager.queue_prompt_tracked(id, "review feedback").unwrap();
         handle.lock().unwrap().mark_render_dirty();
@@ -1073,6 +2526,7 @@ mod tests {
             input: "startup brief".to_owned(),
             baseline_render_revision: Some(100),
             completion: None,
+            defer_until_remote_publication: false,
         });
         let receipt = manager
             .queue_prompt_tracked(id, "cancelled feedback")
@@ -1104,6 +2558,51 @@ mod tests {
     }
 
     #[test]
+    fn prompt_delivery_closing_the_session_resolves_the_pending_receipt() {
+        let (mut manager, id, _handle) = prompt_delivery_fixture();
+        let receipt = manager.queue_prompt_tracked(id, "feedback").unwrap();
+        manager.close(id);
+        assert_eq!(
+            receipt.poll().unwrap().unwrap_err().kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+    }
+
+    #[test]
+    fn prompt_delivery_rejects_empty_and_oversized_text_without_a_pending_slot() {
+        let (mut manager, id, handle) = prompt_delivery_fixture();
+        assert!(matches!(manager.queue_prompt_tracked(id, " \n "),
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidInput));
+        let oversized = "x".repeat(crate::terminal::pty::MAX_INPUT_BYTES + 1);
+        assert!(matches!(manager.queue_prompt_tracked(id, &oversized),
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidInput));
+        assert_eq!(
+            manager.submit_prompt(id, &oversized).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        let escaped = "\u{1b}".repeat(crate::terminal::pty::MAX_INPUT_BYTES / 4);
+        assert_eq!(
+            manager.submit_prompt(id, &escaped).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        assert!(!manager.has_pending_inputs());
+        assert_eq!(handle.lock().unwrap().activity_revision(), 0);
+    }
+
+    #[test]
+    fn focused_session_gets_the_unthrottled_io_lane() {
+        let focused = Uuid::new_v4();
+        let background = Uuid::new_v4();
+        let mut scheduler = RuntimeScheduler::new_for_tests();
+        scheduler.set_priority_session(Some(focused));
+
+        assert!(scheduler.reader_delay(focused).is_zero());
+        assert!(!scheduler.reader_delay(background).is_zero());
+        scheduler.set_priority_session(None);
+        assert!(scheduler.reader_delay(background).is_zero());
+    }
+
+    #[test]
     fn prompt_delivery_missing_handle_resolves_receipt_without_losing_startup() {
         for blocked_startup in [false, true] {
             let (mut manager, id, handle) = prompt_delivery_fixture();
@@ -1113,6 +2612,7 @@ mod tests {
                         input: "startup brief".to_owned(),
                         baseline_render_revision: Some(100),
                         completion: None,
+                        defer_until_remote_publication: false,
                     });
             }
             let first = manager
@@ -1170,49 +2670,383 @@ mod tests {
             }
         }
     }
+}
+
+#[cfg(test)]
+mod full_attach_prompt_recovery_fixtures {
+    use super::*;
+    fn pending_manager() -> (PtyManager, Uuid) {
+        let mut manager = PtyManager::new_for_tests();
+        let id = manager.create_detached(SessionSpec::default());
+        manager.sessions.get_mut(&id).unwrap().remote_recovery = Some(RemoteRecoveryState {
+            lease: RemoteLease::new(id, 117, 39),
+            next_retry: std::time::Instant::now(),
+            fresh: true,
+            retryable: true,
+            startup_delivered: false,
+            error: Some("pending".to_owned()),
+        });
+        (manager, id)
+    }
+    #[test]
+    fn tracked_prompt_keeps_receipt_during_pending_recovery_and_then_accepts() {
+        let (mut manager, id) = pending_manager();
+        let receipt = manager.queue_prompt_tracked(id, "KEEP ORIGINAL").unwrap();
+        manager.flush_pending_inputs();
+        assert!(receipt.poll().is_none());
+        assert_eq!(
+            manager.sessions[&id].pending_prompt.as_ref().unwrap().input,
+            "KEEP ORIGINAL"
+        );
+        let handle = PtyHandle::for_persistence_tests(b"READY");
+        let lease = Arc::clone(
+            &manager.sessions[&id]
+                .remote_recovery
+                .as_ref()
+                .unwrap()
+                .lease,
+        );
+        *lease.completion.lock().unwrap() = Some(RemoteCompletion {
+            result: Ok(RemoteSpawnResult {
+                session_id: id,
+                handle,
+                output_ready: true,
+                owned_birth: true,
+            }),
+            dimensions: (117, 39),
+        });
+        manager.collect_remote_completions();
+        manager.flush_pending_inputs();
+        assert!(receipt.poll().unwrap().is_ok());
+        assert!(manager.sessions[&id].pending_prompt.is_none());
+    }
+    #[test]
+    fn pending_recovery_preserves_cancellation_and_does_not_replace_a_prompt() {
+        let (mut manager, id) = pending_manager();
+        let receipt = manager.queue_prompt_tracked(id, "FIRST").unwrap();
+        assert_eq!(
+            manager
+                .queue_prompt_tracked(id, "SECOND")
+                .err()
+                .unwrap()
+                .kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        drop(receipt);
+        manager.flush_pending_inputs();
+        assert!(manager.sessions[&id].pending_prompt.is_none());
+        let replacement = manager.queue_prompt_tracked(id, "AFTER CANCEL").unwrap();
+        assert!(replacement.poll().is_none());
+    }
+    #[test]
+    fn unproven_birth_has_no_safe_fallback_retry_or_close_rights() {
+        let error = RemoteRecoveryError::birth_pending(Uuid::from_u128(0x6300), "upgrade", false);
+        assert!(!error.safe_local_fallback);
+        assert!(!error.retryable);
+        assert!(!error.may_close);
+        assert_eq!(error.retry_intent, RemoteSpawnIntent::NewBirth);
+    }
+}
+
+#[cfg(test)]
+mod full_attach_worker_fixtures {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    fn job(lease: Arc<RemoteLease>, intent: RemoteSpawnIntent) -> RemoteJob {
+        RemoteJob {
+            lease,
+            spec: SessionSpec::default(),
+            scheduler: Arc::new(Mutex::new(RuntimeScheduler::new_for_tests())),
+            intent,
+            prepared: None,
+            attached_resize: None,
+        }
+    }
 
     #[test]
-    fn prompt_delivery_closing_the_session_resolves_the_pending_receipt() {
-        let (mut manager, id, _handle) = prompt_delivery_fixture();
-        let receipt = manager.queue_prompt_tracked(id, "feedback").unwrap();
-        manager.close(id);
+    fn retired_before_execution_never_calls_remote_spawn() {
+        let lease = RemoteLease::new(Uuid::from_u128(0x6401), 117, 39);
+        lease.pending.store(true, Ordering::Release);
+        lease.retired.store(REMOTE_CLOSED, Ordering::Release);
+        let spawn: AsyncRemoteSpawner = Arc::new(|_, _, _, _, _, _| panic!("retired factory"));
+        perform_remote_job(job(Arc::clone(&lease), RemoteSpawnIntent::NewBirth), &spawn);
+        assert!(!lease.pending.load(Ordering::Acquire));
+        assert!(!lease.attempted.load(Ordering::Acquire));
+        assert!(lease.completion.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn retirement_during_ambiguous_spawn_keeps_uuid_close_rights_without_publication() {
+        let id = Uuid::from_u128(0x6402);
+        let lease = RemoteLease::new(id, 117, 39);
+        let lease_in_factory = Arc::clone(&lease);
+        let spawn: AsyncRemoteSpawner = Arc::new(move |_, cols, rows, _, actual_id, intent| {
+            assert_eq!(
+                (cols, rows, actual_id, intent),
+                (117, 39, id, RemoteSpawnIntent::NewBirth)
+            );
+            lease_in_factory
+                .retired
+                .store(REMOTE_CLOSED, Ordering::Release);
+            Err(RemoteRecoveryError::birth_pending(id, "lost ACK", true).into())
+        });
+        perform_remote_job(job(Arc::clone(&lease), RemoteSpawnIntent::NewBirth), &spawn);
+        assert!(lease.attempted.load(Ordering::Acquire));
+        assert!(lease.cleanup_eligible());
+        assert_eq!(lease.close_intent(), RemoteCloseIntent::OwnedBirth);
+        assert!(lease.completion.lock().unwrap().is_none());
+        assert!(!lease.pending.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn queue_capacity_rejection_preserves_the_unscheduled_identity() {
+        let spawn: AsyncRemoteSpawner =
+            Arc::new(|_, _, _, _, _, _| panic!("fixture starts no worker"));
+        let closer: RemoteCloser = Arc::new(|_, _| panic!("fixture starts no cleanup"));
+        let mut queue = RemoteQueue::new(Uuid::from_u128(0x6403), spawn, closer);
+        queue.started = true; // Exercise actual submit admission with no worker thread.
+        for value in 0..REMOTE_QUEUE_CAPACITY {
+            let lease = RemoteLease::new(Uuid::from_u128(0x6500 + value as u128), 117, 39);
+            queue
+                .submit(job(lease, RemoteSpawnIntent::NewBirth))
+                .unwrap();
+        }
+        let id = Uuid::from_u128(0x64ff);
+        let lease = RemoteLease::new(id, 117, 39);
+        let error = queue
+            .submit(job(Arc::clone(&lease), RemoteSpawnIntent::NewBirth))
+            .unwrap_err();
+        let protected = error.downcast_ref::<RemoteRecoveryError>().unwrap();
+        assert_eq!(protected.session_id, id);
+        assert!(!protected.safe_local_fallback);
+        assert!(!lease.pending.load(Ordering::Acquire));
+        assert!(!lease.attempted.load(Ordering::Acquire));
+        assert_eq!(*lease.dimensions.lock().unwrap(), (117, 39));
+        assert_eq!(
+            queue.state.0.lock().unwrap().ready.len(),
+            REMOTE_QUEUE_CAPACITY
+        );
+    }
+}
+
+#[cfg(test)]
+mod birth_uncertainty_fixtures {
+    use super::*;
+    use std::sync::atomic::Ordering;
+    fn job(lease: Arc<RemoteLease>) -> RemoteJob {
+        RemoteJob {
+            lease,
+            spec: SessionSpec::default(),
+            scheduler: Arc::new(Mutex::new(RuntimeScheduler::new_for_tests())),
+            intent: RemoteSpawnIntent::NewBirth,
+            prepared: None,
+            attached_resize: None,
+        }
+    }
+    fn forbidden_local(
+        _: &SessionSpec,
+        _: u16,
+        _: u16,
+        _: Uuid,
+        _: SharedRuntimeScheduler,
+    ) -> anyhow::Result<PtyHandle> {
+        panic!("duplicate/cancelled local factory")
+    }
+    #[test]
+    fn lost_spawn_ack_then_connect_failure_never_calls_local_factory_or_loses_close_rights() {
+        let id = Uuid::from_u128(0x6701);
+        let lease = RemoteLease::new(id, 117, 39);
+        let lost: AsyncRemoteSpawner = Arc::new(move |_, _, _, _, actual, _| {
+            assert_eq!(actual, id);
+            Err(RemoteRecoveryError::birth_pending(id, "lost ACK", true).into())
+        });
+        perform_remote_job_with_fallback(job(Arc::clone(&lease)), &lost, &forbidden_local);
+        lease.completion.lock().unwrap().take();
+        let disconnected: AsyncRemoteSpawner = Arc::new(move |_, _, _, _, actual, _| {
+            assert_eq!(actual, id);
+            Err(RemoteRecoveryError::before_creation(id, "connect refusal on retry").into())
+        });
+        perform_remote_job_with_fallback(job(Arc::clone(&lease)), &disconnected, &forbidden_local);
+        let completion = lease.completion.lock().unwrap().take().unwrap();
+        let error = completion.result.err().unwrap();
+        let typed = error.downcast_ref::<RemoteRecoveryError>().unwrap();
+        assert_eq!(typed.session_id, id);
+        assert!(!typed.safe_local_fallback);
+        assert!(typed.may_close && lease.cleanup_eligible());
+        assert_eq!(typed.retry_intent, RemoteSpawnIntent::NewBirth);
+        assert_eq!(lease.close_intent(), RemoteCloseIntent::OwnedBirth);
+        assert!(lease.may_have_spawned.load(Ordering::Acquire));
+        assert!(!lease.local_only.load(Ordering::Acquire));
+    }
+    #[test]
+    fn callback_panic_after_possible_spawn_keeps_birth_cleanup_and_no_fallback() {
+        let id = Uuid::from_u128(0x6702);
+        let lease = RemoteLease::new(id, 117, 39);
+        let spawn: AsyncRemoteSpawner = Arc::new(move |_, _, _, _, actual, _| {
+            assert_eq!(actual, id);
+            panic!("panic after admitted Spawn")
+        });
+        perform_remote_job_with_fallback(job(Arc::clone(&lease)), &spawn, &forbidden_local);
+        let completion = lease.completion.lock().unwrap().take().unwrap();
+        let error = completion.result.err().unwrap();
+        let typed = error.downcast_ref::<RemoteRecoveryError>().unwrap();
+        assert!(!typed.safe_local_fallback);
+        assert!(typed.retryable && typed.may_close);
+        assert!(lease.cleanup_eligible());
+        assert_eq!(lease.close_intent(), RemoteCloseIntent::OwnedBirth);
+    }
+    #[test]
+    fn retirement_during_known_uncreated_connect_failure_closes_local_admission() {
+        let id = Uuid::from_u128(0x6703);
+        let lease = RemoteLease::new(id, 117, 39);
+        let closing = Arc::clone(&lease);
+        let spawn: AsyncRemoteSpawner = Arc::new(move |_, _, _, _, _, _| {
+            closing.retired.store(REMOTE_CLOSED, Ordering::Release);
+            closing.close_local_birth_admissions();
+            Err(RemoteRecoveryError::before_creation(id, "known uncreated").into())
+        });
+        perform_remote_job_with_fallback(job(Arc::clone(&lease)), &spawn, &forbidden_local);
+        assert!(!lease.admit_local_birth());
+        assert!(!lease.local_only.load(Ordering::Acquire));
+        assert!(lease.completion.lock().unwrap().is_none());
+        assert!(!lease.pending.load(Ordering::Acquire));
+    }
+}
+
+#[cfg(test)]
+mod t3_recovery_admission_fixtures {
+    use super::*;
+    #[test]
+    fn prepublication_deferred_receipt_waits_but_lost_published_handle_resolves_before_startup() {
+        let mut manager = PtyManager::new_for_tests();
+        let id = manager.create_detached(SessionSpec::default());
+        let lease = RemoteLease::new(id, 117, 39);
+        manager.sessions.get_mut(&id).unwrap().remote_recovery = Some(RemoteRecoveryState {
+            lease: Arc::clone(&lease),
+            next_retry: std::time::Instant::now(),
+            fresh: true,
+            retryable: true,
+            startup_delivered: false,
+            error: None,
+        });
+        let receipt = manager
+            .queue_prompt_tracked(id, "KEEP UNTIL FIRST PUBLICATION")
+            .unwrap();
+        manager.flush_pending_inputs();
+        assert!(receipt.poll().is_none());
+        *lease.completion.lock().unwrap() = Some(RemoteCompletion {
+            dimensions: (117, 39),
+            result: Ok(RemoteSpawnResult {
+                session_id: id,
+                handle: PtyHandle::for_persistence_tests(b""),
+                output_ready: false,
+                owned_birth: true,
+            }),
+        });
+        manager.collect_remote_completions();
+        let session = manager.sessions.get_mut(&id).unwrap();
+        assert!(
+            !session
+                .pending_prompt
+                .as_ref()
+                .unwrap()
+                .defer_until_remote_publication
+        );
+        session.pending_startup_input = Some(PendingStartupInput {
+            input: "KEEP STARTUP".to_owned(),
+            baseline_render_revision: Some(100),
+            completion: None,
+            defer_until_remote_publication: false,
+        });
+        session.handle = None;
+        manager.flush_pending_inputs();
         assert_eq!(
             receipt.poll().unwrap().unwrap_err().kind(),
-            std::io::ErrorKind::BrokenPipe
+            std::io::ErrorKind::NotConnected
+        );
+        assert!(manager.sessions[&id].pending_prompt.is_none());
+        assert_eq!(
+            manager.sessions[&id]
+                .pending_startup_input
+                .as_ref()
+                .unwrap()
+                .input,
+            "KEEP STARTUP"
         );
     }
+}
 
+#[cfg(test)]
+mod permanent_first_publication_failure_fixtures {
+    use super::*;
     #[test]
-    fn prompt_delivery_rejects_empty_and_oversized_text_without_a_pending_slot() {
-        let (mut manager, id, handle) = prompt_delivery_fixture();
-        assert!(matches!(manager.queue_prompt_tracked(id, " \n "),
-            Err(error) if error.kind() == std::io::ErrorKind::InvalidInput));
-        let oversized = "x".repeat(crate::terminal::pty::MAX_INPUT_BYTES + 1);
-        assert!(matches!(manager.queue_prompt_tracked(id, &oversized),
-            Err(error) if error.kind() == std::io::ErrorKind::InvalidInput));
-        assert_eq!(
-            manager.submit_prompt(id, &oversized).unwrap_err().kind(),
-            std::io::ErrorKind::InvalidInput
+    fn permanent_birth_failure_resolves_admitted_feedback_and_rejects_new_receipts() {
+        let mut manager = PtyManager::new_for_tests();
+        let id = manager.create_detached(SessionSpec::default());
+        let lease = RemoteLease::new(id, 117, 39);
+        manager.sessions.get_mut(&id).unwrap().remote_recovery = Some(RemoteRecoveryState {
+            lease: Arc::clone(&lease),
+            next_retry: std::time::Instant::now(),
+            fresh: true,
+            retryable: true,
+            startup_delivered: false,
+            error: None,
+        });
+        let receipt = manager
+            .queue_prompt_tracked(id, "ADMITTED BEFORE REFUSAL")
+            .unwrap();
+        manager.sessions.get_mut(&id).unwrap().pending_startup_input = Some(PendingStartupInput {
+            input: "KEEP UNTRACKED STARTUP".to_owned(),
+            baseline_render_revision: Some(100),
+            completion: None,
+            defer_until_remote_publication: false,
+        });
+        *lease.completion.lock().unwrap() = Some(RemoteCompletion {
+            dimensions: (117, 39),
+            result: Err(RemoteRecoveryError::birth_rejected(id, "permanent refusal").into()),
+        });
+        manager.collect_remote_completions();
+        assert!(
+            !manager.sessions[&id]
+                .remote_recovery
+                .as_ref()
+                .unwrap()
+                .retryable
         );
-        let escaped = "\u{1b}".repeat(crate::terminal::pty::MAX_INPUT_BYTES / 4);
         assert_eq!(
-            manager.submit_prompt(id, &escaped).unwrap_err().kind(),
-            std::io::ErrorKind::InvalidInput
+            manager
+                .queue_prompt_tracked(id, "NEW RECEIPT")
+                .err()
+                .unwrap()
+                .kind(),
+            std::io::ErrorKind::NotConnected
         );
-        assert!(!manager.has_pending_inputs());
-        assert_eq!(handle.lock().unwrap().activity_revision(), 0);
+        manager.flush_pending_inputs();
+        assert_eq!(
+            receipt.poll().unwrap().unwrap_err().kind(),
+            std::io::ErrorKind::NotConnected
+        );
+        assert!(manager.sessions[&id].pending_prompt.is_none());
+        assert_eq!(
+            manager.sessions[&id]
+                .pending_startup_input
+                .as_ref()
+                .unwrap()
+                .input,
+            "KEEP UNTRACKED STARTUP"
+        );
+        assert!(manager.sessions.contains_key(&id));
     }
+}
 
-    #[test]
-    fn focused_session_gets_the_unthrottled_io_lane() {
-        let focused = Uuid::new_v4();
-        let background = Uuid::new_v4();
-        let mut scheduler = RuntimeScheduler::new_for_tests();
-        scheduler.set_priority_session(Some(focused));
-
-        assert!(scheduler.reader_delay(focused).is_zero());
-        assert!(!scheduler.reader_delay(background).is_zero());
-        scheduler.set_priority_session(None);
-        assert!(scheduler.reader_delay(background).is_zero());
+impl Drop for PtyManager {
+    fn drop(&mut self) {
+        // Local PTYs transfer to the aggregate closer before their controller
+        // disappears. Remote births use endpoint release, preserving hot restore.
+        let ids = self.sessions.keys().copied().collect::<Vec<_>>();
+        for id in ids {
+            let _ = self.close(id);
+        }
     }
 }

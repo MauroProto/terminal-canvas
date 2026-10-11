@@ -225,12 +225,22 @@ impl RemoteReader {
                 Some(Response::Output { id, seq, data })
                     if id == self.session_id && seq > self.attached_seq =>
                 {
+                    self.attached_seq = seq;
                     return Some(data);
                 }
                 Some(Response::Exit { id } | Response::Killed { id }) if id == self.session_id => {
                     self.exited = true;
                     return None;
                 }
+                Some(response @ Response::Error { .. }) => {
+                    if crate::daemon::protocol::snapshot_failure_from_response(&response)
+                        .is_some_and(|(id, _)| id == self.session_id)
+                    {
+                        // Recovery refusal retires transport, never the process.
+                        return None;
+                    }
+                }
+                None => return None,
                 // Evento de otra sesión, respuesta a un pedido, o línea
                 // corrupta: se ignora y se sigue leyendo.
                 _ => continue,
@@ -465,6 +475,9 @@ mod tests {
                 snapshot: Vec::new(),
                 seq: 1,
                 alive: true,
+                hook_generation: None,
+                hook_target: None,
+                output_ready: true,
             }),
             encode_line(&Response::Output {
                 id,

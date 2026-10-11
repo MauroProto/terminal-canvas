@@ -30,7 +30,7 @@ impl SessionController {
         self.last_rows = rows.max(1);
         self.pty_manager = Some(Arc::clone(&pty_manager));
         let spawn_result = match pty_manager.lock() {
-            Ok(mut manager) => manager.spawn(spec, cwd, self.last_cols, self.last_rows),
+            Ok(mut manager) => manager.spawn_pending(spec, cwd, self.last_cols, self.last_rows),
             Err(_) => Err(anyhow::anyhow!("PTY manager lock poisoned")),
         };
         match spawn_result {
@@ -60,6 +60,7 @@ impl SessionController {
         match pty_manager.lock() {
             Ok(mut manager) => {
                 let session_id = manager.create_detached_with_id(spec, existing_session_id);
+                manager.set_desired_grid_size(session_id, self.last_cols, self.last_rows);
                 self.session_id = Some(session_id);
                 self.spawn_error = None;
             }
@@ -129,7 +130,7 @@ impl SessionController {
             Ok(mut manager) => match manager.attach_detached(session_id, cols, rows) {
                 Ok(()) => {
                     self.spawn_error = None;
-                    true
+                    manager.is_attached(session_id)
                 }
                 Err(err) => {
                     self.spawn_error = Some(err.to_string());
@@ -153,6 +154,17 @@ impl SessionController {
         }
         self.last_cols = next_cols;
         self.last_rows = next_rows;
+        if let (Some(manager), Some(id)) = (&self.pty_manager, self.session_id) {
+            if let Ok(mut manager) = manager.lock() {
+                if manager.hosts_out_of_process() {
+                    manager.set_desired_grid_size(id, next_cols, next_rows);
+                    if !manager.is_attached(id) {
+                        let _ = manager.attach_detached(id, next_cols, next_rows);
+                    }
+                    return;
+                }
+            }
+        }
         if !self.is_attached() || !self.is_alive() {
             let _ = self.ensure_attached();
             return;
@@ -275,6 +287,23 @@ impl SessionController {
         }
     }
 
+    pub(crate) fn hook_claim(&self) -> Option<crate::hook_authority::Claim> {
+        let id = self.runtime_session_id()?;
+        let manager = self.pty_manager.as_ref()?.lock().ok()?;
+        let spec = manager.spec(id)?;
+        let key = crate::hook_authority::LeafKey {
+            workspace: spec.workspace_id?,
+            panel: spec.panel_id?,
+            leaf: spec.leaf_id?,
+        };
+        crate::hook_runtime::process_runtime()?.current_claim_for_runtime(key, id)
+    }
+    pub(crate) fn request_close_alias(
+        &self,
+        key: crate::hook_authority::LeafKey,
+    ) -> Option<crate::hook_runtime::AliasFence> {
+        Some(crate::hook_runtime::process_runtime()?.request_close_alias(key))
+    }
     pub fn session_handle(&self) -> Option<SharedPtyHandle> {
         self.handle()
     }
@@ -327,6 +356,7 @@ pub fn session_spec(
 ) -> SessionSpec {
     SessionSpec {
         memory_task_id: None,
+        hook_legacy_root: false,
         title,
         cwd,
         startup_command,

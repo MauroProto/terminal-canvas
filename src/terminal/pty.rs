@@ -13,7 +13,7 @@ use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::term::{Config as TermConfig, Term, TermMode};
 use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
 use anyhow::Context as _;
-use portable_pty::{native_pty_system, Child, ChildKiller, CommandBuilder, MasterPty, PtySize};
+use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use uuid::Uuid;
 
 #[path = "input_writer.rs"]
@@ -35,6 +35,7 @@ impl TerminalWriter {
             Self::Remote(link) => link.check_input_open(),
         }
     }
+
     fn enqueue(&self, bytes: &[u8]) -> std::io::Result<()> {
         match self {
             Self::Local(writer) => writer.enqueue(bytes),
@@ -76,6 +77,52 @@ fn next_log_sequence(counter: &AtomicU64) -> Option<u64> {
 
 /// Drain whole frames, allowing one oversized frame so a byte budget can
 /// never prevent forward progress. A zero budget still drains nothing.
+fn retain_raw_read_and_parse<R>(
+    term: &Mutex<Term<EventProxy>>,
+    pending_log: &Mutex<Vec<u8>>,
+    log_seq: &AtomicU64,
+    raw: &[u8],
+    parse: impl FnOnce(&mut Term<EventProxy>) -> R,
+) -> std::io::Result<Option<R>> {
+    // Keep the same term -> pending lock order as Attach/checkpoint. Physical
+    // read bytes are retained before any fallible agent/VT parser sees them.
+    let (mut term, healthy) = match term.lock() {
+        Ok(term) => (term, true),
+        Err(poison) => (poison.into_inner(), false),
+    };
+    let mut pending = pending_log
+        .lock()
+        .map_err(|_| std::io::Error::other("El log raw del PTY está envenenado."))?;
+    let seq = next_log_sequence(log_seq)
+        .ok_or_else(|| std::io::Error::other("Se agotó la secuencia raw del PTY."))?;
+    pending.extend_from_slice(&crate::state::scrollback_log::encode_frame(
+        seq,
+        crate::state::scrollback_log::FrameKind::Output,
+        raw,
+    ));
+    drop(pending);
+    if healthy {
+        Ok(Some(parse(&mut term)))
+    } else {
+        Ok(None)
+    }
+}
+
+fn retain_raw_read_for_reader<R>(
+    term: &Mutex<Term<EventProxy>>,
+    pending: &Mutex<Vec<u8>>,
+    sequence: &AtomicU64,
+    raw: &[u8],
+    parse: impl FnOnce(&mut Term<EventProxy>) -> R,
+) -> std::io::Result<Option<R>> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        retain_raw_read_and_parse(term, pending, sequence, raw, parse)
+    })) {
+        Ok(result) => result,
+        Err(_) => Ok(None), // the poisoned grid switches subsequent reads to raw only
+    }
+}
+
 fn drain_log_prefix(pending: &mut Vec<u8>, max_bytes: usize) -> Vec<u8> {
     if max_bytes == 0 {
         return Vec::new();
@@ -171,6 +218,13 @@ fn yield_for_reader_priority(scheduler: &SharedRuntimeScheduler, session_id: Uui
     }
 }
 
+#[path = "reader_retirement.rs"]
+mod reader_retirement;
+use reader_retirement::{ReadCompletion, ReaderRetirement};
+#[path = "child_lifetime.rs"]
+mod child_lifetime;
+use child_lifetime::ChildLifetime;
+
 pub struct PtyHandle {
     pub term: Arc<Mutex<Term<EventProxy>>>,
     title: Arc<ArcSwap<String>>,
@@ -204,8 +258,9 @@ pub struct PtyHandle {
     /// `None` en una sesión hosteada por el daemon: el PTY real vive allá y
     /// el resize se manda por el socket (P3.15, T3).
     master: Option<Box<dyn MasterPty + Send>>,
-    killer: Option<Box<dyn ChildKiller + Send + Sync>>,
-    child: Option<Box<dyn Child + Send + Sync>>,
+    child_lifetime: Option<ChildLifetime>,
+    process_reaped: Arc<AtomicBool>,
+    master_closer: Option<thread::JoinHandle<()>>,
     /// Sesión del daemon a la que este handle está atado, si es remota.
     #[cfg(all(unix, feature = "daemon"))]
     remote: Option<RemoteLink>,
@@ -213,7 +268,15 @@ pub struct PtyHandle {
     remote_exited: Arc<AtomicBool>,
     /// El daemon ya replayó el historial de una sesión preexistente. El store
     /// local no debe inyectar además el mismo checkpoint.
+    hook_evidence: crate::hook_authority::HostEvidence,
+    hook_local_owner: Option<Uuid>,
     hot_reattached: bool,
+    reader_retirement: Arc<ReaderRetirement>,
+    retirement_log_owned: AtomicBool,
+    legacy_unowned_transfer: AtomicBool,
+    semantic_output_ready: Arc<AtomicBool>,
+    /// usize::MAX keeps ordinary local FlowGate policy; daemon ownership opts in.
+    durable_pressure: Arc<std::sync::atomic::AtomicUsize>,
     _reader_thread: thread::JoinHandle<()>,
 }
 
@@ -233,6 +296,39 @@ pub enum RecoverySnapshot<R> {
 }
 
 impl PtyHandle {
+    /// Runs the production read/retention and child-wait boundaries with injected
+    /// endpoints. It creates no OS child, socket, PTY or graphical surface.
+    #[cfg(test)]
+    pub(crate) fn for_retirement_boundary_tests(
+        mut reader: Box<dyn Read + Send>,
+        child_events: mpsc::Sender<&'static str>,
+        child_wait: mpsc::Receiver<std::io::Result<()>>,
+    ) -> Self {
+        let mut handle = Self::for_persistence_tests(b"");
+        let control = Arc::new(ReaderRetirement::default());
+        let runner = Arc::clone(&control);
+        let term = Arc::clone(&handle.term);
+        let pending = Arc::clone(&handle.pending_log);
+        let sequence = Arc::clone(&handle.log_seq);
+        handle.reader_retirement = control;
+        handle._reader_thread = thread::spawn(move || {
+            let mut bytes = [0; 64];
+            loop {
+                match runner.read_and_retain(&mut *reader, &mut bytes, |raw| {
+                    retain_raw_read_and_parse(&term, &pending, &sequence, raw, |_| ()).map(|_| ())
+                }) {
+                    ReadCompletion::Data => {}
+                    ReadCompletion::Retry | ReadCompletion::Paused => runner.wait_retry(),
+                    ReadCompletion::Eof | ReadCompletion::Failed(_) => break,
+                }
+            }
+        });
+        let child = ChildLifetime::for_wait_boundary(child_events, child_wait);
+        handle.process_reaped = Arc::clone(&child.reaped);
+        handle.child_lifetime = Some(child);
+        handle
+    }
+
     /// In-memory terminal for persistence regressions. It starts no shell,
     /// socket, process watcher or graphical surface.
     #[cfg(test)]
@@ -240,6 +336,11 @@ impl PtyHandle {
         let (event_tx, _event_rx) = mpsc::channel();
         let config = TermConfig::default();
         let scrollback_limit = config.scrolling_history;
+        let reader_retirement = Arc::new(ReaderRetirement::default());
+        assert!(matches!(
+            reader_retirement.read_and_retain(&mut std::io::empty(), &mut [0; 1], |_| Ok(())),
+            ReadCompletion::Eof
+        ));
         let handle = Self {
             term: Arc::new(Mutex::new(Term::new(
                 config,
@@ -272,13 +373,25 @@ impl PtyHandle {
             #[cfg(feature = "ghostty-vt")]
             ghostty_runtime: None,
             master: None,
-            killer: None,
-            child: None,
+            child_lifetime: None,
+            process_reaped: Arc::new(AtomicBool::new(true)),
+            master_closer: None,
             #[cfg(all(unix, feature = "daemon"))]
             remote: None,
             #[cfg(all(unix, feature = "daemon"))]
             remote_exited: Arc::new(AtomicBool::new(false)),
+            hook_evidence: crate::hook_authority::HostEvidence {
+                runtime: Uuid::nil(),
+                generation: None,
+                target: None,
+            },
+            hook_local_owner: None,
             hot_reattached: false,
+            reader_retirement,
+            retirement_log_owned: AtomicBool::new(false),
+            legacy_unowned_transfer: AtomicBool::new(false),
+            semantic_output_ready: Arc::new(AtomicBool::new(false)),
+            durable_pressure: Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX)),
             _reader_thread: thread::spawn(|| {}),
         };
         handle.feed_output_for_persistence_tests(output);
@@ -286,10 +399,24 @@ impl PtyHandle {
     }
 
     #[cfg(test)]
+    pub(crate) fn bind_local_hook_for_retirement_tests(
+        &mut self,
+        claim: crate::hook_authority::Claim,
+    ) {
+        self.hook_evidence = crate::hook_authority::HostEvidence {
+            runtime: claim.runtime,
+            generation: claim.generation,
+            target: Some(claim.key.into()),
+        };
+        self.hook_local_owner = claim.owner;
+    }
+
+    #[cfg(test)]
     pub(crate) fn feed_output_for_persistence_tests(&self, output: &[u8]) {
         if output.is_empty() {
             return;
         }
+        self.semantic_output_ready.store(true, Ordering::Release);
         let mut term = self.term.lock().unwrap();
         let mut pending = self.pending_log.lock().unwrap();
         let mut parser = Processor::<StdSyncHandler>::new();
@@ -350,6 +477,99 @@ impl PtyHandle {
         checkpoint: &[u8],
         frames: &[crate::state::scrollback_log::Frame],
     ) -> anyhow::Result<Self> {
+        let mut hooks = hooks;
+        let endpoint = crate::hook_runtime::process_runtime();
+        if hooks.hook_generation.is_none() {
+            if let (Some(runtime), Some(key)) = (endpoint, hooks.key()) {
+                let claim = runtime.authorize_birth(key, session_id)?;
+                hooks.hook_generation = claim.generation;
+                hooks.hook_owner = claim.owner;
+            }
+        }
+        if let Some(generation) = hooks.hook_generation {
+            let key = hooks
+                .key()
+                .ok_or_else(|| anyhow::anyhow!("bound birth target incomplete"))?;
+            let owner = hooks
+                .hook_owner
+                .ok_or_else(|| anyhow::anyhow!("bound birth owner unavailable"))?;
+            let store = crate::memory::MemoryStore::open_default()?;
+            let claim = store
+                .hook_claim(key)?
+                .ok_or_else(|| anyhow::anyhow!("birth not preauthorized"))?;
+            anyhow::ensure!(
+                claim.runtime == session_id
+                    && claim.generation == Some(generation)
+                    && claim.owner == Some(owner),
+                "birth authority mismatch"
+            );
+            let permit = store
+                .hook_consume_birth_once(claim)?
+                .ok_or_else(|| anyhow::anyhow!("birth already consumed"))?;
+            let mut attempt = SpawnAttempt::managed(claim);
+            let result = permit.run_guarded(&store, |_| {
+                attempt.entered = true;
+                Self::spawn_with_history_unfenced(
+                    cwd,
+                    cols,
+                    rows,
+                    session_id,
+                    scheduler,
+                    hooks,
+                    checkpoint,
+                    frames,
+                    &mut attempt,
+                )
+            });
+            let handle = match result {
+                Ok(handle) => handle,
+                Err(error) => {
+                    if let (Some(runtime), Some(proof)) = (
+                        endpoint.filter(|runtime| runtime.owner == owner),
+                        attempt.no_child_proof(),
+                    ) {
+                        // This proof is created only by an entered, consumed
+                        // factory that never called the physical spawn method.
+                        let _ = runtime.confirm_no_child_birth(proof);
+                    }
+                    return Err(error);
+                }
+            };
+            if let Some(runtime) = endpoint.filter(|runtime| runtime.owner == owner) {
+                if let Err(error) = runtime.attach(key, handle.hook_host_evidence(), false) {
+                    // Keep the actual child and its raw output alive until the
+                    // coordinator obtains a fresh owner CAS and durable drain.
+                    runtime.request_local_close_from_factory(Arc::new(Mutex::new(handle)));
+                    return Err(error);
+                }
+            }
+            return Ok(handle);
+        }
+        Self::spawn_with_history_unfenced(
+            cwd,
+            cols,
+            rows,
+            session_id,
+            scheduler,
+            hooks,
+            checkpoint,
+            frames,
+            &mut SpawnAttempt::unmanaged(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_with_history_unfenced(
+        cwd: Option<&Path>,
+        cols: u16,
+        rows: u16,
+        session_id: Uuid,
+        scheduler: SharedRuntimeScheduler,
+        hooks: HookIdentity,
+        checkpoint: &[u8],
+        frames: &[crate::state::scrollback_log::Frame],
+        attempt: &mut SpawnAttempt,
+    ) -> anyhow::Result<Self> {
         let pty_system = native_pty_system();
         let pair = pty_system.openpty(PtySize {
             rows,
@@ -359,13 +579,17 @@ impl PtyHandle {
         })?;
 
         let mut cmd = shell_command(cwd, hooks);
+        if let Some(generation) = hooks.hook_generation {
+            cmd.env("TC_RUNTIME_ID", session_id.to_string());
+            cmd.env("TC_HOOK_GENERATION", generation.to_string());
+        }
         cmd.env(
             "TC_MEMORY_TASK_ID",
             hooks.memory_task_id(session_id).to_string(),
         );
 
-        let child = pair.slave.spawn_command(cmd).context("spawn PTY child")?;
-        let killer = child.clone_killer();
+        reader_retirement::prepare_nonblocking(&*pair.master)
+            .context("prepare cancellable PTY reader")?;
         let mut reader = pair.master.try_clone_reader().context("clone PTY reader")?;
         let writer = pair.master.take_writer().context("take PTY writer")?;
 
@@ -449,6 +673,30 @@ impl PtyHandle {
         let log_seq_for_reader = Arc::clone(&log_seq);
         let restoring_for_reader = Arc::clone(&restoring_history);
         let scheduler_for_reader = Arc::clone(&scheduler);
+        let durable_pressure = Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX));
+        let semantic_output_ready = Arc::new(AtomicBool::new(false));
+        let pressure_for_reader = Arc::clone(&durable_pressure);
+        let semantic_ready_for_reader = Arc::clone(&semantic_output_ready);
+        let reader_retirement = Arc::new(ReaderRetirement::default());
+        let retirement_for_reader = Arc::clone(&reader_retirement);
+        let alive_for_waiter = Arc::clone(&alive);
+        let scheduler_for_waiter = Arc::clone(&scheduler);
+        let child_lifetime = ChildLifetime::spawn_with(
+            || {
+                // A failed spawn_command may still be physically uncertain.
+                // Mark before the call; its Result never proves absence.
+                attempt.child_attempted = true;
+                pair.slave.spawn_command(cmd)
+            },
+            move || {
+                alive_for_waiter.store(false, Ordering::Relaxed);
+                if let Ok(mut scheduler) = scheduler_for_waiter.lock() {
+                    scheduler.record_exit(session_id);
+                }
+            },
+        )
+        .context("start PTY child lifetime owner")?;
+        let process_reaped = Arc::clone(&child_lifetime.reaped);
         let reader_thread = thread::spawn(move || {
             // The parser processes untrusted terminal output; if it ever
             // panics, contain the damage to this session instead of taking
@@ -462,12 +710,30 @@ impl PtyHandle {
                 // y el kernel bloquea al hijo.
                 let mut gate = crate::terminal::flow_control::FlowGate::new();
                 loop {
+                    if retirement_for_reader.failed() || retirement_for_reader.eof() {
+                        break;
+                    }
+                    if retirement_for_reader.quiescent() {
+                        retirement_for_reader.wait_retry();
+                        continue;
+                    }
                     wait_for_history_restore(&restoring_for_reader);
                     yield_for_reader_priority(&scheduler_for_reader, session_id);
                     let pending_len = pending_log_for_reader
                         .lock()
                         .map(|pending| pending.len())
                         .unwrap_or(0);
+                    let external = pressure_for_reader.load(Ordering::Acquire);
+                    // No timer escape from durable rejection on daemon-owned PTYs.
+                    // Pending-log transfer charges the external queue under the
+                    // same log lock, so draining into RAM cannot reset this gate.
+                    if external != usize::MAX
+                        && external.saturating_add(pending_len)
+                            >= crate::terminal::flow_control::HIGH_WATER
+                    {
+                        thread::sleep(Duration::from_millis(20));
+                        continue;
+                    }
                     if matches!(
                         gate.update(pending_len, std::time::Instant::now()),
                         crate::terminal::flow_control::FlowState::Pause
@@ -475,55 +741,64 @@ impl PtyHandle {
                         thread::sleep(Duration::from_millis(20));
                         continue;
                     }
-                    match reader.read(&mut buf) {
-                        Ok(0) => break,
-                        Ok(read) => {
-                            // La lectura puede haberse desbloqueado justo
-                            // después de iniciar el restore. Conservamos estos
-                            // bytes, pero no los parseamos hasta terminarlo.
+                    let mut parsed = None;
+                    let completion =
+                        retirement_for_reader.read_and_retain(&mut *reader, &mut buf, |raw| {
                             wait_for_history_restore(&restoring_for_reader);
                             let now_ms = pty_clock_now_ms();
-                            let (clean, agent_reports, cwd_reports) =
-                                agent_stream.process(&buf[..read], now_ms);
+                            // A parser panic poisons the grid but not the raw stream.
+                            // Continue physical reads and retain their exact bytes.
+                            parsed = Some(retain_raw_read_for_reader(
+                                &term_for_reader,
+                                &pending_log_for_reader,
+                                &log_seq_for_reader,
+                                raw,
+                                |term| {
+                                    let parts = agent_stream.process(raw, now_ms);
+                                    processor.advance(term, &parts.0);
+                                    parts
+                                },
+                            )?);
+                            Ok(())
+                        });
+                    match completion {
+                        ReadCompletion::Eof => break,
+                        ReadCompletion::Paused | ReadCompletion::Retry => {
+                            retirement_for_reader.wait_retry();
+                            continue;
+                        }
+                        ReadCompletion::Failed(error) => {
+                            log::error!("PTY reader for session {session_id} failed: {error}");
+                            break;
+                        }
+                        ReadCompletion::Data => {
+                            let now_ms = pty_clock_now_ms();
+                            let Some((clean, agent_reports, cwd_reports)) = parsed.flatten() else {
+                                log::error!(
+                                    "El grid no está disponible; el lector conserva sólo raw."
+                                );
+                                continue;
+                            };
+                            if !clean.is_empty() {
+                                semantic_ready_for_reader.store(true, Ordering::Release);
+                            }
                             if let Some(report) = agent_reports.into_iter().next_back() {
                                 agent_status_for_reader.store(Arc::new(Some(report)));
                             }
                             if let Some(new_cwd) = cwd_reports.into_iter().next_back() {
                                 cwd_for_reader.store(Arc::new(Some(new_cwd)));
                             }
-                            if let Ok(mut term) = term_for_reader.lock() {
-                                processor.advance(&mut *term, &clean);
-                                // Keep the grid locked until its matching log
-                                // frame is visible. Checkpoints acquire these
-                                // same locks in this order and cannot observe
-                                // parsed bytes that are still missing a frame.
-                                if !clean.is_empty() {
-                                    if let Ok(mut pending) = pending_log_for_reader.lock() {
-                                        if let Some(seq) = next_log_sequence(&log_seq_for_reader) {
-                                            pending.extend_from_slice(
-                                                &crate::state::scrollback_log::encode_frame(
-                                                    seq,
-                                                    crate::state::scrollback_log::FrameKind::Output,
-                                                    &clean,
-                                                ),
-                                            );
-                                        } else {
-                                            log::error!(
-                                                "se agotó la secuencia incremental del PTY"
-                                            );
-                                        }
-                                    }
-                                }
-                            }
                             #[cfg(feature = "ghostty-vt")]
                             if let Some(ghostty) = &ghostty_for_reader {
                                 ghostty.feed(&clean);
                             }
-                            render_revision_for_reader.fetch_add(1, Ordering::Relaxed);
-                            output_for_reader.store(now_ms, Ordering::Relaxed);
-                            activity_for_reader.fetch_add(1, Ordering::Relaxed);
-                            if let Ok(mut scheduler) = scheduler_for_reader.lock() {
-                                scheduler.record_output(session_id);
+                            if !clean.is_empty() {
+                                render_revision_for_reader.fetch_add(1, Ordering::Relaxed);
+                                output_for_reader.store(now_ms, Ordering::Relaxed);
+                                activity_for_reader.fetch_add(1, Ordering::Relaxed);
+                                if let Ok(mut scheduler) = scheduler_for_reader.lock() {
+                                    scheduler.record_output(session_id);
+                                }
                             }
                             drain_terminal_events(
                                 &event_rx,
@@ -536,15 +811,11 @@ impl PtyHandle {
                                 session_id,
                             );
                         }
-                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                        Err(error) => {
-                            log::error!("PTY reader for session {session_id} failed: {error}");
-                            break;
-                        }
                     }
                 }
             }));
             if loop_result.is_err() {
+                retirement_for_reader.fail();
                 log::error!("PTY reader thread for session {session_id} panicked");
             }
             alive_for_reader.store(false, Ordering::Relaxed);
@@ -562,43 +833,6 @@ impl PtyHandle {
                 session_id,
             );
         });
-
-        // ConPTY may keep its output pipe open until ClosePseudoConsole, even
-        // after the shell has exited. Observe the process independently while
-        // the reader continues draining its final output. Unix keeps EOF as the
-        // output/exit boundary used by daemon replay.
-        #[cfg(windows)]
-        let child = {
-            let alive_for_waiter = Arc::clone(&alive);
-            let scheduler_for_waiter = Arc::clone(&scheduler);
-            let watcher = thread::Builder::new()
-                .name("pty-process-exit".to_owned())
-                .spawn(move || {
-                    let mut child = child;
-                    match child.wait() {
-                        Ok(_) => {
-                            alive_for_waiter.store(false, Ordering::Relaxed);
-                            if let Ok(mut scheduler) = scheduler_for_waiter.lock() {
-                                scheduler.record_exit(session_id);
-                            }
-                        }
-                        Err(error) => {
-                            log::error!(
-                                "No se pudo observar la salida del PTY {session_id}: {error}"
-                            );
-                        }
-                    }
-                });
-            if let Err(error) = watcher {
-                writer_for_reader.close();
-                let mut killer = killer;
-                let _ = killer.kill();
-                return Err(error).context("start PTY process watcher");
-            }
-            None
-        };
-        #[cfg(not(windows))]
-        let child = Some(child);
 
         Ok(Self {
             term,
@@ -624,13 +858,21 @@ impl PtyHandle {
             #[cfg(feature = "ghostty-vt")]
             ghostty_runtime,
             master: Some(pair.master),
-            killer: Some(killer),
-            child,
+            child_lifetime: Some(child_lifetime),
+            process_reaped,
+            master_closer: None,
             #[cfg(all(unix, feature = "daemon"))]
             remote: None,
             #[cfg(all(unix, feature = "daemon"))]
             remote_exited: Arc::new(AtomicBool::new(false)),
+            hook_evidence: hooks.evidence(session_id),
+            hook_local_owner: hooks.hook_owner,
             hot_reattached: false,
+            reader_retirement,
+            retirement_log_owned: AtomicBool::new(false),
+            legacy_unowned_transfer: AtomicBool::new(false),
+            semantic_output_ready,
+            durable_pressure,
             _reader_thread: reader_thread,
         })
     }
@@ -724,6 +966,10 @@ impl PtyHandle {
         let restoring_for_reader = Arc::clone(&restoring_history);
         let exited_for_reader = Arc::clone(&remote_exited);
 
+        let durable_pressure = Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX));
+        let semantic_output_ready = Arc::new(AtomicBool::new(false));
+        let reader_retirement = Arc::new(ReaderRetirement::default());
+        let retirement_for_reader = Arc::clone(&reader_retirement);
         let reader_thread = thread::spawn(move || {
             let loop_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let mut processor = Processor::<StdSyncHandler>::new();
@@ -762,13 +1008,13 @@ impl PtyHandle {
                     if let Ok(mut term) = term_for_reader.lock() {
                         processor.advance(&mut *term, &clean);
                     }
-                    render_revision_for_reader.fetch_add(1, Ordering::Relaxed);
-                    output_for_reader.store(now_ms, Ordering::Relaxed);
-                    if !bytes.is_empty() {
+                    if !clean.is_empty() {
+                        render_revision_for_reader.fetch_add(1, Ordering::Relaxed);
+                        output_for_reader.store(now_ms, Ordering::Relaxed);
                         activity_for_reader.fetch_add(1, Ordering::Relaxed);
-                    }
-                    if let Ok(mut scheduler) = scheduler_for_reader.lock() {
-                        scheduler.record_output(session_id);
+                        if let Ok(mut scheduler) = scheduler_for_reader.lock() {
+                            scheduler.record_output(session_id);
+                        }
                     }
                     drain_terminal_events(
                         &event_rx,
@@ -782,6 +1028,7 @@ impl PtyHandle {
                     );
                 }
             }));
+            retirement_for_reader.request();
             if loop_result.is_err() {
                 log::error!("el lector remoto de la sesión {session_id} paniqueó");
             }
@@ -815,16 +1062,31 @@ impl PtyHandle {
             #[cfg(feature = "ghostty-vt")]
             ghostty_runtime: None,
             master: None,
-            killer: None,
-            child: None,
+            child_lifetime: None,
+            process_reaped: Arc::new(AtomicBool::new(false)),
+            master_closer: None,
             remote: Some(link),
             remote_exited,
+            hook_evidence: crate::hook_authority::HostEvidence {
+                runtime: session_id,
+                generation: None,
+                target: None,
+            },
+            hook_local_owner: None,
             hot_reattached,
+            reader_retirement,
+            retirement_log_owned: AtomicBool::new(false),
+            legacy_unowned_transfer: AtomicBool::new(false),
+            semantic_output_ready,
+            durable_pressure,
             _reader_thread: reader_thread,
         })
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16) {
+        if self.retirement_log_owned.load(Ordering::Acquire) {
+            return;
+        }
         if let Some(master) = self.master.as_ref() {
             let _ = master.resize(PtySize {
                 rows,
@@ -1026,7 +1288,9 @@ impl PtyHandle {
     }
 
     pub fn with_term<R>(&self, f: impl FnOnce(&mut Term<EventProxy>) -> R) -> Option<R> {
-        if self.restoring_history.load(Ordering::Acquire) {
+        if self.retirement_log_owned.load(Ordering::Acquire)
+            || self.restoring_history.load(Ordering::Acquire)
+        {
             return None;
         }
         let mut term = self.term.try_lock().ok()?;
@@ -1052,13 +1316,36 @@ impl PtyHandle {
         self.mark_render_dirty();
     }
 
+    pub fn set_daemon_durable_pressure(&self, pending_bytes: usize) {
+        self.durable_pressure
+            .store(pending_bytes, Ordering::Release);
+    }
+
+    fn charge_transferred_pending(&self, bytes: usize) {
+        if bytes > 0 && self.durable_pressure.load(Ordering::Acquire) == usize::MAX {
+            // Legacy destructive local callers have no durable-ACK ownership.
+            // They cannot later claim a strong physical retirement certificate.
+            self.legacy_unowned_transfer.store(true, Ordering::Release);
+        }
+        let _ =
+            self.durable_pressure
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
+                    (pending != usize::MAX)
+                        .then(|| pending.saturating_add(bytes).min(usize::MAX - 1))
+                });
+    }
+
     /// Drena los frames de log incremental acumulados desde el último autosave
     /// (P1.7). Devuelve los bytes ya encodeados, listos para appendear.
     pub fn drain_pending_log(&self) -> Vec<u8> {
+        if self.retirement_log_owned.load(Ordering::Acquire) {
+            return Vec::new();
+        }
         self.pending_log
             .lock()
             .map(|mut pending| {
                 let drained = std::mem::take(&mut *pending);
+                self.charge_transferred_pending(drained.len());
                 self.log_seq.store(0, Ordering::Relaxed);
                 drained
             })
@@ -1071,10 +1358,14 @@ impl PtyHandle {
     /// Se usa para el carril interactivo (P3.16, T2): la sesión enfocada
     /// tiene un presupuesto de 32 KB por pump y el resto espera al siguiente.
     pub fn drain_pending_log_capped(&self, max_bytes: usize) -> Vec<u8> {
+        if self.retirement_log_owned.load(Ordering::Acquire) {
+            return Vec::new();
+        }
         self.pending_log
             .lock()
             .map(|mut pending| {
                 let drained = drain_log_prefix(&mut pending, max_bytes);
+                self.charge_transferred_pending(drained.len());
                 if pending.is_empty() {
                     self.log_seq.store(0, Ordering::Relaxed);
                 }
@@ -1086,6 +1377,13 @@ impl PtyHandle {
     /// Copia el lote todavía no confirmado. No se quita de RAM hasta que el
     /// worker durable confirma exactamente este prefijo.
     pub fn pending_log_snapshot(&self) -> Vec<u8> {
+        if self.retirement_log_owned.load(Ordering::Acquire) {
+            return Vec::new();
+        }
+        self.retirement_log_snapshot()
+    }
+
+    fn retirement_log_snapshot(&self) -> Vec<u8> {
         self.pending_log
             .lock()
             .map(|pending| pending.clone())
@@ -1093,6 +1391,9 @@ impl PtyHandle {
     }
 
     pub fn acknowledge_pending_log(&self, written_bytes: usize) {
+        if self.retirement_log_owned.load(Ordering::Acquire) {
+            return;
+        }
         if let Ok(mut pending) = self.pending_log.lock() {
             let acknowledged = written_bytes.min(pending.len());
             pending.drain(..acknowledged);
@@ -1109,7 +1410,8 @@ impl PtyHandle {
         &self,
         export: impl FnOnce(&Term<EventProxy>) -> R,
     ) -> Option<(R, usize)> {
-        if self.restoring_history.load(Ordering::Acquire)
+        if self.retirement_log_owned.load(Ordering::Acquire)
+            || self.restoring_history.load(Ordering::Acquire)
             || self.history_restore_failed.load(Ordering::Acquire)
         {
             return None;
@@ -1125,6 +1427,9 @@ impl PtyHandle {
         restore_pending: bool,
         export: impl FnOnce(&Term<EventProxy>) -> R,
     ) -> RecoverySnapshot<R> {
+        if self.retirement_log_owned.load(Ordering::Acquire) {
+            return RecoverySnapshot::Unavailable;
+        }
         let checkpoint = if restore_pending || self.restoring_history.load(Ordering::Acquire) {
             None
         } else {
@@ -1150,6 +1455,215 @@ impl PtyHandle {
         self.restoring_history.load(Ordering::Acquire)
     }
 
+    /// Request input/read quiescence and copy the last complete raw boundary.
+    /// Pending bytes remain in the PTY until the daemon's durable ACK permits Drop.
+    /// None retains the handle while an already-admitted blocking read completes.
+    pub fn semantic_output_ready(&self) -> bool {
+        self.semantic_output_ready.load(Ordering::Acquire)
+    }
+
+    /// The caller owns any earlier batch already moved outside this handle.
+    /// It must retain/ACK that batch as well before the durable prefix permits kill.
+    pub fn claim_retirement_log_owner(&self) {
+        self.retirement_log_owned.store(true, Ordering::Release);
+        self.writer.close();
+        self.reader_retirement.request();
+        if !self.reader_retirement.quiescent() && !self.reader_retirement.draining() {
+            if let Err(error) = reader_retirement::cancel_blocked_read(&self._reader_thread) {
+                log::error!("No se pudo cancelar la lectura del PTY: {error}");
+            }
+        }
+    }
+
+    pub fn take_retirement_prefix(
+        &self,
+        durable: &mut Vec<u8>,
+        destination_seq: &mut u64,
+        has_destination: bool,
+    ) -> std::io::Result<bool> {
+        if self.retirement_pending_snapshot()?.is_none() {
+            return Ok(false);
+        }
+        self.transfer_retirement_frames(durable, destination_seq, has_destination)
+    }
+
+    pub fn take_retirement_tail(
+        &self,
+        durable: &mut Vec<u8>,
+        destination_seq: &mut u64,
+        has_destination: bool,
+    ) -> std::io::Result<bool> {
+        if !self.reader_retirement.draining() && !self.reader_retirement.eof() {
+            return Ok(false);
+        }
+        if self.reader_retirement.failed() {
+            return Err(std::io::Error::other(
+                "El lector de salida no confirmó EOF.",
+            ));
+        }
+        self.transfer_retirement_frames(durable, destination_seq, has_destination)
+    }
+
+    fn transfer_retirement_frames(
+        &self,
+        durable: &mut Vec<u8>,
+        destination_seq: &mut u64,
+        has_destination: bool,
+    ) -> std::io::Result<bool> {
+        if self.log_seq.load(Ordering::Acquire) == u64::MAX {
+            return Err(std::io::Error::other("Secuencia raw agotada."));
+        }
+        let mut pending = self
+            .pending_log
+            .lock()
+            .map_err(|_| std::io::Error::other("Log raw envenenado."))?;
+        if !has_destination && (!pending.is_empty() || !durable.is_empty()) {
+            return Ok(false);
+        }
+        let encoded = [
+            crate::state::scrollback_log::encode_header(0),
+            pending.clone(),
+        ]
+        .concat();
+        let (_, frames, valid_len) = crate::state::scrollback_log::read_frames_with_valid_len(
+            &encoded,
+        )
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "Log raw inválido."))?;
+        if valid_len != encoded.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Log raw incompleto.",
+            ));
+        }
+        let final_seq = destination_seq
+            .checked_add(frames.len() as u64)
+            .ok_or_else(|| std::io::Error::other("Secuencia durable agotada."))?;
+        for frame in frames {
+            *destination_seq += 1;
+            durable.extend_from_slice(&crate::state::scrollback_log::encode_frame(
+                *destination_seq,
+                frame.kind,
+                &frame.payload,
+            ));
+        }
+        debug_assert_eq!(*destination_seq, final_seq);
+        // Transfer exactly once, while the same lock protects newly read bytes.
+        pending.clear();
+        self.set_daemon_durable_pressure(durable.len());
+        Ok(true)
+    }
+
+    /// Called only after the complete pretermination prefix is durably ACKed.
+    /// Resume first: ConPTY close may block waiting for its output to be drained.
+    pub fn begin_retirement_drain(&mut self) -> std::io::Result<()> {
+        self.reader_retirement.resume_drain();
+        if !self.reader_retirement.draining() && !self.reader_retirement.eof() {
+            return Err(std::io::Error::other("El lector no confirmó la pausa."));
+        }
+        if let Some(master) = self.master.take() {
+            let owner = Arc::new(Mutex::new(Some(master)));
+            let worker = Arc::clone(&owner);
+            match thread::Builder::new()
+                .name("pty-master-close".to_owned())
+                .spawn(move || {
+                    let master = worker
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take();
+                    drop(master);
+                }) {
+                Ok(thread) => self.master_closer = Some(thread),
+                Err(error) => {
+                    self.master = owner
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take();
+                    return Err(error);
+                }
+            }
+        }
+        if let Some(child) = &self.child_lifetime {
+            child.terminate();
+        }
+        Ok(())
+    }
+
+    pub(crate) fn hook_host_evidence(&self) -> crate::hook_authority::HostEvidence {
+        self.hook_evidence
+    }
+    pub(crate) fn hook_local_owner(&self) -> Option<Uuid> {
+        self.hook_local_owner
+    }
+    pub(crate) fn set_hook_host_evidence(&mut self, evidence: crate::hook_authority::HostEvidence) {
+        self.hook_evidence = evidence;
+    }
+
+    pub(crate) fn process_reaped(&self) -> bool {
+        self.process_reaped.load(Ordering::Acquire)
+    }
+
+    /// No read error, parser panic, canceled read or finished thread is EOF.
+    pub fn retirement_physical_complete(&self) -> bool {
+        self.writer.close(); // Retry Windows cancel if admission raced the first call.
+        !self.legacy_unowned_transfer.load(Ordering::Acquire)
+            && self.reader_retirement.eof()
+            && self.output_finished()
+            && self.process_reaped()
+            && matches!(&self.writer, TerminalWriter::Local(writer) if writer.finished())
+            && self.master.is_none()
+            && self
+                .master_closer
+                .as_ref()
+                .is_none_or(thread::JoinHandle::is_finished)
+    }
+
+    pub fn retirement_pending_snapshot(&self) -> std::io::Result<Option<Vec<u8>>> {
+        if self.is_remote() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "El cierre durable pertenece al host del PTY.",
+            ));
+        }
+        self.claim_retirement_log_owner();
+        if !self.reader_retirement.quiescent() {
+            return Ok(None);
+        }
+        if self.restoring_history.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        if self.reader_retirement.failed() {
+            return Err(std::io::Error::other(
+                "El lector no confirmó EOF; se conserva el PTY.",
+            ));
+        }
+        if self.log_seq.load(Ordering::Acquire) == u64::MAX {
+            return Err(std::io::Error::other(
+                "El cierre no puede probar captura completa tras agotar secuencias.",
+            ));
+        }
+        let pending = self.pending_log.lock().map_err(|_| {
+            std::io::Error::other(
+                "El log pendiente del PTY no está disponible para confirmar su cierre.",
+            )
+        })?;
+        if !pending.is_empty()
+            && crate::state::scrollback_log::read_frames(
+                &[
+                    crate::state::scrollback_log::encode_header(0),
+                    pending.clone(),
+                ]
+                .concat(),
+            )
+            .is_none()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "El cierre conserva un log incremental inválido.",
+            ));
+        }
+        Ok(Some(pending.clone()))
+    }
+
     /// Crea la frontera atómica de un hot attach. El snapshot del grid y los
     /// frames que todavía no recibieron `seq` se toman bajo el mismo orden de
     /// locks que usa el reader (`term` → `pending_log`), de modo que ningún
@@ -1158,15 +1672,44 @@ impl PtyHandle {
         &self,
         export: impl FnOnce(&mut Term<EventProxy>) -> R,
     ) -> Option<(R, Vec<u8>)> {
-        if self.restoring_history.load(Ordering::Acquire) {
+        if self.retirement_log_owned.load(Ordering::Acquire)
+            || self.restoring_history.load(Ordering::Acquire)
+        {
             return None;
         }
         let mut term = self.term.lock().ok()?;
         let mut pending = self.pending_log.lock().ok()?;
         let snapshot = export(&mut term);
         let frames = std::mem::take(&mut *pending);
+        self.charge_transferred_pending(frames.len());
         self.log_seq.store(0, Ordering::Relaxed);
         Some((snapshot, frames))
+    }
+
+    /// Capture may refuse an oversized or unavailable semantic replay. Refusal
+    /// occurs before taking pending frames or resetting their sequence.
+    /// The exporter must include its metadata/wire validation in this Result.
+    pub fn try_attach_snapshot_and_drain<R, E>(
+        &self,
+        export: impl FnOnce(&mut Term<EventProxy>) -> Result<R, E>,
+    ) -> Result<Option<(R, Vec<u8>)>, E> {
+        if self.retirement_log_owned.load(Ordering::Acquire)
+            || self.restoring_history.load(Ordering::Acquire)
+            || self.history_restore_failed.load(Ordering::Acquire)
+        {
+            return Ok(None);
+        }
+        let Ok(mut term) = self.term.lock() else {
+            return Ok(None);
+        };
+        let Ok(mut pending) = self.pending_log.lock() else {
+            return Ok(None);
+        };
+        let snapshot = export(&mut term)?;
+        let frames = std::mem::take(&mut *pending);
+        self.charge_transferred_pending(frames.len());
+        self.log_seq.store(0, Ordering::Relaxed);
+        Ok(Some((snapshot, frames)))
     }
 
     /// Returning from a TUI needs the hidden primary grid for clients that
@@ -1177,7 +1720,9 @@ impl PtyHandle {
         was_alternate: bool,
         export: impl FnOnce(&mut Term<EventProxy>) -> String,
     ) -> Option<(Vec<u8>, bool, Option<String>)> {
-        if self.restoring_history.load(Ordering::Acquire) {
+        if self.retirement_log_owned.load(Ordering::Acquire)
+            || self.restoring_history.load(Ordering::Acquire)
+        {
             return None;
         }
         let mut term = self.term.lock().ok()?;
@@ -1192,7 +1737,46 @@ impl PtyHandle {
                 max_bytes
             },
         );
+        self.charge_transferred_pending(frames.len());
         Some((frames, alternate, snapshot))
+    }
+
+    /// The caller's old alternate state stays unchanged until this Result
+    /// succeeds. A failed primary repair leaves every raw frame pending.
+    pub fn try_output_update<E>(
+        &self,
+        max_bytes: usize,
+        was_alternate: bool,
+        export: impl FnOnce(&mut Term<EventProxy>) -> Result<String, E>,
+    ) -> Result<Option<(Vec<u8>, bool, Option<String>)>, E> {
+        if self.retirement_log_owned.load(Ordering::Acquire)
+            || self.restoring_history.load(Ordering::Acquire)
+            || self.history_restore_failed.load(Ordering::Acquire)
+        {
+            return Ok(None);
+        }
+        let Ok(mut term) = self.term.lock() else {
+            return Ok(None);
+        };
+        let alternate = term.mode().contains(TermMode::ALT_SCREEN);
+        let snapshot = if was_alternate && !alternate {
+            Some(export(&mut term)?)
+        } else {
+            None
+        };
+        let Ok(mut pending) = self.pending_log.lock() else {
+            return Ok(None);
+        };
+        let frames = drain_log_prefix(
+            &mut pending,
+            if snapshot.is_some() {
+                usize::MAX
+            } else {
+                max_bytes
+            },
+        );
+        self.charge_transferred_pending(frames.len());
+        Ok(Some((frames, alternate, snapshot)))
     }
 
     /// Restaura checkpoint + frames del log incremental en orden (P1.7).
@@ -1517,9 +2101,26 @@ pub struct HookIdentity {
     pub panel_id: Option<Uuid>,
     pub workspace_id: Option<Uuid>,
     pub leaf_id: Option<Uuid>,
+    pub hook_generation: Option<Uuid>,
+    pub(crate) hook_owner: Option<Uuid>,
 }
 
 impl HookIdentity {
+    pub(crate) fn key(self) -> Option<crate::hook_authority::LeafKey> {
+        Some(crate::hook_authority::LeafKey {
+            workspace: self.workspace_id?,
+            panel: self.panel_id?,
+            leaf: self.leaf_id?,
+        })
+    }
+    pub(crate) fn evidence(self, runtime: Uuid) -> crate::hook_authority::HostEvidence {
+        crate::hook_authority::HostEvidence {
+            runtime,
+            generation: self.hook_generation,
+            target: self.key().map(Into::into),
+        }
+    }
+
     pub fn memory_task_id(self, session_id: Uuid) -> Uuid {
         self.memory_task_id
             .or(self.leaf_id)
@@ -1639,29 +2240,68 @@ impl SchedulerEventFlags {
 
 impl Drop for PtyHandle {
     fn drop(&mut self) {
+        if let Some(runtime) = crate::hook_runtime::process_runtime() {
+            if self.is_remote() {
+                runtime.release_endpoint(self.hook_evidence.runtime);
+            } else if self.hook_local_owner == Some(runtime.owner) {
+                runtime.begin_close(self.hook_evidence.runtime, true);
+            }
+        }
         self.writer.close();
         self.alive.store(false, Ordering::Relaxed);
         #[cfg(all(unix, feature = "daemon"))]
         if let Some(remote) = &self.remote {
             remote.disconnect();
         }
-        if let Some(killer) = self.killer.as_mut() {
-            let _ = killer.kill();
+        if let Some(child) = &self.child_lifetime {
+            child.terminate();
+        }
+        // Windows ClosePseudoConsole may block; never run it on the UI/daemon.
+        if let Some(master) = self.master.take() {
+            let _ = thread::Builder::new()
+                .name("pty-master-drop".to_owned())
+                .spawn(move || drop(master));
         }
         // Ojo: una sesión remota **no** se mata al dropear el handle. Cerrar la
         // app dropea todos los handles, y matar ahí sería justo lo contrario de
         // lo que el daemon promete. Matarla es explícito (`kill_remote_session`,
         // que usa el cierre de panel) y los huérfanos los limpia ReconcileLive.
-        // Reap the child off-thread: without a wait() every closed terminal
-        // leaves a zombie process, and long sessions with many terminals
-        // eventually exhaust the process table.
-        if let Some(mut child) = self.child.take() {
-            let _ = thread::Builder::new()
-                .name("pty-reaper".to_owned())
-                .spawn(move || {
-                    let _ = child.wait();
-                });
+        // The retained child worker confirms wait and owns all termination.
+    }
+}
+
+/// The fields are private to this factory module. A caller cannot manufacture
+/// absence from a failed Result, missing handle or a child-wait callback.
+pub(crate) struct NoChildAttempt(crate::hook_authority::Claim);
+impl NoChildAttempt {
+    pub(crate) fn claim(&self) -> crate::hook_authority::Claim {
+        self.0
+    }
+}
+struct SpawnAttempt {
+    claim: Option<crate::hook_authority::Claim>,
+    entered: bool,
+    child_attempted: bool,
+}
+impl SpawnAttempt {
+    fn managed(claim: crate::hook_authority::Claim) -> Self {
+        Self {
+            claim: Some(claim),
+            entered: false,
+            child_attempted: false,
         }
+    }
+    fn unmanaged() -> Self {
+        Self {
+            claim: None,
+            entered: false,
+            child_attempted: false,
+        }
+    }
+    fn no_child_proof(self) -> Option<NoChildAttempt> {
+        (self.entered && !self.child_attempted)
+            .then(|| self.claim.map(NoChildAttempt))
+            .flatten()
     }
 }
 
@@ -2036,6 +2676,328 @@ mod tests {
         assert_eq!(
             command.get_env("TC_LEAF_ID"),
             Some(std::ffi::OsStr::new(&leaf.to_string()))
+        );
+    }
+
+    #[test]
+    fn fallible_attach_refusal_retains_pending_frames_and_log_sequence() {
+        use super::*;
+        let handle = PtyHandle::for_persistence_tests(b"LIVE\r\n");
+        let pending = handle.pending_log_snapshot();
+        let sequence = handle.log_seq.load(Ordering::Relaxed);
+        let cursor = handle.term.lock().unwrap().grid().cursor.point;
+        let refused = handle.try_attach_snapshot_and_drain::<(), &str>(|_| Err("wire budget"));
+        assert_eq!(refused, Err("wire budget"));
+        assert_eq!(handle.pending_log_snapshot(), pending);
+        assert_eq!(handle.log_seq.load(Ordering::Relaxed), sequence);
+        assert_eq!(handle.term.lock().unwrap().grid().cursor.point, cursor);
+    }
+
+    #[test]
+    fn fallible_attach_success_drains_its_matching_frames_exactly_once() {
+        use super::*;
+        let handle = PtyHandle::for_persistence_tests(b"LIVE\r\n");
+        let pending = handle.pending_log_snapshot();
+        let (snapshot, frames) = handle
+            .try_attach_snapshot_and_drain::<_, &str>(|term| {
+                Ok(crate::terminal::export::live_snapshot_with_terminal_state(
+                    term,
+                ))
+            })
+            .unwrap()
+            .unwrap();
+        assert!(snapshot.contains("LIVE"));
+        assert_eq!(frames, pending);
+        assert!(handle.pending_log_snapshot().is_empty());
+        assert_eq!(handle.log_seq.load(Ordering::Relaxed), 0);
+        let (_, second) = handle
+            .try_attach_snapshot_and_drain::<_, &str>(|_| Ok(()))
+            .unwrap()
+            .unwrap();
+        assert!(second.is_empty());
+    }
+
+    #[test]
+    fn fallible_primary_repair_refusal_retains_the_complete_alternate_exit_frames() {
+        use super::*;
+        let handle = PtyHandle::for_persistence_tests(b"PRIMARY\r\n\x1b[?1049hTUI");
+        handle.feed_output_for_persistence_tests(b"\x1b[?1049l\r\nRETURNED");
+        assert!(!handle
+            .term
+            .lock()
+            .unwrap()
+            .mode()
+            .contains(TermMode::ALT_SCREEN));
+        let pending = handle.pending_log_snapshot();
+        let sequence = handle.log_seq.load(Ordering::Relaxed);
+        let refused = handle.try_output_update(1, true, |_| Err::<String, _>("repair budget"));
+        assert_eq!(refused, Err("repair budget"));
+        assert_eq!(handle.pending_log_snapshot(), pending);
+        assert_eq!(handle.log_seq.load(Ordering::Relaxed), sequence);
+        let (frames, alternate, repair) = handle
+            .try_output_update(1, true, |term| {
+                Ok::<_, &str>(crate::terminal::export::live_snapshot_with_terminal_state(
+                    term,
+                ))
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(frames, pending);
+        assert!(!alternate);
+        let repair = repair.unwrap();
+        assert!(repair.contains("PRIMARY"));
+        assert!(repair.contains("RETURNED"));
+        assert!(handle.pending_log_snapshot().is_empty());
+    }
+
+    #[test]
+    fn fallible_normal_output_capture_uses_frame_budget_without_requesting_repair() {
+        use super::*;
+        let handle = PtyHandle::for_persistence_tests(b"FIRST");
+        let prefix = handle.pending_log_snapshot();
+        handle.feed_output_for_persistence_tests(b"SECOND");
+        let (frames, alternate, repair) = handle
+            .try_output_update(prefix.len(), false, |_| -> Result<String, &str> {
+                panic!("no primary repair")
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(frames, prefix);
+        assert!(!alternate);
+        assert!(repair.is_none());
+        assert!(!handle.pending_log_snapshot().is_empty());
+        let (remaining, _, _) = handle
+            .try_output_update(usize::MAX, false, |_| -> Result<String, &str> {
+                panic!("no primary repair")
+            })
+            .unwrap()
+            .unwrap();
+        assert!(!remaining.is_empty());
+        assert!(handle.pending_log_snapshot().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod full_attach_retirement_fixtures {
+    use super::*;
+
+    #[test]
+    fn actual_reads_survive_parser_panic_and_poison_until_real_eof() {
+        let handle = PtyHandle::for_persistence_tests(b"");
+        let reader_state = ReaderRetirement::default();
+        let mut reader = &b"HEADTAIL"[..];
+        let mut buffer = [0; 4];
+        assert!(matches!(
+            reader_state.read_and_retain(&mut reader, &mut buffer, |raw| {
+                retain_raw_read_for_reader(
+                    &handle.term,
+                    &handle.pending_log,
+                    &handle.log_seq,
+                    raw,
+                    |_| panic!("parser after raw retention"),
+                )
+                .map(|_| ())
+            }),
+            ReadCompletion::Data
+        ));
+        assert!(handle.term.is_poisoned());
+        assert!(matches!(
+            reader_state.read_and_retain(&mut reader, &mut buffer, |raw| {
+                retain_raw_read_for_reader(
+                    &handle.term,
+                    &handle.pending_log,
+                    &handle.log_seq,
+                    raw,
+                    |_| panic!("poisoned parser must not run"),
+                )
+                .map(|_| ())
+            }),
+            ReadCompletion::Data
+        ));
+        assert!(!reader_state.eof());
+        assert!(matches!(
+            reader_state.read_and_retain(&mut reader, &mut buffer, |_| panic!("EOF has no raw")),
+            ReadCompletion::Eof
+        ));
+        let (_, frames) = crate::state::scrollback_log::read_frames(
+            &[
+                crate::state::scrollback_log::encode_header(0),
+                handle.retirement_log_snapshot(),
+            ]
+            .concat(),
+        )
+        .unwrap();
+        assert_eq!(
+            frames
+                .iter()
+                .map(|frame| frame.payload.clone())
+                .collect::<Vec<_>>(),
+            [b"HEAD".to_vec(), b"TAIL".to_vec()]
+        );
+    }
+
+    #[test]
+    fn legacy_destructive_drain_has_no_strong_retirement_certificate() {
+        let mut handle = PtyHandle::for_persistence_tests(b"UNACKNOWLEDGED");
+        assert!(!handle.drain_pending_log().is_empty());
+        let mut durable = Vec::new();
+        let mut sequence = 0;
+        assert!(handle
+            .take_retirement_prefix(&mut durable, &mut sequence, true)
+            .unwrap());
+        handle.begin_retirement_drain().unwrap();
+        assert!(!handle.retirement_physical_complete());
+        assert!(handle.drain_pending_log().is_empty());
+    }
+
+    #[test]
+    fn retirement_rejects_truncated_raw_without_transferring_a_valid_prefix() {
+        let handle = PtyHandle::for_persistence_tests(b"KEEP");
+        handle
+            .pending_log
+            .lock()
+            .unwrap()
+            .extend_from_slice(&[1, 2, 3]);
+        let before = handle.retirement_log_snapshot();
+        let mut durable = Vec::new();
+        let mut sequence = 0;
+        assert!(handle
+            .take_retirement_prefix(&mut durable, &mut sequence, true)
+            .is_err());
+        assert_eq!(handle.retirement_log_snapshot(), before);
+        assert!(durable.is_empty());
+        assert_eq!(sequence, 0);
+    }
+    #[test]
+    fn retirement_waits_for_an_admitted_read_and_fences_the_next() {
+        let state = ReaderRetirement::default();
+        assert!(state.begin_read());
+        state.request();
+        assert!(!state.quiescent());
+        assert!(!state.begin_read());
+        state.finish_read();
+        assert!(state.quiescent());
+        assert!(!state.begin_read());
+    }
+    #[test]
+    fn retirement_snapshot_copies_without_ack_or_sequence_reset() {
+        let handle = PtyHandle::for_persistence_tests(b"FINAL RAW");
+        let before = handle.retirement_log_snapshot();
+        let seq = handle.log_seq.load(Ordering::Relaxed);
+        assert_eq!(
+            handle.retirement_pending_snapshot().unwrap(),
+            Some(before.clone())
+        );
+        assert_eq!(handle.retirement_log_snapshot(), before);
+        assert_eq!(handle.log_seq.load(Ordering::Relaxed), seq);
+    }
+    #[test]
+    fn poisoned_pending_log_never_acknowledges_retirement() {
+        let handle = PtyHandle::for_persistence_tests(b"KEEP");
+        handle.poison_pending_log_for_persistence_tests();
+        assert!(handle.retirement_pending_snapshot().is_err());
+    }
+    #[test]
+    fn durable_pressure_is_charged_until_a_host_ack() {
+        let handle = PtyHandle::for_persistence_tests(b"RAW");
+        handle.set_daemon_durable_pressure(0);
+        let pending = handle.retirement_log_snapshot().len();
+        assert_eq!(handle.drain_pending_log_capped(usize::MAX).len(), pending);
+        assert_eq!(handle.durable_pressure.load(Ordering::Acquire), pending);
+        handle.set_daemon_durable_pressure(0);
+        assert_eq!(handle.durable_pressure.load(Ordering::Acquire), 0);
+    }
+}
+
+#[cfg(test)]
+mod raw_before_parser_fixtures {
+    use super::*;
+    fn payloads(frames: &[u8]) -> Vec<Vec<u8>> {
+        let encoded = [
+            crate::state::scrollback_log::encode_header(0),
+            frames.to_vec(),
+        ]
+        .concat();
+        crate::state::scrollback_log::read_frames(&encoded)
+            .unwrap()
+            .1
+            .into_iter()
+            .map(|frame| frame.payload)
+            .collect()
+    }
+    #[test]
+    fn parser_panic_keeps_the_actual_admitted_read_for_durable_retirement() {
+        let handle = PtyHandle::for_persistence_tests(b"");
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = retain_raw_read_and_parse(
+                &handle.term,
+                &handle.pending_log,
+                &handle.log_seq,
+                b"PHYSICAL RAW",
+                |_| panic!("parser panic after read"),
+            );
+        }));
+        assert!(panic.is_err());
+        assert_eq!(
+            payloads(&handle.retirement_pending_snapshot().unwrap().unwrap()),
+            vec![b"PHYSICAL RAW".to_vec()]
+        );
+        assert!(!handle.semantic_output_ready());
+    }
+    #[test]
+    fn poisoned_grid_keeps_new_raw_without_reusing_the_failed_parser() {
+        let handle = PtyHandle::for_persistence_tests(b"");
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = handle.term.lock().unwrap();
+            panic!("poison grid");
+        }));
+        let result = retain_raw_read_and_parse(
+            &handle.term,
+            &handle.pending_log,
+            &handle.log_seq,
+            b"AFTER POISON",
+            |_| panic!("poisoned parser must not run"),
+        )
+        .unwrap();
+        assert!(result.is_none());
+        assert_eq!(
+            payloads(&handle.retirement_pending_snapshot().unwrap().unwrap()),
+            vec![b"AFTER POISON".to_vec()]
+        );
+    }
+    #[test]
+    fn raw_sequence_exhaustion_never_acknowledges_complete_retirement() {
+        let handle = PtyHandle::for_persistence_tests(b"");
+        handle.log_seq.store(u64::MAX, Ordering::Release);
+        assert!(retain_raw_read_and_parse(
+            &handle.term,
+            &handle.pending_log,
+            &handle.log_seq,
+            b"CANNOT NUMBER",
+            |_| ()
+        )
+        .is_err());
+        assert!(handle.retirement_pending_snapshot().is_err());
+    }
+    #[test]
+    fn physical_metadata_is_retained_without_visible_startup_readiness() {
+        let handle = PtyHandle::for_persistence_tests(b"");
+        let raw = b"\x1b]7;file:///tmp/raw-metadata\x07";
+        let mut agent = AgentStatusStream::new();
+        let (clean, _, _) = retain_raw_read_and_parse(
+            &handle.term,
+            &handle.pending_log,
+            &handle.log_seq,
+            raw,
+            |_| agent.process(raw, 1),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(clean.is_empty());
+        assert!(!handle.semantic_output_ready());
+        assert_eq!(
+            payloads(&handle.retirement_pending_snapshot().unwrap().unwrap()),
+            vec![raw.to_vec()]
         );
     }
 }

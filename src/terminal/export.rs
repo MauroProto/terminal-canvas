@@ -61,6 +61,101 @@ pub fn live_snapshot_to_ansi(term: &Term<EventProxy>) -> String {
 /// restore the exact cursor and origin flag. No text, saved cursor, screen,
 /// parser state, or selection is modified; only repaint damage is broadened.
 pub fn live_snapshot_with_terminal_state(term: &mut Term<EventProxy>) -> String {
+    live_snapshot_with_terminal_state_options(term, |term, top, bottom, tabs| {
+        live_snapshot_with_options(term, top, bottom, Some(tabs))
+    })
+}
+
+/// A complete semantic replay with only the oldest whole history rows omitted.
+#[derive(Debug)]
+pub struct BoundedLiveSnapshot {
+    pub ansi: String,
+    pub omitted_history_rows: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LiveSnapshotTooLarge;
+
+impl std::fmt::Display for LiveSnapshotTooLarge {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("la pantalla activa y su estado exceden el límite del snapshot")
+    }
+}
+
+impl std::error::Error for LiveSnapshotTooLarge {}
+
+struct SnapshotText {
+    text: String,
+    max_bytes: usize,
+}
+
+impl std::fmt::Write for SnapshotText {
+    fn write_str(&mut self, text: &str) -> std::fmt::Result {
+        if text.len() > self.max_bytes.saturating_sub(self.text.len()) {
+            return Err(std::fmt::Error);
+        }
+        self.text.push_str(text);
+        Ok(())
+    }
+}
+
+/// Bound UTF-8 bytes without slicing ANSI or modifying the live terminal.
+/// The caller must reserve its metadata and base64/NDJSON envelope separately.
+pub fn bounded_live_snapshot_with_terminal_state(
+    term: &mut Term<EventProxy>,
+    max_bytes: usize,
+) -> Result<BoundedLiveSnapshot, LiveSnapshotTooLarge> {
+    live_snapshot_with_terminal_state_options(term, |term, top, bottom, tabs| {
+        let total_history = term.grid().history_size();
+        let render = |retained: usize| -> Result<BoundedLiveSnapshot, LiveSnapshotTooLarge> {
+            let mut first = -(retained as i32);
+            // Start a retained history tail at a logical line boundary. The
+            // active screen is always retained even when it continues history.
+            while first < 0
+                && first > -(total_history as i32)
+                && term.grid()[Line(first - 1)]
+                    [alacritty_terminal::index::Column(term.grid().columns() - 1)]
+                .flags
+                .contains(Flags::WRAPLINE)
+            {
+                first += 1;
+            }
+            let mut out = SnapshotText {
+                text: String::new(),
+                max_bytes,
+            };
+            write_live_snapshot_with_options(term, top, bottom, Some(tabs), first, &mut out)
+                .map_err(|_| LiveSnapshotTooLarge)?;
+            Ok(BoundedLiveSnapshot {
+                ansi: out.text,
+                omitted_history_rows: total_history - (-first as usize),
+            })
+        };
+        if let Ok(snapshot) = render(total_history) {
+            return Ok(snapshot);
+        }
+        // Fail rather than remove active cells, palette, modes or cursor state.
+        let mut best = render(0)?;
+        let mut low = 0;
+        let mut high = total_history.saturating_sub(1);
+        while low < high {
+            let middle = low + (high - low).div_ceil(2);
+            match render(middle) {
+                Ok(snapshot) => {
+                    best = snapshot;
+                    low = middle;
+                }
+                Err(_) => high = middle - 1,
+            }
+        }
+        Ok(best)
+    })
+}
+
+fn live_snapshot_with_terminal_state_options<R>(
+    term: &mut Term<EventProxy>,
+    export: impl FnOnce(&Term<EventProxy>, usize, usize, &[usize]) -> R,
+) -> R {
     use alacritty_terminal::vte::ansi::{Handler, NamedPrivateMode, PrivateMode};
     let cursor = term.grid().cursor.clone();
     let origin = term.mode().contains(TermMode::ORIGIN);
@@ -86,7 +181,7 @@ pub fn live_snapshot_with_terminal_state(term: &mut Term<EventProxy>) -> String 
         term.unset_private_mode(mode);
     }
     term.grid_mut().cursor = cursor;
-    live_snapshot_with_options(term, top, bottom, Some(&tabs))
+    export(term, top, bottom, &tabs)
 }
 
 fn live_snapshot_with_options(
@@ -95,16 +190,36 @@ fn live_snapshot_with_options(
     bottom: usize,
     tabs: Option<&[usize]>,
 ) -> String {
-    use std::fmt::Write as _;
+    let mut out = String::new();
+    write_live_snapshot_with_options(
+        term,
+        top,
+        bottom,
+        tabs,
+        -(term.grid().history_size() as i32),
+        &mut out,
+    )
+    .expect("String writer cannot fail");
+    out
+}
+
+fn write_live_snapshot_with_options(
+    term: &Term<EventProxy>,
+    top: usize,
+    bottom: usize,
+    tabs: Option<&[usize]>,
+    first: i32,
+    out: &mut impl std::fmt::Write,
+) -> std::fmt::Result {
     let grid = term.grid();
-    let mut out = String::from("\x1bc");
+    out.write_str("\x1bc")?;
     for index in 0..256 {
         if let Some(rgb) = term.colors()[index] {
-            let _ = write!(
+            write!(
                 out,
                 "\x1b]4;{index};rgb:{:02x}/{:02x}/{:02x}\x07",
                 rgb.r, rgb.g, rgb.b
-            );
+            )?;
         }
     }
     for (color, osc) in [
@@ -113,17 +228,16 @@ fn live_snapshot_with_options(
         (NamedColor::Cursor, 12),
     ] {
         if let Some(rgb) = term.colors()[color] {
-            let _ = write!(
+            write!(
                 out,
                 "\x1b]{osc};rgb:{:02x}/{:02x}/{:02x}\x07",
                 rgb.r, rgb.g, rgb.b
-            );
+            )?;
         }
     }
     if term.mode().contains(TermMode::ALT_SCREEN) {
-        out.push_str("\x1b[?1049h");
+        out.write_str("\x1b[?1049h")?;
     }
-    let first = -(grid.history_size() as i32);
     let last = grid.screen_lines() as i32 - 1;
     let mut previous_style = String::new();
     for line in first..=last {
@@ -137,12 +251,14 @@ fn live_snapshot_with_options(
             }
             let style = live_cell_style(cell);
             if style != previous_style {
-                out.push_str(&style);
+                out.write_str(&style)?;
                 previous_style = style;
             }
-            out.push(cell.c);
+            out.write_char(cell.c)?;
             if let Some(extra) = cell.zerowidth() {
-                out.extend(extra);
+                for ch in extra {
+                    out.write_char(*ch)?;
+                }
             }
         }
         // A wrapped row must stay wrapped after a later resize. Let the next
@@ -152,68 +268,70 @@ fn live_snapshot_with_options(
                 .flags
                 .contains(Flags::WRAPLINE)
         {
-            out.push_str("\r\n");
+            out.write_str("\r\n")?;
         }
     }
-    out.push_str("\x1b[0m");
-    let _ = write!(out, "\x1b[{};{}r", top + 1, bottom + 1);
+    out.write_str("\x1b[0m")?;
+    write!(out, "\x1b[{};{}r", top + 1, bottom + 1)?;
     if let Some(tabs) = tabs {
-        out.push_str("\x1b[3g");
+        out.write_str("\x1b[3g")?;
         for column in tabs {
-            let _ = write!(out, "\x1b[1;{}H\x1bH", column + 1);
+            write!(out, "\x1b[1;{}H\x1bH", column + 1)?;
         }
     }
     let saved = &grid.saved_cursor;
-    let _ = write!(
+    write!(
         out,
         "\x1b[{};{}H{}\x1b7",
         saved.point.line.0 + 1,
         saved.point.column.0 + 1,
         live_cell_style(&saved.template)
-    );
+    )?;
     let cursor = &grid.cursor;
     // Restore the saved cursor with origin disabled so absolute saved
     // positions outside the current scroll region remain representable.
-    out.push_str(&live_mode_sequence(*term.mode()));
+    out.write_str(&live_mode_sequence(*term.mode()))?;
     let cursor_line = cursor.point.line.0
         - if term.mode().contains(TermMode::ORIGIN) {
             top as i32
         } else {
             0
         };
-    let _ = write!(
+    write!(
         out,
         "\x1b[{};{}H",
         cursor_line.max(0) + 1,
         cursor.point.column.0 + 1
-    );
+    )?;
     if cursor.input_needs_wrap {
         let mut point = cursor.point;
         if grid[point].flags.contains(Flags::WIDE_CHAR_SPACER) && point.column.0 > 0 {
             point.column.0 -= 1;
-            let _ = write!(
+            write!(
                 out,
                 "\x1b[{};{}H",
                 cursor_line.max(0) + 1,
                 point.column.0 + 1
-            );
+            )?;
         }
         let cell = &grid[point];
-        out.push_str(&live_cell_style(cell));
-        out.push(cell.c);
+        out.write_str(&live_cell_style(cell))?;
+        out.write_char(cell.c)?;
         if let Some(extra) = cell.zerowidth() {
-            out.extend(extra);
+            for ch in extra {
+                out.write_char(*ch)?;
+            }
         }
     }
-    out.push_str(&live_cell_style(&cursor.template));
+    out.write_str(&live_cell_style(&cursor.template))?;
     let style = term.cursor_style();
     let shape = match style.shape {
         alacritty_terminal::vte::ansi::CursorShape::Underline => 3,
         alacritty_terminal::vte::ansi::CursorShape::Beam => 5,
         _ => 1,
     } + usize::from(!style.blinking);
-    let _ = write!(out, "\x1b[{shape} q");
-    out
+    write!(out, "\x1b[{shape} q")?;
+    Ok(())
 }
 
 fn live_cell_style(cell: &Cell) -> String {
@@ -537,6 +655,180 @@ mod tests {
             cells.push(Cell::default());
         }
         Row::from_vec(cells, width)
+    }
+
+    #[test]
+    fn bounded_live_snapshot_keeps_a_fitting_replay_byte_exact() {
+        let mut original = term_with(
+            "history\r\nnext\r\nlast\x1b[2;3H\x1b7\x1b[3;5H\x1b[?1h",
+            3,
+            12,
+        );
+        let full = super::live_snapshot_with_terminal_state(&mut original);
+        let before = original.grid().cursor.clone();
+        let mode = *original.mode();
+        let bounded =
+            super::bounded_live_snapshot_with_terminal_state(&mut original, full.len()).unwrap();
+        assert_eq!(bounded.ansi, full);
+        assert_eq!(bounded.omitted_history_rows, 0);
+        assert_eq!(original.grid().cursor.point, before.point);
+        assert_eq!(
+            original.grid().cursor.input_needs_wrap,
+            before.input_needs_wrap
+        );
+        assert_eq!(*original.mode(), mode);
+    }
+
+    #[test]
+    fn bounded_live_snapshot_keeps_a_valid_unicode_history_tail() {
+        let mut input = String::new();
+        for index in 0..40 {
+            input.push_str(&format!("史{index:02} é\u{301}\r\n"));
+        }
+        let mut original = term_with(&input, 3, 12);
+        let before = super::live_snapshot_with_terminal_state(&mut original);
+        let budget = before.len() / 2;
+        let bounded =
+            super::bounded_live_snapshot_with_terminal_state(&mut original, budget).unwrap();
+        assert!(bounded.ansi.len() <= budget);
+        assert!(bounded.omitted_history_rows > 0);
+        assert!(std::str::from_utf8(bounded.ansi.as_bytes()).is_ok());
+        let replayed = term_with(&bounded.ansi, 3, 12);
+        let original_text = scrollback_to_text(&original);
+        let replayed_text = scrollback_to_text(&replayed);
+        assert!(original_text.ends_with(&replayed_text));
+        assert!(replayed_text.contains("史39 é\u{301}"));
+        assert!(!replayed_text.contains("史00"));
+        assert_eq!(original.grid().cursor.point, replayed.grid().cursor.point);
+        assert_eq!(
+            super::live_snapshot_with_terminal_state(&mut original),
+            before
+        );
+    }
+
+    #[test]
+    fn bounded_live_snapshot_preserves_wrap_and_later_active_output() {
+        let mut input = "abcdefghijklmnop\r\n".repeat(24);
+        input.push_str("\x1b[3;1H12345678");
+        let mut original = term_with(&input, 3, 8);
+        let full = super::live_snapshot_with_terminal_state(&mut original);
+        let bounded =
+            super::bounded_live_snapshot_with_terminal_state(&mut original, full.len() / 2)
+                .unwrap();
+        assert!(bounded.omitted_history_rows > 0);
+        let mut replayed = term_with(&bounded.ansi, 3, 8);
+        assert_eq!(
+            original.grid().cursor.input_needs_wrap,
+            replayed.grid().cursor.input_needs_wrap
+        );
+        for bytes in [b"X".as_slice(), b"\r\nNEW"] {
+            let mut parser = Processor::<StdSyncHandler>::new();
+            parser.advance(&mut original, bytes);
+            let mut parser = Processor::<StdSyncHandler>::new();
+            parser.advance(&mut replayed, bytes);
+            for line in 0..3 {
+                assert_eq!(
+                    row_to_string(&original.grid()[Line(line)]),
+                    row_to_string(&replayed.grid()[Line(line)])
+                );
+            }
+            assert_eq!(original.grid().cursor.point, replayed.grid().cursor.point);
+        }
+    }
+
+    #[test]
+    fn bounded_live_snapshot_preserves_modes_palette_margins_and_tabs() {
+        for alternate in ["", "\x1b[?1049h"] {
+            let mut input = "history\r\n".repeat(30);
+            input.push_str(alternate);
+            input.push_str(
+                "one\r\ntwo\r\nthree\r\nfour\r\nfive\x1b]4;1;rgb:12/34/56\x07\x1b[3g\x1b[1;5H\x1bH\x1b[2;4r\x1b[?6h\x1b[3;1H",
+            );
+            let mut original = term_with(&input, 5, 12);
+            let full = super::live_snapshot_with_terminal_state(&mut original);
+            let budget = if alternate.is_empty() {
+                full.len() / 2
+            } else {
+                full.len()
+            };
+            let bounded =
+                super::bounded_live_snapshot_with_terminal_state(&mut original, budget).unwrap();
+            let mut replayed = term_with(&bounded.ansi, 5, 12);
+            assert_eq!(original.colors()[1], replayed.colors()[1]);
+            assert_eq!(original.mode(), replayed.mode());
+            assert_eq!(
+                original.grid().saved_cursor.point,
+                replayed.grid().saved_cursor.point
+            );
+            for bytes in [b"\r\nNEW\r\nLINE".as_slice(), b"\x1b[1;1H\tTAB"] {
+                let mut parser = Processor::<StdSyncHandler>::new();
+                parser.advance(&mut original, bytes);
+                let mut parser = Processor::<StdSyncHandler>::new();
+                parser.advance(&mut replayed, bytes);
+                for line in 0..5 {
+                    assert_eq!(
+                        row_to_string(&original.grid()[Line(line)]),
+                        row_to_string(&replayed.grid()[Line(line)])
+                    );
+                }
+                assert_eq!(original.grid().cursor.point, replayed.grid().cursor.point);
+            }
+        }
+    }
+
+    #[test]
+    fn bounded_live_snapshot_rejects_a_screen_without_returning_partial_ansi() {
+        let mut original = term_with("漢é\u{301}\x1b[2;3H\x1b[?2004h", 3, 8);
+        let full = super::live_snapshot_with_terminal_state(&mut original);
+        for budget in [0, 1, full.len() - 1] {
+            assert_eq!(
+                super::bounded_live_snapshot_with_terminal_state(&mut original, budget)
+                    .unwrap_err(),
+                super::LiveSnapshotTooLarge
+            );
+            assert_eq!(
+                super::live_snapshot_with_terminal_state(&mut original),
+                full
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_live_snapshot_obeys_a_small_real_ndjson_envelope() {
+        use crate::daemon::protocol::{decode_line, encode_line, read_protocol_line, Response};
+        let mut original = term_with(&"tail é\u{301}\r\n".repeat(80), 3, 12);
+        let id = uuid::Uuid::nil();
+        let seq = u64::MAX;
+        let overhead = encode_line(&Response::Attached {
+            id,
+            snapshot: Vec::new(),
+            seq,
+            alive: false,
+            hook_generation: None,
+            hook_target: None,
+            output_ready: true,
+        })
+        .len();
+        let line_budget = 1024usize;
+        let raw_budget = (line_budget - overhead) / 4 * 3;
+        let bounded =
+            super::bounded_live_snapshot_with_terminal_state(&mut original, raw_budget).unwrap();
+        let response = Response::Attached {
+            id,
+            snapshot: bounded.ansi.into_bytes(),
+            seq,
+            alive: false,
+            hook_generation: None,
+            hook_target: None,
+            output_ready: true,
+        };
+        let encoded = encode_line(&response);
+        assert!(encoded.len() <= line_budget);
+        assert!(encoded.len() <= crate::daemon::protocol::MAX_PROTOCOL_LINE_BYTES);
+        let mut reader = std::io::Cursor::new(encoded.as_bytes());
+        let line = read_protocol_line(&mut reader).unwrap().unwrap();
+        assert_eq!(decode_line::<Response>(&line), Some(response));
     }
 
     #[test]
