@@ -68,6 +68,11 @@ pub fn pid_path(dir: &Path) -> PathBuf {
 /// interno gane un campo).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WireSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hook_generation: Option<Uuid>,
+    /// Captured from authenticated Hello by the host, never deserialized.
+    #[serde(skip)]
+    pub(crate) hook_owner: Option<Uuid>,
     #[serde(default)]
     pub memory_task_id: Option<Uuid>,
     #[serde(default)]
@@ -94,6 +99,8 @@ impl Default for WireSpec {
     fn default() -> Self {
         Self {
             memory_task_id: None,
+            hook_generation: None,
+            hook_owner: None,
             title: String::new(),
             cwd: None,
             startup_command: None,
@@ -112,6 +119,13 @@ fn default_cols() -> u16 {
 
 fn default_rows() -> u16 {
     24
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostHookTarget {
+    pub workspace_id: Uuid,
+    pub panel_id: Uuid,
+    pub leaf_id: Uuid,
 }
 
 /// Pedido de la app al daemon.
@@ -154,6 +168,10 @@ pub enum Request {
     Kill {
         id: Uuid,
     },
+    /// Creator cancellation fences a late Spawn without adopting a foreign UUID.
+    CloseBirth {
+        id: Uuid,
+    },
     /// Sesión enfocada en la UI. El daemon usa esta señal para no retrasar su
     /// reader PTY mientras aplica contrapresión breve a los readers de fondo.
     SetPriority {
@@ -176,6 +194,14 @@ pub enum Response {
     /// Handshake aceptado.
     Welcome {
         version: u32,
+        /// Absent on an older daemon. Ambiguous births may only be retried and
+        /// closed by UUID when the server advertises creator-aware idempotency.
+        #[serde(default)]
+        birth_idempotent: bool,
+        #[serde(default)]
+        birth_cancel_safe: bool,
+        #[serde(default)]
+        hook_birth_authority: bool,
     },
     Spawned {
         id: Uuid,
@@ -188,6 +214,14 @@ pub enum Response {
         snapshot: Vec<u8>,
         seq: u64,
         alive: bool,
+        /// Actual raw PTY output has been observed. Semantic replay, metadata
+        /// and sequence advancement alone cannot prove startup readiness.
+        #[serde(default)]
+        output_ready: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hook_generation: Option<Uuid>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hook_target: Option<HostHookTarget>,
     },
     Sessions {
         ids: Vec<Uuid>,
@@ -216,6 +250,22 @@ pub enum Response {
     Error {
         message: String,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BirthCapabilities {
+    pub idempotent: bool,
+    pub cancel_safe: bool,
+    pub hook_authority: bool,
+}
+
+impl BirthCapabilities {
+    pub fn permits_birth(self) -> bool {
+        self.idempotent && self.cancel_safe
+    }
+    pub fn permits_hook_birth(self) -> bool {
+        self.permits_birth() && self.hook_authority
+    }
 }
 
 /// Adaptador binario para mantener NDJSON observable sin fingir que el PTY es
@@ -248,6 +298,151 @@ pub fn encode_line<T: Serialize>(message: &T) -> String {
     line
 }
 
+/// The serializer's base64 expansion and final LF belong to the wire budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotWireTooLarge;
+
+impl std::fmt::Display for SnapshotWireTooLarge {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("el snapshot y su metadata exceden el límite del protocolo")
+    }
+}
+
+impl std::error::Error for SnapshotWireTooLarge {}
+
+/// Safe for both Attach and the semantic Output repair at the same boundary.
+/// UUID length, maximum sequence and alive=false are reserved before capture.
+pub fn snapshot_payload_budget(
+    id: Uuid,
+    max_line_bytes: usize,
+) -> Result<usize, SnapshotWireTooLarge> {
+    let attached = encode_line(&Response::Attached {
+        id,
+        snapshot: Vec::new(),
+        seq: u64::MAX,
+        alive: false,
+        output_ready: false,
+        hook_generation: Some(Uuid::nil()),
+        hook_target: Some(HostHookTarget {
+            workspace_id: Uuid::nil(),
+            panel_id: Uuid::nil(),
+            leaf_id: Uuid::nil(),
+        }),
+    })
+    .len();
+    let repair = encode_line(&Response::Output {
+        id,
+        seq: u64::MAX,
+        data: Vec::new(),
+    })
+    .len();
+    let remaining = max_line_bytes
+        .checked_sub(attached.max(repair))
+        .ok_or(SnapshotWireTooLarge)?;
+    Ok((remaining / 4) * 3)
+}
+
+/// Reserve the exact metadata bytes before exporting the semantic ANSI state.
+pub fn snapshot_ansi_budget(
+    id: Uuid,
+    metadata_bytes: usize,
+    max_line_bytes: usize,
+) -> Result<usize, SnapshotWireTooLarge> {
+    snapshot_payload_budget(id, max_line_bytes)?
+        .checked_sub(metadata_bytes)
+        .ok_or(SnapshotWireTooLarge)
+}
+
+/// Serialize into a bounded sink and reserve the final LF. An error returns
+/// no partial line; the caller must not write any bytes to its socket.
+pub fn encode_response_line_with_limit(
+    response: &Response,
+    max_line_bytes: usize,
+) -> std::io::Result<Vec<u8>> {
+    // Reject oversized binary payloads before wire_bytes allocates base64.
+    // The final serializer remains authoritative for all other fields.
+    match response {
+        Response::Attached { id, snapshot, .. }
+        | Response::Output {
+            id, data: snapshot, ..
+        } if snapshot.len() > snapshot_payload_budget(*id, max_line_bytes).unwrap_or(0) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "respuesta binaria del daemon demasiado grande",
+            ));
+        }
+        _ => {}
+    }
+    struct LineBytes {
+        bytes: Vec<u8>,
+        max_bytes: usize,
+    }
+    impl std::io::Write for LineBytes {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() > self.max_bytes.saturating_sub(self.bytes.len()) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "respuesta del daemon demasiado grande",
+                ));
+            }
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let max_bytes = max_line_bytes.checked_sub(1).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "límite del protocolo inválido",
+        )
+    })?;
+    let mut line = LineBytes {
+        bytes: Vec::new(),
+        max_bytes,
+    };
+    serde_json::to_writer(&mut line, response).map_err(std::io::Error::other)?;
+    line.bytes.push(b'\n');
+    Ok(line.bytes)
+}
+
+/// A compatible reason inside the existing Error envelope. Unknown future
+/// reason strings remain parseable; adding a Response variant is unnecessary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotFailureKind {
+    TooLarge,
+    Unavailable,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SnapshotFailureDetails {
+    id: Uuid,
+    kind: SnapshotFailureKind,
+}
+
+const SNAPSHOT_FAILURE_PREFIX: &str = "terminal_canvas_snapshot_failure_v1:";
+
+pub fn snapshot_failure_response(id: Uuid, kind: SnapshotFailureKind) -> Response {
+    let details = SnapshotFailureDetails { id, kind };
+    let encoded = serde_json::to_string(&details).expect("snapshot failure fields serialize");
+    Response::Error {
+        message: format!("{SNAPSHOT_FAILURE_PREFIX}{encoded}"),
+    }
+}
+
+pub fn snapshot_failure_from_response(response: &Response) -> Option<(Uuid, SnapshotFailureKind)> {
+    let Response::Error { message } = response else {
+        return None;
+    };
+    let details: SnapshotFailureDetails =
+        serde_json::from_str(message.strip_prefix(SNAPSHOT_FAILURE_PREFIX)?).ok()?;
+    Some((details.id, details.kind))
+}
+
 /// Parsea una línea NDJSON. `None` si está vacía o no es del tipo esperado:
 /// una línea corrupta no puede tumbar la conexión.
 pub fn decode_line<T: for<'de> Deserialize<'de>>(line: &str) -> Option<T> {
@@ -256,6 +451,29 @@ pub fn decode_line<T: for<'de> Deserialize<'de>>(line: &str) -> Option<T> {
         return None;
     }
     serde_json::from_str(line).ok()
+}
+
+/// A definite foreign UUID collision cannot confer adoption or Kill rights.
+/// The legacy Error envelope remains readable by older binaries.
+const BIRTH_REJECTED_PREFIX: &str = "terminal_canvas_birth_rejected_v1:";
+
+pub fn birth_rejected_response(id: Uuid) -> Response {
+    Response::Error {
+        message: format!("{BIRTH_REJECTED_PREFIX}{id}"),
+    }
+}
+
+pub fn birth_rejected_from_response(response: &Response) -> Option<Uuid> {
+    let Response::Error { message } = response else {
+        return None;
+    };
+    message.strip_prefix(BIRTH_REJECTED_PREFIX)?.parse().ok()
+}
+
+pub fn close_pending_response(id: Uuid) -> Response {
+    Response::Error {
+        message: format!("terminal_canvas_close_pending_v1:{id}"),
+    }
 }
 
 /// Lee una línea del protocolo con un límite de memoria estricto.
@@ -469,6 +687,9 @@ mod tests {
                     leaf_id: Some(Uuid::new_v4()),
                     cols: 120,
                     rows: 40,
+                    hook_generation: None,
+
+                    hook_owner: None,
                 },
             },
             Request::Attach { id },
@@ -502,6 +723,9 @@ mod tests {
         let cases = vec![
             Response::Welcome {
                 version: PROTOCOL_VERSION,
+                birth_idempotent: true,
+                birth_cancel_safe: false,
+                hook_birth_authority: false,
             },
             Response::Spawned { id },
             Response::Attached {
@@ -509,6 +733,9 @@ mod tests {
                 snapshot: b"hola\n".to_vec(),
                 seq: 42,
                 alive: true,
+                output_ready: false,
+                hook_generation: None,
+                hook_target: None,
             },
             Response::Sessions { ids: vec![id] },
             Response::Output {
@@ -675,5 +902,247 @@ mod tests {
         assert!(socket_path_fits(&socket_path(std::path::Path::new(
             "/tmp/tc"
         ))));
+    }
+
+    #[test]
+    fn snapshot_wire_budget_fits_maximum_sequence_and_base64_padding() {
+        let id = Uuid::from_u128(1);
+        for limit in [512, 513, 514, 1024] {
+            let budget = super::snapshot_payload_budget(id, limit).unwrap();
+            for removed in 0..3 {
+                let data = vec![0xff; budget - removed];
+                let attached = Response::Attached {
+                    id,
+                    snapshot: data.clone(),
+                    seq: u64::MAX,
+                    alive: false,
+                    output_ready: false,
+                    hook_generation: None,
+                    hook_target: None,
+                };
+                let repair = Response::Output {
+                    id,
+                    seq: u64::MAX,
+                    data,
+                };
+                for response in [attached, repair] {
+                    let line = super::encode_response_line_with_limit(&response, limit).unwrap();
+                    assert!(line.len() <= limit);
+                    assert_eq!(
+                        super::decode_line::<Response>(std::str::from_utf8(&line).unwrap()),
+                        Some(response)
+                    );
+                }
+            }
+            let oversized = Response::Attached {
+                id,
+                snapshot: vec![0; budget + 1],
+                seq: u64::MAX,
+                alive: false,
+                output_ready: false,
+                hook_generation: None,
+                hook_target: None,
+            };
+            assert!(super::encode_response_line_with_limit(&oversized, limit).is_err());
+        }
+    }
+
+    #[test]
+    fn snapshot_wire_budget_reserves_every_metadata_byte_before_capture() {
+        let id = Uuid::from_u128(2);
+        let limit = 512;
+        let payload = super::snapshot_payload_budget(id, limit).unwrap();
+        let metadata = b"\x1b]2;title\x07\x1b]7;/tmp/repo\x07";
+        let ansi = super::snapshot_ansi_budget(id, metadata.len(), limit).unwrap();
+        assert_eq!(ansi + metadata.len(), payload);
+        let mut snapshot = vec![b'X'; ansi];
+        snapshot.extend_from_slice(metadata);
+        let response = Response::Attached {
+            id,
+            snapshot,
+            seq: u64::MAX,
+            alive: false,
+            output_ready: false,
+            hook_generation: None,
+            hook_target: None,
+        };
+        assert!(super::encode_response_line_with_limit(&response, limit).is_ok());
+        assert!(super::snapshot_ansi_budget(id, payload + 1, limit).is_err());
+        assert!(super::snapshot_payload_budget(id, 1).is_err());
+    }
+
+    #[test]
+    fn bounded_response_encoder_refuses_oversize_without_returning_partial_line() {
+        let response = Response::Error {
+            message: "long".repeat(64),
+        };
+        assert!(super::encode_response_line_with_limit(&response, 64).is_err());
+        assert!(super::encode_response_line_with_limit(&response, 0).is_err());
+        let expected = super::encode_line(&response);
+        let line = super::encode_response_line_with_limit(&response, expected.len()).unwrap();
+        assert_eq!(line, expected.as_bytes());
+        assert!(super::encode_response_line_with_limit(&response, expected.len() - 1).is_err());
+    }
+
+    #[test]
+    fn snapshot_failure_remains_a_legacy_error_and_accepts_unknown_reason_codes() {
+        let id = Uuid::from_u128(3);
+        let response = super::snapshot_failure_response(id, super::SnapshotFailureKind::TooLarge);
+        assert!(matches!(response, Response::Error { .. }));
+        let line = super::encode_line(&response);
+        let decoded: Response = super::decode_line(&line).unwrap();
+        assert_eq!(
+            super::snapshot_failure_from_response(&decoded),
+            Some((id, super::SnapshotFailureKind::TooLarge))
+        );
+        let Response::Error { message } = response else {
+            unreachable!()
+        };
+        let future = Response::Error {
+            message: message.replace("too_large", "future_reason"),
+        };
+        assert_eq!(
+            super::snapshot_failure_from_response(&future),
+            Some((id, super::SnapshotFailureKind::Unknown))
+        );
+        assert_eq!(
+            super::snapshot_failure_from_response(&Response::Error {
+                message: "unstructured refusal".to_owned()
+            }),
+            None
+        );
+    }
+}
+
+#[cfg(test)]
+mod birth_capability_contract_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_welcome_defaults_to_no_birth_ownership_guarantee() {
+        assert_eq!(
+            decode_line::<Response>("{\"type\":\"welcome\",\"version\":4}\n"),
+            Some(Response::Welcome {
+                version: 4,
+                birth_idempotent: false,
+                birth_cancel_safe: false,
+                hook_birth_authority: false,
+            })
+        );
+    }
+
+    #[test]
+    fn idempotent_birth_capability_roundtrips_without_changing_protocol_version() {
+        let response = Response::Welcome {
+            version: PROTOCOL_VERSION,
+            birth_idempotent: true,
+            birth_cancel_safe: false,
+            hook_birth_authority: false,
+        };
+        assert_eq!(
+            decode_line::<Response>(&encode_line(&response)),
+            Some(response)
+        );
+    }
+
+    #[test]
+    fn birth_rejection_is_typed_and_remains_a_legacy_error_envelope() {
+        let id = Uuid::new_v4();
+        let response = birth_rejected_response(id);
+        assert!(matches!(response, Response::Error { .. }));
+        assert_eq!(birth_rejected_from_response(&response), Some(id));
+        assert_eq!(
+            decode_line::<Response>(&encode_line(&response)),
+            Some(response)
+        );
+        assert_eq!(
+            birth_rejected_from_response(&Response::Error {
+                message: "unknown".into()
+            }),
+            None
+        );
+        assert_eq!(
+            birth_rejected_from_response(&Response::Error {
+                message: format!("{BIRTH_REJECTED_PREFIX}bad uuid")
+            }),
+            None
+        );
+    }
+}
+
+#[cfg(test)]
+mod attached_readiness_contract_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_attached_without_readiness_is_conservatively_not_ready() {
+        let id = Uuid::new_v4();
+        let line = format!("{{\"type\":\"attached\",\"id\":\"{id}\",\"snapshot\":\"\",\"seq\":99,\"alive\":true}}\n");
+        assert_eq!(
+            decode_line::<Response>(&line),
+            Some(Response::Attached {
+                id,
+                snapshot: Vec::new(),
+                seq: 99,
+                alive: true,
+                output_ready: false,
+                hook_generation: None,
+                hook_target: None,
+            })
+        );
+    }
+}
+
+#[cfg(test)]
+mod full_attach_capability_fixtures {
+    use super::*;
+    #[test]
+    fn legacy_welcome_never_proves_birth_cancellation() {
+        let response = decode_line::<Response>(r#"{"type":"welcome","version":4}"#).unwrap();
+        assert!(matches!(
+            response,
+            Response::Welcome {
+                birth_idempotent: false,
+                birth_cancel_safe: false,
+                ..
+            }
+        ));
+        assert!(!BirthCapabilities {
+            idempotent: true,
+            cancel_safe: false,
+            hook_authority: false
+        }
+        .permits_birth());
+        assert!(BirthCapabilities {
+            idempotent: true,
+            cancel_safe: true,
+            hook_authority: false
+        }
+        .permits_birth());
+    }
+    #[test]
+    fn close_birth_roundtrips_the_original_uuid() {
+        let id = Uuid::from_u128(0x6101);
+        assert_eq!(
+            decode_line::<Request>(&encode_line(&Request::CloseBirth { id })),
+            Some(Request::CloseBirth { id })
+        );
+    }
+    #[test]
+    fn binary_refusal_precedes_base64_serialization() {
+        let id = Uuid::from_u128(0x6102);
+        let cap = 512;
+        let bytes = vec![0xff; snapshot_payload_budget(id, cap).unwrap() + 1];
+        let error = encode_response_line_with_limit(
+            &Response::Output {
+                id,
+                seq: 1,
+                data: bytes,
+            },
+            cap,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("respuesta binaria"));
     }
 }

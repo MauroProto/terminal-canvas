@@ -15,7 +15,8 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 use super::protocol::{
-    decode_line, encode_line, read_protocol_line, socket_path, Request, Response, PROTOCOL_VERSION,
+    decode_line, encode_line, read_protocol_line, socket_path, BirthCapabilities, Request,
+    Response, PROTOCOL_VERSION,
 };
 
 /// Cuánto se espera a que el daemon recién lanzado abra el socket.
@@ -46,6 +47,8 @@ pub struct DaemonConn {
     /// Sin esta cola, un `Output` en el momento equivocado se leía como si
     /// fuera la respuesta y el pedido devolvía basura.
     pending_events: std::collections::VecDeque<Response>,
+    pending_event_bytes: usize,
+    invalid: bool,
 }
 
 impl DaemonConn {
@@ -86,6 +89,14 @@ impl DaemonConn {
     }
 
     pub fn connect_raw_as(dir: &Path, token: &str, client_id: Uuid) -> Option<UnixStream> {
+        Self::connect_raw_with_capabilities_as(dir, token, client_id).map(|(stream, _)| stream)
+    }
+
+    pub fn connect_raw_with_capabilities_as(
+        dir: &Path,
+        token: &str,
+        client_id: Uuid,
+    ) -> Option<(UnixStream, BirthCapabilities)> {
         let stream = UnixStream::connect(socket_path(dir)).ok()?;
         stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
         stream
@@ -106,7 +117,19 @@ impl DaemonConn {
         writer.flush().ok()?;
         let line = read_protocol_line(&mut reader).ok()??;
         match decode_line::<Response>(&line) {
-            Some(Response::Welcome { version }) if version == PROTOCOL_VERSION => Some(stream),
+            Some(Response::Welcome {
+                version,
+                birth_idempotent,
+                birth_cancel_safe,
+                hook_birth_authority,
+            }) if version == PROTOCOL_VERSION => Some((
+                stream,
+                BirthCapabilities {
+                    idempotent: birth_idempotent,
+                    cancel_safe: birth_cancel_safe,
+                    hook_authority: hook_birth_authority,
+                },
+            )),
             _ => None,
         }
     }
@@ -130,46 +153,95 @@ impl DaemonConn {
             writer,
             client_id,
             pending_events: std::collections::VecDeque::new(),
+            pending_event_bytes: 0,
+            invalid: false,
         };
         match conn.request(&Request::Hello {
             version: PROTOCOL_VERSION,
             token: token.to_owned(),
             client_id,
         }) {
-            Some(Response::Welcome { version }) if version == PROTOCOL_VERSION => Some(conn),
+            Some(Response::Welcome { version, .. }) if version == PROTOCOL_VERSION => Some(conn),
             _ => None,
         }
     }
 
-    /// Manda un pedido y espera la respuesta.
+    /// Compatibility wrapper. None is unavailable, never proof of absence.
     pub fn request(&mut self, request: &Request) -> Option<Response> {
-        self.writer
-            .write_all(encode_line(request).as_bytes())
-            .ok()?;
-        self.writer.flush().ok()?;
+        self.request_checked(request).ok()
+    }
+
+    /// A framing or transport error retires the stream so a late reply can
+    /// never be mistaken for the response to a subsequent request.
+    pub fn request_checked(&mut self, request: &Request) -> std::io::Result<Response> {
+        if self.invalid {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "La conexión al daemon ya no es válida.",
+            ));
+        }
+        let result = self.request_on_stream(request);
+        if result.is_err() {
+            self.invalid = true;
+            let _ = self.writer.shutdown(std::net::Shutdown::Both);
+        }
+        result
+    }
+
+    fn request_on_stream(&mut self, request: &Request) -> std::io::Result<Response> {
+        self.writer.write_all(encode_line(request).as_bytes())?;
+        self.writer.flush()?;
         loop {
-            let line = read_protocol_line(&mut self.reader).ok()??;
-            let Some(response) = decode_line::<Response>(&line) else {
-                continue; // línea corrupta: se ignora, no tumba la conexión
-            };
+            let line = read_protocol_line(&mut self.reader)?.ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "El daemon cerró la conexión.",
+                )
+            })?;
+            let response = decode_line::<Response>(&line).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "El daemon devolvió una línea inválida.",
+                )
+            })?;
             if is_pushed_event(&response) {
-                // Llegó un evento mientras esperábamos la respuesta: se encola
-                // en vez de devolverlo como si fuera la respuesta al pedido.
+                let bytes = match &response {
+                    Response::Output { data, .. } => data.len(),
+                    Response::InputError { message, .. } => message.len(),
+                    _ => 0,
+                };
+                // The queue is bounded by count and decoded payload bytes.
+                // Closing the stream triggers recovery rather than silently
+                // losing sequence-bearing events.
+                if self.pending_events.len() >= 128
+                    || self.pending_event_bytes.saturating_add(bytes) > 8 * 1024 * 1024
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "La cola de eventos del daemon superó su presupuesto.",
+                    ));
+                }
+                self.pending_event_bytes += bytes;
                 self.pending_events.push_back(response);
                 continue;
             }
-            return Some(response);
+            return Ok(response);
         }
     }
 
     /// Eventos que llegaron mientras se atendían pedidos.
     pub fn drain_events(&mut self) -> Vec<Response> {
+        self.pending_event_bytes = 0;
         self.pending_events.drain(..).collect()
     }
 
     pub fn spawn_session(&mut self, spec: super::protocol::WireSpec) -> Option<Uuid> {
-        match self.request(&Request::Spawn { spec, id: None })? {
-            Response::Spawned { id } => Some(id),
+        let proposed_id = Uuid::new_v4();
+        match self.request(&Request::Spawn {
+            spec,
+            id: Some(proposed_id),
+        })? {
+            Response::Spawned { id } if id == proposed_id => Some(id),
             _ => None,
         }
     }
@@ -178,22 +250,36 @@ impl DaemonConn {
     /// cual los eventos son nuevos.
     pub fn attach(&mut self, id: Uuid) -> Option<(Vec<u8>, u64)> {
         match self.request(&Request::Attach { id })? {
-            Response::Attached { snapshot, seq, .. } => Some((snapshot, seq)),
+            Response::Attached {
+                id: actual,
+                snapshot,
+                seq,
+                ..
+            } if actual == id => Some((snapshot, seq)),
             _ => None,
         }
     }
 
+    /// Legacy presentation helper. Empty may mean unavailable; creation and
+    /// recovery decisions must use list_checked instead.
     pub fn list(&mut self) -> Vec<Uuid> {
-        match self.request(&Request::List) {
-            Some(Response::Sessions { ids }) => ids,
-            _ => Vec::new(),
+        self.list_checked().unwrap_or_default()
+    }
+
+    pub fn list_checked(&mut self) -> std::io::Result<Vec<Uuid>> {
+        match self.request_checked(&Request::List)? {
+            Response::Sessions { ids } => Ok(ids),
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "El daemon no confirmó la lista de sesiones.",
+            )),
         }
     }
 
     pub fn kill(&mut self, id: Uuid) -> bool {
         matches!(
             self.request(&Request::Kill { id }),
-            Some(Response::Killed { .. })
+            Some(Response::Killed { id: actual }) if actual == id
         )
     }
 
@@ -316,6 +402,11 @@ mod tests {
         }));
         assert!(!super::is_pushed_event(&Response::Spawned { id }));
         assert!(!super::is_pushed_event(&Response::ShuttingDown));
-        assert!(!super::is_pushed_event(&Response::Welcome { version: 1 }));
+        assert!(!super::is_pushed_event(&Response::Welcome {
+            version: 1,
+            birth_idempotent: false,
+            birth_cancel_safe: false,
+            hook_birth_authority: false,
+        }));
     }
 }

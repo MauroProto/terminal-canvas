@@ -12,8 +12,9 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 use super::protocol::{
-    decode_line, encode_line, handshake_ok, read_protocol_line, Request, Response, WireSpec,
-    PROTOCOL_VERSION,
+    birth_rejected_response, decode_line, encode_response_line_with_limit, handshake_ok,
+    read_protocol_line, snapshot_ansi_budget, snapshot_failure_response, Request, Response,
+    SnapshotFailureKind, WireSpec, MAX_PROTOCOL_LINE_BYTES, PROTOCOL_VERSION,
 };
 use crate::runtime::{RuntimeScheduler, SharedPtyHandle};
 use crate::terminal::pty::{HookIdentity, PtyHandle};
@@ -34,6 +35,53 @@ const INTERACTIVE_BYTE_BUDGET: usize = 32 * 1024;
 /// Compact long-lived TUI logs from a disposable replay, never by truncating
 /// bytes needed to recover the hidden primary screen.
 const MAX_ALTERNATE_LOG_BYTES: u64 = 4 * 1024 * 1024;
+/// Raw streaming output is split before base64 serialization. Semantic repair
+/// is a single complete snapshot, bounded independently by its wire envelope.
+const RAW_OUTPUT_CHUNK_BYTES: usize = 64 * 1024;
+const LIVE_REPAIR_RETRY: Duration = Duration::from_secs(2);
+const MAX_BIRTH_IDENTITIES: usize = 8192;
+
+#[derive(Clone, Copy)]
+struct LiveRepairPending {
+    kind: SnapshotFailureKind,
+    retry_at: Instant,
+}
+
+/// Metadata and both base64 envelopes are budgeted before pending frames move.
+/// This limit concerns the NDJSON line, not total terminal/history memory.
+fn bounded_wire_snapshot(
+    term: &mut alacritty_terminal::term::Term<crate::terminal::pty::EventProxy>,
+    metadata: &[u8],
+    id: Uuid,
+    line_limit: usize,
+) -> Result<String, SnapshotFailureKind> {
+    let budget = snapshot_ansi_budget(id, metadata.len(), line_limit)
+        .map_err(|_| SnapshotFailureKind::TooLarge)?;
+    let metadata = std::str::from_utf8(metadata).map_err(|_| SnapshotFailureKind::Unavailable)?;
+    let mut snapshot =
+        crate::terminal::export::bounded_live_snapshot_with_terminal_state(term, budget)
+            .map_err(|_| SnapshotFailureKind::TooLarge)?
+            .ansi;
+    snapshot.push_str(metadata);
+    encode_response_line_with_limit(
+        &Response::Attached {
+            id,
+            snapshot: snapshot.as_bytes().to_vec(),
+            seq: u64::MAX,
+            alive: false,
+            output_ready: false,
+            hook_generation: Some(Uuid::nil()),
+            hook_target: Some(super::protocol::HostHookTarget {
+                workspace_id: Uuid::nil(),
+                panel_id: Uuid::nil(),
+                leaf_id: Uuid::nil(),
+            }),
+        },
+        line_limit,
+    )
+    .map_err(|_| SnapshotFailureKind::TooLarge)?;
+    Ok(snapshot)
+}
 
 /// Estado de una sesión desde la vista del daemon.
 pub struct DaemonSession {
@@ -51,12 +99,38 @@ pub struct DaemonSession {
     last_metadata: Vec<u8>,
     was_alternate: bool,
     last_input_error: Option<String>,
+    live_repair: Option<LiveRepairPending>,
+    output_ready: bool,
+    retirement_requested: bool,
+    retirement_captured: bool,
+    retirement_draining: bool,
+    retirement_final_captured: bool,
+    /// Stable authenticated app identity which created this birth. Attach is
+    /// adoption, and cannot grant creator status after a UUID collision.
+    birth_client: Option<Uuid>,
+    adopters: HashSet<Uuid>,
     /// El PTY real (T2). `None` en los tests del registro, que no montan
     /// procesos: la lógica de sesiones se testea sin spawnear nada.
     pub handle: Option<SharedPtyHandle>,
 }
 
 impl DaemonSession {
+    fn client_may_close(&self, client_id: Uuid) -> bool {
+        self.birth_client == Some(client_id) || self.adopters.contains(&client_id)
+    }
+
+    fn refuse_live_snapshot(&mut self, kind: SnapshotFailureKind, now: Instant) {
+        self.live_repair = Some(LiveRepairPending {
+            kind,
+            retry_at: now.checked_add(LIVE_REPAIR_RETRY).unwrap_or(now),
+        });
+    }
+
+    fn repair_retry_due(&self, now: Instant) -> bool {
+        self.live_repair
+            .is_some_and(|repair| now >= repair.retry_at)
+    }
+
     fn new(spec: WireSpec) -> Self {
         Self {
             spec,
@@ -69,12 +143,21 @@ impl DaemonSession {
             last_metadata: Vec::new(),
             was_alternate: false,
             last_input_error: None,
+            live_repair: None,
+            output_ready: false,
+            retirement_requested: false,
+            retirement_captured: false,
+            retirement_draining: false,
+            retirement_final_captured: false,
+            birth_client: None,
+            adopters: HashSet::new(),
             handle: None,
         }
     }
 
     /// Registra salida nueva y devuelve el `seq` que le toca.
     pub fn push_output(&mut self, data: &[u8]) -> u64 {
+        self.output_ready |= !data.is_empty();
         self.record_persist_frame(crate::state::scrollback_log::FrameKind::Output, data);
         self.push_output_event(data)
     }
@@ -114,28 +197,59 @@ impl DaemonSession {
                 payload,
             ));
         self.scrollback_dirty = true;
+        if let Some(handle) = &self.handle {
+            handle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .set_daemon_durable_pressure(self.persist_pending.len());
+        }
     }
 
-    fn ingest_pty_frames(&mut self, frames: &[u8]) -> Option<(u64, Vec<u8>)> {
+    fn ingest_pty_frames(&mut self, frames: &[u8]) -> Vec<(u64, Vec<u8>)> {
+        if let Some(handle) = &self.handle {
+            self.output_ready |= handle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .semantic_output_ready();
+        } else {
+            self.output_ready |= decode_frames(frames).iter().any(|frame| {
+                frame.kind == crate::state::scrollback_log::FrameKind::Output
+                    && !frame.payload.is_empty()
+            });
+        }
+        let mut events = Vec::new();
         let mut output = Vec::new();
         for frame in decode_frames(frames) {
+            // Durable frames keep their original kind, order and payload.
             self.record_persist_frame(frame.kind, &frame.payload);
-            if frame.kind == crate::state::scrollback_log::FrameKind::Output {
-                output.extend_from_slice(&frame.payload);
+            if frame.kind != crate::state::scrollback_log::FrameKind::Output {
+                continue;
+            }
+            for bytes in frame.payload.chunks(RAW_OUTPUT_CHUNK_BYTES) {
+                if output.len() + bytes.len() > RAW_OUTPUT_CHUNK_BYTES {
+                    let seq = self.push_output_event(&output);
+                    events.push((seq, std::mem::take(&mut output)));
+                }
+                output.extend_from_slice(bytes);
             }
         }
-        if output.is_empty() {
-            None
-        } else {
+        if !output.is_empty() {
             let seq = self.push_output_event(&output);
-            Some((seq, output))
+            events.push((seq, output));
         }
+        events
     }
 
     fn acknowledge_persisted(&mut self, written_bytes: usize) {
         let acknowledged = written_bytes.min(self.persist_pending.len());
         self.persist_pending.drain(..acknowledged);
-        if self.persist_pending.is_empty() {
+        if let Some(handle) = &self.handle {
+            handle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .set_daemon_durable_pressure(self.persist_pending.len());
+        }
+        if self.persist_pending.is_empty() && !self.retirement_requested {
             // La secuencia de estos frames sólo ordena el lote en RAM. El
             // writer durable los renumera contra el archivo, así que reiniciar
             // al vaciar el lote evita un contador de vida infinita.
@@ -146,44 +260,69 @@ impl DaemonSession {
     /// Snapshot semántico + salida todavía no numerada, tomados en una única
     /// frontera. El evento devuelto debe difundirse a subscribers anteriores;
     /// el cliente que está haciendo attach ya lo recibe dentro del snapshot.
-    fn attach_boundary(&mut self) -> (Vec<u8>, Option<(u64, Vec<u8>)>) {
-        let boundary = self.handle.clone().and_then(|handle| {
-            handle.lock().ok().and_then(|pty| {
-                let ((mut snapshot, alternate), frames) =
-                    pty.attach_snapshot_and_drain(|term| {
-                        (
-                            crate::terminal::export::live_snapshot_with_terminal_state(term),
-                            term.mode()
-                                .contains(alacritty_terminal::term::TermMode::ALT_SCREEN),
-                        )
-                    })?;
-                snapshot.push_str(&String::from_utf8_lossy(&pty.metadata_osc(true)));
-                Some((snapshot, frames, alternate))
-            })
-        });
-        let Some((snapshot, frames, alternate)) = boundary else {
-            // Fallback de tests/sesiones sin PTY.
-            return (self.snapshot.clone(), None);
+    fn attach_boundary(
+        &mut self,
+        id: Uuid,
+        line_limit: usize,
+        now: Instant,
+    ) -> Result<(Vec<u8>, Vec<(u64, Vec<u8>)>), SnapshotFailureKind> {
+        if let Some(repair) = self.live_repair.filter(|_| !self.repair_retry_due(now)) {
+            return Err(repair.kind);
+        }
+        let Some(handle) = self.handle.clone() else {
+            // Only the process-free registry uses a raw fallback. A real PTY
+            // with an unreadable/restoring grid must never masquerade as it.
+            encode_response_line_with_limit(
+                &Response::Attached {
+                    id,
+                    snapshot: self.snapshot.clone(),
+                    seq: self.seq,
+                    alive: self.alive,
+                    output_ready: self.output_ready,
+                    hook_generation: self.spec.hook_generation,
+                    hook_target: host_target_from_spec(&self.spec),
+                },
+                line_limit,
+            )
+            .map_err(|_| SnapshotFailureKind::TooLarge)?;
+            return Ok((self.snapshot.clone(), Vec::new()));
         };
-        // Attach can be the first observer of a TUI exit, before the
-        // output pump. Existing clients that attached in alternate screen
-        // have no primary grid, so raw exit bytes cannot restore history.
-        let restore_primary = self.was_alternate && !alternate;
+        let boundary = handle
+            .lock()
+            .map_err(|_| SnapshotFailureKind::Unavailable)
+            .and_then(|pty| {
+                let metadata = pty.metadata_osc(true);
+                pty.try_attach_snapshot_and_drain(|term| {
+                    let snapshot = bounded_wire_snapshot(term, &metadata, id, line_limit)?;
+                    let alternate = term
+                        .mode()
+                        .contains(alacritty_terminal::term::TermMode::ALT_SCREEN);
+                    Ok::<_, SnapshotFailureKind>((snapshot, alternate))
+                })?
+                .ok_or(SnapshotFailureKind::Unavailable)
+            });
+        let ((snapshot, alternate), frames) = match boundary {
+            Ok(boundary) => boundary,
+            Err(kind) => {
+                self.refuse_live_snapshot(kind, now);
+                return Err(kind);
+            }
+        };
+        let restore_primary = self.live_repair.is_some() || (self.was_alternate && !alternate);
         self.was_alternate = alternate;
-        let event = self.ingest_pty_frames(&frames);
+        self.live_repair = None;
+        let output = self.ingest_pty_frames(&frames);
         let snapshot = snapshot.into_bytes();
-        let event = if restore_primary {
-            // Preserve the raw frames for durability; the semantic snapshot
-            // only replaces their live event. A checkpoint may have drained
-            // every frame already, in which case the repair needs a new seq.
-            let seq = event
-                .map(|(seq, _)| seq)
+        let events = if restore_primary {
+            let seq = output
+                .last()
+                .map(|(seq, _)| *seq)
                 .unwrap_or_else(|| self.push_output_event(&snapshot));
-            Some((seq, snapshot.clone()))
+            vec![(seq, snapshot.clone())]
         } else {
-            event
+            output
         };
-        (snapshot, event)
+        Ok((snapshot, events))
     }
 }
 
@@ -255,10 +394,13 @@ fn pump_order(sessions: &HashMap<Uuid, DaemonSession>, priority: Option<Uuid>) -
 #[derive(Default)]
 pub struct DaemonState {
     sessions: HashMap<Uuid, DaemonSession>,
+    hook_store: Option<crate::memory::MemoryStore>,
     /// Instancias de app que adoptaron cada sesión. Una sesión puede estar
     /// adjunta temporalmente en dos UIs durante una reconexión; mientras
     /// cualquiera de sus claimants siga vivo, otra app no puede eliminarla.
     session_claimants: HashMap<Uuid, HashSet<Uuid>>,
+    /// No eviction: a late authenticated Spawn must remain fenced.
+    birth_tombstones: HashMap<Uuid, Uuid>,
     /// Cantidad de sockets autenticados por instancia (control + PTYs).
     client_connections: HashMap<Uuid, usize>,
     /// Conexiones de app abiertas ahora mismo.
@@ -272,9 +414,15 @@ pub struct DaemonState {
     /// con su propio presupuesto de 32 KB para que tipear nunca se sienta
     /// atrás de un panel de fondo escupiendo salida.
     priority_session: Option<Uuid>,
+    /// None selects the production limit; tests inject a small real envelope.
+    snapshot_line_limit: Option<usize>,
 }
 
 impl DaemonState {
+    fn snapshot_line_limit(&self) -> usize {
+        self.snapshot_line_limit.unwrap_or(MAX_PROTOCOL_LINE_BYTES)
+    }
+
     pub fn new() -> Self {
         Self {
             // Si el proceso arrancó pero la app murió antes del handshake,
@@ -337,6 +485,9 @@ impl DaemonState {
                         panel_id: spec.panel_id,
                         workspace_id: spec.workspace_id,
                         leaf_id: spec.leaf_id,
+
+                        hook_generation: spec.hook_generation,
+                        hook_owner: spec.hook_owner,
                     },
                     &history.checkpoint,
                     &history.frames,
@@ -358,6 +509,18 @@ impl DaemonState {
             &crate::state::scrollback_store::LeafSessionHistory,
         ) -> anyhow::Result<PtyHandle>,
     ) -> anyhow::Result<Uuid> {
+        let id = match desired_id {
+            Some(id) if self.sessions.contains_key(&id) => {
+                anyhow::bail!("el UUID solicitado ya pertenece a otra sesión: {id}");
+            }
+            Some(id) => id,
+            None => loop {
+                let candidate = Uuid::new_v4();
+                if !self.sessions.contains_key(&candidate) {
+                    break candidate;
+                }
+            },
+        };
         // Validate before registering the session or opening a PTY. Starting
         // a fresh shell after a failed read would let its later autosave
         // replace history which neither the daemon nor the UI recovered.
@@ -369,11 +532,7 @@ impl DaemonState {
             )?,
             None => crate::state::scrollback_store::LeafSessionHistory::default(),
         };
-        // Se respeta el id que propone el cliente para que el id de la app y
-        // el del daemon coincidan; si ya está tomado, se genera uno nuevo.
-        let id = desired_id
-            .filter(|id| !self.sessions.contains_key(id))
-            .unwrap_or_else(Uuid::new_v4);
+
         let handle = spawn_pty(id, &spec, &history).inspect_err(|err| {
             log::warn!("no se pudo espawnear el PTY de {id}: {err}");
         })?;
@@ -383,6 +542,7 @@ impl DaemonState {
             }
         }
         let mut session = DaemonSession::new(spec);
+        handle.set_daemon_durable_pressure(0);
         session.handle = Some(Arc::new(Mutex::new(handle)));
         self.sessions.insert(id, session);
         Ok(id)
@@ -393,6 +553,9 @@ impl DaemonState {
         let Some(session) = self.sessions.get(&id) else {
             return false;
         };
+        if session.retirement_requested {
+            return false;
+        }
         if let Some(handle) = session.handle.as_ref() {
             if let Ok(pty) = handle.lock() {
                 pty.write_all(data);
@@ -406,6 +569,9 @@ impl DaemonState {
         let Some(session) = self.sessions.get_mut(&id) else {
             return false;
         };
+        if session.retirement_requested {
+            return false;
+        }
         session.spec.cols = cols;
         session.spec.rows = rows;
         session.scrollback_dirty = true;
@@ -424,7 +590,13 @@ impl DaemonState {
     /// primero con presupuesto propio (32 KB) antes que el resto, para que
     /// tipear nunca se sienta atrás de un panel de fondo escupiendo salida.
     pub fn pump_output(&mut self) -> Vec<Response> {
+        self.pump_output_at(Instant::now())
+    }
+
+    fn pump_output_at(&mut self, now: Instant) -> Vec<Response> {
         let mut events = Vec::new();
+        let mut refused = Vec::new();
+        let line_limit = self.snapshot_line_limit();
         let ids = pump_order(&self.sessions, self.priority_session);
         let mut interactive_budget = if self.priority_session.is_some() {
             INTERACTIVE_BYTE_BUDGET
@@ -438,42 +610,109 @@ impl DaemonState {
             let Some(handle) = session.handle.clone() else {
                 continue;
             };
+            if session.retirement_requested {
+                self.capture_retirement(id);
+                continue;
+            }
             let is_priority = self.priority_session == Some(id);
-            let (frames, alive, alternate, replacement) = match handle.lock() {
+            let boundary = match handle.lock() {
                 Ok(pty) => {
-                    // Process liveness (including terminal exit events) is not
-                    // an EOF boundary. Sample reader completion before draining:
-                    // a completion during this drain is handled by the next pump.
                     let alive = !pty.output_finished();
                     let budget = if alive && is_priority && interactive_budget > 0 {
                         interactive_budget
                     } else {
                         usize::MAX
                     };
-                    let Some((frames, alternate, replacement)) = pty.output_update(
-                        budget,
-                        session.was_alternate,
-                        crate::terminal::export::live_snapshot_with_terminal_state,
-                    ) else {
-                        continue;
-                    };
-                    if is_priority {
-                        interactive_budget = interactive_budget.saturating_sub(frames.len());
+                    if session.live_repair.is_some() && !session.repair_retry_due(now) {
+                        // The first refusal drained nothing. Later pumps move only
+                        // complete raw frames into the durable queue, with no live
+                        // delivery or rendered repair recorded as PTY output.
+                        Ok((
+                            pty.drain_pending_log_capped(RAW_OUTPUT_CHUNK_BYTES),
+                            alive,
+                            session.was_alternate,
+                            None,
+                            true,
+                        ))
+                    } else {
+                        let metadata = pty.metadata_osc(true);
+                        if session.live_repair.is_some() {
+                            pty.try_attach_snapshot_and_drain(|term| {
+                                let snapshot =
+                                    bounded_wire_snapshot(term, &metadata, id, line_limit)?;
+                                let alternate = term
+                                    .mode()
+                                    .contains(alacritty_terminal::term::TermMode::ALT_SCREEN);
+                                Ok::<_, SnapshotFailureKind>((snapshot, alternate))
+                            })
+                            .and_then(|boundary| boundary.ok_or(SnapshotFailureKind::Unavailable))
+                            .map(|((snapshot, alternate), frames)| {
+                                (frames, alive, alternate, Some(snapshot), false)
+                            })
+                        } else {
+                            pty.try_output_update(budget, session.was_alternate, |term| {
+                                bounded_wire_snapshot(term, &metadata, id, line_limit)
+                            })
+                            .and_then(|boundary| boundary.ok_or(SnapshotFailureKind::Unavailable))
+                            .map(|(frames, alternate, repair)| {
+                                (frames, alive, alternate, repair, false)
+                            })
+                        }
                     }
-                    (frames, alive, alternate, replacement)
                 }
-                Err(_) => (Vec::new(), false, session.was_alternate, None),
+                Err(poison) => {
+                    if session.live_repair.is_some() && !session.repair_retry_due(now) {
+                        // A poisoned outer mutex does not make its independent
+                        // pending-log lock unsafe for a durable rescue. Its grid
+                        // still cannot be used as a semantic snapshot.
+                        let pty = poison.into_inner();
+                        Ok((
+                            pty.drain_pending_log_capped(RAW_OUTPUT_CHUNK_BYTES),
+                            !pty.output_finished(),
+                            session.was_alternate,
+                            None,
+                            true,
+                        ))
+                    } else {
+                        Err(SnapshotFailureKind::Unavailable)
+                    }
+                }
             };
-            session.was_alternate = alternate;
+            let (frames, alive, alternate, replacement, durable_only) = match boundary {
+                Ok(boundary) => boundary,
+                Err(kind) => {
+                    session.refuse_live_snapshot(kind, now);
+                    refused.push(id);
+                    continue;
+                }
+            };
+            if is_priority {
+                interactive_budget = interactive_budget.saturating_sub(frames.len());
+            }
             let output = session.ingest_pty_frames(&frames);
+            if durable_only {
+                // Liveness remains separate from snapshot availability. Existing
+                // subscribers were disconnected at refusal; no false Exit is sent.
+                if !alive {
+                    session.alive = false;
+                }
+                continue;
+            }
+            session.was_alternate = alternate;
+            session.live_repair = None;
             if let Some(snapshot) = replacement {
                 let data = snapshot.into_bytes();
                 let seq = output
-                    .map(|(seq, _)| seq)
+                    .last()
+                    .map(|(seq, _)| *seq)
                     .unwrap_or_else(|| session.push_output_event(&data));
                 events.push(Response::Output { id, seq, data });
-            } else if let Some((seq, data)) = output {
-                events.push(Response::Output { id, seq, data });
+            } else {
+                events.extend(output.into_iter().map(|(seq, data)| Response::Output {
+                    id,
+                    seq,
+                    data,
+                }));
             }
             if let Ok(pty) = handle.lock() {
                 if let Some(message) = pty.input_error() {
@@ -485,18 +724,23 @@ impl DaemonState {
                 let metadata = pty.metadata_osc(false);
                 if metadata != session.last_metadata {
                     session.last_metadata = metadata.clone();
-                    let seq = session.push_output_event(&metadata);
-                    events.push(Response::Output {
-                        id,
-                        seq,
-                        data: metadata,
-                    });
+                    for data in metadata.chunks(RAW_OUTPUT_CHUNK_BYTES) {
+                        let seq = session.push_output_event(data);
+                        events.push(Response::Output {
+                            id,
+                            seq,
+                            data: data.to_vec(),
+                        });
+                    }
                 }
             }
             if !alive && session.alive {
                 session.alive = false;
                 events.push(Response::Exit { id });
             }
+        }
+        for id in refused {
+            self.disconnect_session_subscribers(id);
         }
         events
     }
@@ -505,41 +749,90 @@ impl DaemonState {
     /// lock del PTY, pero el I/O durable se hace después de soltar el registro
     /// global del daemon.
     fn take_dirty_scrollback_targets(&mut self) -> Vec<ScrollbackTarget> {
+        self.take_dirty_scrollback_targets_at(Instant::now())
+    }
+
+    fn take_dirty_scrollback_targets_at(&mut self, now: Instant) -> Vec<ScrollbackTarget> {
         let mut targets = Vec::new();
         let mut events = Vec::new();
+        let mut refused = Vec::new();
+        let line_limit = self.snapshot_line_limit();
         for (session_id, session) in &mut self.sessions {
+            if session.retirement_requested {
+                continue;
+            }
             if !session.scrollback_dirty {
                 continue;
             }
             let Some(panel_id) = session.spec.panel_id else {
                 continue;
             };
-            let boundary = session.handle.as_ref().and_then(|handle| {
-                handle.lock().ok()?.attach_snapshot_and_drain(|term| {
-                    (!term
-                        .mode()
-                        .contains(alacritty_terminal::term::TermMode::ALT_SCREEN))
-                    .then(|| crate::terminal::export::scrollback_to_ansi(term))
-                })
-            });
-            let Some((text, frames)) = boundary else {
+            if session.live_repair.is_some() && !session.repair_retry_due(now) {
+                continue;
+            }
+            let Some(handle) = session.handle.clone() else {
                 continue;
             };
-            // The checkpoint includes output the pump has not seen yet.
-            // Number and broadcast it now, and acknowledge that same prefix
-            // only after the checkpoint is durable.
-            if let Some((seq, data)) = session.ingest_pty_frames(&frames) {
+            let boundary = handle
+                .lock()
+                .map_err(|_| SnapshotFailureKind::Unavailable)
+                .and_then(|pty| {
+                    let metadata = pty.metadata_osc(true);
+                    pty.try_attach_snapshot_and_drain(|term| {
+                        let alternate = term
+                            .mode()
+                            .contains(alacritty_terminal::term::TermMode::ALT_SCREEN);
+                        let repair = if session.live_repair.is_some()
+                            || (session.was_alternate && !alternate)
+                        {
+                            Some(bounded_wire_snapshot(
+                                term,
+                                &metadata,
+                                *session_id,
+                                line_limit,
+                            )?)
+                        } else {
+                            None
+                        };
+                        // Checkpoint text stays complete and independent of the
+                        // bounded live replay. Both exports observe the same grid
+                        // before the pending frames can leave the atomic boundary.
+                        let text =
+                            (!alternate).then(|| crate::terminal::export::scrollback_to_ansi(term));
+                        Ok::<_, SnapshotFailureKind>((text, repair, alternate))
+                    })?
+                    .ok_or(SnapshotFailureKind::Unavailable)
+                });
+            let ((text, repair, alternate), frames) = match boundary {
+                Ok(boundary) => boundary,
+                Err(kind) => {
+                    session.refuse_live_snapshot(kind, now);
+                    refused.push(*session_id);
+                    continue;
+                }
+            };
+            let output = session.ingest_pty_frames(&frames);
+            session.was_alternate = alternate;
+            session.live_repair = None;
+            if let Some(snapshot) = repair {
+                let data = snapshot.into_bytes();
+                let seq = output
+                    .last()
+                    .map(|(seq, _)| *seq)
+                    .unwrap_or_else(|| session.push_output_event(&data));
                 events.push(Response::Output {
                     id: *session_id,
                     seq,
                     data,
                 });
+            } else {
+                events.extend(output.into_iter().map(|(seq, data)| Response::Output {
+                    id: *session_id,
+                    seq,
+                    data,
+                }));
             }
-            // Keep the primary checkpoint and incremental transitions while
-            // an alternate-screen application is active.
-            let Some(text) = text else {
-                continue;
-            };
+            let Some(text) = text else { continue };
             session.scrollback_dirty = false;
             targets.push(ScrollbackTarget {
                 session_id: *session_id,
@@ -549,9 +842,13 @@ impl DaemonState {
                 pending_bytes: session.persist_pending.len(),
             });
         }
+        for id in refused {
+            self.disconnect_session_subscribers(id);
+        }
         self.broadcast(&events);
         targets
     }
+
     fn incremental_scrollback_targets(&self) -> Vec<IncrementalTarget> {
         self.sessions
             .iter()
@@ -587,19 +884,107 @@ impl DaemonState {
         self.sessions.get(&id)
     }
 
+    /// True only after durable final output permits destroying the handle.
     pub fn kill(&mut self, id: Uuid) -> bool {
-        match self.sessions.remove(&id) {
-            Some(session) => {
-                self.broadcast(&[Response::Exit { id }]);
-                self.session_claimants.remove(&id);
-                if self.priority_session == Some(id) {
-                    self.priority_session = None;
-                }
-                // Cerrar el handle mata al hijo: si no, queda huérfano.
-                drop(session.handle);
-                true
+        let Some(session) = self.sessions.get_mut(&id) else {
+            return false;
+        };
+        if host_target_from_spec(&session.spec).is_some()
+            && !host_close_fenced(self.hook_store.as_ref(), id, session, None)
+        {
+            return false;
+        }
+        session.retirement_requested = true;
+        // Registry-only sessions have no PTY/log ownership. Production creation
+        // always publishes a handle; retaining this route preserves that harness.
+        if session.handle.is_none() {
+            session.retirement_captured = true;
+            session.retirement_final_captured = true;
+        }
+        self.capture_retirement(id);
+        if !self.sessions.get(&id).is_some_and(|session| {
+            session.retirement_final_captured
+                && (session.handle.is_none() || session.persist_pending.is_empty())
+        }) {
+            return false;
+        }
+        let session = self.sessions.remove(&id).expect("retirement was validated");
+        if let Some(creator) = session.birth_client {
+            self.birth_tombstones.insert(id, creator);
+        }
+        self.broadcast(&[Response::Exit { id }]);
+        self.disconnect_session_subscribers(id);
+        self.session_claimants.remove(&id);
+        if self.priority_session == Some(id) {
+            self.priority_session = None;
+        }
+        drop(session.handle);
+        true
+    }
+
+    fn capture_retirement(&mut self, id: Uuid) {
+        let Some(session) = self.sessions.get_mut(&id) else {
+            return;
+        };
+        if !session.retirement_requested || session.retirement_final_captured {
+            return;
+        }
+        let Some(handle) = session.handle.clone() else {
+            return;
+        };
+        let mut pty = handle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !session.retirement_captured {
+            match pty.take_retirement_prefix(
+                &mut session.persist_pending,
+                &mut session.persist_seq,
+                session.spec.panel_id.is_some(),
+            ) {
+                Ok(true) => session.retirement_captured = true,
+                Ok(false) | Err(_) => return,
             }
-            None => false,
+        }
+        // This includes all output previously moved into the durable queue too.
+        // No child termination is admitted before this exact prefix is ACKed.
+        if !session.retirement_draining {
+            if !session.persist_pending.is_empty() {
+                return;
+            }
+            if pty.begin_retirement_drain().is_err() {
+                return;
+            }
+            session.retirement_draining = true;
+        }
+        // Transfer incrementally while draining: durable rejection still keeps
+        // pressure high, but successful ACKs let the reader reach physical EOF.
+        // Sample the physical boundary BEFORE the final transfer. If EOF races
+        // an earlier transfer, this remains false and another pump captures the
+        // newly appended tail; it cannot mark an empty early transfer as final.
+        let physical_complete = pty.retirement_physical_complete();
+        if !matches!(
+            pty.take_retirement_tail(
+                &mut session.persist_pending,
+                &mut session.persist_seq,
+                session.spec.panel_id.is_some()
+            ),
+            Ok(true)
+        ) {
+            return;
+        }
+        // A finished/panicked/canceled reader is insufficient. No more read or
+        // resize frames can arrive after this true EOF + child-wait boundary.
+        session.retirement_final_captured = physical_complete;
+    }
+
+    fn finish_acknowledged_retirements(&mut self) {
+        let ids: Vec<_> = self
+            .sessions
+            .iter()
+            .filter_map(|(id, session)| session.retirement_requested.then_some(*id))
+            .collect();
+        for id in ids {
+            let _ = self.kill(id);
         }
     }
 
@@ -614,7 +999,9 @@ impl DaemonState {
             }
         }
         for id in live {
-            if self.sessions.contains_key(id) {
+            if self.sessions.get(id).is_some_and(|session| {
+                session.birth_client.is_none() || session.client_may_close(client_id)
+            }) {
                 self.session_claimants
                     .entry(*id)
                     .or_default()
@@ -629,6 +1016,11 @@ impl DaemonState {
                 if live.contains(id) {
                     return false;
                 }
+                if self.sessions.get(id).is_some_and(|session| {
+                    session.birth_client.is_some() && !session.client_may_close(client_id)
+                }) {
+                    return false;
+                }
                 !self.session_claimants.get(id).is_some_and(|claimants| {
                     claimants
                         .iter()
@@ -636,14 +1028,7 @@ impl DaemonState {
                 })
             })
             .collect();
-        for id in &orphans {
-            self.sessions.remove(id);
-            self.session_claimants.remove(id);
-            if self.priority_session == Some(*id) {
-                self.priority_session = None;
-            }
-        }
-        let mut sorted = orphans;
+        let mut sorted: Vec<_> = orphans.into_iter().filter(|id| self.kill(*id)).collect();
         sorted.sort_by_key(Uuid::as_u128);
         sorted
     }
@@ -681,6 +1066,18 @@ impl DaemonState {
 
     /// Empuja los eventos a las apps conectadas y descarta los canales muertos
     /// (una app que se cerró): sin esto la lista crecería para siempre.
+    fn disconnect_session_subscribers(&mut self, session_id: Uuid) {
+        self.subscribers.retain(|subscriber| {
+            if subscriber.session_id != session_id {
+                return true;
+            }
+            if let Some(stream) = subscriber.disconnect.as_ref() {
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+            }
+            false
+        });
+    }
+
     pub fn broadcast(&mut self, events: &[Response]) {
         use std::sync::mpsc::TrySendError;
 
@@ -1025,7 +1422,38 @@ fn handle_request_for_client(
         Request::Hello { .. } => Response::Error {
             message: "handshake repetido".to_owned(),
         },
-        Request::Spawn { spec, id } => {
+        Request::Spawn { mut spec, id } => {
+            spec.hook_owner = Some(client_id);
+            if id.is_some_and(|id| state.birth_tombstones.contains_key(&id)) {
+                return birth_rejected_response(id.expect("identity was checked"));
+            }
+            if state
+                .sessions
+                .len()
+                .saturating_add(state.birth_tombstones.len())
+                >= MAX_BIRTH_IDENTITIES
+                && !id.is_some_and(|id| state.sessions.contains_key(&id))
+            {
+                return Response::Error {
+                    message: "La capacidad protegida de nacimientos está completa.".to_owned(),
+                };
+            }
+            if let Some(id) = id {
+                if let Some(session) = state.session(id) {
+                    // Repeating the same birth after a lost ACK must not run
+                    // a second shell or startup command. A different creator
+                    // never inherits this UUID through Spawn.
+                    return if session.birth_client == Some(client_id)
+                        && !session.retirement_requested
+                        && session.spec.hook_generation == spec.hook_generation
+                        && host_target_from_spec(&session.spec) == host_target_from_spec(&spec)
+                    {
+                        Response::Spawned { id }
+                    } else {
+                        birth_rejected_response(id)
+                    };
+                }
+            }
             let id = match scheduler {
                 Some(scheduler) => match state.spawn_with_pty(spec, scheduler, id) {
                     Ok(id) => id,
@@ -1036,7 +1464,7 @@ fn handle_request_for_client(
                     }
                 },
                 // Sin scheduler (tests del registro) no se espawnea nada.
-                None => match id.filter(|id| state.session(*id).is_none()) {
+                None => match id {
                     Some(id) => {
                         state.insert_session(id, spec);
                         id
@@ -1044,6 +1472,9 @@ fn handle_request_for_client(
                     None => state.spawn(spec),
                 },
             };
+            if let Some(session) = state.session_mut(id) {
+                session.birth_client = Some(client_id);
+            }
             state
                 .session_claimants
                 .entry(id)
@@ -1051,30 +1482,50 @@ fn handle_request_for_client(
                 .insert(client_id);
             Response::Spawned { id }
         }
-        Request::Attach { id } => match state.session_mut(id) {
-            Some(session) => {
-                let (snapshot, pending_output) = session.attach_boundary();
-                let seq = session.seq;
-                let response = Response::Attached {
-                    id,
-                    snapshot,
-                    seq,
-                    alive: session.alive,
-                };
-                if let Some((seq, data)) = pending_output {
-                    state.broadcast(&[Response::Output { id, seq, data }]);
+        Request::Attach { id } => {
+            let line_limit = state.snapshot_line_limit();
+            match state.session_mut(id) {
+                Some(session) => {
+                    if session.retirement_requested {
+                        return super::protocol::close_pending_response(id);
+                    }
+                    // Explicit adoption also authorizes closing a known session
+                    // whose snapshot is unavailable. It never changes its creator.
+                    session.adopters.insert(client_id);
+                    let (snapshot, pending_output) =
+                        match session.attach_boundary(id, line_limit, Instant::now()) {
+                            Ok(boundary) => boundary,
+                            Err(kind) => {
+                                state.disconnect_session_subscribers(id);
+                                return snapshot_failure_response(id, kind);
+                            }
+                        };
+                    let response = Response::Attached {
+                        id,
+                        snapshot,
+                        seq: session.seq,
+                        alive: session.alive,
+                        output_ready: session.output_ready,
+                        hook_generation: session.spec.hook_generation,
+                        hook_target: host_target_from_spec(&session.spec),
+                    };
+                    let events: Vec<_> = pending_output
+                        .into_iter()
+                        .map(|(seq, data)| Response::Output { id, seq, data })
+                        .collect();
+                    state.broadcast(&events);
+                    state
+                        .session_claimants
+                        .entry(id)
+                        .or_default()
+                        .insert(client_id);
+                    response
                 }
-                state
-                    .session_claimants
-                    .entry(id)
-                    .or_default()
-                    .insert(client_id);
-                response
+                None => Response::Error {
+                    message: format!("sesión desconocida: {id}"),
+                },
             }
-            None => Response::Error {
-                message: format!("sesión desconocida: {id}"),
-            },
-        },
+        }
         Request::Write { id, data } => {
             if state.write_to(id, &data) {
                 Response::Sessions {
@@ -1098,12 +1549,76 @@ fn handle_request_for_client(
             }
         }
         Request::Kill { id } => {
+            if state.session(id).is_some_and(|session| {
+                host_target_from_spec(&session.spec).is_some()
+                    && !host_close_fenced(state.hook_store.as_ref(), id, session, Some(client_id))
+            }) {
+                return birth_rejected_response(id);
+            }
+            if state
+                .session(id)
+                .is_some_and(|session| !session.client_may_close(client_id))
+            {
+                return birth_rejected_response(id);
+            }
             if state.kill(id) {
                 Response::Killed { id }
+            } else if state.session(id).is_some() {
+                super::protocol::close_pending_response(id)
             } else {
                 Response::Error {
                     message: format!("sesión desconocida: {id}"),
                 }
+            }
+        }
+        Request::CloseBirth { id } => {
+            if let Some(session) = state.session(id) {
+                let managed = host_target_from_spec(&session.spec).is_some();
+                if (managed
+                    && !host_close_fenced(state.hook_store.as_ref(), id, session, Some(client_id)))
+                    || (!managed && session.birth_client != Some(client_id))
+                {
+                    return birth_rejected_response(id);
+                }
+                if state.kill(id) {
+                    Response::Killed { id }
+                } else {
+                    super::protocol::close_pending_response(id)
+                }
+            } else if let Some(creator) = state.birth_tombstones.get(&id) {
+                if *creator == client_id
+                    || host_unknown_close_fence(state.hook_store.as_ref(), id, client_id).is_some()
+                {
+                    Response::Killed { id }
+                } else {
+                    birth_rejected_response(id)
+                }
+            } else if state
+                .sessions
+                .len()
+                .saturating_add(state.birth_tombstones.len())
+                < MAX_BIRTH_IDENTITIES
+            {
+                // Only an unconsumed, durably fenced nonce proves no factory
+                // ran. Consumed + absent registry is still uncertain after a
+                // crash/restart; never acknowledge it as physical closure.
+                let Some(claim) =
+                    host_unknown_close_fence(state.hook_store.as_ref(), id, client_id)
+                else {
+                    return super::protocol::close_pending_response(id);
+                };
+                let no_factory = state.hook_store.as_ref().is_some_and(|store| {
+                    store
+                        .hook_birth_consumed(claim)
+                        .is_ok_and(|consumed| !consumed)
+                });
+                if !no_factory {
+                    return super::protocol::close_pending_response(id);
+                }
+                state.birth_tombstones.insert(id, client_id);
+                Response::Killed { id }
+            } else {
+                super::protocol::close_pending_response(id)
             }
         }
         Request::SetPriority { id } => {
@@ -1182,7 +1697,9 @@ pub fn serve(dir: &Path, token: String) -> std::io::Result<()> {
     }
     log::info!("daemon escuchando en {}", socket.display());
 
-    let state = Arc::new(Mutex::new(DaemonState::new()));
+    let mut registry = DaemonState::new();
+    registry.hook_store = crate::memory::process_store();
+    let state = Arc::new(Mutex::new(registry));
     let shutdown = Arc::new(Mutex::new(false));
     let scheduler = Arc::new(Mutex::new(RuntimeScheduler::new()));
 
@@ -1204,9 +1721,20 @@ pub fn serve(dir: &Path, token: String) -> std::io::Result<()> {
                     }
                     if checkpoint_due {
                         scrollback_targets = state.take_dirty_scrollback_targets();
-                    } else {
-                        incremental_targets = state.incremental_scrollback_targets();
                     }
+                    incremental_targets = if checkpoint_due {
+                        state
+                            .incremental_scrollback_targets()
+                            .into_iter()
+                            .filter(|target| {
+                                state
+                                    .session(target.session_id)
+                                    .is_some_and(|session| session.retirement_requested)
+                            })
+                            .collect()
+                    } else {
+                        state.incremental_scrollback_targets()
+                    };
                 }
                 if checkpoint_due {
                     // Nunca sostener el registro global durante export/fsync:
@@ -1225,7 +1753,8 @@ pub fn serve(dir: &Path, token: String) -> std::io::Result<()> {
                         }
                     }
                     last_persist = Instant::now();
-                } else {
+                }
+                {
                     let (acknowledgements, rollover) =
                         persist_incremental_targets(incremental_targets);
                     if let Ok(mut state) = state.lock() {
@@ -1240,6 +1769,9 @@ pub fn serve(dir: &Path, token: String) -> std::io::Result<()> {
                             }
                         }
                     }
+                }
+                if let Ok(mut state) = state.lock() {
+                    state.finish_acknowledged_retirements();
                 }
             }
         });
@@ -1346,6 +1878,12 @@ fn serve_connection(
                         std::thread::spawn(move || {
                             while let Ok(event) = event_rx.recv() {
                                 if write_response(&event_writer, &event).is_err() {
+                                    // Close the read half too: framing failure must
+                                    // not leave a timed-out request socket reusable.
+                                    let stream = event_writer
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                    let _ = stream.shutdown(std::net::Shutdown::Both);
                                     break;
                                 }
                             }
@@ -1354,6 +1892,11 @@ fn serve_connection(
                             &writer,
                             &Response::Welcome {
                                 version: PROTOCOL_VERSION,
+                                birth_idempotent: true,
+                                birth_cancel_safe: true,
+                                // Enabled only by the composed V3 physical
+                                // child.wait + EOF + final-tail ACK producer.
+                                hook_birth_authority: false,
                             },
                         );
                     } else {
@@ -1446,12 +1989,34 @@ fn serve_connection(
     }
 }
 
+/// Encode and validate completely before invoking the socket writer. No
+/// oversized line or partial JSON prefix is ever presented to the transport.
+fn with_encoded_response(
+    response: &Response,
+    line_limit: usize,
+    write: impl FnOnce(&[u8]) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let line = encode_response_line_with_limit(response, line_limit)?;
+    write(&line)
+}
+
 fn write_response(writer: &Arc<Mutex<UnixStream>>, response: &Response) -> std::io::Result<()> {
-    let mut writer = writer
-        .lock()
-        .map_err(|_| std::io::Error::other("escritor del daemon envenenado"))?;
-    writer.write_all(encode_line(response).as_bytes())?;
-    writer.flush()
+    let result = with_encoded_response(response, MAX_PROTOCOL_LINE_BYTES, |line| {
+        let mut writer = writer
+            .lock()
+            .map_err(|_| std::io::Error::other("escritor del daemon envenenado"))?;
+        writer.write_all(line)?;
+        writer.flush()
+    });
+    if result.is_err() {
+        // Every call path, including Welcome and synchronous errors, invalidates
+        // the read half too. A failed stream cannot deliver a later stale reply.
+        let stream = writer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+    }
+    result
 }
 
 /// Path del directorio del daemon, con override por env para los tests de
@@ -1539,12 +2104,9 @@ mod tests {
             WireSpec::default(),
             Some(existing),
             None,
-            |id, _, _| {
-                assert_ne!(id, existing);
-                Err(anyhow::anyhow!("injected creation failure"))
-            },
+            |_, _, _| panic!("a UUID collision must be rejected before the PTY factory"),
         );
-        assert_eq!(result.unwrap_err().to_string(), "injected creation failure");
+        assert!(result.unwrap_err().to_string().contains("UUID solicitado"));
         assert_eq!(state.session_ids(), vec![existing]);
         let session = state.session(existing).unwrap();
         assert_eq!(session.spec, existing_spec);
@@ -1562,7 +2124,9 @@ mod tests {
         );
         assert!(matches!(
             response,
-            Response::Attached { id, snapshot, seq: 1, alive: true }
+            Response::Attached { id, snapshot, seq: 1, alive: true,
+            ..
+        }
                 if id == existing && snapshot == b"retained output"
         ));
     }
@@ -2807,3 +3371,820 @@ mod tests {
 #[cfg(test)]
 #[path = "attach_transition_tests.rs"]
 mod attach_transition_tests;
+
+#[cfg(test)]
+mod bounded_attach_contract_tests {
+    use super::*;
+    use crate::daemon::protocol::{snapshot_failure_from_response, snapshot_payload_budget};
+    use crate::state::scrollback_log::FrameKind;
+    use crate::terminal::pty::EventProxy;
+    use alacritty_terminal::term::test::TermSize;
+    use alacritty_terminal::term::{Config, Term, TermMode};
+    use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
+    use std::sync::mpsc;
+
+    // A parser-backed fake starts only the existing sink/input and no-op reader
+    // helpers; it never starts a PTY, shell, socket, watcher, app or server.
+    fn fixture(output: &[u8]) -> (DaemonState, Uuid, SharedPtyHandle) {
+        let mut state = DaemonState::new();
+        let id = Uuid::new_v4();
+        state.insert_session(
+            id,
+            WireSpec {
+                panel_id: Some(Uuid::new_v4()),
+                ..WireSpec::default()
+            },
+        );
+        let handle = Arc::new(Mutex::new(PtyHandle::for_persistence_tests(output)));
+        state.session_mut(id).unwrap().handle = Some(Arc::clone(&handle));
+        (state, id, handle)
+    }
+
+    fn durable_output(session: &DaemonSession) -> Vec<u8> {
+        decode_frames(&session.persist_pending)
+            .into_iter()
+            .filter(|frame| frame.kind == FrameKind::Output)
+            .flat_map(|frame| frame.payload)
+            .collect()
+    }
+
+    #[test]
+    fn refused_attach_preserves_pending_durable_sequence_and_other_subscriptions() {
+        let (mut state, id, handle) = fixture(b"UNSEEN_RAW");
+        state
+            .session_mut(id)
+            .unwrap()
+            .push_output(b"ALREADY_DURABLE");
+        let before_pending = handle.lock().unwrap().pending_log_snapshot();
+        let before_seq = state.session(id).unwrap().seq;
+        let before_persist = state.session(id).unwrap().persist_pending.clone();
+        let other = Uuid::new_v4();
+        state.insert_session(other, WireSpec::default());
+        let (tx, rx) = mpsc::sync_channel(8);
+        state.subscribe(Uuid::new_v4(), id, tx, None);
+        let (other_tx, other_rx) = mpsc::sync_channel(8);
+        state.subscribe(Uuid::new_v4(), other, other_tx, None);
+        state.snapshot_line_limit = Some(1);
+        let response = handle_request(&mut state, Request::Attach { id }, None);
+        assert_eq!(
+            snapshot_failure_from_response(&response),
+            Some((id, SnapshotFailureKind::TooLarge))
+        );
+        let session = state.session(id).unwrap();
+        assert_eq!(session.seq, before_seq);
+        assert_eq!(session.persist_pending, before_persist);
+        assert_eq!(
+            handle.lock().unwrap().pending_log_snapshot(),
+            before_pending
+        );
+        assert!(session.alive);
+        assert!(session.live_repair.is_some());
+        assert_eq!(state.subscriber_count(), 1);
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+        assert!(matches!(
+            other_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        assert!(!state.session_claimants.contains_key(&id));
+    }
+
+    #[test]
+    fn rejection_then_durable_only_pump_then_repair_preserves_ack_prefix_and_uuid() {
+        let (mut state, id, handle) = fixture(b"FIRST");
+        let now = Instant::now();
+        state.snapshot_line_limit = Some(1);
+        assert_eq!(
+            state
+                .session_mut(id)
+                .unwrap()
+                .attach_boundary(id, 1, now)
+                .unwrap_err(),
+            SnapshotFailureKind::TooLarge
+        );
+        assert!(!handle.lock().unwrap().pending_log_snapshot().is_empty());
+        assert!(state.session(id).unwrap().persist_pending.is_empty());
+        assert!(state
+            .pump_output_at(now + Duration::from_millis(1))
+            .is_empty());
+        assert!(handle.lock().unwrap().pending_log_snapshot().is_empty());
+        assert_eq!(durable_output(state.session(id).unwrap()), b"FIRST");
+        let first_prefix = state.session(id).unwrap().persist_pending.len();
+        handle
+            .lock()
+            .unwrap()
+            .feed_output_for_persistence_tests(b"SECOND");
+        assert!(state
+            .pump_output_at(now + Duration::from_millis(2))
+            .is_empty());
+        assert_eq!(durable_output(state.session(id).unwrap()), b"FIRSTSECOND");
+        state
+            .session_mut(id)
+            .unwrap()
+            .acknowledge_persisted(first_prefix);
+        assert_eq!(durable_output(state.session(id).unwrap()), b"SECOND");
+        assert!(state
+            .take_dirty_scrollback_targets_at(now + Duration::from_millis(3))
+            .is_empty());
+        assert_eq!(durable_output(state.session(id).unwrap()), b"SECOND");
+        state.snapshot_line_limit = None;
+        let events = state.pump_output_at(now + LIVE_REPAIR_RETRY);
+        assert!(events.iter().any(
+            |event| matches!(event, Response::Output { id: source, data, .. }
+            if *source == id && String::from_utf8_lossy(data).contains("FIRSTSECOND"))
+        ));
+        assert!(state.session(id).unwrap().live_repair.is_none());
+        assert_eq!(
+            durable_output(state.session(id).unwrap()),
+            b"SECOND",
+            "rendered repair must not become a durable raw output frame"
+        );
+        let targets = state.take_dirty_scrollback_targets_at(now + LIVE_REPAIR_RETRY);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].session_id, id);
+        assert!(targets[0].text.contains("FIRSTSECOND"));
+        assert_eq!(
+            targets[0].pending_bytes,
+            state.session(id).unwrap().persist_pending.len()
+        );
+        assert_eq!(
+            durable_output(state.session(id).unwrap()),
+            b"SECOND",
+            "capture alone never acknowledges durable frames"
+        );
+    }
+
+    struct View {
+        term: Term<EventProxy>,
+        parser: Processor<StdSyncHandler>,
+        seq: u64,
+    }
+
+    impl View {
+        fn attached(response: Response) -> Self {
+            let Response::Attached { snapshot, seq, .. } = response else {
+                panic!("expected Attached")
+            };
+            let (tx, _rx) = mpsc::channel();
+            let mut view = Self {
+                term: Term::new(
+                    Config::default(),
+                    &TermSize::new(80, 24),
+                    EventProxy::new(tx),
+                ),
+                parser: Processor::<StdSyncHandler>::new(),
+                seq,
+            };
+            view.parser.advance(&mut view.term, &snapshot);
+            view
+        }
+
+        fn receive(&mut self, rx: &mpsc::Receiver<Response>, id: Uuid) {
+            for event in rx.try_iter() {
+                if let Response::Output {
+                    id: source,
+                    seq,
+                    data,
+                } = event
+                {
+                    assert_eq!(source, id);
+                    assert!(seq > self.seq);
+                    self.seq = seq;
+                    self.parser.advance(&mut self.term, &data);
+                }
+            }
+        }
+
+        fn assert_repaired(&self) {
+            assert!(!self.term.mode().contains(TermMode::ALT_SCREEN));
+            let text = crate::terminal::export::scrollback_to_text(&self.term);
+            for marker in ["PRIMARY", "RETURNED"] {
+                assert_eq!(
+                    text.lines().filter(|line| line.trim() == marker).count(),
+                    1,
+                    "{text:?}"
+                );
+            }
+        }
+    }
+
+    fn assert_transition_order(first_observer: u8) {
+        let (mut state, id, handle) = fixture(b"\x1b[2J\x1b[3J\x1b[HPRIMARY\r\n\x1b[?1049hTUI");
+        let mut first = View::attached(handle_request(&mut state, Request::Attach { id }, None));
+        assert!(first.term.mode().contains(TermMode::ALT_SCREEN));
+        let (tx, rx) = mpsc::sync_channel(64);
+        state.subscribe(Uuid::new_v4(), id, tx, None);
+        handle
+            .lock()
+            .unwrap()
+            .feed_output_for_persistence_tests(b"\x1b[?1049l\r\nRETURNED\r\n");
+        if first_observer == 1 {
+            let events = state.pump_output();
+            state.broadcast(&events);
+        } else if first_observer == 2 {
+            let targets = state.take_dirty_scrollback_targets();
+            assert_eq!(targets.len(), 1);
+            assert!(targets[0].text.contains("PRIMARY"));
+            assert!(targets[0].text.contains("RETURNED"));
+        }
+        let second = View::attached(handle_request(&mut state, Request::Attach { id }, None));
+        first.receive(&rx, id);
+        first.assert_repaired();
+        second.assert_repaired();
+        for _ in 0..3 {
+            let events = state.pump_output();
+            state.broadcast(&events);
+            first.receive(&rx, id);
+        }
+        first.assert_repaired();
+        let durable = durable_output(state.session(id).unwrap());
+        for marker in [b"PRIMARY".as_slice(), b"RETURNED".as_slice()] {
+            assert_eq!(
+                durable
+                    .windows(marker.len())
+                    .filter(|window| *window == marker)
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn attach_first_repairs_primary_without_duplicate_durable_output() {
+        assert_transition_order(0);
+    }
+
+    #[test]
+    fn pump_first_repairs_primary_without_duplicate_durable_output() {
+        assert_transition_order(1);
+    }
+
+    #[test]
+    fn checkpoint_first_repairs_primary_without_duplicate_durable_output() {
+        assert_transition_order(2);
+    }
+
+    #[test]
+    fn refused_checkpoint_keeps_primary_repair_pending_and_unacknowledged() {
+        let (mut state, id, handle) = fixture(b"PRIMARY\r\n\x1b[?1049hTUI");
+        assert!(matches!(
+            handle_request(&mut state, Request::Attach { id }, None),
+            Response::Attached { .. }
+        ));
+        handle
+            .lock()
+            .unwrap()
+            .feed_output_for_persistence_tests(b"\x1b[?1049l\r\nRETURNED");
+        let pending = handle.lock().unwrap().pending_log_snapshot();
+        let seq = state.session(id).unwrap().seq;
+        let durable = state.session(id).unwrap().persist_pending.clone();
+        state.snapshot_line_limit = Some(1);
+        assert!(state.take_dirty_scrollback_targets().is_empty());
+        let session = state.session(id).unwrap();
+        assert!(session.was_alternate);
+        assert!(session.live_repair.is_some());
+        assert!(session.scrollback_dirty);
+        assert_eq!(session.seq, seq);
+        assert_eq!(session.persist_pending, durable);
+        assert_eq!(handle.lock().unwrap().pending_log_snapshot(), pending);
+    }
+
+    #[test]
+    fn refused_pump_keeps_primary_repair_pending_and_unacknowledged() {
+        let (mut state, id, handle) = fixture(b"PRIMARY\r\n\x1b[?1049hTUI");
+        assert!(matches!(
+            handle_request(&mut state, Request::Attach { id }, None),
+            Response::Attached { .. }
+        ));
+        handle
+            .lock()
+            .unwrap()
+            .feed_output_for_persistence_tests(b"\x1b[?1049l\r\nRETURNED");
+        let pending = handle.lock().unwrap().pending_log_snapshot();
+        let seq = state.session(id).unwrap().seq;
+        state.snapshot_line_limit = Some(1);
+        assert!(state.pump_output().is_empty());
+        let session = state.session(id).unwrap();
+        assert!(session.was_alternate);
+        assert!(session.live_repair.is_some());
+        assert!(session.alive);
+        assert_eq!(session.seq, seq);
+        assert_eq!(handle.lock().unwrap().pending_log_snapshot(), pending);
+    }
+
+    #[test]
+    fn raw_burst_chunks_roundtrip_with_strict_sequences_and_exact_durable_payload() {
+        let payload = vec![b'x'; RAW_OUTPUT_CHUNK_BYTES * 3 + 7];
+        let (mut state, id, _handle) = fixture(&payload);
+        let events = state.pump_output();
+        let mut previous = 0;
+        let mut live = Vec::new();
+        for event in events {
+            if let Response::Output {
+                id: source,
+                seq,
+                data,
+            } = &event
+            {
+                assert_eq!(*source, id);
+                assert!(*seq > previous);
+                previous = *seq;
+                assert!(data.len() <= RAW_OUTPUT_CHUNK_BYTES);
+                let encoded =
+                    encode_response_line_with_limit(&event, MAX_PROTOCOL_LINE_BYTES).unwrap();
+                assert!(encoded.len() <= MAX_PROTOCOL_LINE_BYTES);
+                assert_eq!(
+                    decode_line::<Response>(std::str::from_utf8(&encoded).unwrap()),
+                    Some(event.clone())
+                );
+                if data.iter().all(|byte| *byte == b'x') {
+                    live.extend_from_slice(data);
+                }
+            }
+        }
+        assert_eq!(live, payload);
+        assert_eq!(durable_output(state.session(id).unwrap()), payload);
+    }
+
+    #[test]
+    fn metadata_budget_failure_happens_before_atomic_drain_and_utf8_is_not_lossy() {
+        let (_state, id, handle) = fixture(b"RAW");
+        let pending = handle.lock().unwrap().pending_log_snapshot();
+        let cap = 512;
+        let metadata = vec![b'm'; snapshot_payload_budget(id, cap).unwrap() + 1];
+        let result = handle
+            .lock()
+            .unwrap()
+            .try_attach_snapshot_and_drain(|term| bounded_wire_snapshot(term, &metadata, id, cap));
+        assert_eq!(result.unwrap_err(), SnapshotFailureKind::TooLarge);
+        assert_eq!(handle.lock().unwrap().pending_log_snapshot(), pending);
+        let result = handle
+            .lock()
+            .unwrap()
+            .try_attach_snapshot_and_drain(|term| {
+                bounded_wire_snapshot(term, &[0xff], id, MAX_PROTOCOL_LINE_BYTES)
+            });
+        assert_eq!(result.unwrap_err(), SnapshotFailureKind::Unavailable);
+        assert_eq!(handle.lock().unwrap().pending_log_snapshot(), pending);
+    }
+
+    #[test]
+    fn final_writer_guard_never_calls_transport_for_an_oversized_response() {
+        let response = Response::Output {
+            id: Uuid::new_v4(),
+            seq: 1,
+            data: vec![b'x'; 512],
+        };
+        let mut transmitted = Vec::new();
+        let result = with_encoded_response(&response, 128, |line| {
+            transmitted.extend_from_slice(line);
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert!(transmitted.is_empty());
+        with_encoded_response(&response, MAX_PROTOCOL_LINE_BYTES, |line| {
+            transmitted.extend_from_slice(line);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            decode_line::<Response>(std::str::from_utf8(&transmitted).unwrap()),
+            Some(response)
+        );
+    }
+
+    #[test]
+    fn poisoned_outer_handle_refuses_before_drain_without_a_false_exit() {
+        let (mut state, id, handle) = fixture(b"RESCUE");
+        let pending = handle.lock().unwrap().pending_log_snapshot();
+        let poisoned = Arc::clone(&handle);
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = poisoned.lock().unwrap();
+            panic!("injected outer mutex failure");
+        }))
+        .is_err());
+        let now = Instant::now();
+        assert!(state.pump_output_at(now).is_empty());
+        assert!(state.session(id).unwrap().alive);
+        assert_eq!(state.session(id).unwrap().seq, 0);
+        let rescued = match handle.lock() {
+            Ok(_) => panic!("expected poisoned outer mutex"),
+            Err(poison) => poison.into_inner().pending_log_snapshot(),
+        };
+        assert_eq!(rescued, pending);
+        assert!(state
+            .pump_output_at(now + Duration::from_millis(1))
+            .is_empty());
+        assert_eq!(durable_output(state.session(id).unwrap()), b"RESCUE");
+    }
+}
+
+#[cfg(test)]
+mod full_attach_birth_retirement_fixtures {
+    use super::*;
+    use crate::daemon::protocol::{birth_rejected_from_response, snapshot_failure_from_response};
+
+    #[test]
+    fn actual_final_read_and_child_wait_cannot_race_an_empty_tail_capture() {
+        use std::io::{self, Read};
+        use std::sync::mpsc;
+        struct Reader {
+            step: usize,
+            events: mpsc::Sender<&'static str>,
+            release: mpsc::Receiver<()>,
+        }
+        impl Read for Reader {
+            fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+                self.step += 1;
+                match self.step {
+                    1 => {
+                        bytes[..6].copy_from_slice(b"PREFIX");
+                        Ok(6)
+                    }
+                    2 => {
+                        self.events.send("blocked-before-pause").unwrap();
+                        self.release.recv().unwrap();
+                        Err(io::ErrorKind::Interrupted.into())
+                    }
+                    3 => {
+                        self.events.send("final-read-admitted").unwrap();
+                        self.release.recv().unwrap();
+                        bytes[..4].copy_from_slice(b"TAIL");
+                        Ok(4)
+                    }
+                    _ => Ok(0),
+                }
+            }
+        }
+        let (events_tx, events_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (child_tx, child_rx) = mpsc::channel();
+        let (wait_tx, wait_rx) = mpsc::channel();
+        let handle = Arc::new(Mutex::new(PtyHandle::for_retirement_boundary_tests(
+            Box::new(Reader {
+                step: 0,
+                events: events_tx,
+                release: release_rx,
+            }),
+            child_tx,
+            wait_rx,
+        )));
+        handle.lock().unwrap().set_daemon_durable_pressure(0);
+        let id = Uuid::from_u128(0x6260);
+        let owner = Uuid::from_u128(0x6261);
+        let mut state = DaemonState::new();
+        state.insert_session(
+            id,
+            WireSpec {
+                panel_id: Some(Uuid::from_u128(0x6262)),
+                ..WireSpec::default()
+            },
+        );
+        state.session_mut(id).unwrap().birth_client = Some(owner);
+        state.session_mut(id).unwrap().handle = Some(handle.clone());
+        assert_eq!(
+            events_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            "blocked-before-pause"
+        );
+        assert!(!state.kill(id));
+        assert!(child_rx.try_recv().is_err());
+        release_tx.send(()).unwrap(); // injected completion of canceled sync IO
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !state.session(id).unwrap().retirement_captured {
+            state.capture_retirement(id);
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        let prefix = state.session(id).unwrap().persist_pending.clone();
+        assert_eq!(decode_frames(&prefix)[0].payload, b"PREFIX");
+        assert!(handle.lock().unwrap().pending_log_snapshot().is_empty());
+        assert!(child_rx.try_recv().is_err()); // no termination before durable ACK
+        state
+            .session_mut(id)
+            .unwrap()
+            .acknowledge_persisted(prefix.len());
+        state.capture_retirement(id);
+        assert_eq!(
+            child_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            "terminate"
+        );
+        assert_eq!(
+            child_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            "wait"
+        );
+        assert_eq!(
+            events_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            "final-read-admitted"
+        );
+        wait_tx.send(Ok(())).unwrap();
+        state.capture_retirement(id); // empty early tail, final read still blocked
+        assert!(state.session(id).unwrap().persist_pending.is_empty());
+        assert!(!state.session(id).unwrap().retirement_final_captured);
+        assert!(!state.kill(id));
+        release_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !handle.lock().unwrap().output_finished() {
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        // A stale UI ACK has no ownership of the newly admitted physical tail.
+        handle.lock().unwrap().acknowledge_pending_log(prefix.len());
+        assert_eq!(
+            decode_frames(
+                &handle
+                    .lock()
+                    .unwrap()
+                    .retirement_pending_snapshot()
+                    .unwrap()
+                    .unwrap()
+            )[0]
+            .payload,
+            b"TAIL"
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !state.session(id).unwrap().retirement_final_captured {
+            state.capture_retirement(id);
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        let tail = state.session(id).unwrap().persist_pending.clone();
+        assert_eq!(
+            decode_frames(&tail)
+                .iter()
+                .map(|frame| frame.payload.clone())
+                .collect::<Vec<_>>(),
+            [b"TAIL".to_vec()]
+        );
+        assert!(!state.kill(id)); // exact final durable tail ACK still missing
+        state
+            .session_mut(id)
+            .unwrap()
+            .acknowledge_persisted(tail.len());
+        assert!(state.kill(id));
+        assert_eq!(
+            request(&mut state, owner, Request::CloseBirth { id }),
+            Response::Killed { id }
+        );
+    }
+
+    fn request(state: &mut DaemonState, client: Uuid, request: Request) -> Response {
+        handle_request_for_client(state, request, None, client)
+    }
+
+    fn fake_session(panel: Option<Uuid>) -> (DaemonState, Uuid, Uuid, SharedPtyHandle) {
+        let mut state = DaemonState::new();
+        let id = Uuid::from_u128(0x6201);
+        let creator = Uuid::from_u128(0x6202);
+        state.insert_session(
+            id,
+            WireSpec {
+                panel_id: panel,
+                ..WireSpec::default()
+            },
+        );
+        let handle = Arc::new(Mutex::new(PtyHandle::for_persistence_tests(b"FINAL")));
+        handle.lock().unwrap().set_daemon_durable_pressure(0);
+        let session = state.session_mut(id).unwrap();
+        session.birth_client = Some(creator);
+        session.handle = Some(Arc::clone(&handle));
+        (state, id, creator, handle)
+    }
+
+    #[test]
+    fn lost_spawn_ack_repeats_uuid_without_replacing_the_creator_session() {
+        let mut state = DaemonState::new();
+        let id = Uuid::from_u128(0x6210);
+        let creator = Uuid::from_u128(0x6211);
+        let spec = WireSpec {
+            startup_command: Some("once".to_owned()),
+            ..WireSpec::default()
+        };
+        let _lost_ack = request(
+            &mut state,
+            creator,
+            Request::Spawn {
+                id: Some(id),
+                spec: spec.clone(),
+            },
+        );
+        state.session_mut(id).unwrap().push_output(b"PRESERVED");
+        let before = state.session(id).unwrap().persist_pending.clone();
+        let reply = request(
+            &mut state,
+            creator,
+            Request::Spawn {
+                id: Some(id),
+                spec: WireSpec::default(),
+            },
+        );
+        assert_eq!(reply, Response::Spawned { id });
+        assert_eq!(state.session_ids(), vec![id]);
+        assert_eq!(state.session(id).unwrap().spec, spec);
+        assert_eq!(state.session(id).unwrap().persist_pending, before);
+        assert_eq!(state.session(id).unwrap().birth_client, Some(creator));
+    }
+
+    #[test]
+    fn cancelled_birth_fences_a_late_spawn_and_foreign_creator() {
+        let mut state = DaemonState::new();
+        let id = Uuid::from_u128(0x6220);
+        let creator = Uuid::from_u128(0x6221);
+        let path =
+            std::env::temp_dir().join(format!("tc-host-close-ledger-{}.sqlite", Uuid::new_v4()));
+        let store = crate::memory::MemoryStore::open(&path).unwrap();
+        let key = crate::hook_authority::LeafKey {
+            workspace: Uuid::new_v4(),
+            panel: Uuid::new_v4(),
+            leaf: Uuid::new_v4(),
+        };
+        let birth = store
+            .hook_transition(
+                creator,
+                Uuid::new_v4(),
+                &crate::memory::hook_ledger::LedgerIntent::Reserve {
+                    expected: None,
+                    key,
+                    birth: crate::hook_authority::BirthBinding {
+                        runtime: id,
+                        generation: Uuid::new_v4(),
+                    },
+                    owner: creator,
+                },
+            )
+            .unwrap()
+            .claim
+            .unwrap();
+        store
+            .hook_transition(
+                creator,
+                Uuid::new_v4(),
+                &crate::memory::hook_ledger::LedgerIntent::FenceRetire { expected: birth },
+            )
+            .unwrap();
+        state.hook_store = Some(store);
+        assert_eq!(
+            request(&mut state, creator, Request::CloseBirth { id }),
+            Response::Killed { id }
+        );
+        let late = request(
+            &mut state,
+            creator,
+            Request::Spawn {
+                id: Some(id),
+                spec: WireSpec::default(),
+            },
+        );
+        assert_eq!(birth_rejected_from_response(&late), Some(id));
+        let foreign = request(
+            &mut state,
+            Uuid::from_u128(0x6222),
+            Request::CloseBirth { id },
+        );
+        assert_eq!(birth_rejected_from_response(&foreign), Some(id));
+        assert!(state.session_ids().is_empty());
+        assert_eq!(state.birth_tombstones[&id], creator);
+        drop(state);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
+    fn foreign_birth_rejection_never_grants_adoption_or_kill() {
+        let (mut state, id, creator, _) = fake_session(Some(Uuid::from_u128(0x6230)));
+        let foreign = Uuid::from_u128(0x6231);
+        assert_eq!(
+            birth_rejected_from_response(&request(
+                &mut state,
+                foreign,
+                Request::Spawn {
+                    id: Some(id),
+                    spec: WireSpec::default()
+                }
+            )),
+            Some(id)
+        );
+        assert_eq!(
+            birth_rejected_from_response(&request(&mut state, foreign, Request::CloseBirth { id })),
+            Some(id)
+        );
+        assert!(!state.session(id).unwrap().adopters.contains(&foreign));
+        assert_eq!(state.session(id).unwrap().birth_client, Some(creator));
+        assert!(!state.session(id).unwrap().retirement_requested);
+    }
+
+    #[test]
+    fn creator_close_waits_for_final_raw_ack_even_after_snapshot_refusal() {
+        let (mut state, id, creator, handle) = fake_session(Some(Uuid::from_u128(0x6240)));
+        state.snapshot_line_limit = Some(1);
+        assert!(snapshot_failure_from_response(&request(
+            &mut state,
+            creator,
+            Request::Attach { id }
+        ))
+        .is_some());
+        let before = handle.lock().unwrap().pending_log_snapshot();
+        let close = request(&mut state, creator, Request::CloseBirth { id });
+        assert!(matches!(close, Response::Error { .. }));
+        assert!(state.session(id).unwrap().handle.is_some());
+        assert!(!before.is_empty());
+        assert!(handle.lock().unwrap().pending_log_snapshot().is_empty());
+        assert_eq!(
+            decode_frames(&state.session(id).unwrap().persist_pending)[0].payload,
+            b"FINAL"
+        );
+        state.finish_acknowledged_retirements();
+        assert!(state.session(id).is_some());
+        let bytes = state.session(id).unwrap().persist_pending.len();
+        state.session_mut(id).unwrap().acknowledge_persisted(bytes);
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        while state.session(id).is_some() {
+            state.finish_acknowledged_retirements();
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert_eq!(state.birth_tombstones[&id], creator);
+        assert_eq!(
+            request(&mut state, creator, Request::CloseBirth { id }),
+            Response::Killed { id }
+        );
+    }
+
+    #[test]
+    fn old_prefix_ack_cannot_destroy_the_unacknowledged_final_tail() {
+        let (mut state, id, _, _) = fake_session(Some(Uuid::from_u128(0x6250)));
+        state.session_mut(id).unwrap().push_output(b"PREFIX");
+        let prefix = state.session(id).unwrap().persist_pending.len();
+        assert!(!state.kill(id));
+        state.session_mut(id).unwrap().acknowledge_persisted(prefix);
+        state.finish_acknowledged_retirements();
+        assert!(state.session(id).is_some());
+        let pending = &state.session(id).unwrap().persist_pending;
+        assert_eq!(decode_frames(pending)[0].payload, b"FINAL");
+        let bytes = pending.len();
+        state.session_mut(id).unwrap().acknowledge_persisted(bytes);
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        while state.session(id).is_some() {
+            state.finish_acknowledged_retirements();
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn reconcile_and_missing_destination_keep_the_pending_pty_protected() {
+        let (mut state, id, creator, handle) = fake_session(None);
+        let pending = handle.lock().unwrap().pending_log_snapshot();
+        assert!(state.reconcile_live(creator, &[]).is_empty());
+        assert!(state.session(id).unwrap().retirement_requested);
+        assert!(!state.session(id).unwrap().retirement_captured);
+        assert_eq!(
+            handle
+                .lock()
+                .unwrap()
+                .retirement_pending_snapshot()
+                .unwrap()
+                .unwrap(),
+            pending
+        );
+        assert!(state.session(id).unwrap().persist_pending.is_empty());
+        assert!(!state.should_shutdown_with_request(Instant::now(), true));
+    }
+}
+
+fn host_target_from_spec(spec: &WireSpec) -> Option<super::protocol::HostHookTarget> {
+    Some(super::protocol::HostHookTarget {
+        workspace_id: spec.workspace_id?,
+        panel_id: spec.panel_id?,
+        leaf_id: spec.leaf_id?,
+    })
+}
+
+fn host_unknown_close_fence(
+    store: Option<&crate::memory::MemoryStore>,
+    runtime: Uuid,
+    owner: Uuid,
+) -> Option<crate::hook_authority::Claim> {
+    store?.hook_close_claim(runtime, Some(owner)).ok()?
+}
+
+fn host_close_fenced(
+    store: Option<&crate::memory::MemoryStore>,
+    runtime: Uuid,
+    session: &DaemonSession,
+    owner: Option<Uuid>,
+) -> bool {
+    let Some(target) = host_target_from_spec(&session.spec) else {
+        return true;
+    };
+    store
+        .and_then(|store| store.hook_close_claim(runtime, owner).ok().flatten())
+        .is_some_and(|claim| {
+            claim.generation == session.spec.hook_generation
+                && claim.key.workspace == target.workspace_id
+                && claim.key.panel == target.panel_id
+                && claim.key.leaf == target.leaf_id
+        })
+}
