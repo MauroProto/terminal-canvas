@@ -40,9 +40,9 @@ def wait_for(label, observe, timeout=DEADLINE):
     raise AssertionError(f"Timed out waiting for {label}")
 
 
-def command(*args):
+def command(*args, env=None):
     return subprocess.run(args, check=True, capture_output=True, text=True,
-                          timeout=15).stdout.strip()
+                          timeout=15, env=env).stdout.strip()
 
 
 def leaf_ids(node):
@@ -72,6 +72,7 @@ class Desktop:
         self.window = None
         self.starts = 0
         self.screenshots = 0
+        self.ocr_times = []
         self.data_mode = stat.S_IMODE((self.profile / "data").stat().st_mode)
         write_new(self.profile / "config" / "config.toml",
                   '[terminal]\nshell = "/bin/bash"\nscrollback_lines = 50000\n'
@@ -164,7 +165,15 @@ else:
 
     def ocr(self, label):
         path = self.screenshot(label)
-        text = command("tesseract", str(path), "stdout", "-l", "eng")
+        # Avoid OpenMP oversubscription alongside the software WGPU renderer:
+        # https://tesseract-ocr.github.io/tessdoc/FAQ.html#can-i-increase-speed-of-ocr
+        ocr_env = self.env.copy()
+        ocr_env["OMP_THREAD_LIMIT"] = "1"
+        started = time.monotonic()
+        try:
+            text = command("tesseract", str(path), "stdout", "-l", "eng", env=ocr_env)
+        finally:
+            self.ocr_times.append({"label": label, "seconds": time.monotonic() - started})
         write_new(path.with_suffix(".txt"), text)
         return " ".join(unicodedata.normalize("NFKD", text).encode(
             "ascii", "ignore").decode().lower().split())
@@ -335,6 +344,7 @@ def main():
         raise
     finally:
         desktop.cleanup()
+        result["ocr_times"] = desktop.ocr_times
         write_new(args.output / "result.json", json.dumps(result, indent=2) + "\n")
         print(json.dumps(result, indent=2), flush=True)
 
