@@ -31,6 +31,7 @@ fn guest_app(ctx: &egui::Context) -> TerminalApp {
 }
 
 fn pump_until(
+    phase: &str,
     host: &mut CollabManager,
     guest: &mut TerminalApp,
     done: impl Fn(&CollabManager, &TerminalApp) -> bool,
@@ -48,9 +49,13 @@ fn pump_until(
         }
         assert!(
             Instant::now() < deadline,
-            "Online setup timeout: host={:?}, guest={:?}, host_error={:?}, guest_error={:?}",
+            "Online {phase} timeout: host={:?}, guest={:?}, joining={}, guest_id={:?}, snapshot={}, host_guests={:?}, host_error={:?}, guest_error={:?}",
             host.session_state(),
             guest.collab.session_state(),
+            guest.collab.join_in_flight(),
+            guest.collab.guest_view().my_guest_id,
+            guest.collab.guest_view().snapshot.is_some(),
+            host.guests(),
             host.last_error(),
             guest.collab.last_error()
         );
@@ -139,23 +144,28 @@ fn online_guest_dialog_text_never_reaches_the_real_host_transport() {
             guest.local_device_id.clone(),
         )
         .unwrap();
-    pump_until(&mut host, &mut guest, |host, _| {
+    pump_until("join request", &mut host, &mut guest, |host, _| {
         !host.pending_joins().is_empty()
     });
     assert_eq!(host.pending_joins().len(), 1);
     let id = host.pending_joins()[0].guest_id;
     host.approve_join(id);
-    pump_until(&mut host, &mut guest, |_, guest| {
-        guest.collab.session_state() == CollabSessionState::Live
-            && guest.collab.guest_view().snapshot.is_some()
-    });
+    pump_until(
+        "approval and snapshot",
+        &mut host,
+        &mut guest,
+        |_, guest| {
+            guest.collab.session_state() == CollabSessionState::Live
+                && guest.collab.guest_view().snapshot.is_some()
+        },
+    );
     guest.collab.focus_remote_panel(Uuid::from_u128(2));
     guest.collab.request_control(Uuid::from_u128(2));
-    pump_until(&mut host, &mut guest, |host, _| {
+    pump_until("control request", &mut host, &mut guest, |host, _| {
         !host.pending_control_requests().is_empty()
     });
     host.grant_control(Uuid::from_u128(2), id);
-    pump_until(&mut host, &mut guest, |_, guest| {
+    pump_until("control grant", &mut host, &mut guest, |_, guest| {
         guest.collab.guest_view().snapshot.as_ref().unwrap().panels[0].controller == Some(id)
     });
 
