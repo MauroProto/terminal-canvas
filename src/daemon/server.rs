@@ -726,6 +726,12 @@ impl DaemonState {
         }
     }
 
+    /// An explicit idle-shutdown request remains pending, but can only take
+    /// effect while the current registry contains no sessions.
+    fn should_shutdown_with_request(&self, now: Instant, requested: bool) -> bool {
+        (requested && self.sessions.is_empty()) || self.should_shutdown(now)
+    }
+
     /// ¿Puede apagarse? Solo si no quedan apps ni sesiones. Con sesiones vivas
     /// el daemon se queda, que es justo el motivo de que exista.
     pub fn should_shutdown(&self, now: Instant) -> bool {
@@ -1246,14 +1252,14 @@ pub fn serve(dir: &Path, token: String) -> std::io::Result<()> {
         let socket = socket.clone();
         std::thread::spawn(move || loop {
             std::thread::sleep(Duration::from_secs(5));
-            let idle = state
-                .lock()
-                .map(|state| state.should_shutdown(Instant::now()))
-                .unwrap_or(false);
             let asked = shutdown.lock().map(|flag| *flag).unwrap_or(false);
-            if idle || asked {
-                let _ = std::fs::remove_file(&socket);
-                std::process::exit(0);
+            if let Ok(state) = state.lock() {
+                if state.should_shutdown_with_request(Instant::now(), asked) {
+                    // Keep the registry locked through exit: a new Spawn
+                    // cannot be registered after the final idle decision.
+                    let _ = std::fs::remove_file(&socket);
+                    std::process::exit(0);
+                }
             }
         });
     }
