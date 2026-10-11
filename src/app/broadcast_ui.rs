@@ -634,6 +634,83 @@ mod tests {
     }
 
     #[test]
+    fn portable_context_broadcast_mixed_unavailable_destinations_keep_retry_draft() {
+        for change in ["provider", "runtime", "removed"] {
+            let (mut app, destinations) = context_fixture();
+            let state = app.broadcast.as_mut().unwrap();
+            state.text = "  Keep this frozen request.  ".to_owned();
+            state.toggle_context(true);
+            state.set_all_alive(true);
+            let context = state.context.clone().unwrap();
+            let original_runtime = state.targets[2].runtime_session_id;
+            let original_leaf = state.targets[2].leaf_id;
+            let source_revision = destinations[0].1.lock().unwrap().activity_revision();
+            let replacement_handle = match change {
+                "provider" => {
+                    app.workspaces[0].panels[2].set_title("Codex replacement".to_owned());
+                    None
+                }
+                "runtime" => {
+                    let manager = app.workspaces[0].pty_manager();
+                    let workspace_id = app.workspaces[0].id;
+                    let crate::panel::WorkspacePanel::Terminal(panel) =
+                        &mut app.workspaces[0].panels[2];
+                    assert!(panel.replace_focused_session(
+                        Arc::clone(&manager),
+                        None,
+                        workspace_id,
+                        "gemini".to_owned(),
+                        "gemini".to_owned()
+                    ));
+                    assert_eq!(panel.focused_leaf_id(), original_leaf);
+                    let new_runtime = panel.focused_runtime_session_id();
+                    assert_ne!(new_runtime, original_runtime);
+                    let handle = manager
+                        .lock()
+                        .unwrap()
+                        .handle(new_runtime.unwrap())
+                        .unwrap();
+                    Some(handle)
+                }
+                "removed" => {
+                    app.workspaces[0].panels.remove(2);
+                    None
+                }
+                _ => unreachable!(),
+            };
+
+            app.dispatch_broadcast();
+            let state = app.broadcast.as_ref().unwrap();
+            assert_eq!(state.text, "  Keep this frozen request.  ");
+            assert!(state.include_context);
+            assert_eq!(state.context.as_ref(), Some(&context));
+            assert!(!state.targets[1].selected);
+            assert!(state.targets[2].selected);
+            assert!(!state.targets[2].alive);
+            assert_eq!(state.targets[2].runtime_session_id, original_runtime);
+            assert!(state.selected_ids().is_empty());
+            assert_eq!(destinations[1].1.lock().unwrap().activity_revision(), 1);
+            assert_eq!(destinations[2].1.lock().unwrap().activity_revision(), 0);
+            assert_eq!(destinations[3].1.lock().unwrap().activity_revision(), 0);
+            assert_eq!(
+                destinations[0].1.lock().unwrap().activity_revision(),
+                source_revision
+            );
+            if let Some(handle) = replacement_handle {
+                assert_eq!(handle.lock().unwrap().activity_revision(), 0);
+            }
+
+            app.dispatch_broadcast();
+            assert_eq!(destinations[1].1.lock().unwrap().activity_revision(), 1);
+            assert_eq!(
+                app.broadcast.as_ref().unwrap().context.as_ref(),
+                Some(&context)
+            );
+            assert!(app.broadcast.as_ref().unwrap().targets[2].selected);
+        }
+    }
+
+    #[test]
     fn portable_context_broadcast_rejects_large_payload_and_retains_draft() {
         let (mut app, destinations) = context_fixture();
         let state = app.broadcast.as_mut().unwrap();
