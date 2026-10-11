@@ -51,7 +51,7 @@ jobs:
 
       - name: Install Linux font dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y pkg-config libfontconfig1-dev libfreetype6-dev xvfb xauth openbox xdotool imagemagick tesseract-ocr libvulkan1 mesa-vulkan-drivers
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libfontconfig1-dev libfreetype6-dev xvfb xauth openbox xdotool imagemagick tesseract-ocr libvulkan1 mesa-vulkan-drivers libxkbcommon-x11-0
 
       - name: Format check
         if: runner.os == 'Linux'

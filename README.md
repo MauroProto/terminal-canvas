@@ -120,10 +120,10 @@ Use Rust through `rustup`; the repository pins its compiler and tools in
 `rust-toolchain.toml`, matching CI. Windows source builds require the MSVC C++
 build tools. Build commands use the committed dependency lockfile. The graphics
 stack requires Rust 1.95 or newer; CI and `rust-toolchain.toml` use 1.98.0.
-On Ubuntu/Debian, install the font dependencies used by Wayland window decorations:
+On Ubuntu/Debian, install the font build dependencies and native X11 keyboard runtime:
 
 ```bash
-sudo apt-get install pkg-config libfontconfig1-dev libfreetype6-dev
+sudo apt-get install pkg-config libfontconfig1-dev libfreetype6-dev libxkbcommon-x11-0
 ```
 
 ```bash

@@ -38,6 +38,17 @@ No comprueba permisos de escritura ni el contenido de tus datos. Tampoco
 informa las rutas efectivas de memoria o historial definidas por overrides;
 revisá esas variables antes de preparar un respaldo.
 
+## Arranque gráfico en Linux
+
+La sesión X11 requiere `libxkbcommon-x11.so.0`. En Ubuntu/Debian la provee
+`libxkbcommon-x11-0`. Si el log informa que esa biblioteca no pudo cargarse,
+instalá ese paquete y volvé a abrir la app. Para compilar desde fuentes también
+se necesitan los paquetes de fuentes indicados en el README.
+
+El health-check revisa el paquete y sus helpers; no abre WGPU ni valida las
+bibliotecas del escritorio o el driver gráfico. CI prueba la apertura nativa en
+un escritorio Linux aislado y conserva [evidencia gráfica](GUI-VALIDATION.md).
+
 ## Memoria al actualizar la aplicación
 
 La app actualiza una base de memoria de esquema 1 o 2 a 3 antes de iniciar
