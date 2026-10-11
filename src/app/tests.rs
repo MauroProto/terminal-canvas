@@ -3890,3 +3890,31 @@ fn rename_from_palette_uses_one_enter_to_open_and_a_later_enter_to_save() {
     assert!(app.terminal_input_is_routable());
     assert!(app.ws().panels[0].runtime_session_id().is_none());
 }
+
+#[test]
+fn rename_title_focus_is_not_requested_again_after_tab_navigation() {
+    let ctx = egui::Context::default();
+    let mut app = detached_test_app_with_panel(&ctx);
+    let panel_id = app.ws().panels[0].id();
+    app.ws_mut().bring_to_front(panel_id);
+    rename_dialog_frame_for_test(
+        &ctx,
+        &mut app,
+        vec![rename_dialog_input_for_test(egui::Key::F2)],
+    );
+    rename_dialog_frame_for_test(&ctx, &mut app, Vec::new());
+    rename_dialog_frame_for_test(
+        &ctx,
+        &mut app,
+        vec![rename_dialog_input_for_test(egui::Key::Tab)],
+    );
+    let after_tab = ctx.memory(|memory| memory.focused());
+    assert!(after_tab.is_some());
+    assert_ne!(
+        after_tab,
+        Some(egui::Id::new(super::dialogs::RENAME_TITLE_ID))
+    );
+    rename_dialog_frame_for_test(&ctx, &mut app, Vec::new());
+    assert_eq!(ctx.memory(|memory| memory.focused()), after_tab);
+    assert_eq!(app.renaming_panel, Some(panel_id));
+}
