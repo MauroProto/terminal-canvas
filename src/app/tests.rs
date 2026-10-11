@@ -3754,3 +3754,71 @@ fn windows_file_drop_outside_a_panel_does_not_replace_the_clipboard() {
     assert!(copied.is_empty());
     assert!(app.ws().all_runtime_session_ids().is_empty());
 }
+
+fn rename_dialog_input_for_test(key: egui::Key) -> egui::Event {
+    egui::Event::Key {
+        key,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: Modifiers::NONE,
+    }
+}
+
+fn rename_dialog_frame_for_test(
+    ctx: &egui::Context,
+    app: &mut super::TerminalApp,
+    events: Vec<egui::Event>,
+) {
+    let mut output = ctx.run_ui(
+        RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 600.0))),
+            focused: true,
+            events,
+            ..Default::default()
+        },
+        |ui| {
+            let canvas = ui.available_rect_before_wrap();
+            if let Some(command) = app.handle_shortcuts(ui.ctx()) {
+                app.execute_command(command, ui.ctx(), canvas);
+            }
+            if let Some(command) = app.command_palette.show(ui.ctx(), canvas) {
+                app.execute_command(command, ui.ctx(), canvas);
+            }
+            app.show_rename_dialog(ui.ctx());
+        },
+    );
+    output.textures_delta.clear();
+    output.drop_without_applying_deltas();
+}
+
+#[test]
+fn rename_shortcut_focuses_title_before_the_next_text_event() {
+    let ctx = egui::Context::default();
+    let mut app = detached_test_app_with_panel(&ctx);
+    let panel_id = app.ws().panels[0].id();
+    app.ws_mut().bring_to_front(panel_id);
+    let original = app.ws().panels[0].title().to_owned();
+    assert!(app.ws().panels[0].runtime_session_id().is_none());
+
+    rename_dialog_frame_for_test(
+        &ctx,
+        &mut app,
+        vec![rename_dialog_input_for_test(egui::Key::F2)],
+    );
+    assert_eq!(app.renaming_panel, Some(panel_id));
+    assert_eq!(
+        ctx.memory(|memory| memory.focused()),
+        Some(egui::Id::new(super::dialogs::RENAME_TITLE_ID))
+    );
+    assert!(!app.terminal_input_is_routable());
+
+    rename_dialog_frame_for_test(
+        &ctx,
+        &mut app,
+        vec![egui::Event::Text(" nombre".to_owned())],
+    );
+    assert!(app.rename_buf.ends_with(" nombre"));
+    assert_eq!(app.ws().panels[0].title(), original);
+    assert!(app.ws().panels[0].runtime_session_id().is_none());
+}
