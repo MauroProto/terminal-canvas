@@ -132,6 +132,7 @@ impl HostSessionContext {
 
 #[derive(Debug)]
 struct GuestSessionContext {
+    approved: bool,
     session_id: ShareSessionId,
     guest_id: GuestId,
     session_secret: String,
@@ -1064,6 +1065,7 @@ impl CollabManager {
                                 continue;
                             }
                             self.guest = Some(GuestSessionContext {
+                                approved: response.auto_approved,
                                 session_id: invite.session_id,
                                 guest_id: response.guest_id,
                                 session_secret: invite.session_secret,
@@ -1078,6 +1080,7 @@ impl CollabManager {
                                 scroll_offsets: HashMap::new(),
                             };
                             self.mode = CollabMode::Guest;
+                            self.session_state = CollabSessionState::Starting;
                             self.broker_url = invite.broker_url;
                             self.received_message_seq.clear();
                         }
@@ -1106,23 +1109,36 @@ impl CollabManager {
         }
     }
 
+    fn handle_connected(&mut self) {
+        if matches!(self.session_state, CollabSessionState::Ended) {
+            return;
+        }
+        match self.mode {
+            CollabMode::Host => {
+                self.session_state = CollabSessionState::Live;
+                self.last_error = None;
+                // Queued frames can be lost during a reconnect; republish the
+                // full workspace and rekey state on the next UI tick.
+                if let Some(host) = &mut self.host {
+                    host.last_snapshot = None;
+                    host.last_rekey_recovery_at = None;
+                }
+            }
+            CollabMode::Guest => {
+                // A connected socket is not permission to join. The broker
+                // replays JoinApproved separately for authorized guests.
+                self.session_state = CollabSessionState::Starting;
+                self.last_error = None;
+            }
+            CollabMode::Inactive => {}
+        }
+    }
+
     fn handle_transport_events(&mut self) {
         self.apply_http_outcomes();
         for event in self.transport.drain_events() {
             match event {
-                super::transport::TransportEvent::Connected => {
-                    if matches!(self.mode, CollabMode::Host) {
-                        self.session_state = CollabSessionState::Live;
-                        self.last_error = None;
-                        // A reconnect may have lost queued frames. Force the
-                        // next UI tick to publish a complete snapshot even if
-                        // the workspace itself did not change.
-                        if let Some(host) = &mut self.host {
-                            host.last_snapshot = None;
-                            host.last_rekey_recovery_at = None;
-                        }
-                    }
-                }
+                super::transport::TransportEvent::Connected => self.handle_connected(),
                 super::transport::TransportEvent::Disconnected => {
                     if !matches!(self.session_state, CollabSessionState::Ended) {
                         self.session_state = CollabSessionState::Disconnected;
@@ -1145,16 +1161,7 @@ impl CollabManager {
 
     fn handle_broker_message(&mut self, message: BrokerControlMessage) {
         match message {
-            BrokerControlMessage::Connected { .. } => {
-                if matches!(self.mode, CollabMode::Host) {
-                    self.session_state = CollabSessionState::Live;
-                    self.last_error = None;
-                    if let Some(host) = &mut self.host {
-                        host.last_snapshot = None;
-                        host.last_rekey_recovery_at = None;
-                    }
-                }
-            }
+            BrokerControlMessage::Connected { .. } => self.handle_connected(),
             BrokerControlMessage::JoinRequested { request } => {
                 if let Some(host) = &mut self.host {
                     if !host
@@ -1167,14 +1174,24 @@ impl CollabManager {
                 }
             }
             BrokerControlMessage::JoinApproved { decision } => {
-                if self.guest.as_ref().map(|guest| guest.guest_id) == Some(decision.guest_id) {
-                    self.session_state = CollabSessionState::Live;
+                if let Some(guest) = &mut self.guest {
+                    if guest.guest_id == decision.guest_id
+                        && decision.approved
+                        && !matches!(self.session_state, CollabSessionState::Ended)
+                    {
+                        guest.approved = true;
+                        self.session_state = CollabSessionState::Live;
+                        self.last_error = None;
+                    }
                 }
             }
             BrokerControlMessage::JoinDenied { decision } => {
-                if self.guest.as_ref().map(|guest| guest.guest_id) == Some(decision.guest_id) {
-                    self.session_state = CollabSessionState::Ended;
-                    self.last_error = Some("Join request was denied".to_owned());
+                if let Some(guest) = &mut self.guest {
+                    if guest.guest_id == decision.guest_id {
+                        guest.approved = false;
+                        self.session_state = CollabSessionState::Ended;
+                        self.last_error = Some("Join request was denied".to_owned());
+                    }
                 }
             }
             BrokerControlMessage::Presence { guests } => {
@@ -1204,15 +1221,24 @@ impl CollabManager {
                 }
             }
             BrokerControlMessage::HostDisconnected => {
-                if matches!(self.mode, CollabMode::Guest) {
+                if matches!(self.mode, CollabMode::Guest)
+                    && !matches!(self.session_state, CollabSessionState::Ended)
+                {
                     self.session_state = CollabSessionState::Disconnected;
                     self.last_error =
                         Some("El host perdió la conexión de la sesión compartida".to_owned());
                 }
             }
             BrokerControlMessage::HostReconnected => {
-                if matches!(self.mode, CollabMode::Guest) {
-                    self.session_state = CollabSessionState::Live;
+                if matches!(self.mode, CollabMode::Guest)
+                    && !matches!(self.session_state, CollabSessionState::Ended)
+                {
+                    self.session_state = if self.guest.as_ref().is_some_and(|guest| guest.approved)
+                    {
+                        CollabSessionState::Live
+                    } else {
+                        CollabSessionState::Starting
+                    };
                     self.last_error = None;
                 }
             }
@@ -1762,6 +1788,7 @@ mod tests {
         manager.mode = CollabMode::Guest;
         manager.session_state = CollabSessionState::Starting;
         manager.guest = Some(GuestSessionContext {
+            approved: false,
             session_id: ShareSessionId(Uuid::new_v4()),
             guest_id,
             session_secret: "secret".to_owned(),
@@ -1770,10 +1797,24 @@ mod tests {
             next_message_seq: 1,
         });
 
+        // A Close event from the previous session can arrive while the HTTP
+        // join is in flight. Connecting must clear that stale status.
+        manager.session_state = CollabSessionState::Disconnected;
+        manager.handle_connected();
+        assert_eq!(manager.session_state, CollabSessionState::Starting);
         manager.handle_broker_message(BrokerControlMessage::Connected {
             role: SessionRole::Guest,
             guest_id: Some(guest_id),
         });
+        manager.handle_broker_message(BrokerControlMessage::JoinApproved {
+            decision: JoinDecision {
+                guest_id,
+                approved: false,
+            },
+        });
+        manager.handle_broker_message(BrokerControlMessage::HostDisconnected);
+        assert_eq!(manager.session_state, CollabSessionState::Disconnected);
+        manager.handle_broker_message(BrokerControlMessage::HostReconnected);
         assert_eq!(manager.session_state, CollabSessionState::Starting);
 
         manager.handle_broker_message(BrokerControlMessage::JoinApproved {
@@ -1783,6 +1824,23 @@ mod tests {
             },
         });
         assert_eq!(manager.session_state, CollabSessionState::Live);
+        manager.handle_broker_message(BrokerControlMessage::JoinDenied {
+            decision: JoinDecision {
+                guest_id,
+                approved: false,
+            },
+        });
+        manager.handle_connected();
+        manager.handle_broker_message(BrokerControlMessage::HostDisconnected);
+        manager.handle_broker_message(BrokerControlMessage::HostReconnected);
+        manager.handle_broker_message(BrokerControlMessage::JoinApproved {
+            decision: JoinDecision {
+                guest_id,
+                approved: true,
+            },
+        });
+        assert_eq!(manager.session_state, CollabSessionState::Ended);
+        assert!(!manager.guest.as_ref().unwrap().approved);
     }
 
     #[test]
@@ -1792,6 +1850,7 @@ mod tests {
         manager.mode = CollabMode::Guest;
         manager.session_state = CollabSessionState::Live;
         manager.guest = Some(GuestSessionContext {
+            approved: true,
             session_id: ShareSessionId(Uuid::new_v4()),
             guest_id,
             session_secret: "secret".to_owned(),
@@ -1917,6 +1976,7 @@ mod tests {
         manager.mode = CollabMode::Guest;
         manager.session_state = CollabSessionState::Live;
         manager.guest = Some(GuestSessionContext {
+            approved: true,
             session_id: ShareSessionId(Uuid::new_v4()),
             guest_id: GuestId(Uuid::new_v4()),
             session_secret: secret.clone(),
@@ -1958,6 +2018,7 @@ mod tests {
         manager.mode = CollabMode::Guest;
         manager.session_state = CollabSessionState::Live;
         manager.guest = Some(GuestSessionContext {
+            approved: true,
             session_id,
             guest_id: GuestId(Uuid::new_v4()),
             session_secret: secret.clone(),
@@ -1998,6 +2059,7 @@ mod tests {
         manager.mode = CollabMode::Guest;
         manager.session_state = CollabSessionState::Live;
         manager.guest = Some(GuestSessionContext {
+            approved: true,
             session_id,
             guest_id: my_guest_id,
             session_secret: secret.clone(),
@@ -2137,6 +2199,7 @@ mod tests {
         manager.mode = CollabMode::Guest;
         manager.session_state = CollabSessionState::Live;
         manager.guest = Some(GuestSessionContext {
+            approved: true,
             session_id: ShareSessionId(Uuid::new_v4()),
             guest_id: GuestId(Uuid::new_v4()),
             session_secret: old_secret.clone(),
@@ -2191,6 +2254,7 @@ mod tests {
         manager.mode = CollabMode::Guest;
         manager.session_state = CollabSessionState::Live;
         manager.guest = Some(GuestSessionContext {
+            approved: true,
             session_id: ShareSessionId(Uuid::new_v4()),
             guest_id: GuestId(Uuid::new_v4()),
             session_secret: new_secret.clone(),
