@@ -69,32 +69,76 @@ pub fn downloads_dir() -> PathBuf {
 
 /// Cosechador de procesos auxiliares.
 ///
-/// `std::process::Child` **no** espera al proceso hijo cuando se suelta, así
-/// que todo proceso lanzado y olvidado queda como zombi en la tabla de
-/// procesos hasta que la app termina. En una sesión larga con muchas campanas
-/// o notificaciones eso se acumula. Un único hilo los espera a todos; una
-/// alternativa por-proceso costaría un hilo por campana.
+/// Child no espera al proceso cuando se suelta. Un único worker revisa todos
+/// los hijos pendientes: un navegador de larga duración no retiene los hijos
+/// que ya terminaron ni requiere un hilo por cada campana.
 fn reaper() -> &'static Mutex<std::sync::mpsc::Sender<(String, Child)>> {
     static REAPER: OnceLock<Mutex<std::sync::mpsc::Sender<(String, Child)>>> = OnceLock::new();
     REAPER.get_or_init(|| {
         let (tx, rx) = std::sync::mpsc::channel::<(String, Child)>();
-        // Si el hilo no arranca, el canal igual acepta envíos y los procesos
-        // simplemente no se cosechan: peor, pero nunca un fallo para el que llama.
         let _ = std::thread::Builder::new()
             .name("process-reaper".to_owned())
-            .spawn(move || {
-                while let Ok((label, mut child)) = rx.recv() {
-                    match child.wait() {
-                        Ok(status) if !status.success() => {
-                            log::debug!("{label} terminó con estado {status}");
-                        }
-                        Err(err) => log::debug!("no se pudo esperar a {label}: {err}"),
-                        _ => {}
-                    }
-                }
-            });
+            .spawn(move || reap_children(rx, Child::try_wait));
         Mutex::new(tx)
     })
+}
+
+/// Wait for arrivals when idle; poll all live children at a bounded cadence.
+/// A bounded intake batch keeps a busy sender from starving exited children.
+fn reap_children<T>(
+    rx: std::sync::mpsc::Receiver<(String, T)>,
+    mut try_wait: impl FnMut(&mut T) -> std::io::Result<Option<std::process::ExitStatus>>,
+) {
+    use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
+
+    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+    const MAX_INTAKE_BATCH: usize = 64;
+    let mut pending = Vec::new();
+    let mut disconnected = false;
+    loop {
+        if pending.is_empty() {
+            if disconnected {
+                return;
+            }
+            match rx.recv() {
+                Ok(child) => pending.push(child),
+                Err(_) => return,
+            }
+        } else if disconnected {
+            // Preserve running detached applications after the sender closes.
+            std::thread::sleep(POLL_INTERVAL);
+        } else {
+            match rx.recv_timeout(POLL_INTERVAL) {
+                Ok(child) => pending.push(child),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => disconnected = true,
+            }
+        }
+
+        for _ in 0..MAX_INTAKE_BATCH {
+            match rx.try_recv() {
+                Ok(child) => pending.push(child),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
+            }
+        }
+        pending.retain_mut(|(label, child)| match try_wait(child) {
+            Ok(None) => true,
+            Ok(Some(status)) => {
+                if !status.success() {
+                    log::debug!("{label} terminó con estado {status}");
+                }
+                false
+            }
+            Err(err) => {
+                log::debug!("no se pudo esperar a {label}: {err}");
+                false
+            }
+        });
+    }
 }
 
 /// Lanza un proceso auxiliar **sin bloquear** al que llama y lo deja a cargo
