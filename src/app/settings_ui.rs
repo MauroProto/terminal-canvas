@@ -153,6 +153,22 @@ impl TerminalApp {
         }
     }
 
+    pub(super) fn show_config_load_warning(&self, ui: &mut egui::Ui) {
+        let Err(error) = config::ensure_config_write_allowed() else {
+            return;
+        };
+        egui::Panel::top("config-load-warning")
+            .resizable(false)
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new("Configuración sin cargar: guardado bloqueado")
+                        .strong()
+                        .color(egui::Color32::from_rgb(235, 170, 95)),
+                );
+                ui.label(error.to_string());
+            });
+    }
+
     fn settings_body(&mut self, ui: &mut egui::Ui) {
         let Some(draft) = self.settings_draft.as_mut() else {
             return;

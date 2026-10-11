@@ -1427,6 +1427,7 @@ impl TerminalApp {
         if let Some(command) = self.handle_shortcuts(&ctx) {
             self.execute_command(command, &ctx, ui.available_rect_before_wrap());
         }
+        self.show_config_load_warning(ui);
         self.show_persistence_warning(ui);
         self.show_layout_save_warning(ui);
         self.show_preferences_warning(ui);
