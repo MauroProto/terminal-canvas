@@ -42,8 +42,8 @@ pub fn shortcut_command(modifiers: &Modifiers, key: Key) -> Option<Command> {
         (true, true, K) => Some(AttachScreenshot),
         (true, true, R) => Some(ResumeConversation),
         (true, true, Enter) => Some(BroadcastCommand),
-        (true, true, OpenBracket) => Some(FocusPrev),
-        (true, true, CloseBracket) => Some(FocusNext),
+        (true, true, OpenBracket | OpenCurlyBracket) => Some(FocusPrev),
+        (true, true, CloseBracket | CloseCurlyBracket) => Some(FocusNext),
         (true, true, Num0) => Some(ZoomToFitAll),
         (true, false, B) => Some(ToggleSidebar),
         (true, false, P) => Some(QuickOpen),
@@ -60,6 +60,30 @@ pub fn shortcut_command(modifiers: &Modifiers, key: Key) -> Option<Command> {
 #[cfg(all(test, not(target_os = "macos")))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn panel_focus_accepts_the_shifted_logical_bracket_key() {
+        // egui-winit translates the character produced by Shift first. On a
+        // US layout Ctrl+Shift+[ therefore arrives as OpenCurlyBracket.
+        let mut modifiers = Modifiers {
+            ctrl: true,
+            shift: true,
+            ..Modifiers::NONE
+        };
+        for (character, expected) in [
+            ("[", Command::FocusPrev),
+            ("{", Command::FocusPrev),
+            ("]", Command::FocusNext),
+            ("}", Command::FocusNext),
+        ] {
+            let key = Key::from_name(character).expect("egui logical punctuation key");
+            assert_eq!(shortcut_command(&modifiers, key), Some(expected));
+        }
+        modifiers.shift = false;
+        assert_eq!(shortcut_command(&modifiers, Key::OpenCurlyBracket), None);
+        modifiers.ctrl = false;
+        assert_eq!(shortcut_command(&modifiers, Key::OpenBracket), None);
+    }
 
     #[test]
     fn splits_are_reachable_when_command_is_control() {
