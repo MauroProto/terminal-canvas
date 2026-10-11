@@ -2,6 +2,19 @@ use egui::{vec2, Color32, Vec2};
 
 use crate::theme::colors as palette;
 
+/// Saved desktop dividers use the same bounds as their drag controls.
+pub const DESKTOP_SPLIT_MIN: f32 = 0.18;
+pub const DESKTOP_SPLIT_MAX: f32 = 0.82;
+pub const DEFAULT_DESKTOP_SPLIT: f32 = 0.5;
+
+pub fn normalize_desktop_split(ratio: f32) -> f32 {
+    if ratio.is_finite() {
+        ratio.clamp(DESKTOP_SPLIT_MIN, DESKTOP_SPLIT_MAX)
+    } else {
+        DEFAULT_DESKTOP_SPLIT
+    }
+}
+
 pub const ZOOM_MIN: f32 = 0.125;
 pub const ZOOM_MAX: f32 = 4.0;
 pub const ZOOM_KEYBOARD_FACTOR: f32 = 1.15;

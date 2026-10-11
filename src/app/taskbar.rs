@@ -3,8 +3,9 @@ use crate::state::{PanelPlacement, SnapSlot};
 use crate::terminal::panel::snap_slot_rect;
 
 const MAX_VISIBLE_PANELS: usize = 4;
-pub(super) const SPLIT_MIN: f32 = 0.18;
-pub(super) const SPLIT_MAX: f32 = 0.82;
+pub(super) use crate::canvas::config::{
+    DESKTOP_SPLIT_MAX as SPLIT_MAX, DESKTOP_SPLIT_MIN as SPLIT_MIN,
+};
 
 pub(super) fn auto_layout_slots(visible_count: usize) -> Vec<SnapSlot> {
     match visible_count {

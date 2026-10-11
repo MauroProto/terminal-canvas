@@ -5,7 +5,8 @@ use egui::{pos2, Color32, Pos2, Rect, Vec2};
 use uuid::Uuid;
 
 use crate::canvas::config::{
-    normalize_panel_size, DEFAULT_PANEL_HEIGHT, DEFAULT_PANEL_WIDTH, PANEL_GAP, ZOOM_MAX, ZOOM_MIN,
+    normalize_desktop_split, normalize_panel_size, DEFAULT_DESKTOP_SPLIT, DEFAULT_PANEL_HEIGHT,
+    DEFAULT_PANEL_WIDTH, PANEL_GAP, ZOOM_MAX, ZOOM_MIN,
 };
 use crate::collab::{SharedPanelSnapshot, TerminalInputEvent};
 use crate::orchestration::PanelRuntimeObservation;
@@ -77,8 +78,8 @@ impl Workspace {
             next_color: 0,
             pty_manager: Arc::new(Mutex::new(PtyManager::new())),
             last_auto_tile_signature: None,
-            split_x: 0.5,
-            split_y: 0.5,
+            split_x: DEFAULT_DESKTOP_SPLIT,
+            split_y: DEFAULT_DESKTOP_SPLIT,
         }
     }
 
@@ -125,8 +126,8 @@ impl Workspace {
             next_color: desktop.next_color,
             pty_manager,
             last_auto_tile_signature: None,
-            split_x: 0.5,
-            split_y: 0.5,
+            split_x: normalize_desktop_split(desktop.split_x),
+            split_y: normalize_desktop_split(desktop.split_y),
         };
         workspace.reconcile_order_counters();
         if workspace
@@ -150,6 +151,8 @@ impl Workspace {
             desktop: WorkspaceDesktopState {
                 next_z: self.next_z,
                 next_color: self.next_color,
+                split_x: normalize_desktop_split(self.split_x),
+                split_y: normalize_desktop_split(self.split_y),
             },
             legacy_canvas: LegacyCanvasState {
                 viewport_pan: [self.viewport_pan.x, self.viewport_pan.y],
@@ -922,6 +925,7 @@ mod tests {
             desktop: WorkspaceDesktopState {
                 next_z: 2,
                 next_color: 1,
+                ..WorkspaceDesktopState::default()
             },
             legacy_canvas: LegacyCanvasState {
                 viewport_pan: [0.0, 0.0],
@@ -977,6 +981,7 @@ mod tests {
             desktop: WorkspaceDesktopState {
                 next_z: 2,
                 next_color: 1,
+                ..WorkspaceDesktopState::default()
             },
             legacy_canvas: LegacyCanvasState {
                 viewport_pan: [0.0, 0.0],
@@ -1039,6 +1044,7 @@ mod tests {
             desktop: WorkspaceDesktopState {
                 next_z: 21,
                 next_color: 4,
+                ..WorkspaceDesktopState::default()
             },
             legacy_canvas: LegacyCanvasState {
                 viewport_pan: [0.0, 0.0],

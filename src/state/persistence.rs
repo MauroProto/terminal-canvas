@@ -53,12 +53,31 @@ pub struct WorkspaceState {
     pub legacy_canvas: LegacyCanvasState,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkspaceDesktopState {
     #[serde(default)]
     pub next_z: u32,
     #[serde(default)]
     pub next_color: usize,
+    #[serde(default = "default_desktop_split")]
+    pub split_x: f32,
+    #[serde(default = "default_desktop_split")]
+    pub split_y: f32,
+}
+
+fn default_desktop_split() -> f32 {
+    crate::canvas::config::DEFAULT_DESKTOP_SPLIT
+}
+
+impl Default for WorkspaceDesktopState {
+    fn default() -> Self {
+        Self {
+            next_z: 0,
+            next_color: 0,
+            split_x: default_desktop_split(),
+            split_y: default_desktop_split(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -172,6 +191,7 @@ impl From<LegacyWorkspaceState> for WorkspaceState {
             desktop: WorkspaceDesktopState {
                 next_z: value.next_z,
                 next_color: value.next_color,
+                ..WorkspaceDesktopState::default()
             },
             legacy_canvas: LegacyCanvasState {
                 viewport_pan: value.viewport_pan,
@@ -970,6 +990,7 @@ mod tests {
                 desktop: WorkspaceDesktopState {
                     next_z: 2,
                     next_color: 1,
+                    ..WorkspaceDesktopState::default()
                 },
                 legacy_canvas: LegacyCanvasState {
                     viewport_pan: [0.0, 0.0],
