@@ -776,15 +776,28 @@ impl PtyManager {
     /// Flushea `pending_startup_input` (is_startup=true) o `pending_prompt`
     /// (false) si el handle está listo. Conserva el prompt si la cola está llena.
     fn flush_one_pending(session: &mut ManagedSession, is_startup: bool) {
+        let Some(handle) = session.handle.as_ref() else {
+            // Preserve startup input for reconnect, but resolve the tracked
+            // prompt even when that startup slot would block its own flush.
+            if let Some((completion, _)) = session
+                .pending_prompt
+                .as_mut()
+                .and_then(|pending| pending.completion.take())
+            {
+                let _ = completion.send(Err(std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "El terminal se desconectó antes de aceptar el prompt pendiente.",
+                )));
+                session.pending_prompt = None;
+            }
+            return;
+        };
         let pending_ref = if is_startup {
             session.pending_startup_input.as_mut()
         } else {
             session.pending_prompt.as_mut()
         };
         let Some(pending) = pending_ref else {
-            return;
-        };
-        let Some(handle) = session.handle.as_ref() else {
             return;
         };
         // Hold a single lock across the readiness check and the write so
