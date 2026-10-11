@@ -72,6 +72,7 @@ impl RuntimeHarness {
                     panel_id: None,
                     workspace_id: None,
                     leaf_id: None,
+                    hook_legacy_root: false,
                 },
             );
 
@@ -142,6 +143,7 @@ impl RuntimeHarness {
                     panel_id: None,
                     workspace_id: None,
                     leaf_id: None,
+                    hook_legacy_root: false,
                 },
             );
 
