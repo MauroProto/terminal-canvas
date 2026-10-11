@@ -236,13 +236,13 @@ impl TerminalApp {
                     let pending_focus = ui
                         .ctx()
                         .data(|data| data.get_temp::<Uuid>(Id::new(RENAME_FOCUS_PENDING_ID)));
-                    if pending_focus == Some(panel_id)
+                    let initial_focus_granted = pending_focus == Some(panel_id)
                         && ui.is_enabled()
                         && ui.is_visible()
                         && ui
                             .ctx()
-                            .memory(|memory| memory.allows_interaction(ui.layer_id()))
-                    {
+                            .memory(|memory| memory.allows_interaction(ui.layer_id()));
+                    if initial_focus_granted {
                         ui.ctx()
                             .memory_mut(|memory| memory.request_focus(Id::new(RENAME_TITLE_ID)));
                         ui.ctx()
@@ -254,7 +254,10 @@ impl TerminalApp {
                         false,
                         Some(Id::new(RENAME_TITLE_ID)),
                     );
-                    if response.lost_focus()
+                    // Enter can end editing before the first focus grant has any frame history.
+                    if (response.lost_focus()
+                        || (initial_focus_granted
+                            && !ui.ctx().memory(|memory| memory.has_focus(response.id))))
                         && ui.input(|i: &egui::InputState| i.key_pressed(Key::Enter))
                     {
                         save = true;
