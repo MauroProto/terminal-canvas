@@ -319,8 +319,12 @@ fn attaching_inside_a_tui_recovers_primary_history_when_it_exits() {
 
 #[test]
 fn reattach_snapshot_preserves_scrollback_beyond_the_raw_tail_cap() {
-    use mi_terminal::daemon::protocol::Request;
+    use alacritty_terminal::term::test::TermSize;
+    use alacritty_terminal::term::{Config, Term};
+    use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
+    use mi_terminal::daemon::protocol::{Request, Response};
 
+    const OUTPUT_BYTES: usize = 400_000;
     let (daemon, token) = start_daemon();
     let mut conn = DaemonConn::try_connect(&daemon.dir, &token).expect("conecta");
     let id = conn
@@ -329,10 +333,15 @@ fn reattach_snapshot_preserves_scrollback_beyond_the_raw_tail_cap() {
             spec.rows = 24;
         }))
         .expect("spawn");
+    conn.attach(id).expect("subscribe before writing");
     let start = format!("SNAP_START_{}", uuid::Uuid::new_v4().simple());
     let end = format!("SNAP_END_{}", uuid::Uuid::new_v4().simple());
-    let command =
-        format!("python3 -c \"import sys;sys.stdout.write('{start}'+'x'*400000+'{end}')\"\n");
+    let (start_head, start_tail) = start.split_at(start.len() / 2);
+    let (end_head, end_tail) = end.split_at(end.len() / 2);
+    let command = format!(
+        "python3 -c \"import sys;sys.stdout.write('{start_head}'+'{start_tail}'+'x'*{OUTPUT_BYTES}+'{end_head}'+'{end_tail}');sys.stdout.flush()\"\n"
+    );
+    assert!(!command.contains(&start) && !command.contains(&end));
     assert!(conn
         .request(&Request::Write {
             id,
@@ -340,30 +349,66 @@ fn reattach_snapshot_preserves_scrollback_beyond_the_raw_tail_cap() {
         })
         .is_some());
 
+    // Wait on the stream: repeatedly exporting the growing grid under its
+    // lock starves the producer and turns this fidelity test into a poll race.
     let deadline = Instant::now() + Duration::from_secs(10);
-    let snapshot = loop {
-        let (snapshot, _) = conn.attach(id).expect("attach");
-        let completed = snapshot
-            .windows(end.len())
-            .filter(|window| *window == end.as_bytes())
-            .count()
-            >= 2;
-        if completed && snapshot.len() > mi_terminal::daemon::server::MAX_SNAPSHOT_BYTES {
-            break snapshot;
+    let mut output = Vec::new();
+    let mut completed = 0;
+    loop {
+        assert!(conn
+            .list_checked()
+            .expect("live stream connection")
+            .contains(&id));
+        for event in conn.drain_events() {
+            if let Response::Output {
+                id: actual, data, ..
+            } = event
+            {
+                assert_eq!(actual, id);
+                let previous = output.len();
+                output.extend_from_slice(&data);
+                completed +=
+                    daemon_response::newly_completed_matches(&output, previous, end.as_bytes());
+            }
         }
-        assert!(Instant::now() < deadline, "la salida nunca terminó");
-        std::thread::sleep(Duration::from_millis(50));
-    };
+        assert!(output.len() < 2 * 1024 * 1024);
+        assert!(
+            completed <= 1,
+            "marker cannot come from echo or duplication"
+        );
+        if completed == 1 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "payload did not finish: bytes={}, markers={completed}",
+            output.len()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(daemon_response::longest_printed_run(&output, 'x') >= OUTPUT_BYTES);
+
+    // One actual reattach must recover the whole history beyond the raw tail.
+    let (snapshot, _) = conn.attach(id).expect("reattach after complete output");
     assert!(
         snapshot.len() > mi_terminal::daemon::server::MAX_SNAPSHOT_BYTES,
         "el reattach sigue limitado al tail crudo: {} bytes",
         snapshot.len()
     );
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut term = Term::new(
+        Config::default(),
+        &TermSize::new(80, 24),
+        mi_terminal::terminal::pty::EventProxy::new(tx),
+    );
+    let mut parser = Processor::<StdSyncHandler>::new();
+    parser.advance(&mut term, &snapshot);
+    let text = mi_terminal::terminal::export::scrollback_to_text(&term);
+    let unwrapped = text.lines().collect::<String>();
+    let expected = format!("{start}{}{end}", "x".repeat(OUTPUT_BYTES));
     assert!(
-        snapshot
-            .windows(start.len())
-            .any(|window| window == start.as_bytes()),
-        "se perdió el comienzo del scrollback"
+        unwrapped.contains(&expected),
+        "reattach lost the start, payload, or end"
     );
 }
 
