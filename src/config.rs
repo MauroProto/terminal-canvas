@@ -1009,4 +1009,20 @@ mod config_recovery_tests {
         assert!(save_to_path_with_limit(&enormous, &path, 64).is_err());
         assert_eq!(entries(&path), before);
     }
+
+    #[test]
+    fn non_regular_primary_blocks_even_with_a_valid_backup() {
+        let dir = TempDirectory::new();
+        let path = dir.path();
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("keep"), b"private").unwrap();
+        let backup = crate::state::durable_write::backup_path(&path, 0);
+        std::fs::write(&backup, "").unwrap();
+        assert!(matches!(
+            load_result_from_path(&path),
+            ConfigLoadReport::Failed(_)
+        ));
+        assert_eq!(std::fs::read(path.join("keep")).unwrap(), b"private");
+        assert_eq!(std::fs::read(backup).unwrap(), b"");
+    }
 }
