@@ -1025,9 +1025,7 @@ fn handle_request_for_client(
                     Ok(id) => id,
                     Err(error) => {
                         return Response::Error {
-                            message: format!(
-                                "no se pudo recuperar el historial del terminal: {error}"
-                            ),
+                            message: format!("no se pudo crear la sesión del terminal: {error}"),
                         };
                     }
                 },
