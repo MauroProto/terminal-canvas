@@ -1,0 +1,96 @@
+# Integration of T3 Code reliability patterns
+
+Reference: pingdotgg/t3code at
+`5f7294d452a5c6d6e0b7bd2c992478f830fbe212`.
+Initial TerminalCanvas base: `c7b989e18a61fbbcadf9dcf7e382ac55128340ef`.
+
+This work adapts patterns to the existing Rust terminal/canvas application.
+It does not replace the terminal UI or change online/invitation behavior.
+T3 source is a reference; the prompt-submission implementation is original.
+
+## Prompt acceptance
+
+The checked APIs distinguish two results:
+
+- `PromptSubmission::InputQueued`: the complete sanitized input was accepted by
+  the bounded terminal writer. This is not proof that an agent read the input,
+  completed a task, or that the asynchronous writer has finished writing it.
+- `PromptSubmission::Deferred`: the runtime retains one bounded startup prompt
+  and returns a receipt. The caller keeps its original feedback/notes until
+  that receipt reports input-queue acceptance or failure.
+
+`submit_prompt_to_ready_panel` is for capture and broadcast actions. It does
+not start a detached terminal or change the active terminal leaf. A terminal
+with startup/deferred input rejects a later submission rather than allowing
+it to overtake existing input.
+
+The review updates only the submitted draft/note versions. A newer draft,
+edited note, or note added while delivery was pending remains pending.
+Closing the review drops its receipt and cancels a prompt that has not started
+being accepted. Already accepted input cannot be recalled. Legacy
+fire-and-forget APIs explicitly preserve their old lifetime and are not
+confirmation APIs for new UI flows.
+
+A second deferred prompt is rejected with `WouldBlock`; it cannot replace
+the first. Capacity retries retain the same prompt and receipt. A closed
+session, closed input channel, or poisoned terminal handle produces failure
+instead of an acknowledgement. Partial broadcast failures preserve the draft
+and deselect successful destinations, so retrying does not resend to them.
+
+This startup slot is volatile. It is not a durable FIFO of agent tasks and does
+not survive process loss. Persistent task queues require an operation journal
+and reconciliation before being presented as reliable workflow queues.
+
+## Integration boundaries
+
+Work is isolated on `codex/t3-quality-integration`. Existing worktrees and the
+main checkout are not reset or rewritten. Configuration and directory-recovery
+proposals, and the already integrated diagnostic and rename improvements,
+belong to other work streams and are preserved by this implementation.
+
+When combining changes, merge the narrow call-site changes in `src/app.rs` and
+the new review state field into existing work. Do not replace those files with
+whole copies. Existing test bodies remain; review fixtures add
+`pending_delivery: None` and share their empty-workspace constructor.
+
+## Subsequent work and required evidence
+
+1. Integrate and verify the existing typed configuration-recovery proposal,
+   preserving its origin and reviewed behavior. Keep the existing diagnostic
+   collection report and explicit layout-save acknowledgement behavior.
+2. Persist a session descriptor per leaf: cwd/worktree, shell, provider profile,
+   native conversation ID, and recovery grade.
+3. Introduce a user-owned Windows session host with versioned local IPC and
+   process-generation checks. Distinguish UI reconnection from reboot recovery.
+4. Add durable operation IDs, receipts, and an execution outbox. Reconcile
+   ambiguous external outcomes; do not claim exactly-once execution.
+5. Implement provider capability contracts and actionable permission requests.
+   Only expose actions whose installed provider actually supports them.
+6. Build persistent editable task queues on that operation model. Hold pending
+   tasks after restart; never infer agent readiness from terminal output alone.
+7. Connect memory and handoffs to versioned complete task exports. Show the
+   selected and omitted context and retain provenance.
+8. Add execution-scoped diffs/checkpoints with owned-worktree restoration and
+   separate outcomes for filesystem and provider rollback.
+9. Measure UI/service/provider resources separately, with bounded histories,
+   closed-view subscription cleanup, and concurrency admission under pressure.
+10. Extend command/focus routing, project preferences, accessibility checks,
+    traceable diagnostics, and service-aware update rollback.
+
+Acceptance must include dead/full input channels, repeated operation IDs,
+process loss, suspension, inaccessible configuration, disk exhaustion, stale
+permissions, interrupted migrations, and installed-package smoke tests.
+Performance comparisons need identical hardware/workloads and measured p95
+input/frame latency, RSS, CPU, recovery time, and long idle sessions. Source
+inspection and encoded-payload limits do not establish those measurements.
+
+## Primary references
+
+- [Transactional command admission](https://github.com/pingdotgg/t3code/blob/5f7294d452a5c6d6e0b7bd2c992478f830fbe212/apps/server/src/orchestration-v2/EventSink.ts)
+- [Durable effects and process-loss policy](https://github.com/pingdotgg/t3code/blob/5f7294d452a5c6d6e0b7bd2c992478f830fbe212/apps/server/src/orchestration-v2/EffectOutbox.ts)
+- [Provider adapter boundary](https://github.com/pingdotgg/t3code/blob/5f7294d452a5c6d6e0b7bd2c992478f830fbe212/packages/provider-core/src/server/ProviderAdapter.ts)
+- [Queued runs](https://github.com/pingdotgg/t3code/blob/5f7294d452a5c6d6e0b7bd2c992478f830fbe212/docs/user/composer.md)
+- [Portable context handoffs](https://github.com/pingdotgg/t3code/blob/5f7294d452a5c6d6e0b7bd2c992478f830fbe212/docs/user/portable-handoffs.md)
+- [Background service platform support](https://github.com/pingdotgg/t3code/blob/5f7294d452a5c6d6e0b7bd2c992478f830fbe212/docs/user/background-service.md)
+- [Performance regression strategy](https://github.com/pingdotgg/t3code/blob/5f7294d452a5c6d6e0b7bd2c992478f830fbe212/docs/internals/performance-regressions.md)
+- [Provider replay harness](https://github.com/pingdotgg/t3code/blob/5f7294d452a5c6d6e0b7bd2c992478f830fbe212/apps/server/src/orchestration-v2/testkit/ProviderReplayHarness.ts)

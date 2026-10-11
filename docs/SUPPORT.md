@@ -125,6 +125,19 @@ archivo especial o un enlace no se rota automáticamente.
 
 ## Notas de revisión y guardados pendientes
 
+Enviar feedback o notas confirma aceptación por la entrada del terminal, no
+que el agente ya las leyó o ejecutó. Durante el arranque, el review conserva
+el contenido hasta recibir ese resultado. Si falla el envío o desaparece la
+sesión, el contenido sigue pendiente y se muestra el motivo. Un borrador o
+nota editada durante la espera no se elimina ni se marca como enviada por una
+confirmación del texto anterior. Cerrar el review cancela el envío diferido si
+todavía no comenzó a aceptarse; no retira texto ya aceptado.
+
+El envío diferido de arranque vive en memoria y no es una cola de tareas que
+sobreviva al cierre de la app. Si un broadcast falla parcialmente, se conserva
+el borrador con los destinos fallidos seleccionados; los que ya aceptaron el
+texto quedan deseleccionados para evitar repetirlo al reintentar.
+
 Una colección de notas admite hasta 4 MiB de JSON codificado en UTF-8, incluidos
 campos, metadatos y formato. El mismo máximo se aplica a cargar notas, importar
 un archivo legacy y guardar la colección. Importar un archivo que supera el
