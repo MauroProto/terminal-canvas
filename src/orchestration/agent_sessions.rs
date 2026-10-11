@@ -69,16 +69,25 @@ pub struct AgentSessionEntry {
 /// La regla es reemplazar los separadores por `-`, pero según la versión el
 /// punto de un directorio oculto se conserva (`-Users-mauro-.cursor-...`) o
 /// también se reemplaza (`/Users/mauro/.pencil/...` →
-/// `-Users-mauro--pencil-...`). Probamos ambas en vez de adivinar.
+/// `-Users-mauro--pencil-...`). También se acepta la normalización de espacios
+/// y otros caracteres a guiones; las variantes anteriores siguen disponibles.
 pub fn slug_variants(cwd: &Path) -> Vec<String> {
     let raw = cwd.to_string_lossy();
-    let keep_dots = raw.replace(['/', '\\'], "-");
+    // A Windows drive colon cannot be retained as a filename component. It
+    // could also turn Path::join into a drive-relative path outside the profile.
+    let keep_dots = raw.replace(['/', '\\', ':'], "-");
     let replace_dots = keep_dots.replace('.', "-");
-    if keep_dots == replace_dots {
-        vec![keep_dots]
-    } else {
-        vec![keep_dots, replace_dots]
+    let normalized: String = raw
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
+        .collect();
+    let mut variants = Vec::new();
+    for variant in [keep_dots, replace_dots, normalized] {
+        if !variants.contains(&variant) {
+            variants.push(variant);
+        }
     }
+    variants
 }
 
 fn claude_projects_root() -> Option<PathBuf> {
@@ -284,6 +293,30 @@ mod tests {
     #[test]
     fn a_path_without_dots_yields_a_single_variant() {
         assert_eq!(slug_variants(Path::new("/tmp/plain")).len(), 1);
+    }
+
+    #[test]
+    fn windows_project_history_stays_inside_the_selected_profile() {
+        let root =
+            std::env::temp_dir().join(format!("tc-claude-windows-slug-{}", uuid::Uuid::new_v4()));
+        let cwd = Path::new(r"C:\Users\Mauro\My Project");
+        let projects = root.join("projects");
+        let folder = projects.join("C--Users-Mauro-My-Project");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(
+            folder.join("windows-session.jsonl"),
+            r#"{"type":"ai-title","aiTitle":"Windows project history"}"#,
+        )
+        .unwrap();
+        for variant in slug_variants(cwd) {
+            assert!(!variant.contains(':'));
+            assert!(projects.join(variant).starts_with(&projects));
+        }
+        let rows = super::list_claude_sessions_from_root(&projects, cwd);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "windows-session");
+        assert_eq!(rows[0].title, "Windows project history");
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
