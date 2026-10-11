@@ -431,3 +431,147 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod resume_identity_tests {
+    use std::sync::{Arc, Mutex};
+
+    use egui::{pos2, vec2, Color32};
+    use uuid::Uuid;
+
+    use super::{replace_and_remember_resume_session, ResumePlan};
+    use crate::orchestration::AgentProvider;
+    use crate::panel::CanvasPanel;
+    use crate::runtime::PtyManager;
+    use crate::terminal::panel::TerminalPanel;
+    use crate::terminal::session_controller::session_spec;
+    use crate::terminal::split_tree::{Axis, SplitNode};
+
+    fn panel_with_old_identity() -> CanvasPanel {
+        let mut panel = CanvasPanel::Terminal(TerminalPanel::new(
+            pos2(10.0, 20.0),
+            vec2(640.0, 420.0),
+            Color32::WHITE,
+            1,
+        ));
+        panel.set_agent_command(Some("claude --model sonnet".to_owned()));
+        panel.set_agent_session_id(Some("old-conversation".to_owned()));
+        panel
+    }
+
+    #[test]
+    fn selected_resume_id_survives_save_and_cold_specs_without_hooks() {
+        let mut saved = panel_with_old_identity().to_saved();
+        let root =
+            Uuid::parse_str(saved.root_leaf.as_deref().expect("root leaf")).expect("root UUID");
+        let mut tree = SplitNode::leaf(root);
+        let selected_leaf = tree.split(root, Axis::Horizontal).expect("split leaf");
+        let launch_command = "claude --model sonnet";
+        let workspace_id = Uuid::from_u128(42);
+        saved.split_tree = Some(serde_json::to_value(&tree).expect("serialize tree"));
+        saved.focused_leaf = Some(selected_leaf.to_string());
+        saved
+            .leaf_agent_commands
+            .insert(selected_leaf.to_string(), launch_command.to_owned());
+        saved
+            .leaf_agent_session_ids
+            .insert(selected_leaf.to_string(), "old-selected".to_owned());
+        let manager = Arc::new(Mutex::new(PtyManager::new_for_tests()));
+        let mut panel = CanvasPanel::Terminal(TerminalPanel::from_saved(
+            saved,
+            &egui::Context::default(),
+            None,
+            workspace_id,
+            Arc::clone(&manager),
+        ));
+        let panel_id = panel.id();
+        let resume = ResumePlan::exact(AgentProvider::ClaudeCode, launch_command, "chosen-B")
+            .expect("valid selected conversation");
+        let mut captured_spec = None;
+
+        // Model only replacement's metadata effect; never attach or spawn a PTY.
+        let resumed =
+            replace_and_remember_resume_session(&mut panel, resume.exact_session_id, |panel| {
+                assert_eq!(panel.agent_session_id(), Some("old-selected"));
+                captured_spec = Some(session_spec(
+                    "Selected conversation".to_owned(),
+                    None,
+                    Some(resume.command),
+                    None,
+                    Some(panel.id()),
+                    Some(panel.focused_leaf_id()),
+                    Some(workspace_id),
+                ));
+                panel.set_agent_command(Some(launch_command.to_owned()));
+                panel.set_agent_session_id(None);
+                assert_eq!(panel.agent_session_id(), None);
+                true
+            });
+        assert!(resumed);
+        let spec = captured_spec.expect("captured pure SessionSpec");
+        assert_eq!(
+            spec.startup_command.as_deref(),
+            Some("claude --model sonnet --resume chosen-B")
+        );
+        assert_eq!(spec.panel_id, Some(panel_id));
+        assert_eq!(spec.leaf_id, Some(selected_leaf));
+        assert_eq!(spec.workspace_id, Some(workspace_id));
+        assert_eq!(panel.focused_leaf_id(), selected_leaf);
+        assert_eq!(panel.agent_session_id(), Some("chosen-B"));
+        assert_eq!(panel.agent_command(), Some(launch_command));
+        let saved = panel.to_saved();
+        assert_eq!(saved.agent_session_id.as_deref(), Some("old-conversation"));
+        assert_eq!(
+            saved
+                .leaf_agent_session_ids
+                .get(&root.to_string())
+                .map(String::as_str),
+            Some("old-conversation")
+        );
+        assert_eq!(
+            saved
+                .leaf_agent_session_ids
+                .get(&selected_leaf.to_string())
+                .map(String::as_str),
+            Some("chosen-B")
+        );
+        assert_eq!(
+            saved
+                .leaf_agent_commands
+                .get(&selected_leaf.to_string())
+                .map(String::as_str),
+            Some(launch_command)
+        );
+
+        let encoded = serde_json::to_vec(&saved).expect("serialize panel");
+        let saved = serde_json::from_slice(&encoded).expect("deserialize panel");
+        let cold_manager = Arc::new(Mutex::new(PtyManager::new_for_tests()));
+        let cold = TerminalPanel::from_saved(
+            saved,
+            &egui::Context::default(),
+            None,
+            workspace_id,
+            Arc::clone(&cold_manager),
+        );
+        assert_eq!(cold.id, panel_id);
+        assert_eq!(cold.focused_leaf_id(), selected_leaf);
+        assert_eq!(cold.agent_session_id(), Some("chosen-B"));
+        assert_eq!(cold.agent_command(), Some(launch_command));
+        let runtime_ids = cold.all_runtime_session_ids();
+        let guard = cold_manager.lock().expect("cold manager");
+        assert_eq!(guard.attached_session_count(), 0);
+        assert_eq!(guard.detached_session_count(), 2);
+        assert_eq!(
+            guard.startup_command_for_tests(runtime_ids[0]),
+            Some("claude --model sonnet --resume old-conversation")
+        );
+        assert_eq!(
+            guard.startup_command_for_tests(runtime_ids[1]),
+            Some("claude --model sonnet --resume chosen-B")
+        );
+        drop(guard);
+        let guard = manager.lock().expect("original detached manager");
+        assert_eq!(guard.attached_session_count(), 0);
+        assert_eq!(guard.detached_session_count(), 2);
+    }
+}
