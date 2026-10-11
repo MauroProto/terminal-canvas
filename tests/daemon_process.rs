@@ -14,6 +14,14 @@ use std::time::{Duration, Instant};
 use mi_terminal::daemon::client::DaemonConn;
 use mi_terminal::daemon::protocol::{self, WireSpec};
 
+// External clients can customize public fields but cannot fabricate the
+// host-captured owner. Keep the actual typed WireSpec default and protocol.
+fn session_spec(configure: impl FnOnce(&mut WireSpec)) -> WireSpec {
+    let mut spec = WireSpec::default();
+    configure(&mut spec);
+    spec
+}
+
 #[path = "support/daemon_response.rs"]
 mod daemon_response;
 
@@ -148,12 +156,11 @@ fn sessions_survive_the_app_and_can_be_reattached() {
     let session_id = {
         let mut conn = DaemonConn::try_connect(&daemon.dir, &token).expect("conecta");
         let id = conn
-            .spawn_session(WireSpec {
-                title: "Terminal".to_owned(),
-                cols: 80,
-                rows: 24,
-                ..WireSpec::default()
-            })
+            .spawn_session(session_spec(|spec| {
+                spec.title = "Terminal".to_owned();
+                spec.cols = 80;
+                spec.rows = 24;
+            }))
             .expect("spawnea");
         assert_eq!(conn.list(), vec![id]);
         id
@@ -183,10 +190,9 @@ fn attaching_inside_a_tui_recovers_primary_history_when_it_exits() {
     use mi_terminal::daemon::protocol::{Request, Response};
     let (daemon, token) = start_daemon();
     let mut conn = DaemonConn::try_connect(&daemon.dir, &token).expect("connect");
-    let id = conn.spawn_session(WireSpec {
-        startup_command: Some("printf 'TC_PRIMARY_HISTORY\\r\\n\\033[?1049hTC_TUI_SCREEN'; read tc_done; printf '\\033[?1049lTC_RETURNED\\r\\n'".to_owned()),
-        ..Default::default()
-    }).expect("spawn");
+    let id = conn.spawn_session(session_spec(|spec| {
+    spec.startup_command = Some("printf 'TC_PRIMARY_HISTORY\\r\\n\\033[?1049hTC_TUI_SCREEN'; read tc_done; printf '\\033[?1049lTC_RETURNED\\r\\n'".to_owned());
+})).expect("spawn");
     let deadline = Instant::now() + Duration::from_secs(10);
     let (snapshot, attached_seq) = loop {
         let attached = conn.attach(id).expect("attach");
@@ -251,11 +257,10 @@ fn reattach_snapshot_preserves_scrollback_beyond_the_raw_tail_cap() {
     let (daemon, token) = start_daemon();
     let mut conn = DaemonConn::try_connect(&daemon.dir, &token).expect("conecta");
     let id = conn
-        .spawn_session(WireSpec {
-            cols: 80,
-            rows: 24,
-            ..WireSpec::default()
-        })
+        .spawn_session(session_spec(|spec| {
+            spec.cols = 80;
+            spec.rows = 24;
+        }))
         .expect("spawn");
     let start = format!("SNAP_START_{}", uuid::Uuid::new_v4().simple());
     let end = format!("SNAP_END_{}", uuid::Uuid::new_v4().simple());
@@ -523,12 +528,11 @@ fn a_real_pty_echoes_what_the_app_writes() {
     send(
         &Request::Spawn {
             id: None,
-            spec: WireSpec {
-                title: "Terminal".to_owned(),
-                cols: 80,
-                rows: 24,
-                ..WireSpec::default()
-            },
+            spec: session_spec(|spec| {
+                spec.title = "Terminal".to_owned();
+                spec.cols = 80;
+                spec.rows = 24;
+            }),
         },
         &mut writer,
     );
@@ -782,13 +786,14 @@ fn split_sessions_persist_to_distinct_leaf_checkpoints() {
     let second_leaf = uuid::Uuid::new_v4();
     let mut first = DaemonConn::try_connect(&daemon.dir, &token).expect("primera conexión");
     let mut second = DaemonConn::try_connect(&daemon.dir, &token).expect("segunda conexión");
-    let spec = |leaf_id| WireSpec {
-        title: "Terminal".to_owned(),
-        panel_id: Some(panel_id),
-        leaf_id: Some(leaf_id),
-        cols: 80,
-        rows: 24,
-        ..WireSpec::default()
+    let spec = |leaf_id| {
+        session_spec(|spec| {
+            spec.title = "Terminal".to_owned();
+            spec.panel_id = Some(panel_id);
+            spec.leaf_id = Some(leaf_id);
+            spec.cols = 80;
+            spec.rows = 24;
+        })
     };
     let first_id = first
         .spawn_session(spec(first_leaf))

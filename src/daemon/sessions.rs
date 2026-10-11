@@ -446,40 +446,6 @@ fn close_remote_fenced(
     anyhow::bail!("physical hook-generation closure requires the stronger host capability")
 }
 
-#[cfg(test)]
-fn close_legacy_protocol_only_fixture(endpoint: &DaemonEndpoint, id: Uuid) -> anyhow::Result<()> {
-    // The legacy wire fixture remains available for protocol assertions. It is
-    // never a managed retirement ACK in the application call graph.
-    let (stream, _) = DaemonConn::connect_raw_with_capabilities_as(
-        &endpoint.dir,
-        &endpoint.token,
-        endpoint.client_id,
-    )
-    .ok_or_else(|| anyhow::anyhow!("fixture connection unavailable"))?;
-    let mut writer = stream.try_clone()?;
-    let mut reader = BufReader::new(stream);
-    // Adopt only an explicitly existing UUID. Snapshot refusal grants adoption
-    // in the new server without turning this close into a fresh Spawn.
-    match request(&mut writer, &mut reader, &Request::Attach { id })? {
-        Response::Attached { id: actual, .. } if actual == id => {}
-        error @ Response::Error { .. } => {
-            if let Some((failed_id, _)) = snapshot_failure_from_response(&error) {
-                anyhow::ensure!(failed_id == id, "Error de cierre para otra identidad.");
-            } else {
-                return match request(&mut writer, &mut reader, &Request::List)? {
-                    Response::Sessions { ids } if !ids.contains(&id) => Ok(()),
-                    _ => anyhow::bail!("No se confirmó la adopción para cerrar {id}."),
-                };
-            }
-        }
-        _ => anyhow::bail!("Respuesta inválida al adoptar para cierre."),
-    }
-    match request(&mut writer, &mut reader, &Request::Kill { id })? {
-        Response::Killed { id: actual } if actual == id => Ok(()),
-        _ => anyhow::bail!("El daemon todavía no confirmó el cierre durable de {id}."),
-    }
-}
-
 /// Confirm creator-owned birth retirement by the host ACK, including its
 /// late-Spawn tombstone. SL2 callers must additionally drain their hook effects;
 /// this API does not prove ledger/bootstrap admission fencing by itself.
