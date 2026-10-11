@@ -167,3 +167,13 @@ en Unix, y ensayo de paquetes del mismo SHA. Los recibos externos de entrega
 registran esos resultados; esta descripción no acredita su ejecución por sí
 sola. No se ejecutaron builds completos, Cargo tests ni una GUI en esta PC para
 este pase. La validación nativa con perfiles y agentes reales sigue pendiente.
+
+## Autoridad para guardar config.toml
+
+La carga de configuración distingue tres resultados: todos los candidatos ausentes; configuración completa conocida, principal o backup; y carga fallida. El valor efectivo de emergencia de una carga fallida no se trata como configuración leída. La app instala valor y procedencia juntos al arrancar y mantiene bloqueados los guardados de configuración hasta una nueva carga correcta al reiniciar.
+
+La protección se comprueba en Settings/onboarding, antes de aceptar el snapshot en el worker y de nuevo en config::save antes de serializar o tocar archivos. Un rechazo previo a submit no genera un payload fallido para reintentar. Las escrituras válidas ya aceptadas mantienen el mecanismo existente de coalescing, ACK y retry, incluido su payload original; sus ACKs no reparan una carga desconocida.
+
+Los reads aceptan únicamente archivos regulares y como máximo 4 MiB de contenido completo. En Unix se usa O_NOFOLLOW | O_NONBLOCK y se rechazan múltiples hardlinks; en Windows se conserva el chequeo de enlaces y tipo, sin afirmar equivalencia frente a todos los reemplazos concurrentes. El cap se verifica con metadata y una lectura limitada a cap + 1, por lo que un crecimiento posterior o un error luego de un prefijo TOML válido tampoco acepta contenido parcial.
+
+El TOML serializado completo también debe estar dentro de 4 MiB antes de crear directorios, proteger, escribir temporales o rotar backups. Un precheck checked de shell/token limita los campos variables actuales; no se presenta como serializer streaming ni como snapshot atómico de todos los archivos. La protección privada puede ajustar permisos y crear el directorio al cargar; la carga fallida no rota ni reemplaza los contenidos. No hay un deadline global para syscalls del filesystem ni recuperación en vivo en esta fase.
