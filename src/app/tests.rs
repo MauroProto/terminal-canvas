@@ -3741,3 +3741,16 @@ fn windows_file_drop_copies_multiple_paths_in_order_without_shell_quotes() {
     assert_eq!(copied, vec![paths.join("\n")]);
     assert!(app.ws().all_runtime_session_ids().is_empty());
 }
+
+#[cfg(windows)]
+#[test]
+fn windows_file_drop_outside_a_panel_does_not_replace_the_clipboard() {
+    let ctx = egui::Context::default();
+    let mut app = detached_test_app_with_panel(&ctx);
+    app.viewport = Viewport::default();
+    let (hit, copied) =
+        file_drop_output(&mut app, &ctx, &[r"C:\drop\a&b.txt"], pos2(1000.0, 1000.0));
+    assert_eq!(hit, None);
+    assert!(copied.is_empty());
+    assert!(app.ws().all_runtime_session_ids().is_empty());
+}
