@@ -29,6 +29,10 @@ with in-memory terminal grids. It checks approval, control grants and that modal
 or unfocused guest text never reaches the host. Terminal tests fence input to the
 leaf and runtime shown in the snapshot: stale targets are rejected, and legacy
 input without a target is accepted only for an unambiguous single-leaf terminal.
+Broker regressions also join before the host socket exists, reconnect the host
+and recover pending requests without replaying approvals or denials. Membership
+updates precede actionable requests; expired requests and departed guests lose
+their pending UI entries and control grants, including after a late HTTP failure.
 
 `tests/provider_bridge_process.rs` interprets the app's Claude JSON and Codex TOML
 launch settings and starts the configured `--chat-mcp` executable over stdio.
