@@ -8,6 +8,9 @@
 use egui::{vec2, Align2, RichText, ScrollArea};
 use uuid::Uuid;
 
+use crate::orchestration::portable_context::{ContextOrigin, TerminalSelectionContext};
+use crate::orchestration::AgentProvider;
+use crate::panel::WorkspacePanel;
 use crate::theme::colors as palette;
 
 use super::TerminalApp;
@@ -17,6 +20,8 @@ use super::TerminalApp;
 pub(super) struct BroadcastTarget {
     pub(super) panel_id: Uuid,
     pub(super) leaf_id: Uuid,
+    runtime_session_id: Option<Uuid>,
+    provider_hint: Option<AgentProvider>,
     pub(super) title: String,
     /// Un panel sin terminal vivo no puede recibir nada: se lista en gris y
     /// no se puede tildar.
@@ -29,15 +34,30 @@ pub(super) struct BroadcastState {
     request_focus: bool,
     pub(super) text: String,
     pub(super) targets: Vec<BroadcastTarget>,
+    context: Option<TerminalSelectionContext>,
+    context_error: Option<String>,
+    include_context: bool,
 }
 
 impl BroadcastState {
+    fn eligible(&self, target: &BroadcastTarget) -> bool {
+        target.alive
+            && (!self.include_context
+                || (target
+                    .provider_hint
+                    .is_some_and(|provider| provider != AgentProvider::Unknown)
+                    && self.context.as_ref().is_some_and(|context| {
+                        context.origin.panel_id != target.panel_id
+                            || context.origin.leaf_id != target.leaf_id
+                    })))
+    }
+
     /// Panels vivos y tildados. Los muertos se filtran incluso si quedaron
     /// tildados de antes (el panel pudo morir con el diálogo abierto).
     fn selected_ids(&self) -> Vec<Uuid> {
         self.targets
             .iter()
-            .filter(|target| target.alive && target.selected)
+            .filter(|target| self.eligible(target) && target.selected)
             .map(|target| target.panel_id)
             .collect()
     }
@@ -47,7 +67,10 @@ impl BroadcastState {
     }
 
     fn alive_count(&self) -> usize {
-        self.targets.iter().filter(|target| target.alive).count()
+        self.targets
+            .iter()
+            .filter(|target| self.eligible(target))
+            .count()
     }
 
     /// ¿Se puede enviar? Hace falta texto y al menos un destino vivo tildado.
@@ -56,14 +79,68 @@ impl BroadcastState {
     }
 
     fn set_all_alive(&mut self, selected: bool) {
-        for target in self.targets.iter_mut().filter(|target| target.alive) {
-            target.selected = selected;
+        for index in 0..self.targets.len() {
+            let eligible = self.eligible(&self.targets[index]);
+            self.targets[index].selected = selected && eligible;
         }
+    }
+
+    fn toggle_context(&mut self, enabled: bool) {
+        self.include_context = enabled && self.context.is_some();
+        // Attaching an excerpt must not silently broadcast it to all agents.
+        // Both mode transitions require an explicit destination selection.
+        self.set_all_alive(false);
+    }
+
+    fn prepare_prompt(&self) -> std::io::Result<String> {
+        if self.include_context {
+            self.context
+                .as_ref()
+                .ok_or_else(|| std::io::Error::other("El contexto seleccionado ya no existe."))?
+                .prepare_prompt(&self.text)
+        } else {
+            Ok(self.text.trim().to_owned())
+        }
+    }
+}
+
+impl BroadcastTarget {
+    fn matches_panel(&self, panel: &WorkspacePanel) -> bool {
+        panel.is_alive()
+            && panel.focused_leaf_id() == self.leaf_id
+            && panel.focused_runtime_session_id() == self.runtime_session_id
+            && panel.provider_hint() == self.provider_hint
     }
 }
 
 impl TerminalApp {
     pub(super) fn open_broadcast(&mut self) {
+        // Freeze the selection once. Rendering, retries, and workspace changes
+        // cannot silently replace the excerpt the user reviewed.
+        let candidate = self.ws().focused_panel().and_then(|panel| {
+            let selection = panel.selected_text()?;
+            if selection.trim().is_empty() {
+                return None;
+            }
+            Some(TerminalSelectionContext::new(
+                ContextOrigin {
+                    workspace_id: self.ws().id,
+                    panel_id: panel.id(),
+                    leaf_id: panel.focused_leaf_id(),
+                    runtime_session_id: panel.focused_runtime_session_id(),
+                    memory_task_id: panel.focused_memory_task_id(),
+                    title: panel.title().to_owned(),
+                    provider_hint: panel.provider_hint(),
+                    cwd: panel.current_cwd(),
+                },
+                selection,
+            ))
+        });
+        let (context, context_error) = match candidate {
+            Some(Ok(context)) => (Some(context), None),
+            Some(Err(error)) => (None, Some(error.to_string())),
+            None => (None, None),
+        };
         let targets: Vec<BroadcastTarget> = self
             .ws()
             .panels
@@ -85,6 +162,8 @@ impl TerminalApp {
                 BroadcastTarget {
                     panel_id: panel.id(),
                     leaf_id: panel.focused_leaf_id(),
+                    runtime_session_id: panel.focused_runtime_session_id(),
+                    provider_hint: panel.provider_hint(),
                     title,
                     alive: panel.is_alive(),
                     // Por defecto todos los vivos: el caso común es "a todos".
@@ -102,6 +181,9 @@ impl TerminalApp {
             request_focus: true,
             text: String::new(),
             targets,
+            context,
+            context_error,
+            include_context: false,
         });
     }
 
@@ -160,11 +242,56 @@ impl TerminalApp {
                         );
                         ui.add_space(10.0);
 
+                        if let Some(context) = state.context.as_ref() {
+                            let label = format!(
+                                "Incluir selección de {} · {}",
+                                context.origin.title,
+                                context.origin.provider_hint.unwrap_or_default().label()
+                            );
+                            let mut enabled = state.include_context;
+                            if ui.checkbox(&mut enabled, label).changed() {
+                                state.toggle_context(enabled);
+                            }
+                            if state.include_context {
+                                let context = state.context.as_ref().expect("captured context");
+                                ui.label(
+                                    RichText::new("Elegí los agentes de destino. Se comparte sólo el fragmento seleccionado y su origen.")
+                                        .size(11.0)
+                                        .color(palette::DIM),
+                                );
+                                ui.collapsing("Vista previa del contexto", |ui| {
+                                    if let Some(cwd) = &context.origin.cwd {
+                                        ui.label(format!("Carpeta de origen: {cwd}"));
+                                    }
+                                    ui.label(format!("Captura: {} · hoja {}", context.origin.panel_id, context.origin.leaf_id));
+                                    ScrollArea::vertical()
+                                        .id_salt("broadcast-context-preview")
+                                        .max_height(140.0)
+                                        .show(ui, |ui| {
+                                            ui.label(RichText::new(&context.selection).monospace());
+                                        });
+                                });
+                            }
+                        } else {
+                            ui.label(
+                                RichText::new(state.context_error.as_deref().unwrap_or(
+                                    "Para compartir contexto, seleccioná texto en el chat de origen antes de abrir este diálogo.",
+                                ))
+                                .size(11.0)
+                                .color(palette::DIM),
+                            );
+                        }
+                        ui.add_space(6.0);
+
                         let field = ui.add(
                             egui::TextEdit::multiline(&mut state.text)
                                 .desired_rows(3)
                                 .desired_width(f32::INFINITY)
-                                .hint_text("git pull --rebase"),
+                                .hint_text(if state.include_context {
+                                    "Revisá esta propuesta y continuá desde acá…"
+                                } else {
+                                    "Mensaje o comando para los destinos elegidos"
+                                }),
                         );
                         if std::mem::take(&mut state.request_focus) {
                             field.request_focus();
@@ -191,9 +318,12 @@ impl TerminalApp {
                             .id_salt("broadcast-targets")
                             .max_height(200.0)
                             .show(ui, |ui| {
-                                for target in state.targets.iter_mut() {
-                                    if target.alive {
-                                        ui.checkbox(&mut target.selected, &target.title);
+                                for index in 0..state.targets.len() {
+                                    let eligible = state.eligible(&state.targets[index]);
+                                    let target = &mut state.targets[index];
+                                    let label = format!("{} · {}", target.title, target.provider_hint.unwrap_or_default().label());
+                                    if eligible {
+                                        ui.checkbox(&mut target.selected, label);
                                     } else {
                                         // Sin terminal vivo: visible pero no
                                         // seleccionable, para que se entienda
@@ -202,7 +332,7 @@ impl TerminalApp {
                                             let mut off = false;
                                             ui.checkbox(
                                                 &mut off,
-                                                format!("{} (sin terminal)", target.title),
+                                                format!("{label} (no disponible para este envío)"),
                                             );
                                         });
                                     }
@@ -257,7 +387,7 @@ impl TerminalApp {
         for target in &mut state.targets {
             target.alive = workspace
                 .and_then(|workspace| workspace.panel(target.panel_id))
-                .is_some_and(|panel| panel.is_alive() && panel.focused_leaf_id() == target.leaf_id);
+                .is_some_and(|panel| target.matches_panel(panel));
         }
     }
 
@@ -269,7 +399,13 @@ impl TerminalApp {
         if !state.can_send() {
             return;
         }
-        let text = state.text.trim().to_owned();
+        let text = match state.prepare_prompt() {
+            Ok(text) => text,
+            Err(error) => {
+                self.toast_error(error.to_string());
+                return;
+            }
+        };
         let ids = state.selected_ids();
         let workspace_id = state.workspace_id;
         let mut sent = 0usize;
@@ -309,14 +445,21 @@ impl TerminalApp {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use uuid::Uuid;
 
     use super::{BroadcastState, BroadcastTarget};
+    use crate::app::TerminalApp;
+    use crate::orchestration::AgentProvider;
+    use crate::terminal::{panel::TerminalPanel, pty::PtyHandle};
 
     fn target(title: &str, alive: bool, selected: bool) -> BroadcastTarget {
         BroadcastTarget {
             panel_id: Uuid::new_v4(),
             leaf_id: Uuid::new_v4(),
+            runtime_session_id: Some(Uuid::new_v4()),
+            provider_hint: None,
             title: title.to_owned(),
             alive,
             selected,
@@ -329,7 +472,300 @@ mod tests {
             request_focus: true,
             text: text.to_owned(),
             targets,
+            context: None,
+            context_error: None,
+            include_context: false,
         }
+    }
+
+    type Destination = (Uuid, Arc<Mutex<PtyHandle>>);
+
+    fn context_fixture() -> (TerminalApp, Vec<Destination>) {
+        let mut app = crate::app::preferences_ui_tests::detached_app();
+        let manager = app.workspaces[0].pty_manager();
+        manager
+            .lock()
+            .unwrap()
+            .set_remote_spawner(Box::new(|_, _, _, _, wanted| {
+                Ok((
+                    wanted.unwrap_or_else(Uuid::new_v4),
+                    PtyHandle::for_persistence_tests(b""),
+                ))
+            }));
+        let mut destinations = Vec::new();
+        for title in [
+            "Claude source",
+            "Codex target",
+            "Gemini target",
+            "Plain shell",
+        ] {
+            let mut panel = TerminalPanel::new(
+                egui::Pos2::ZERO,
+                egui::vec2(400.0, 240.0),
+                egui::Color32::WHITE,
+                0,
+            );
+            panel.rename_title(title.to_owned());
+            panel.attach_session_with_spec(
+                Arc::clone(&manager),
+                None,
+                crate::runtime::SessionSpec::default(),
+            );
+            let handle = manager
+                .lock()
+                .unwrap()
+                .handle(panel.runtime_session_id().unwrap())
+                .unwrap();
+            destinations.push((panel.id, handle));
+            app.workspaces[0].add_restored_terminal(panel);
+        }
+        app.workspaces[0].bring_to_front(destinations[0].0);
+        let source = destinations[0].1.lock().unwrap();
+        source.feed_output_for_persistence_tests(b"original selected answer");
+        let mut term = source.term.lock().unwrap();
+        use alacritty_terminal::index::{Column, Line, Point, Side};
+        use alacritty_terminal::selection::{Selection, SelectionType};
+        let mut selection = Selection::new(
+            SelectionType::Simple,
+            Point::new(Line(0), Column(0)),
+            Side::Left,
+        );
+        selection.update(Point::new(Line(0), Column(23)), Side::Right);
+        term.selection = Some(selection);
+        drop(term);
+        drop(source);
+        app.open_broadcast();
+        (app, destinations)
+    }
+
+    #[test]
+    fn portable_context_broadcast_requires_explicit_destinations_and_excludes_source_shell() {
+        let (mut app, destinations) = context_fixture();
+        let state = app.broadcast.as_mut().unwrap();
+        assert!(!state.include_context, "selection is opt-in");
+        let context = state.context.clone().unwrap();
+        assert_eq!(context.selection, "original selected answer");
+        assert_eq!(
+            context.origin.provider_hint,
+            Some(AgentProvider::ClaudeCode)
+        );
+        assert_eq!(context.origin.panel_id, destinations[0].0);
+        state.text = "  Revisá esto con otro proveedor.  ".to_owned();
+        state.toggle_context(true);
+        assert_eq!(state.selected_count(), 0);
+        assert!(!state.can_send());
+        state.set_all_alive(true);
+        assert_eq!(
+            state.selected_ids(),
+            vec![destinations[1].0, destinations[2].0]
+        );
+        let prompt = state.prepare_prompt().unwrap();
+        let transfer: serde_json::Value =
+            serde_json::from_str(prompt.split_once("\n\n").unwrap().1).unwrap();
+        assert_eq!(transfer["request"], state.text);
+        assert_eq!(transfer["context"]["selection"], context.selection);
+        state.toggle_context(false);
+        assert_eq!(state.selected_count(), 0);
+        state.set_all_alive(true);
+        assert_eq!(
+            state.selected_count(),
+            4,
+            "ordinary broadcast still includes shells"
+        );
+    }
+
+    #[test]
+    fn portable_context_broadcast_retry_keeps_frozen_selection_and_failed_targets() {
+        let (mut app, destinations) = context_fixture();
+        destinations[2]
+            .1
+            .lock()
+            .unwrap()
+            .close_input_for_prompt_tests();
+        let state = app.broadcast.as_mut().unwrap();
+        state.text = "  Request with whitespace.  ".to_owned();
+        state.toggle_context(true);
+        state.set_all_alive(true);
+        let context = state.context.clone().unwrap();
+        let source_revision = destinations[0].1.lock().unwrap().activity_revision();
+        // New output and another active workspace must not change the captured
+        // context or redirect dispatch to the currently visible workspace.
+        destinations[0]
+            .1
+            .lock()
+            .unwrap()
+            .feed_output_for_persistence_tests(b"new output");
+        app.workspaces
+            .push(crate::state::Workspace::new("Other workspace", None));
+        app.active_ws = 1;
+        app.dispatch_broadcast();
+        let state = app.broadcast.as_ref().unwrap();
+        assert_eq!(state.context.as_ref(), Some(&context));
+        assert_eq!(state.text, "  Request with whitespace.  ");
+        assert_eq!(state.selected_ids(), vec![destinations[2].0]);
+        assert_eq!(destinations[1].1.lock().unwrap().activity_revision(), 1);
+        assert_eq!(destinations[2].1.lock().unwrap().activity_revision(), 0);
+        assert_eq!(destinations[3].1.lock().unwrap().activity_revision(), 0);
+        assert_eq!(
+            destinations[0].1.lock().unwrap().activity_revision(),
+            source_revision + 1
+        );
+        app.dispatch_broadcast();
+        assert_eq!(destinations[1].1.lock().unwrap().activity_revision(), 1);
+        assert_eq!(
+            app.broadcast.as_ref().unwrap().context.as_ref(),
+            Some(&context)
+        );
+    }
+
+    #[test]
+    fn portable_context_broadcast_rejects_large_payload_and_retains_draft() {
+        let (mut app, destinations) = context_fixture();
+        let state = app.broadcast.as_mut().unwrap();
+        state.text = "x".repeat(256 * 1024);
+        state.toggle_context(true);
+        state.set_all_alive(true);
+        let context = state.context.clone().unwrap();
+        app.dispatch_broadcast();
+        let state = app.broadcast.as_ref().unwrap();
+        assert_eq!(state.text.len(), 256 * 1024);
+        assert_eq!(state.context.as_ref(), Some(&context));
+        assert_eq!(state.selected_count(), 2);
+        assert_eq!(destinations[1].1.lock().unwrap().activity_revision(), 0);
+        assert_eq!(destinations[2].1.lock().unwrap().activity_revision(), 0);
+    }
+
+    #[test]
+    fn portable_context_broadcast_rejects_replaced_session_with_same_leaf() {
+        let (mut app, _destinations) = context_fixture();
+        let state = app.broadcast.as_mut().unwrap();
+        state.text = "continue".to_owned();
+        state.toggle_context(true);
+        state.targets[1].selected = true;
+        let old_leaf = state.targets[1].leaf_id;
+        let old_runtime = state.targets[1].runtime_session_id;
+        let manager = app.workspaces[0].pty_manager();
+        let workspace_id = app.workspaces[0].id;
+        let crate::panel::WorkspacePanel::Terminal(panel) = &mut app.workspaces[0].panels[1];
+        assert!(panel.replace_focused_session(
+            Arc::clone(&manager),
+            None,
+            workspace_id,
+            "codex".to_owned(),
+            "codex".to_owned()
+        ));
+        assert_eq!(panel.focused_leaf_id(), old_leaf);
+        let new_runtime = panel.focused_runtime_session_id();
+        assert_ne!(new_runtime, old_runtime);
+        let new_handle = manager
+            .lock()
+            .unwrap()
+            .handle(new_runtime.unwrap())
+            .unwrap();
+        app.dispatch_broadcast();
+        assert!(!app.broadcast.as_ref().unwrap().targets[1].alive);
+        assert_eq!(new_handle.lock().unwrap().activity_revision(), 0);
+        assert!(app.broadcast.as_ref().unwrap().context.is_some());
+    }
+
+    #[test]
+    fn portable_context_broadcast_rejects_changed_provider_hint() {
+        let (mut app, destinations) = context_fixture();
+        let state = app.broadcast.as_mut().unwrap();
+        state.text = "continue".to_owned();
+        state.toggle_context(true);
+        state.targets[1].selected = true;
+        app.workspaces[0].panels[1].set_title("Gemini replacement".to_owned());
+        app.dispatch_broadcast();
+        assert!(!app.broadcast.as_ref().unwrap().targets[1].alive);
+        assert_eq!(destinations[1].1.lock().unwrap().activity_revision(), 0);
+        assert!(app.broadcast.as_ref().unwrap().context.is_some());
+    }
+
+    fn broadcast_frame(
+        app: &mut TerminalApp,
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+    ) -> Vec<(String, egui::Pos2)> {
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                focused: true,
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1024.0, 768.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ui| app.show_broadcast(ui.ctx()),
+        );
+        let labels = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::epaint::Shape::Text(text) => Some((
+                    text.galley.text().to_owned(),
+                    text.pos + text.galley.rect.center().to_vec2(),
+                )),
+                _ => None,
+            })
+            .collect();
+        output.textures_delta.clear();
+        output.drop_without_applying_deltas();
+        labels
+    }
+
+    fn click_events(position: egui::Pos2) -> Vec<egui::Event> {
+        vec![
+            egui::Event::PointerMoved(position),
+            egui::Event::PointerButton {
+                pos: position,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::PointerButton {
+                pos: position,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]
+    }
+
+    #[test]
+    fn portable_context_broadcast_ui_selects_context_destination_and_queues_on_send() {
+        let (mut app, destinations) = context_fixture();
+        app.broadcast.as_mut().unwrap().text = "Review with Codex".to_owned();
+        let ctx = egui::Context::default();
+        broadcast_frame(&mut app, &ctx, Vec::new());
+        let labels = broadcast_frame(&mut app, &ctx, Vec::new());
+        let include = labels
+            .iter()
+            .find(|(text, _)| text.starts_with("Incluir selección"))
+            .unwrap()
+            .1;
+        broadcast_frame(&mut app, &ctx, click_events(include));
+        assert!(app.broadcast.as_ref().unwrap().include_context);
+        assert_eq!(app.broadcast.as_ref().unwrap().selected_count(), 0);
+        let labels = broadcast_frame(&mut app, &ctx, Vec::new());
+        let codex = labels
+            .iter()
+            .find(|(text, _)| text == "Codex target · Codex")
+            .unwrap()
+            .1;
+        broadcast_frame(&mut app, &ctx, click_events(codex));
+        assert_eq!(
+            app.broadcast.as_ref().unwrap().selected_ids(),
+            vec![destinations[1].0]
+        );
+        let labels = broadcast_frame(&mut app, &ctx, Vec::new());
+        let send = labels.iter().find(|(text, _)| text == "Enviar").unwrap().1;
+        broadcast_frame(&mut app, &ctx, click_events(send));
+        assert!(app.broadcast.is_none());
+        assert_eq!(destinations[1].1.lock().unwrap().activity_revision(), 1);
+        assert_eq!(destinations[2].1.lock().unwrap().activity_revision(), 0);
+        assert_eq!(destinations[3].1.lock().unwrap().activity_revision(), 0);
     }
 
     #[test]
