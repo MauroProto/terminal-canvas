@@ -3512,3 +3512,31 @@ fn layout_save_ack_preserves_read_and_lease_pauses_and_cannot_restart_writes() {
         assert!(!labels.contains("No se pudo guardar el layout"));
     }
 }
+
+#[test]
+fn layout_save_warning_clear_helper_requires_current_snapshot_without_ack_side_effects() {
+    use std::time::{Duration, Instant};
+
+    let ctx = egui::Context::default();
+    let mut app = detached_test_app_with_panel(&ctx);
+    let saved = app.snapshot_state();
+    app.persisted_state = Some(saved.clone());
+    app.sidebar_visible = !app.sidebar_visible;
+    let current = app.snapshot_state();
+    app.layout_save_warning = Some("controlled save warning".to_owned());
+    app.autosave = crate::state::persistence::AutosaveController::new(Duration::ZERO);
+    app.clear_layout_save_warning_if_current(&saved);
+    assert_eq!(
+        app.layout_save_warning.as_deref(),
+        Some("controlled save warning")
+    );
+    app.clear_layout_save_warning_if_current(&current);
+    assert!(app.layout_save_warning.is_none());
+    assert_eq!(app.persisted_state.as_ref(), Some(&saved));
+    assert_eq!(
+        app.autosave
+            .should_persist(&current, app.persisted_state.as_ref(), Instant::now(),),
+        crate::state::persistence::AutosaveDecision::SaveNow,
+        "the helper only dismisses the notice; its caller must own a real ACK",
+    );
+}
