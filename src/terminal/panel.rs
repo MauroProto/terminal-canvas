@@ -1531,6 +1531,49 @@ impl TerminalPanel {
             .submit_prompt(text)
     }
 
+    /// Address a particular live leaf without changing focus or starting it.
+    pub fn submit_prompt_to_leaf(
+        &self,
+        leaf: Uuid,
+        runtime: Uuid,
+        text: &str,
+    ) -> std::io::Result<()> {
+        let session = self
+            .leaf_session(leaf)
+            .ok_or_else(|| std::io::Error::other("La hoja de destino ya no existe"))?;
+        if session.runtime_session_id() != Some(runtime) {
+            return Err(std::io::Error::other("Cambió la sesión de destino"));
+        }
+        session.submit_prompt(text)
+    }
+
+    pub fn conversation_leaves(
+        &self,
+        workspace_id: Uuid,
+    ) -> Vec<crate::conversation::Conversation> {
+        self.leaf_ids()
+            .into_iter()
+            .filter_map(|id| {
+                let session = self.leaf_session(id)?;
+                Some(crate::conversation::Conversation {
+                    id,
+                    workspace_id,
+                    panel_id: self.id,
+                    title: self.title.clone(),
+                    provider: self
+                        .leaf_agent_commands
+                        .get(&id)
+                        .and_then(|cmd| AgentProvider::detect(cmd)),
+                    cwd: session.with_pty(PtyHandle::current_cwd).flatten(),
+                    memory_task_id: self.leaf_memory_task_ids.get(&id).copied(),
+                    native_session_id: self.leaf_agent_session_ids.get(&id).cloned(),
+                    runtime_session_id: session.runtime_session_id(),
+                    binding_id: None,
+                })
+            })
+            .collect()
+    }
+
     pub fn submit_prompt(
         &mut self,
         text: &str,

@@ -15,6 +15,7 @@ pub enum Command {
     ExportDiagnostics,
     AttachScreenshot,
     BroadcastCommand,
+    OpenConversations,
     ResumeConversation,
     SharePanelPrivate,
     SharePanelVisibleOnly,
@@ -53,6 +54,11 @@ pub struct CommandEntry {
 }
 
 pub const COMMANDS: &[CommandEntry] = &[
+    CommandEntry {
+        command: Command::OpenConversations,
+        label: "Conversaciones y contexto (Chat Connections)",
+        shortcut: "",
+    },
     CommandEntry {
         command: Command::NewTerminal,
         label: "New Terminal",

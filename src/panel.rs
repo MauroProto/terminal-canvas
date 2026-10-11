@@ -16,6 +16,24 @@ pub enum WorkspacePanel {
 pub type CanvasPanel = WorkspacePanel;
 
 impl WorkspacePanel {
+    pub fn conversation_leaves(
+        &self,
+        workspace_id: Uuid,
+    ) -> Vec<crate::conversation::Conversation> {
+        match self {
+            Self::Terminal(panel) => panel.conversation_leaves(workspace_id),
+        }
+    }
+    pub fn submit_prompt_to_leaf(
+        &self,
+        leaf: Uuid,
+        runtime: Uuid,
+        text: &str,
+    ) -> std::io::Result<()> {
+        match self {
+            Self::Terminal(panel) => panel.submit_prompt_to_leaf(leaf, runtime, text),
+        }
+    }
     pub fn set_agent_command(&mut self, command: Option<String>) {
         match self {
             Self::Terminal(panel) => panel.set_agent_command(command),

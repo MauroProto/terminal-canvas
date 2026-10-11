@@ -28,6 +28,7 @@ pub mod code_highlight;
 mod code_review_ui;
 #[allow(float_literal_f32_fallback)]
 mod collab_ui;
+mod conversation_ui;
 mod desktop;
 mod dialogs;
 mod export_action;
@@ -116,6 +117,7 @@ pub struct TerminalApp {
     settings_open: bool,
     settings_draft: Option<settings_ui::SettingsDraft>,
     broadcast: Option<broadcast_ui::BroadcastState>,
+    conversations: Option<conversation_ui::ConversationUi>,
     resume_picker: Option<resume_ui::ResumeState>,
     file_tree: crate::sidebar::file_tree::FileTreeState,
     /// Paneles cuyo scrollback persistido ya se reinyectó en esta corrida.
@@ -323,6 +325,7 @@ impl TerminalApp {
                 settings_open: false,
                 settings_draft: None,
                 broadcast: None,
+                conversations: None,
                 resume_picker: None,
                 file_tree: Default::default(),
                 scrollback_restored: HashSet::new(),
@@ -433,6 +436,7 @@ impl TerminalApp {
                 settings_open: false,
                 settings_draft: None,
                 broadcast: None,
+                conversations: None,
                 resume_picker: None,
                 file_tree: Default::default(),
                 scrollback_restored: HashSet::new(),
@@ -556,6 +560,9 @@ impl TerminalApp {
             app.join_session_draft.error = None;
         }
 
+        if side_effects && persistence_writes_enabled {
+            app.start_conversations(egui_ctx);
+        }
         app
     }
 
@@ -716,6 +723,7 @@ impl TerminalApp {
             Command::ExportDiagnostics => self.export_diagnostics(),
             Command::AttachScreenshot => self.start_screenshot_capture(ctx),
             Command::BroadcastCommand => self.open_broadcast(),
+            Command::OpenConversations => self.open_conversations(),
             Command::ResumeConversation => self.open_resume_picker(),
             Command::SharePanelPrivate => {
                 self.set_focused_panel_share_scope(PanelShareScope::Private)
@@ -1125,6 +1133,7 @@ impl TerminalApp {
         // Accepted notes must enter the existing final preference-save barrier.
         self.poll_review_prompt_delivery();
         let preferences_saved = self.drain_preferences_for_shutdown();
+        let conversations_saved = self.finish_conversations();
         let _ = self.drain_persistence_worker();
         // Ownership may have changed while the worker was finishing its queue.
         if !self.ensure_persistence_ownership() {
@@ -1142,6 +1151,7 @@ impl TerminalApp {
             anyhow::bail!("Some terminal history could not be saved");
         }
         preferences_saved?;
+        conversations_saved?;
         if !self.ensure_persistence_ownership() {
             anyhow::bail!("Another app took ownership before saving completed");
         }
@@ -1395,6 +1405,7 @@ impl TerminalApp {
         self.publish_collab_snapshot();
         self.poll_join_session_result();
         self.poll_pending_launches(ctx);
+        self.poll_conversations(ctx);
         self.restore_pending_scrollbacks();
         self.finish_prepared_update(ctx);
         self.maybe_persist_state(ctx);
@@ -1674,6 +1685,7 @@ impl TerminalApp {
             || self.quick_open.is_some()
             || self.settings_open
             || self.broadcast.is_some()
+            || self.conversations.as_ref().is_some_and(|hub| hub.open)
             || self.resume_picker.is_some()
             || self.launch_agent.is_some()
             || self.memory_ui.is_some()
@@ -2531,6 +2543,7 @@ impl TerminalApp {
         self.show_settings(ctx);
         self.show_memory_hub(ctx);
         self.show_broadcast(ctx);
+        self.show_conversations(ctx);
         self.show_resume_picker(ctx);
         // Los toasts van último: se dibujan por encima de cualquier overlay.
         self.show_toasts(ctx);
