@@ -36,6 +36,10 @@ impl SettingsDraft {
     }
 
     fn to_config(&self) -> AppConfig {
+        self.to_config_with_current(&crate::config::runtime_config())
+    }
+
+    fn to_config_with_current(&self, current: &AppConfig) -> AppConfig {
         let shell = self.shell.trim().to_owned();
         AppConfig {
             font_size: self.font_size,
@@ -47,8 +51,8 @@ impl SettingsDraft {
             shell: if shell.is_empty() { None } else { Some(shell) },
             // El token de Linear no se edita acá (vive en config.toml):
             // se conserva tal cual para que guardar Settings no lo borre.
-            linear_token: crate::config::runtime_config().linear_token,
-            onboarding_dismissed: crate::config::runtime_config().onboarding_dismissed,
+            linear_token: current.linear_token.clone(),
+            onboarding_dismissed: current.onboarding_dismissed,
         }
     }
 }
@@ -108,6 +112,10 @@ impl TerminalApp {
                                 .size(11.5)
                                 .color(palette::DIM),
                         );
+                        if let Err(error) = config::ensure_config_write_allowed() {
+                            ui.add_space(8.0);
+                            ui.label(RichText::new(error.to_string()).color(palette::TEXT));
+                        }
                         ui.add_space(12.0);
                         ui.separator();
 
@@ -123,9 +131,12 @@ impl TerminalApp {
                         ui.add_space(8.0);
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.style_mut().spacing.item_spacing.x = 8.0;
-                            if super::dialogs::dialog_action_button(ui, "Guardar", true) {
-                                save = true;
-                            }
+                            let can_save = config::ensure_config_write_allowed().is_ok();
+                            ui.add_enabled_ui(can_save, |ui| {
+                                if super::dialogs::dialog_action_button(ui, "Guardar", true) {
+                                    save = true;
+                                }
+                            });
                             if super::dialogs::dialog_action_button(ui, "Cancelar", false) {
                                 cancel = true;
                             }
@@ -133,11 +144,10 @@ impl TerminalApp {
                     });
             });
 
-        if save {
-            self.apply_settings_draft();
+        if cancel {
             self.settings_open = false;
             self.settings_draft = None;
-        } else if cancel {
+        } else if save && self.apply_settings_draft() {
             self.settings_open = false;
             self.settings_draft = None;
         }
@@ -237,20 +247,27 @@ impl TerminalApp {
         );
     }
 
-    fn apply_settings_draft(&mut self) {
+    fn apply_settings_draft(&mut self) -> bool {
         let Some(draft) = self.settings_draft.as_ref() else {
-            return;
+            return false;
         };
         let new_config = draft.to_config();
+        if let Err(error) = self
+            .preferences_worker
+            .try_save_settings(new_config.clone())
+        {
+            self.toast_error(error.to_string());
+            return false;
+        }
         // El tamaño de fuente se aplica en vivo.
         set_base_font_size(new_config.font_size);
         // Actualiza la config runtime (los booleanos se leen en vivo).
         config::update_runtime_config(new_config.clone());
-        self.preferences_worker.save_settings(new_config);
         // Forzá un repintado para que el cambio de fuente se vea ya.
         if let Some(ctx) = self.ctx.clone() {
             ctx.request_repaint();
         }
+        true
     }
 }
 

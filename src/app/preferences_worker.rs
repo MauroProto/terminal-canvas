@@ -410,6 +410,7 @@ impl PreferencesWorker {
         self.submit(Job::ImportNotes(key, request, root));
         request
     }
+    #[cfg(test)]
     pub(super) fn save_settings(&mut self, config: crate::config::AppConfig) {
         if let Err(error) = self.try_save_settings(config) {
             log::warn!("{error}");

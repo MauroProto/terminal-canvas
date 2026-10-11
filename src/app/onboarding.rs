@@ -115,7 +115,7 @@ impl TerminalApp {
     }
 
     fn show_onboarding_overlay(&mut self, ctx: &egui::Context) {
-        if self.onboarding_dismissed {
+        if self.onboarding_dismissed || crate::config::ensure_config_write_allowed().is_err() {
             return;
         }
         let mut dismiss = false;
@@ -155,11 +155,14 @@ impl TerminalApp {
 
     /// Cierra el overlay y lo persiste, para no repetirlo en cada arranque.
     fn dismiss_onboarding(&mut self) {
-        self.onboarding_dismissed = true;
         let mut config = crate::config::runtime_config();
         config.onboarding_dismissed = true;
-        crate::config::update_runtime_config(config.clone());
-        self.preferences_worker.save_settings(config);
+        if let Err(error) = self.preferences_worker.try_save_settings(config.clone()) {
+            self.toast_error(error.to_string());
+            return;
+        }
+        self.onboarding_dismissed = true;
+        crate::config::update_runtime_config(config);
     }
 }
 
