@@ -912,4 +912,28 @@ mod config_recovery_tests {
         ));
         assert!(input.calls >= 2);
     }
+
+    #[test]
+    fn exact_limit_sentinel_growth_and_huge_metadata_are_bounded() {
+        let mut exact = reader(b"    ");
+        assert_eq!(read_config_bytes(&mut exact, 4, 4).unwrap(), b"    ");
+        let mut growth = reader(b"     ");
+        assert_eq!(
+            read_config_bytes(&mut growth, 4, 4),
+            Err(ConfigLoadIssueKind::TooLarge)
+        );
+        assert!(growth.requested <= 5);
+        let mut huge = reader(b"");
+        assert_eq!(
+            read_config_bytes(&mut huge, u64::MAX, 4),
+            Err(ConfigLoadIssueKind::TooLarge)
+        );
+        assert_eq!(huge.calls, 0);
+        let mut overflow = reader(b"");
+        assert_eq!(
+            read_config_bytes(&mut overflow, 0, usize::MAX),
+            Err(ConfigLoadIssueKind::TooLarge)
+        );
+        assert_eq!(overflow.calls, 0);
+    }
 }
