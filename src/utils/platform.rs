@@ -602,4 +602,45 @@ mod tests {
         assert_eq!(held, Ok("held"));
         assert!(terminated.is_ok(), "worker did not stop after reaping");
     }
+
+    #[test]
+    fn reaper_preserves_live_child_after_sender_disconnects() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{mpsc, Arc};
+        use std::time::Duration;
+
+        let (tx, rx) = mpsc::channel();
+        let (dropped_tx, dropped_rx) = mpsc::channel();
+        let ready = Arc::new(AtomicBool::new(false));
+        let (observed_tx, observed_rx) = mpsc::channel();
+        tx.send((
+            "held".to_owned(),
+            FakeReaperChild {
+                id: "held",
+                ready: ready.clone(),
+                fail_wait: false,
+                alive_observed: Some(observed_tx),
+                dropped: dropped_tx,
+            },
+        ))
+        .expect("queue fixture");
+        drop(tx);
+        let (handle, stopped) = spawn_fake_reaper(rx);
+        // Start the hold only after the worker has polled the live child.
+        let observed_live = observed_rx.recv_timeout(Duration::from_secs(2));
+        let still_live = dropped_rx.recv_timeout(Duration::from_millis(150)).is_err();
+        ready.store(true, Ordering::Release);
+        let held = dropped_rx.recv_timeout(Duration::from_secs(2));
+        let terminated = stopped.recv_timeout(Duration::from_secs(2));
+        if terminated.is_ok() {
+            handle.join().expect("worker");
+        }
+        assert!(
+            observed_live.is_ok(),
+            "worker never observed the live child"
+        );
+        assert!(still_live, "disconnect dropped a live detached child");
+        assert_eq!(held, Ok("held"));
+        assert!(terminated.is_ok(), "worker did not drain on disconnect");
+    }
 }
