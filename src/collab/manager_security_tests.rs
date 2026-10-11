@@ -152,3 +152,68 @@ fn security_control_requests_are_bounded_and_cleanup_recovers_capacity() {
     assert_eq!(manager.controller_for(panel), None);
     assert!(manager.last_error.is_none());
 }
+
+#[test]
+fn security_expired_or_decided_join_cannot_return_after_http_failure() {
+    for next_state in [
+        None,
+        Some(GuestConnectionState::Approved),
+        Some(GuestConnectionState::Denied),
+    ] {
+        let (mut manager, guest_id, _) = host_fixture(0);
+        let mut presence = manager.host.as_ref().unwrap().guests[&guest_id].clone();
+        presence.connection_state = GuestConnectionState::Pending;
+        manager.handle_broker_message(BrokerControlMessage::Presence {
+            guests: vec![presence.clone()],
+        });
+        let join = JoinRequest {
+            guest_id,
+            display_name: presence.display_name.clone(),
+            device_id: "device".to_owned(),
+            requested_at: Utc::now(),
+        };
+        manager.handle_broker_message(BrokerControlMessage::JoinRequested {
+            request: join.clone(),
+        });
+        manager.handle_broker_message(BrokerControlMessage::JoinRequested {
+            request: join.clone(),
+        });
+        assert_eq!(
+            manager.pending_joins().len(),
+            1,
+            "reconnect replay must be deduplicated"
+        );
+        manager.host.as_mut().unwrap().pending_joins.clear();
+        manager.restore_pending_join(guest_id, Some(join.clone()));
+        assert_eq!(
+            manager.pending_joins().len(),
+            1,
+            "still-pending failed decisions remain retryable"
+        );
+        let guests = next_state
+            .map(|state| {
+                presence.connection_state = state;
+                vec![presence]
+            })
+            .unwrap_or_default();
+        manager.handle_broker_message(BrokerControlMessage::Presence { guests });
+        assert!(manager.pending_joins().is_empty());
+        manager.restore_pending_join(guest_id, Some(join));
+        assert!(
+            manager.pending_joins().is_empty(),
+            "late failure resurrected a finished join"
+        );
+    }
+}
+
+#[test]
+fn security_departed_guest_loses_control_without_a_disconnected_presence() {
+    let (mut manager, guest, snapshot) = host_fixture(1);
+    let terminal = snapshot.panels[0].panel_id;
+    manager.grant_control(terminal, guest);
+    assert_eq!(manager.controller_for(terminal), Some(guest));
+    manager.handle_broker_message(BrokerControlMessage::Presence { guests: Vec::new() });
+    assert_eq!(manager.controller_for(terminal), None);
+    assert!(manager.pending_control_requests().is_empty());
+    assert!(manager.host.as_ref().unwrap().terminal_controls.is_empty());
+}

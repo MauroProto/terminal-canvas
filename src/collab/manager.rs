@@ -1098,6 +1098,15 @@ impl CollabManager {
         let Some(host) = &mut self.host else {
             return;
         };
+        // Presence is sent before JoinRequested. A late HTTP failure must not
+        // revive a request the broker has already expired or decided.
+        if !host
+            .guests
+            .get(&guest_id)
+            .is_some_and(|guest| matches!(guest.connection_state, GuestConnectionState::Pending))
+        {
+            return;
+        }
         if let Some(request) = removed_request {
             if !host
                 .pending_joins
@@ -1196,11 +1205,22 @@ impl CollabManager {
             }
             BrokerControlMessage::Presence { guests } => {
                 if let Some(host) = &mut self.host {
+                    let departed = host
+                        .guests
+                        .keys()
+                        .copied()
+                        .filter(|id| !guests.iter().any(|guest| guest.id == *id))
+                        .collect::<Vec<_>>();
                     host.guests = guests
                         .iter()
                         .cloned()
                         .map(|guest| (guest.id, guest))
                         .collect();
+                    host.pending_joins.retain(|request| {
+                        host.guests.get(&request.guest_id).is_some_and(|guest| {
+                            matches!(guest.connection_state, GuestConnectionState::Pending)
+                        })
+                    });
                     let disconnected = host
                         .guests
                         .values()
@@ -1211,6 +1231,7 @@ impl CollabManager {
                             )
                         })
                         .map(|guest| guest.id)
+                        .chain(departed)
                         .collect::<Vec<_>>();
                     for guest_id in disconnected {
                         self.release_controls_for_guest(guest_id);
