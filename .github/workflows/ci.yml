@@ -1,12 +1,8 @@
 name: CI
 
 on:
-  push:
-    branches:
-      - master
-      - "codex/**"
-  pull_request:
-  # Also verify an exact selected branch after a token-driven delivery.
+  # Local development is the default. Remote validation requires an explicit
+  # request and repository Actions must first be enabled by the owner.
   workflow_dispatch:
 
 permissions:
@@ -15,11 +11,10 @@ permissions:
 env:
   CARGO_BUILD_JOBS: 2
 
-# Un push nuevo cancela la corrida anterior de la misma rama (en master no,
-# para no perder señal de commits intermedios).
+# Un nuevo pedido manual reemplaza la corrida anterior de la misma rama.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+  cancel-in-progress: true
 
 jobs:
   test:
@@ -137,37 +132,6 @@ jobs:
           persist-credentials: false
       - name: Verify browser extension
         run: node --test extension/tests/*.test.cjs
-
-  bench:
-    # Presupuesto de performance (Ship-it 7.3): compara las rutas calientes
-    # contra el commit anterior y falla si algo se degrada más de 15%.
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    if: github.event_name == 'pull_request'
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0, Node 24
-        with:
-          persist-credentials: false
-          # El script necesita el commit base para armar el worktree.
-          fetch-depth: 0
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.98.0"
-
-      - name: Cache cargo artifacts
-        uses: Swatinem/rust-cache@v2
-
-      - name: Install Linux font dependencies
-        run: sudo apt-get update && sudo apt-get install -y pkg-config libfontconfig1-dev libfreetype6-dev
-
-      - name: Compare hot-path benchmarks
-        env:
-          BASE_REF: ${{ github.base_ref }}
-        run: scripts/bench-compare.sh "origin/$BASE_REF" 15
 
   audit:
     runs-on: ubuntu-24.04

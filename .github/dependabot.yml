@@ -1,13 +1,13 @@
-# Actualizaciones automatizadas de dependencias: un PR semanal por
-# ecosistema, para que las correcciones de seguridad no dependan de que
-# alguien se acuerde de correr `cargo update`.
+# Desarrollo local: sin PRs rutinarios de actualización de versiones.
+# El límite 0 no desactiva las alertas ni las actualizaciones de seguridad;
+# esas funciones dependen de la configuración de seguridad del repositorio.
 version: 2
 updates:
   - package-ecosystem: cargo
     directory: /
     schedule:
       interval: weekly
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 0
     groups:
       egui-family:
         patterns:
@@ -19,3 +19,4 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    open-pull-requests-limit: 0

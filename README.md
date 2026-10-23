@@ -233,6 +233,19 @@ The repository is in active consolidation. The main priorities are:
 
 ## Verification
 
+Development and validation run locally by default. GitHub Actions was disabled
+for this repository on October 23, 2026 to stop remote build/test usage; pushes
+still back up the code normally. CI is manual-only, and routine Dependabot
+version-update PRs are disabled. Existing Actions artifacts expire normally.
+
+Contributors and coding agents: do not enable Actions, dispatch CI/release jobs,
+or add automatic remote workflows unless the owner explicitly requests remote
+validation or a release. A normal code change is not such a request. The optional
+manual CI still tests all supported platforms and can be expensive. Local checks
+cover only the host platform; cross-platform verification requires a separate,
+explicitly requested run. Release automation is also unavailable while Actions
+is disabled; local packaging scripts remain available.
+
 Runtime and regression coverage lives under `tests/runtime` plus module-local tests.
 
 Run the same checks used by CI with the pinned Rust toolchain:
