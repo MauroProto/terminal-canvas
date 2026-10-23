@@ -65,7 +65,7 @@ eframe = { version = "0.36.2", default-features = false, features = ["accesskit"
 egui = "0.36.2"
 unicode-segmentation = "=1.13.3"
 alacritty_terminal = "0.25.1"
-libghostty-vt = { version = "0.1.1", optional = true }
+libghostty-vt = { version = "0.2.2", optional = true }
 portable-pty = "0.9"
 axum = { version = "0.7", features = ["ws", "json"] }
 axum-server = { version = "0.7", features = ["tls-rustls"] }
