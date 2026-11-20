@@ -30,21 +30,28 @@ fn fixture_root() -> PathBuf {
     root
 }
 
-fn start(root: PathBuf, db: &Path) -> (TestDaemon, String) {
-    let dir = root.join("d");
-    let history = root.join("history");
+fn fixture_binary(name: &str) -> PathBuf {
     let mut binary = std::env::current_exe().unwrap();
     binary.pop();
     if binary.ends_with("deps") {
         binary.pop();
     }
-    binary.push("mi-terminal-daemon");
+    binary.push(name);
     assert!(
         binary.is_file(),
-        "real daemon binary is required: {}",
+        "build the fixture binary before testing: {}",
         binary.display()
     );
-    let child = Command::new(binary)
+    binary
+}
+
+fn start(root: PathBuf, db: &Path) -> (TestDaemon, String) {
+    let dir = root.join("d");
+    let history = root.join("history");
+    let shell_home = root.join("shell-home");
+    std::fs::create_dir(&shell_home).unwrap();
+    let child = Command::new(fixture_binary("mi-terminal-daemon"))
+        .env("HOME", shell_home)
         .env("TERMINAL_CANVAS_HOME", root.join("profile"))
         .env("MI_TERMINAL_DAEMON_DIR", &dir)
         .env("MI_TERMINAL_SCROLLBACK_DIR", &history)
@@ -449,4 +456,100 @@ fn real_daemon_with_unavailable_memory_never_advertises_or_spawns_a_managed_birt
         Response::Sessions { ids: Vec::new() }
     );
     assert_eq!(std::fs::read(db).unwrap(), b"not a SQLite database");
+}
+
+#[cfg(feature = "daemon")]
+#[test]
+fn real_daemon_qwen_fixture_launches_once_and_keeps_the_selected_cwd() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = fixture_root().canonicalize().unwrap();
+    let db = root.join("memory.db");
+    let store = MemoryStore::open(&db).unwrap();
+    let owner = Uuid::new_v4();
+    let id = Uuid::new_v4();
+    let key = LeafKey {
+        workspace: Uuid::new_v4(),
+        panel: Uuid::new_v4(),
+        leaf: Uuid::new_v4(),
+    };
+    let reserved = transition(
+        &store,
+        owner,
+        LedgerIntent::Reserve {
+            expected: None,
+            key,
+            birth: BirthBinding {
+                runtime: id,
+                generation: Uuid::new_v4(),
+            },
+            owner,
+        },
+    );
+    let checkout = root.join("chosen checkout");
+    let binaries = root.join("fixture binaries");
+    std::fs::create_dir(&checkout).unwrap();
+    std::fs::create_dir(&binaries).unwrap();
+    let fake_qwen = binaries.join("qwen");
+    // No provider CLI, network, authentication or ambient PATH lookup.
+    std::fs::write(
+        &fake_qwen,
+        b"#!/bin/sh\nprintf '%s\t%s\n' \"$PWD\" \"$#\" >> qwen-launches.txt\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake_qwen, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let requests = root.join("profile/data/agent-launches");
+    let startup = crate::orchestration::agent_launcher::qwen_daemon_fixture_command(
+        &requests,
+        &fixture_binary("mi-terminal"),
+        fake_qwen,
+    )
+    .unwrap();
+    let report = checkout.join("qwen-launches.txt");
+    let expected = format!("{}\t0\n", checkout.display());
+
+    let (daemon, token) = start(root, &db);
+    let (mut client, caps) = WireClient::connect(&daemon, &token, owner);
+    assert!(caps.permits_hook_birth());
+    let spawn = Request::Spawn {
+        id: Some(id),
+        spec: WireSpec {
+            cwd: Some(checkout.to_str().unwrap().to_owned()),
+            startup_command: Some(startup),
+            workspace_id: Some(key.workspace),
+            panel_id: Some(key.panel),
+            leaf_id: Some(key.leaf),
+            hook_generation: reserved.generation,
+            ..WireSpec::default()
+        },
+    };
+    assert_eq!(client.request(&spawn), Response::Spawned { id });
+    let deadline = Instant::now() + Duration::from_secs(12);
+    loop {
+        if std::fs::read_to_string(&report).as_deref().ok() == Some(expected.as_str()) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "fake Qwen did not start at the selected directory with zero arguments: {:?}",
+            std::fs::read_to_string(&report)
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(store.hook_birth_consumed(reserved).unwrap());
+    assert_eq!(std::fs::read_dir(&requests).unwrap().count(), 0);
+
+    // Simulate losing a spawn ACK and reconnecting the application's client.
+    drop(client);
+    let (mut reconnect, _) = WireClient::connect(&daemon, &token, owner);
+    assert_eq!(reconnect.request(&spawn), Response::Spawned { id });
+    assert!(matches!(
+        reconnect.request(&Request::Attach { id }),
+        Response::Attached { id: actual, .. } if actual == id
+    ));
+    assert_eq!(
+        reconnect.request(&Request::List),
+        Response::Sessions { ids: vec![id] }
+    );
+    assert_eq!(std::fs::read_to_string(report).unwrap(), expected);
 }

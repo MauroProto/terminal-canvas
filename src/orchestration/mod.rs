@@ -16,6 +16,8 @@ mod worktree_archive;
 mod worktree_removal_safety;
 mod worktree_trash;
 
+#[cfg(all(test, unix))]
+pub(crate) use agent_detect::detect_installed;
 #[allow(unused_imports)]
 pub use agent_detect::{install_hint, AgentDetector, InstalledAgents};
 #[allow(unused_imports)]

@@ -291,6 +291,22 @@ fn helper_command(executable: &Path, token: Uuid, shell: &str) -> String {
     )
 }
 
+#[cfg(all(test, unix, feature = "daemon"))]
+pub(crate) fn qwen_daemon_fixture_command(
+    request_dir: &Path,
+    terminal_executable: &Path,
+    qwen_executable: PathBuf,
+) -> anyhow::Result<String> {
+    let request = LaunchRequest {
+        provider: AgentProvider::QwenCode,
+        brief: String::new(),
+        interactive_qwen_executable: Some(qwen_executable),
+    };
+    validate_interactive_qwen(&request)?;
+    let token = write_launch_request(request_dir, &request)?;
+    Ok(helper_command(terminal_executable, token, "/bin/bash"))
+}
+
 /// Called before GUI/config initialization. Accept only registered providers:
 /// resolve most in the terminal's PATH; launch interactive Qwen at the exact
 /// executable picked from the application's PATH.

@@ -42,6 +42,33 @@ bridge cleanup. It does not launch or authenticate a model session. Claude's
 history and global hook paths respect `CLAUDE_CONFIG_DIR`; an isolated app profile
 continues to prohibit rewriting global provider configuration.
 
+### Headless Qwen launcher and cold layout
+
+The app tests exercise the accessible provider picker without starting Qwen.
+They check that the manual dialog can select it or offer its install hint, but
+a captured-page draft offers neither. The cold-layout test restores two
+split panes, checks that their four runtime identities stay distinct, and
+compares the built PTY specs: the retained managed worktree is used, the
+missing worktree falls back to the workspace, and neither starts Qwen.
+
+### Real daemon and the interactive Qwen launcher
+
+The opt-in Unix daemon suite covers a fake Qwen executable using the same
+one-shot helper and daemon-managed PTY used by the application. It checks the
+selected directory, zero arguments, a repeated spawn and client reattach.
+It does not run a provider, use credentials or require network access.
+
+On Linux or macOS with unprivileged local Unix socket binding, run:
+
+```sh
+cargo build --locked --features daemon --bin mi-terminal --bin mi-terminal-daemon
+cargo test --locked --features daemon --lib real_daemon_qwen_fixture
+```
+
+The existing manually dispatched CI job also runs this fixture within the
+Unix all-targets daemon suite. A build-only result, or an environment that
+denies Unix socket binding, is not native daemon verification.
+
 These checks do not cover the native folder picker, native Windows/macOS GUI
 interaction, hardware GPU performance, authenticated provider replies, signed
 updates or collaboration between two physical machines across a real network.

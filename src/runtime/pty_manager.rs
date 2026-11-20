@@ -1885,6 +1885,11 @@ impl PtyManager {
             .as_deref()
     }
 
+    #[cfg(all(test, unix))]
+    pub(crate) fn cwd_for_tests(&self, session_id: Uuid) -> Option<&std::path::Path> {
+        self.sessions.get(&session_id)?.spec.cwd.as_deref()
+    }
+
     /// Declara la sesión del panel enfocado para el carril interactivo.
     pub fn set_priority_session(&mut self, session_id: Option<Uuid>) {
         if let Ok(mut scheduler) = self.scheduler.lock() {

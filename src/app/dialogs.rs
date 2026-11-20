@@ -504,12 +504,13 @@ impl TerminalApp {
                             // Onboarding (7.2): el combo lista lo que está
                             // instalado; el resto va abajo, deshabilitado y
                             // con el comando para instalarlo.
-                            for provider in crate::orchestration::launch_presets() {
-                                if provider == crate::orchestration::AgentProvider::QwenCode
-                                    && (draft.requires_native_prompt || !installed.resolved)
-                                {
-                                    continue;
-                                }
+                            let offered = crate::orchestration::launch_presets()
+                                .into_iter()
+                                .filter(|provider| {
+                                    *provider != crate::orchestration::AgentProvider::QwenCode
+                                        || (!draft.requires_native_prompt && installed.resolved)
+                                });
+                            for provider in offered.clone() {
                                 if installed.is_available(provider) {
                                     ui.selectable_value(
                                         &mut draft.provider,
@@ -518,8 +519,7 @@ impl TerminalApp {
                                     );
                                 }
                             }
-                            let missing: Vec<_> = crate::orchestration::launch_presets()
-                                .into_iter()
+                            let missing: Vec<_> = offered
                                 .filter(|provider| !installed.is_available(*provider))
                                 .collect();
                             if !missing.is_empty() {
@@ -1047,6 +1047,84 @@ mod tests {
     use egui_kittest::kittest::Queryable as _;
 
     use super::dialog_action_button;
+
+    #[cfg(unix)]
+    fn fake_qwen_installation() -> (std::path::PathBuf, crate::orchestration::InstalledAgents) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("launcher-path-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let fake = dir.join("qwen");
+        std::fs::write(&fake, "#!/bin/sh\nexit 91\n").unwrap();
+        std::fs::set_permissions(fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let installed = crate::orchestration::detect_installed(dir.to_str().unwrap());
+        (dir, installed)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn qwen_picker_shows_interactive_input_only_after_explicit_selection() {
+        use crate::orchestration::AgentProvider;
+        let (dir, installed) = fake_qwen_installation();
+        let ctx = egui::Context::default();
+        let mut app = super::TerminalApp::new_for_tests(&ctx);
+        app.open_launch_agent_dialog();
+        app.installed_agents = installed;
+        app.launch_agent.as_mut().unwrap().brief = "keep this draft".to_owned();
+        let panel_count = app.ws().panels.len();
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(900.0, 700.0))
+            .build_ui_state(|ui, app| app.show_launch_dialog(ui.ctx()), app);
+
+        harness.get_by_value("Claude Code").click();
+        harness.run_steps(3);
+        harness.get_by_label("Qwen Code").click();
+        harness.run_steps(3);
+
+        let app = harness.state();
+        let draft = app.launch_agent.as_ref().unwrap();
+        assert_eq!(draft.provider, AgentProvider::QwenCode);
+        assert_eq!(draft.brief, "keep this draft");
+        assert!(draft.pending_memory.is_none() && draft.pending_session.is_none());
+        assert_eq!(app.ws().panels.len(), panel_count);
+        assert!(harness.query_by_label("Brief").is_none());
+        assert!(harness
+            .query_by_label("Qwen Code opens interactively. Enter your prompt in the terminal.")
+            .is_some());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn qwen_picker_install_hint_is_manual_only_even_when_qwen_is_missing() {
+        let (dir, installed) = fake_qwen_installation();
+        let ctx = egui::Context::default();
+        let mut app = super::TerminalApp::new_for_tests(&ctx);
+        app.open_launch_agent_dialog();
+        app.installed_agents = crate::orchestration::detect_installed("");
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(900.0, 700.0))
+            .build_ui_state(|ui, app| app.show_launch_dialog(ui.ctx()), app);
+
+        harness.get_by_value("Claude Code").click();
+        harness.run_steps(3);
+        assert!(harness.query_by_label("Qwen Code").is_none());
+        assert!(harness
+            .query_by_label("Qwen Code — npm i -g @qwen-code/qwen-code")
+            .is_some());
+
+        harness
+            .state_mut()
+            .launch_agent
+            .as_mut()
+            .unwrap()
+            .requires_native_prompt = true;
+        harness.run_steps(3);
+        assert!(harness.query_by_label_contains("Qwen Code").is_none());
+        harness.state_mut().installed_agents = installed;
+        harness.run_steps(3);
+        assert!(harness.query_by_label_contains("Qwen Code").is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn dialog_actions_are_real_accessible_buttons() {
