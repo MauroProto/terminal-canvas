@@ -504,6 +504,11 @@ impl TerminalApp {
                             // instalado; el resto va abajo, deshabilitado y
                             // con el comando para instalarlo.
                             for provider in crate::orchestration::launch_presets() {
+                                if provider == crate::orchestration::AgentProvider::QwenCode
+                                    && (draft.requires_native_prompt || !installed.resolved)
+                                {
+                                    continue;
+                                }
                                 if installed.is_available(provider) {
                                     ui.selectable_value(
                                         &mut draft.provider,
@@ -536,8 +541,12 @@ impl TerminalApp {
                         });
                     dialog_field_label(ui, "Task");
                     dialog_singleline(ui, &mut draft.task_title, false);
-                    dialog_field_label(ui, "Brief");
-                    dialog_multiline(ui, &mut draft.brief, 80.0);
+                    if draft.provider == crate::orchestration::AgentProvider::QwenCode {
+                        ui.label("Qwen Code opens interactively. Enter your prompt in the terminal.");
+                    } else {
+                        dialog_field_label(ui, "Brief");
+                        dialog_multiline(ui, &mut draft.brief, 80.0);
+                    }
                     dialog_field_label(ui, "Repo mode");
                     egui::ComboBox::from_id_salt("launch-agent-worktree")
                         .selected_text(match draft.worktree_mode {

@@ -1691,6 +1691,11 @@ impl TerminalPanel {
 
     fn resume_command_for_leaf(&self, leaf: crate::terminal::split_tree::LeafId) -> Option<String> {
         let command = self.leaf_agent_commands.get(&leaf)?;
+        // An interactive Qwen launch requires a new explicit user action. A
+        // saved pane can reattach, but a fresh PTY must not run it again.
+        if Some(command.trim()) == AgentProvider::QwenCode.launch_command() {
+            return None;
+        }
         let provider = AgentProvider::detect(command).unwrap_or_default();
         match self.leaf_agent_session_ids.get(&leaf) {
             Some(session_id) => {
@@ -3231,6 +3236,30 @@ mod persistence_tests {
                 .expect("manager lock")
                 .detached_session_count(),
             2
+        );
+    }
+
+    #[test]
+    fn restoring_a_qwen_pane_does_not_start_the_cli() {
+        let leaf = Uuid::new_v4();
+        let tree = SplitNode::leaf(leaf);
+        let mut saved = split_state(leaf, leaf, &tree, &[]);
+        saved.agent_command = Some("qwen".to_owned());
+        let manager = Arc::new(Mutex::new(PtyManager::new_for_tests()));
+        let panel = TerminalPanel::from_saved(
+            saved,
+            &egui::Context::default(),
+            Some(Path::new("/tmp")),
+            Uuid::new_v4(),
+            Arc::clone(&manager),
+        );
+
+        assert_eq!(panel.agent_command(), Some("qwen"));
+        assert_eq!(panel.resume_command_for_leaf(leaf), None);
+        let runtime = panel.all_runtime_session_ids()[0];
+        assert_eq!(
+            manager.lock().unwrap().startup_command_for_tests(runtime),
+            None
         );
     }
 

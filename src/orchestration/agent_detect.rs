@@ -18,6 +18,7 @@ pub fn install_hint(provider: AgentProvider) -> Option<&'static str> {
         AgentProvider::GeminiCli => Some("npm i -g @google/gemini-cli"),
         AgentProvider::Aider => Some("pipx install aider-chat"),
         AgentProvider::OpenCode => Some("npm i -g opencode-ai"),
+        AgentProvider::QwenCode => Some("npm i -g @qwen-code/qwen-code"),
         AgentProvider::CursorAgent => Some("curl https://cursor.com/install -fsS | bash"),
         AgentProvider::Copilot => Some("npm i -g @github/copilot"),
         AgentProvider::Goose => Some("brew install block-goose-cli"),
@@ -248,6 +249,25 @@ mod tests {
         assert_eq!(installed.count(), 1);
         assert!(!installed.none_installed());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn detects_qwen_in_path_without_executing_it() {
+        let (dir, path_var) = fake_path_with("qwen");
+        let installed = detect_installed(&path_var);
+        assert_eq!(
+            installed.path_of(AgentProvider::QwenCode),
+            Some(&dir.join("qwen"))
+        );
+        assert!(!detect_installed("").is_available(AgentProvider::QwenCode));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.join("qwen"), std::fs::Permissions::from_mode(0o644))
+                .unwrap();
+            assert!(!detect_installed(&path_var).is_available(AgentProvider::QwenCode));
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

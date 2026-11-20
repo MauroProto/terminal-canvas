@@ -51,13 +51,15 @@ impl LaunchMemoryWorker {
             .name("launch-memory-worker".to_owned())
             .spawn(move || {
                 while let Ok(mut job) = jobs_rx.recv() {
-                    job.request.brief = crate::memory::launch_brief_with_memory_scoped(
-                        &job.request.brief,
-                        job.request.base_cwd.as_deref(),
-                        crate::memory::process_store().as_ref(),
-                        job.request.task_id,
-                        Some(job.request.workspace_id),
-                    );
+                    if job.request.provider != AgentProvider::QwenCode {
+                        job.request.brief = crate::memory::launch_brief_with_memory_scoped(
+                            &job.request.brief,
+                            job.request.base_cwd.as_deref(),
+                            crate::memory::process_store().as_ref(),
+                            job.request.task_id,
+                            Some(job.request.workspace_id),
+                        );
+                    }
                     let repo_root =
                         crate::orchestration::Orchestrator::resolve_launch_repo(&job.request);
                     let bootstrap = crate::orchestration::agent_launcher::prepare(
@@ -554,6 +556,17 @@ impl TerminalApp {
             }
             return;
         }
+        let qwen_interactive = draft.provider == AgentProvider::QwenCode;
+        if qwen_interactive && self.installed_agents.path_of(draft.provider).is_none() {
+            if let Some(current) = self.launch_agent.as_mut() {
+                current.error = Some(if self.installed_agents.resolved {
+                    "No se encontró Qwen Code en PATH.".to_owned()
+                } else {
+                    "Buscando Qwen Code en PATH. Volvé a intentar en un momento.".to_owned()
+                });
+            }
+            return;
+        }
         let request = AgentLaunchRequest {
             workspace_id: draft.workspace_id,
             task_id: None,
@@ -563,7 +576,11 @@ impl TerminalApp {
                 .and_then(|workspace| workspace.cwd.clone()),
             provider: draft.provider,
             task_title: draft.task_title.clone(),
-            brief: draft.brief.clone(),
+            brief: if qwen_interactive {
+                String::new()
+            } else {
+                draft.brief.clone()
+            },
             worktree_mode: draft.worktree_mode,
         };
         let request_id = Uuid::new_v4();
