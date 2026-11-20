@@ -1,5 +1,5 @@
-//! Prompt-bearing launches cross the shell using only an opaque UUID. The
-//! helper reads a private request and passes the prompt as a native argument.
+//! Agent launches can cross the shell using only an opaque UUID. The helper
+//! reads a private, single-use request and starts the supported provider.
 
 use std::ffi::OsString;
 use std::io::{Read, Write};
@@ -23,6 +23,8 @@ const STALE_AFTER: Duration = Duration::from_secs(24 * 3600);
 struct LaunchRequest {
     provider: AgentProvider,
     brief: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    interactive_qwen_executable: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -50,9 +52,14 @@ impl Drop for Lease {
 pub struct PreparedAgentLaunch {
     pub command: String,
     lease: Arc<Lease>,
+    provider: AgentProvider,
 }
 
 impl PreparedAgentLaunch {
+    pub fn provider(&self) -> AgentProvider {
+        self.provider
+    }
+
     pub fn hand_off(&self) {
         self.lease.handed_off.store(true, Ordering::Release);
     }
@@ -81,8 +88,32 @@ pub fn prepare(
     {
         return Ok(None);
     }
+    prepare_request(LaunchRequest {
+        provider,
+        brief: brief.to_owned(),
+        interactive_qwen_executable: None,
+    })
+    .map(Some)
+}
+
+/// Only a Qwen executable discovered in the application's PATH may be pinned.
+/// Never pass its path, credentials, or a prompt as shell input.
+pub fn prepare_interactive_qwen() -> anyhow::Result<PreparedAgentLaunch> {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let executable = super::agent_detect::resolve_interactive_qwen(&path)
+        .ok_or_else(|| anyhow::anyhow!("No se encontró Qwen Code en el PATH de My Terminal"))?;
+    let request = LaunchRequest {
+        provider: AgentProvider::QwenCode,
+        brief: String::new(),
+        interactive_qwen_executable: Some(executable),
+    };
+    validate_interactive_qwen(&request)?;
+    prepare_request(request)
+}
+
+fn prepare_request(request: LaunchRequest) -> anyhow::Result<PreparedAgentLaunch> {
     let directory = request_dir()?;
-    let token = write_request(&directory, provider, brief)?;
+    let token = write_launch_request(&directory, &request)?;
     let path = directory.join(format!("{token}.json"));
     let lease = Arc::new(Lease {
         path,
@@ -93,12 +124,28 @@ pub fn prepare(
         .shell
         .unwrap_or_else(crate::utils::platform::default_shell);
     let command = helper_command(&executable, token, &shell);
-    Ok(Some(PreparedAgentLaunch { command, lease }))
+    Ok(PreparedAgentLaunch {
+        command,
+        lease,
+        provider: request.provider,
+    })
 }
 
+#[cfg(test)]
 fn write_request(directory: &Path, provider: AgentProvider, brief: &str) -> anyhow::Result<Uuid> {
+    write_launch_request(
+        directory,
+        &LaunchRequest {
+            provider,
+            brief: brief.to_owned(),
+            interactive_qwen_executable: None,
+        },
+    )
+}
+
+fn write_launch_request(directory: &Path, request: &LaunchRequest) -> anyhow::Result<Uuid> {
     anyhow::ensure!(
-        !brief.contains('\0'),
+        !request.brief.contains('\0'),
         "El prompt contiene un carácter NUL no válido"
     );
     let mut builder = std::fs::DirBuilder::new();
@@ -117,10 +164,7 @@ fn write_request(directory: &Path, provider: AgentProvider, brief: &str) -> anyh
     );
     cleanup_stale(directory, SystemTime::now());
     let token = Uuid::new_v4();
-    let bytes = serde_json::to_vec(&LaunchRequest {
-        provider,
-        brief: brief.to_owned(),
-    })?;
+    let bytes = serde_json::to_vec(request)?;
     anyhow::ensure!(
         bytes.len() as u64 <= MAX_REQUEST_BYTES,
         "El prompt supera el límite de 2 MiB"
@@ -247,8 +291,9 @@ fn helper_command(executable: &Path, token: Uuid, shell: &str) -> String {
     )
 }
 
-/// Called before GUI/config initialization. No arbitrary executable is accepted
-/// from the command line or request: only a supported provider resolved in PATH.
+/// Called before GUI/config initialization. Accept only registered providers:
+/// resolve most in the terminal's PATH; launch interactive Qwen at the exact
+/// executable picked from the application's PATH.
 pub fn run_from_cli(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<Option<i32>> {
     let args: Vec<_> = args.into_iter().skip(1).collect();
     if args.first().is_none_or(|arg| arg != "--run-agent") {
@@ -261,6 +306,11 @@ pub fn run_from_cli(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<
         .and_then(|value| Uuid::parse_str(value).ok())
         .ok_or_else(|| anyhow::anyhow!("Identificador de lanzamiento inválido"))?;
     let request = consume_request(&request_dir()?, token)?;
+    if request.provider == AgentProvider::QwenCode {
+        let executable = validate_interactive_qwen(&request)?;
+        let command = native_provider_command(executable)?;
+        return execute_request(request, command).map(Some);
+    }
     let command = request
         .provider
         .launch_command()
@@ -284,6 +334,37 @@ pub fn run_from_cli(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<
         &request.brief,
     )?;
     execute_request(request, command).map(Some)
+}
+
+fn validate_interactive_qwen(request: &LaunchRequest) -> anyhow::Result<&Path> {
+    anyhow::ensure!(
+        request.provider == AgentProvider::QwenCode && request.brief.is_empty(),
+        "Qwen Code solo admite el inicio interactivo sin prompt"
+    );
+    let executable = request
+        .interactive_qwen_executable
+        .as_deref()
+        .filter(|path| path.is_absolute())
+        .ok_or_else(|| anyhow::anyhow!("Falta la ruta absoluta de Qwen Code"))?;
+    let expected_name = |name: &std::ffi::OsStr| {
+        #[cfg(windows)]
+        {
+            ["qwen", "qwen.exe", "qwen.com", "qwen.cmd", "qwen.bat"]
+                .iter()
+                .any(|allowed| name.eq_ignore_ascii_case(std::ffi::OsStr::new(allowed)))
+        }
+        #[cfg(not(windows))]
+        {
+            name == "qwen"
+        }
+    };
+    anyhow::ensure!(
+        executable.file_name().is_some_and(expected_name)
+            && super::agent_detect::is_executable(executable),
+        "Qwen Code no está disponible en {}. Actualizá la detección del launcher.",
+        executable.display()
+    );
+    Ok(executable)
 }
 
 fn execute_request(request: LaunchRequest, mut command: Command) -> anyhow::Result<i32> {
@@ -446,6 +527,63 @@ fn main() {
         args
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn qwen_launch_pins_executable_with_spaces_without_arguments() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = Fixture::new();
+        let binary_dir = fixture.0.join("selected PATH with spaces");
+        let checkout = fixture.0.join("selected checkout with spaces");
+        std::fs::create_dir(&binary_dir).unwrap();
+        std::fs::create_dir(&checkout).unwrap();
+        let executable = binary_dir.join("qwen");
+        std::fs::write(
+            &executable,
+            b"#!/bin/sh\nprintf '%s\n%s\n' \"$PWD\" \"$#\" > launch.txt\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let request = LaunchRequest {
+            provider: AgentProvider::QwenCode,
+            brief: String::new(),
+            interactive_qwen_executable: Some(executable.clone()),
+        };
+        let request_directory = fixture.0.join("launch state");
+        let token = write_launch_request(&request_directory, &request).unwrap();
+        let request = consume_request(&request_directory, token).unwrap();
+        assert!(consume_request(&request_directory, token).is_err());
+        let mut command =
+            native_provider_command(validate_interactive_qwen(&request).unwrap()).unwrap();
+        command
+            .current_dir(&checkout)
+            .env_clear()
+            .env("PATH", "/does-not-contain-qwen");
+        assert_eq!(execute_request(request, command).unwrap(), 0);
+
+        let result = std::fs::read_to_string(checkout.join("launch.txt")).unwrap();
+        let lines: Vec<_> = result.lines().collect();
+        assert_eq!(
+            Path::new(lines[0]).canonicalize().unwrap(),
+            checkout.canonicalize().unwrap()
+        );
+        assert_eq!(lines[1], "0");
+
+        let mut request = LaunchRequest {
+            provider: AgentProvider::QwenCode,
+            brief: "this prompt must never reach the CLI".to_owned(),
+            interactive_qwen_executable: Some(executable.clone()),
+        };
+        assert!(validate_interactive_qwen(&request).is_err());
+        request.brief.clear();
+        request.interactive_qwen_executable = Some(PathBuf::from("qwen"));
+        assert!(validate_interactive_qwen(&request).is_err());
+        std::fs::remove_file(&executable).unwrap();
+        request.interactive_qwen_executable = Some(executable);
+        assert!(validate_interactive_qwen(&request).is_err());
+    }
+
     #[test]
     fn private_request_round_trips_and_is_consumed_once() {
         let fixture = Fixture::new();
@@ -537,6 +675,7 @@ fn main() {
             let path = fixture.0.join(format!("{token}.json"));
             let launch = PreparedAgentLaunch {
                 command: String::new(),
+                provider: AgentProvider::ClaudeCode,
                 lease: Arc::new(Lease {
                     path: path.clone(),
                     handed_off: AtomicBool::new(false),
@@ -620,7 +759,8 @@ fn main() {
             execute_request(
                 LaunchRequest {
                     provider: AgentProvider::ClaudeCode,
-                    brief: brief.to_owned()
+                    brief: brief.to_owned(),
+                    interactive_qwen_executable: None,
                 },
                 command
             )

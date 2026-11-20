@@ -19,6 +19,27 @@ use super::TerminalApp;
 
 pub(super) const ORCHESTRATION_REFRESH_INTERVAL: Duration = Duration::from_millis(750);
 
+fn prepare_qwen_launch(
+    request: &AgentLaunchRequest,
+) -> anyhow::Result<Option<crate::orchestration::agent_launcher::PreparedAgentLaunch>> {
+    use anyhow::Context;
+    let cwd = request
+        .base_cwd
+        .as_deref()
+        .filter(|cwd| cwd.is_absolute())
+        .context("Elegí una carpeta para el workspace antes de abrir Qwen Code")?;
+    anyhow::ensure!(
+        cwd.is_dir(),
+        "No se puede abrir Qwen Code: {} no es una carpeta disponible",
+        cwd.display()
+    );
+    anyhow::ensure!(
+        request.brief.is_empty(),
+        "Qwen Code solo admite el inicio interactivo sin prompt"
+    );
+    crate::orchestration::agent_launcher::prepare_interactive_qwen().map(Some)
+}
+
 enum LaunchSource {
     Manual(Uuid),
     GithubIssue(u64),
@@ -62,10 +83,14 @@ impl LaunchMemoryWorker {
                     }
                     let repo_root =
                         crate::orchestration::Orchestrator::resolve_launch_repo(&job.request);
-                    let bootstrap = crate::orchestration::agent_launcher::prepare(
-                        job.request.provider,
-                        &job.request.brief,
-                    );
+                    let bootstrap = if job.request.provider == AgentProvider::QwenCode {
+                        prepare_qwen_launch(&job.request)
+                    } else {
+                        crate::orchestration::agent_launcher::prepare(
+                            job.request.provider,
+                            &job.request.brief,
+                        )
+                    };
                     if completion_tx
                         .send(MemoryLaunchCompletion {
                             repo_root,
@@ -557,7 +582,10 @@ impl TerminalApp {
             return;
         }
         let qwen_interactive = draft.provider == AgentProvider::QwenCode;
-        if qwen_interactive && self.installed_agents.path_of(draft.provider).is_none() {
+        if qwen_interactive
+            && (!self.installed_agents.resolved
+                || self.installed_agents.path_of(draft.provider).is_none())
+        {
             if let Some(current) = self.launch_agent.as_mut() {
                 current.error = Some(if self.installed_agents.resolved {
                     "No se encontró Qwen Code en PATH.".to_owned()

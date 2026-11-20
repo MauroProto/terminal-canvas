@@ -83,12 +83,19 @@ The `MI_TERMINAL_ALLOW_OSC52` environment variable still overrides `allow_osc52`
 ## Qwen Code
 
 Install the official Qwen Code CLI separately and make sure `qwen` is on the
-app’s `PATH`. In **Launch agent**, pick **Qwen Code** and select your usual
-workspace or a separate Git worktree. My Terminal opens an interactive
-`qwen` terminal in that directory; enter prompts and manage authentication
-inside the CLI. It does not send an initial brief or memory context, or offer
-Qwen-specific capture or conversation resume. Restoring a saved pane does
-not start a fresh Qwen process.
+app’s `PATH`. In **Launch agent**, pick **Qwen Code** and choose **Shared repo**
+to use your workspace directory, or **Worktree per agent** to use a separate
+Git worktree. A workspace without a Git repo can only use the first mode.
+Use **Refresh installed providers** if you installed the CLI while My Terminal
+was open. If it is only on your shell’s `PATH`, start My Terminal from
+that shell so the app inherits it.
+
+My Terminal opens the detected `qwen` executable in that directory; enter
+prompts and manage authentication inside the CLI. My Terminal does not send
+an initial brief or memory context, or offer Qwen-specific capture or
+conversation resume. Restoring a saved pane does not start a fresh Qwen
+process. If a retained managed worktree is still available, a fresh shell
+opens there; otherwise it opens in the workspace directory.
 
 ## Keyboard shortcuts
 

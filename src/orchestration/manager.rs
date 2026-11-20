@@ -686,6 +686,47 @@ impl Orchestrator {
     }
 
     #[allow(dead_code)]
+    /// Restore the shell directory, not the Qwen process. Only the local pane
+    /// originally assigned to this intact managed worktree can use it.
+    pub(crate) fn restored_qwen_worktree(
+        &self,
+        workspace_id: Uuid,
+        panel_id: Uuid,
+        workspace_cwd: &std::path::Path,
+    ) -> Option<PathBuf> {
+        let session = self.state.sessions.iter().find(|session| {
+            session.provider == AgentProvider::QwenCode
+                && session.workspace_id == workspace_id
+                && session.panel_id == Some(panel_id)
+        })?;
+        let repo_root = session.repo_root.as_deref()?;
+        let worktree = session.worktree_path.as_deref()?;
+        if !repo_root.is_absolute()
+            || !worktree.is_absolute()
+            || !workspace_cwd.is_absolute()
+            || session.cwd.as_deref() != Some(worktree)
+        {
+            return None;
+        }
+        let repo_root = repo_root.canonicalize().ok()?;
+        let workspace_cwd = workspace_cwd.canonicalize().ok()?;
+        if !workspace_cwd.starts_with(&repo_root) {
+            return None;
+        }
+        let expected_parent = repo_root.join(".terminalcanvas").join("worktrees");
+        let name = worktree.file_name()?;
+        let expected_worktree = expected_parent.join(name);
+        let actual = worktree.canonicalize().ok()?;
+        let git_file = actual.join(".git");
+        let git_metadata = git_file.symlink_metadata().ok()?;
+        (actual == expected_worktree
+            && actual.is_dir()
+            && git_metadata.is_file()
+            && git_metadata.len() <= 4096
+            && super::worktree_removal_safety::is_linked_worktree(&actual, &repo_root))
+        .then_some(actual)
+    }
+
     pub fn inbox(&self) -> &[InboxEvent] {
         &self.state.inbox
     }
@@ -1018,8 +1059,22 @@ impl Orchestrator {
     ) -> anyhow::Result<LaunchPreparation> {
         if request.provider == AgentProvider::QwenCode {
             anyhow::ensure!(
-                request.brief.trim().is_empty() && prepared_launch.is_none(),
+                request.brief.trim().is_empty()
+                    && prepared_launch
+                        .as_ref()
+                        .is_none_or(|launch| launch.provider() == AgentProvider::QwenCode),
                 "Qwen Code solo admite el inicio interactivo sin prompt"
+            );
+            anyhow::ensure!(
+                request
+                    .base_cwd
+                    .as_ref()
+                    .is_some_and(|cwd| cwd.is_absolute()),
+                "Elegí una carpeta para el workspace antes de abrir Qwen Code"
+            );
+            anyhow::ensure!(
+                request.worktree_mode != WorktreeMode::Auto || resolved_repo_root.is_some(),
+                "Qwen Code necesita un repositorio Git para crear un worktree. Elegí Shared repo para abrir en la carpeta actual."
             );
         }
 
@@ -1135,7 +1190,11 @@ impl Orchestrator {
             dirty: false,
             repo_root,
             shared_repo_mode,
-            startup_command: bootstrap.command.clone(),
+            startup_command: if request.provider == AgentProvider::QwenCode {
+                request.provider.launch_command().map(str::to_owned)
+            } else {
+                bootstrap.command.clone()
+            },
             command_summary: None,
             review_summary: ReviewSummary::default(),
             conflict_risk: false,
@@ -3514,6 +3573,20 @@ mod tests {
             worktree_mode: WorktreeMode::SharedRepo,
         };
         assert!(orchestrator.prepare_launch(request.clone()).is_err());
+        let no_checkout = AgentLaunchRequest {
+            base_cwd: None,
+            brief: String::new(),
+            ..request.clone()
+        };
+        assert!(orchestrator.prepare_launch(no_checkout).is_err());
+        let no_worktree = AgentLaunchRequest {
+            brief: String::new(),
+            worktree_mode: WorktreeMode::Auto,
+            ..request.clone()
+        };
+        assert!(orchestrator
+            .prepare_launch_with_repo(no_worktree, None)
+            .is_err());
         assert!(orchestrator.tasks().is_empty());
         assert!(orchestrator.sessions().is_empty());
 
@@ -3609,6 +3682,27 @@ mod tests {
         assert_eq!(plan.startup_command.as_deref(), Some("qwen"));
         assert_eq!(plan.startup_input, None);
         assert!(plan.prepared_launch.is_none());
+
+        let panel_id = uuid::Uuid::new_v4();
+        orchestrator.bind_launch_to_panel(session_id, panel_id, Some(uuid::Uuid::new_v4()));
+        assert_eq!(
+            orchestrator.restored_qwen_worktree(plan.workspace_id, panel_id, &dir.join("nested")),
+            Some(cwd.canonicalize().unwrap())
+        );
+        assert!(orchestrator
+            .restored_qwen_worktree(uuid::Uuid::new_v4(), panel_id, &dir)
+            .is_none());
+        assert!(orchestrator
+            .restored_qwen_worktree(plan.workspace_id, panel_id, dir.parent().unwrap())
+            .is_none());
+        std::fs::remove_file(cwd.join(".git")).unwrap();
+        assert!(orchestrator
+            .restored_qwen_worktree(plan.workspace_id, panel_id, &dir)
+            .is_none());
+        std::fs::write(cwd.join(".git"), "").unwrap();
+        assert!(orchestrator
+            .restored_qwen_worktree(plan.workspace_id, panel_id, &dir)
+            .is_none());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

@@ -479,6 +479,7 @@ impl TerminalApp {
         dialog_backdrop(ctx);
         let mut cancel = false;
         let mut submit = false;
+        let mut refresh_installed = false;
         Area::new(Id::new("launch-agent-dialog"))
             .order(Order::Foreground)
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
@@ -539,6 +540,16 @@ impl TerminalApp {
                                 }
                             }
                         });
+                    let idle = draft.pending_memory.is_none() && draft.pending_session.is_none();
+                    if ui
+                        .add_enabled(idle, egui::Button::new("Refresh installed providers"))
+                        .clicked()
+                    {
+                        refresh_installed = true;
+                    }
+                    if self.agent_detector.pending() {
+                        ctx.request_repaint_after(std::time::Duration::from_millis(50));
+                    }
                     dialog_field_label(ui, "Task");
                     dialog_singleline(ui, &mut draft.task_title, false);
                     if draft.provider == crate::orchestration::AgentProvider::QwenCode {
@@ -595,6 +606,11 @@ impl TerminalApp {
                     }
                 });
             });
+        if refresh_installed {
+            self.installed_agents.resolved = false;
+            self.agent_detector = crate::orchestration::AgentDetector::start();
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
         if cancel {
             if let Some(session_id) = draft.pending_session {
                 self.orchestrator.cancel_launch(session_id);

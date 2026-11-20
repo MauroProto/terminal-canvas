@@ -39,20 +39,27 @@ pub fn resolve_in_path(command: &str, path_var: &str) -> Option<PathBuf> {
         let path = PathBuf::from(command);
         return is_executable(&path).then_some(path);
     }
-    for dir in std::env::split_paths(path_var) {
-        let candidate = dir.join(command);
-        #[cfg(windows)]
-        if let Some(path) = resolve_windows_extensions(
-            &candidate,
-            &std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_owned()),
-        ) {
-            return Some(path);
-        }
-        if is_executable(&candidate) {
-            return Some(candidate);
-        }
+    std::env::split_paths(path_var).find_map(|dir| resolve_in_directory(command, &dir))
+}
+
+fn resolve_in_directory(command: &str, dir: &std::path::Path) -> Option<PathBuf> {
+    let candidate = dir.join(command);
+    #[cfg(windows)]
+    if let Some(path) = resolve_windows_extensions(
+        &candidate,
+        &std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_owned()),
+    ) {
+        return Some(path);
     }
-    None
+    is_executable(&candidate).then_some(candidate)
+}
+
+pub(super) fn resolve_interactive_qwen(path: &std::ffi::OsStr) -> Option<PathBuf> {
+    // A relative PATH entry would be reinterpreted in the destination
+    // checkout. Only offer Qwen when the app can pin an absolute executable.
+    std::env::split_paths(path)
+        .filter(|dir| dir.is_absolute())
+        .find_map(|dir| resolve_in_directory("qwen", &dir))
 }
 
 #[cfg(windows)]
@@ -69,7 +76,7 @@ fn resolve_windows_extensions(candidate: &std::path::Path, extensions: &str) -> 
 }
 
 #[cfg(unix)]
-fn is_executable(path: &std::path::Path) -> bool {
+pub(super) fn is_executable(path: &std::path::Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(path)
         .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
@@ -77,7 +84,7 @@ fn is_executable(path: &std::path::Path) -> bool {
 }
 
 #[cfg(not(unix))]
-fn is_executable(path: &std::path::Path) -> bool {
+pub(super) fn is_executable(path: &std::path::Path) -> bool {
     path.is_file()
 }
 
@@ -138,10 +145,18 @@ impl AgentDetector {
     }
 
     /// Devuelve el resultado apenas esté listo (una sola vez).
+    pub fn pending(&self) -> bool {
+        self.receiver.is_some()
+    }
+
     pub fn poll(&mut self) -> Option<InstalledAgents> {
-        let result = self.receiver.as_ref()?.try_recv().ok()?;
+        let result = match self.receiver.as_ref()?.try_recv() {
+            Ok(result) => Some(result),
+            Err(std::sync::mpsc::TryRecvError::Empty) => return None,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => None,
+        };
         self.receiver = None;
-        Some(result)
+        result
     }
 }
 
@@ -152,7 +167,12 @@ pub fn detect_installed(path_var: &str) -> InstalledAgents {
         let Some(command) = provider.launch_command() else {
             continue;
         };
-        if let Some(path) = resolve_in_path(command, path_var) {
+        let path = if provider == AgentProvider::QwenCode {
+            resolve_interactive_qwen(std::ffi::OsStr::new(path_var))
+        } else {
+            resolve_in_path(command, path_var)
+        };
+        if let Some(path) = path {
             available.insert(provider, path);
         }
     }

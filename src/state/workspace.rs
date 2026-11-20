@@ -88,6 +88,14 @@ impl Workspace {
     }
 
     pub fn from_saved(saved: WorkspaceState, ctx: &egui::Context) -> Self {
+        Self::from_saved_with_qwen_worktree(saved, ctx, |_, _, _| None)
+    }
+
+    pub(crate) fn from_saved_with_qwen_worktree(
+        saved: WorkspaceState,
+        ctx: &egui::Context,
+        mut restored_worktree: impl FnMut(Uuid, Uuid, &Path) -> Option<PathBuf>,
+    ) -> Self {
         let WorkspaceState {
             id,
             name,
@@ -103,10 +111,20 @@ impl Workspace {
         let pty_manager = Arc::new(Mutex::new(PtyManager::new()));
         let mut panels = Vec::new();
         for panel in saved_panels {
+            let managed_qwen_cwd = if panel.agent_command.as_deref()
+                == crate::orchestration::AgentProvider::QwenCode.launch_command()
+            {
+                cwd.as_deref().and_then(|workspace_cwd| {
+                    let panel_id = Uuid::parse_str(&panel.id).ok()?;
+                    restored_worktree(workspace_id, panel_id, workspace_cwd)
+                })
+            } else {
+                None
+            };
             panels.push(CanvasPanel::Terminal(TerminalPanel::from_saved(
                 panel,
                 ctx,
-                cwd.as_deref(),
+                managed_qwen_cwd.as_deref().or(cwd.as_deref()),
                 workspace_id,
                 Arc::clone(&pty_manager),
             )));
