@@ -106,6 +106,11 @@ impl Toasts {
             .collect()
     }
 
+    #[cfg(test)]
+    pub(super) fn texts_for_tests(&self) -> Vec<&str> {
+        self.items.iter().map(|toast| toast.text.as_str()).collect()
+    }
+
     pub(super) fn is_empty(&self) -> bool {
         self.items.is_empty()
     }

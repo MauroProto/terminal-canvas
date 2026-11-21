@@ -31,6 +31,7 @@ pub use code_diff::{
     is_managed_worktree, list_git_worktrees, parse_unified_diff, remove_git_worktree, DiffLine,
     DiffLineKind, DiffLoader, FileDiff, RepoDiff, WorktreeInfo, WorktreeJob, WorktreeOps,
 };
+pub(crate) use code_diff::{WorktreeMutation, WorktreeOutcome};
 #[allow(unused_imports)]
 pub use diff_notes::{
     format_note, legacy_notes_available, load_legacy_notes, load_notes, save_notes,

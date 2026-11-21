@@ -993,6 +993,7 @@ index 1..2 100644
         });
         assert!(outcome.worktrees.is_empty());
         assert!(outcome.error.is_none(), "listing must not report an error");
+        assert_eq!(outcome.mutation, None);
     }
 
     #[test]
@@ -1004,6 +1005,10 @@ index 1..2 100644
             live_paths: Vec::new(),
         });
         assert!(outcome.error.is_some(), "removal outside a repo must fail");
+        assert!(matches!(
+            outcome.mutation,
+            Some(super::WorktreeMutation::Archive(_))
+        ));
         assert!(outcome.worktrees.is_empty());
     }
 
@@ -1066,13 +1071,20 @@ pub enum WorktreeJob {
     },
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum WorktreeMutation {
+    Archive(PathBuf),
+    Restore(PathBuf),
+}
+
 /// Resultado de un trabajo de worktree. Siempre trae el listado actualizado,
-/// así la UI no necesita encadenar un segundo pedido después de borrar.
+/// así la UI no necesita encadenar un segundo pedido después de moverlo.
 #[derive(Debug)]
 pub struct WorktreeOutcome {
     pub repo_root: PathBuf,
     pub worktrees: Vec<WorktreeInfo>,
-    /// Mensaje de error del borrado, si falló.
+    /// La acción solicitada, incluso si falló. Un listado no inicia una acción.
+    pub(crate) mutation: Option<WorktreeMutation>,
     pub error: Option<String>,
 }
 
@@ -1141,21 +1153,31 @@ fn run_worktree_job(job: WorktreeJob) -> WorktreeOutcome {
             repo_root,
             worktree_path,
             live_paths,
-        } => (repo_root, Some((false, worktree_path, live_paths))),
+        } => (
+            repo_root,
+            Some((WorktreeMutation::Archive(worktree_path), live_paths)),
+        ),
         WorktreeJob::Restore {
             repo_root,
             worktree_path,
             live_paths,
-        } => (repo_root, Some((true, worktree_path, live_paths))),
+        } => (
+            repo_root,
+            Some((WorktreeMutation::Restore(worktree_path), live_paths)),
+        ),
     };
     let main_root = list_git_worktrees(&repo_root)
         .first()
         .map(|wt| wt.path.clone());
-    let error = operation.and_then(|(restore, path, live)| {
-        let result = match main_root {
-            Some(ref root) if restore => super::worktree_archive::restore(root, &path, &live),
-            Some(ref root) => super::worktree_archive::archive(root, &path, &live).map(|_| ()),
-            None => Err(anyhow::anyhow!(
+    let error = operation.as_ref().and_then(|(mutation, live)| {
+        let result = match (main_root.as_deref(), mutation) {
+            (Some(root), WorktreeMutation::Archive(path)) => {
+                super::worktree_archive::archive(root, path, live).map(|_| ())
+            }
+            (Some(root), WorktreeMutation::Restore(path)) => {
+                super::worktree_archive::restore(root, path, live)
+            }
+            (None, _) => Err(anyhow::anyhow!(
                 "No se pudo resolver el repositorio principal"
             )),
         };
@@ -1164,6 +1186,7 @@ fn run_worktree_job(job: WorktreeJob) -> WorktreeOutcome {
     WorktreeOutcome {
         worktrees: list_git_worktrees(&repo_root),
         repo_root,
+        mutation: operation.map(|(mutation, _)| mutation),
         error,
     }
 }

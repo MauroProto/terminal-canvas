@@ -11,7 +11,9 @@ use std::path::{Path, PathBuf};
 use egui::{pos2, vec2, Align2, Color32, FontId, RichText, ScrollArea, Sense, Stroke};
 use uuid::Uuid;
 
-use crate::orchestration::{DiffLine, DiffLineKind, FileDiff, WorktreeInfo, WorktreeJob};
+use crate::orchestration::{
+    DiffLine, DiffLineKind, FileDiff, WorktreeInfo, WorktreeJob, WorktreeMutation, WorktreeOutcome,
+};
 use crate::theme::colors as palette;
 
 use super::TerminalApp;
@@ -1075,35 +1077,38 @@ impl TerminalApp {
                             palette::DIM
                         };
                         ui.label(RichText::new(tag).size(10.0).color(tag_color));
-                        ui.label(
-                            RichText::new(worktree.path.display().to_string())
-                                .size(10.5)
-                                .color(palette::TEXT)
-                                .monospace(),
-                        );
-                        if !worktree.branch.is_empty() {
-                            ui.label(
-                                RichText::new(format!("⎇ {}", worktree.branch))
-                                    .size(10.0)
-                                    .color(palette::DIM),
-                            );
-                        }
-                        if worktree.archived_from.is_some()
-                            && ui.small_button("Restaurar").clicked()
-                        {
-                            to_restore = Some(worktree.path.clone());
-                        }
-                        if !worktree.is_main && worktree.is_managed {
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    ui.add_space(14.0);
-                                    if ui.small_button("Archivar").clicked() {
-                                        to_remove = Some(worktree.path.clone());
-                                    }
-                                },
-                            );
-                        }
+                        // Allocate the actions before the variable-length text.
+                        // The worktree list only scrolls vertically.
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.add_space(14.0);
+                            if !worktree.is_main
+                                && worktree.is_managed
+                                && ui.small_button("Archivar").clicked()
+                            {
+                                to_remove = Some(worktree.path.clone());
+                            }
+                            if worktree.archived_from.is_some()
+                                && ui.small_button("Restaurar").clicked()
+                            {
+                                to_restore = Some(worktree.path.clone());
+                            }
+                            let path = worktree.path.display();
+                            let description = if worktree.branch.is_empty() {
+                                path.to_string()
+                            } else {
+                                format!("{path}   ⎇ {}", worktree.branch)
+                            };
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(&description)
+                                        .size(10.5)
+                                        .color(palette::TEXT)
+                                        .monospace(),
+                                )
+                                .truncate(),
+                            )
+                            .on_hover_text(description);
+                        });
                     });
                 }
             });
@@ -1162,16 +1167,40 @@ impl TerminalApp {
 
     /// Recoge los resultados del worker de worktrees.
     pub(super) fn poll_worktree_ops(&mut self) {
-        let outcomes = self.worktree_ops.poll();
-        let Some(state) = self.code_review.as_mut() else {
-            return;
-        };
-        for outcome in outcomes {
-            if outcome.repo_root != state.repo_root {
-                continue;
-            }
+        for outcome in self.worktree_ops.poll() {
+            self.apply_worktree_outcome(outcome);
+        }
+    }
+
+    fn apply_worktree_outcome(&mut self, outcome: WorktreeOutcome) {
+        if let Some(state) = self
+            .code_review
+            .as_mut()
+            .filter(|state| state.repo_root == outcome.repo_root)
+        {
             state.worktrees = outcome.worktrees;
             state.worktree_error = outcome.error;
+            return;
+        }
+
+        let (verb, completed, path) = match outcome.mutation {
+            Some(WorktreeMutation::Archive(path)) => ("archivar", "archivó", path),
+            Some(WorktreeMutation::Restore(path)) => ("restaurar", "restauró", path),
+            None => return, // Background list refreshes never notify.
+        };
+        let name = path
+            .file_name()
+            .unwrap_or(path.as_os_str())
+            .to_string_lossy();
+        let repo = outcome
+            .repo_root
+            .file_name()
+            .unwrap_or(outcome.repo_root.as_os_str())
+            .to_string_lossy();
+        if let Some(error) = outcome.error {
+            self.toast_error(format!("No se pudo {verb} {name} ({repo}): {error}"));
+        } else {
+            self.toast_success(format!("Se {completed} {name} ({repo})"));
         }
     }
 
@@ -1929,6 +1958,146 @@ pub(super) enum NoteAction {
 mod tests {
     use super::{build_review_rows, diff_line_anchor, ReviewRow, NOTE_ROW_HEIGHT};
     use crate::orchestration::{DiffLine, DiffLineKind, FileDiff};
+
+    #[test]
+    fn worktree_buttons_remain_visible_with_long_paths() {
+        use crate::app::preferences_ui_tests::{detached_app, review_state};
+        use crate::orchestration::{DiffNotes, WorktreeInfo};
+        use std::path::PathBuf;
+
+        fn visible_text(shape: &egui::epaint::Shape, clip: egui::Rect, label: &str) -> bool {
+            match shape {
+                egui::epaint::Shape::Text(text) => {
+                    text.galley.text() == label && clip.contains_rect(shape.visual_bounding_rect())
+                }
+                egui::epaint::Shape::Vec(shapes) => {
+                    shapes.iter().any(|shape| visible_text(shape, clip, label))
+                }
+                _ => false,
+            }
+        }
+
+        let mut app = detached_app();
+        let repo = PathBuf::from("/tmp").join("client project with spaces/".repeat(12));
+        let managed = repo.join(".terminalcanvas/worktrees/agent branch");
+        let archived = repo.join(".terminalcanvas-archive/wt-archive");
+        let mut review = review_state(
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            repo,
+            DiffNotes::default(),
+        );
+        review.worktrees = vec![
+            WorktreeInfo {
+                path: managed.clone(),
+                branch: format!("{}checkout", "feature/".repeat(16)),
+                is_managed: true,
+                ..Default::default()
+            },
+            WorktreeInfo {
+                path: archived,
+                branch: format!("{}checkout", "archived/".repeat(16)),
+                archived_from: Some(managed),
+                ..Default::default()
+            },
+        ];
+        app.code_review = Some(review);
+        let ctx = egui::Context::default();
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(430.0, 360.0));
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(viewport),
+                ..Default::default()
+            },
+            |ui| {
+                egui::CentralPanel::default().show(ui, |ui| app.code_review_worktrees(ui));
+            },
+        );
+        output.textures_delta.clear();
+        for label in ["Archivar", "Restaurar"] {
+            assert!(
+                output
+                    .shapes
+                    .iter()
+                    .any(|egui::epaint::ClippedShape { clip_rect, shape }| {
+                        visible_text(shape, clip_rect.intersect(viewport), label)
+                    }),
+                "{label} should fit inside the worktree viewport",
+            );
+        }
+    }
+
+    #[test]
+    fn offscreen_worktree_mutations_notify_once_without_replacing_another_review() {
+        use crate::app::preferences_ui_tests::{detached_app, review_state};
+        use crate::orchestration::{DiffNotes, WorktreeInfo, WorktreeMutation, WorktreeOutcome};
+        use std::path::PathBuf;
+
+        let mut app = detached_app();
+        let original_repo = PathBuf::from("/repo/original");
+        let worktree = original_repo.join("worktrees/checkout");
+        let outcome = |mutation, error: Option<&str>| WorktreeOutcome {
+            repo_root: original_repo.clone(),
+            worktrees: vec![WorktreeInfo {
+                path: worktree.clone(),
+                ..Default::default()
+            }],
+            mutation,
+            error: error.map(str::to_owned),
+        };
+        let error = "La ubicación original ya existe";
+        app.apply_worktree_outcome(outcome(None, None));
+        assert!(app.toasts.is_empty());
+        app.apply_worktree_outcome(outcome(
+            Some(WorktreeMutation::Restore(worktree.clone())),
+            Some(error),
+        ));
+        assert_eq!(
+            app.toasts.texts_for_tests(),
+            ["No se pudo restaurar checkout (original): La ubicación original ya existe"]
+        );
+
+        let mut other = review_state(
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            PathBuf::from("/repo/other"),
+            DiffNotes::default(),
+        );
+        other.worktrees = vec![WorktreeInfo {
+            path: other.repo_root.clone(),
+            ..Default::default()
+        }];
+        other.worktree_error = Some("other view state".into());
+        app.code_review = Some(other);
+        app.apply_worktree_outcome(outcome(
+            Some(WorktreeMutation::Archive(worktree.clone())),
+            None,
+        ));
+        app.apply_worktree_outcome(outcome(None, None));
+        let state = app.code_review.as_ref().unwrap();
+        assert_eq!(state.worktrees[0].path, state.repo_root);
+        assert_eq!(state.worktree_error.as_deref(), Some("other view state"));
+        assert_eq!(app.toasts.texts_for_tests().len(), 2);
+        assert_eq!(
+            app.toasts.texts_for_tests()[1],
+            "Se archivó checkout (original)"
+        );
+
+        let state = app.code_review.as_mut().unwrap();
+        state.repo_root.clone_from(&original_repo);
+        app.apply_worktree_outcome(outcome(
+            Some(WorktreeMutation::Restore(worktree.clone())),
+            Some(error),
+        ));
+        let state = app.code_review.as_ref().unwrap();
+        assert_eq!(state.worktrees[0].path, worktree);
+        assert_eq!(state.worktree_error.as_deref(), Some(error));
+        assert_eq!(
+            app.toasts.texts_for_tests().len(),
+            2,
+            "do not duplicate inline feedback"
+        );
+    }
 
     fn diff_line(new_ln: usize) -> DiffLine {
         DiffLine {
