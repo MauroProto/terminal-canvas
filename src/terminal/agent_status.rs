@@ -287,25 +287,37 @@ fn parse_code(digits: &[u8]) -> Option<u32> {
 }
 
 /// Extrae el path de un payload OSC 7 (`file://host/path`). Acepta también un
-/// path absoluto sin scheme.
+/// path absoluto literal, como el que reenvía nuestro propio daemon.
 fn parse_osc7_cwd(bytes: &[u8]) -> Option<String> {
-    let text = std::str::from_utf8(bytes).ok()?.trim().to_owned();
-    if text.is_empty() {
-        return None;
-    }
+    let text = std::str::from_utf8(bytes).ok()?.trim_start();
     if let Some(rest) = text.strip_prefix("file://") {
-        // file://host/path → quedarnos con el path (host puede ser vacío).
         let path_start = rest.find('/')?;
-        let path = &rest[path_start..];
-        if path.is_empty() {
-            return None;
+        return decode_osc7_uri_path(&rest[path_start..]);
+    }
+    text.starts_with('/').then(|| text.to_owned())
+}
+
+fn decode_osc7_uri_path(path: &str) -> Option<String> {
+    // Keep the printed path and host policy unchanged; decode URI byte escapes
+    // without URL normalization or treating '+' as a space. Non-escape '%'
+    // remains literal for shell integrations that emit raw paths.
+    let mut encoded = path.as_bytes();
+    let mut decoded = Vec::with_capacity(encoded.len());
+    while let [byte, tail @ ..] = encoded {
+        if let (b'%', [high, low, rest @ ..]) = (*byte, tail) {
+            let high = char::from(*high).to_digit(16);
+            let low = char::from(*low).to_digit(16);
+            if let (Some(high), Some(low)) = (high, low) {
+                decoded.push((high * 16 + low) as u8);
+                encoded = rest;
+                continue;
+            }
         }
-        return Some(path.to_owned());
+        decoded.push(*byte);
+        encoded = tail;
     }
-    if text.starts_with('/') {
-        return Some(text);
-    }
-    None
+    let decoded = String::from_utf8(decoded).ok()?;
+    (!decoded.chars().any(char::is_control)).then_some(decoded)
 }
 
 fn parse_agent_status_payload(bytes: &[u8], now_ms: i64) -> Option<AgentStatusReport> {
@@ -552,6 +564,20 @@ mod tests {
         assert_eq!(clean, b"");
         assert_eq!(reports.len(), 1);
         assert_eq!(cwds, vec!["/tmp".to_owned()]);
+    }
+
+    #[test]
+    fn osc7_file_uri_decodes_checkout_spaces_exactly_once() {
+        let bytes = b"x\x1b]7;file://host/tmp/selected%20worktree/caf%C3%A9%2520+notes%20\x07y";
+        let (clean, reports, cwds) = AgentStatusStream::new().process(bytes, 1);
+        assert_eq!(clean, b"xy");
+        assert!(reports.is_empty());
+        assert_eq!(cwds, ["/tmp/selected worktree/café%20+notes "]);
+
+        let metadata =
+            super::metadata_osc(cwds.first().map(String::as_str), None, "Terminal", None);
+        let (_, _, forwarded_cwds) = AgentStatusStream::new().process(&metadata, 2);
+        assert_eq!(forwarded_cwds, cwds);
     }
 
     #[test]

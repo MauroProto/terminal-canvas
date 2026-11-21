@@ -42,7 +42,7 @@ fn common_git_dir(repo_root: &Path) -> Option<PathBuf> {
 
 /// Comprueba el enlace en ambas direcciones y que el gitdir pertenece al
 /// `common dir` del repositorio. Un archivo `.git` inventado ya no alcanza.
-fn is_linked_worktree(path: &Path, repo_root: &Path) -> bool {
+pub(super) fn is_linked_worktree(path: &Path, repo_root: &Path) -> bool {
     let dot_git = path.join(".git");
     if !dot_git.is_file() {
         return false;

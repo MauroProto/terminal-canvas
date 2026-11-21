@@ -81,17 +81,12 @@ impl WorkspacePanel {
         }
     }
 
-    pub fn live_leaf_cwds(&self) -> Vec<std::path::PathBuf> {
+    pub(crate) fn live_leaf_cwds(
+        &self,
+        manager: &Mutex<crate::runtime::PtyManager>,
+    ) -> Vec<std::path::PathBuf> {
         match self {
-            Self::Terminal(panel) => panel
-                .leaf_ids()
-                .into_iter()
-                .filter_map(|id| {
-                    let handle = panel.leaf_session_handle(id)?;
-                    let session = handle.lock().ok()?;
-                    session.current_cwd().map(std::path::PathBuf::from)
-                })
-                .collect(),
+            Self::Terminal(panel) => panel.live_leaf_cwds(manager),
         }
     }
 

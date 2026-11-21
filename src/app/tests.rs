@@ -2921,6 +2921,173 @@ fn split_resize_ids_return_none_for_stale_indexes() {
     assert_eq!(super::split_resize_panel_ids(&workspace, &hit), None);
 }
 
+#[cfg(unix)]
+#[test]
+fn qwen_cold_layout_keeps_checkout_even_after_closing_original_leaf() {
+    use crate::terminal::split_tree::{Axis, SplitNode};
+    use serde_json::json;
+
+    let repo = unique_temp_dir("cold qwen layout").canonicalize().unwrap();
+    let nested = repo.join("nested checkout");
+    let retained = repo.join(".terminalcanvas/worktrees/retained");
+    let removed = repo.join(".terminalcanvas/worktrees/removed");
+    let metadata = repo.join(".git/worktrees/retained");
+    for path in [&nested, &retained, &metadata] {
+        fs::create_dir_all(path).unwrap();
+    }
+    // Exact Git backlink shape, but no Git subprocess or launch is needed.
+    fs::write(
+        retained.join(".git"),
+        format!("gitdir: {}\n", metadata.display()),
+    )
+    .unwrap();
+    fs::write(metadata.join("commondir"), "../..\n").unwrap();
+    fs::write(
+        metadata.join("gitdir"),
+        retained.join(".git").to_str().unwrap(),
+    )
+    .unwrap();
+
+    let workspace = Workspace::from_folder(nested.clone());
+    let workspace_id = workspace.id;
+    let mut saved = workspace.to_saved();
+    let mut sessions = Vec::new();
+    let mut panes = Vec::new();
+
+    for (index, dir) in [&retained, &removed].into_iter().enumerate() {
+        let panel_id = Uuid::new_v4();
+        let leaves = [Uuid::new_v4(), Uuid::new_v4()];
+        let runtimes = [Uuid::new_v4(), Uuid::new_v4()];
+        let tree = SplitNode::Split {
+            axis: Axis::Horizontal,
+            ratio: 0.5,
+            first: Box::new(SplitNode::leaf(leaves[0])),
+            second: Box::new(SplitNode::leaf(leaves[1])),
+        };
+        let mut panel = TerminalPanel::new(
+            pos2(20.0, 20.0),
+            vec2(600.0, 420.0),
+            Color32::WHITE,
+            index as u32,
+        )
+        .to_saved();
+        panel.id = panel_id.to_string();
+        panel.focused = index == 0;
+        panel.root_leaf = Some(leaves[0].to_string());
+        panel.focused_leaf = Some(leaves[1].to_string());
+        panel.split_tree = Some(serde_json::to_value(tree).unwrap());
+        panel.agent_command = Some("qwen".into());
+        panel
+            .leaf_agent_commands
+            .insert(leaves[0].to_string(), "qwen".into());
+        panel.runtime_session_id = Some(runtimes[0].to_string());
+        panel.leaf_runtime_session_ids = leaves
+            .into_iter()
+            .zip(runtimes)
+            .map(|(leaf, runtime)| (leaf.to_string(), runtime.to_string()))
+            .collect();
+        saved.panels.push(panel);
+        sessions.push(json!({
+            "session_id": Uuid::new_v4(), "panel_id": panel_id, "runtime_session_id": runtimes[0],
+            "workspace_id": workspace_id, "provider": "QwenCode", "label": "Qwen fixture",
+            "cwd": dir, "worktree_path": dir, "repo_root": repo,
+            "created_at": "2026-01-01T00:00:00Z", "last_activity_at": "2026-01-01T00:00:00Z"
+        }));
+        panes.push((panel_id, leaves, runtimes));
+    }
+    let snapshot = json!({
+        "workspaces": [saved], "active_ws": 0, "sidebar_visible": false,
+        "orchestration": {"sessions": sessions}
+    });
+    let decoded = serde_json::from_slice(&serde_json::to_vec(&snapshot).unwrap()).unwrap();
+    let mut app = super::TerminalApp::build(
+        &egui::Context::default(),
+        None,
+        Some(decoded),
+        None,
+        false,
+        false,
+    );
+    let restored = app.ws();
+    assert_eq!(restored.id, workspace_id);
+    let manager = restored.pty_manager();
+    let manager = manager.lock().unwrap();
+    for ((panel_id, leaves, runtimes), expected_dir) in
+        panes.iter().copied().zip([&retained, &nested])
+    {
+        let panel = restored.panel(panel_id).unwrap();
+        assert_eq!(panel.leaf_ids(), leaves);
+        assert_eq!(panel.focused_leaf_id(), leaves[1]);
+        assert_eq!(panel.all_runtime_session_ids(), runtimes);
+        for id in runtimes {
+            assert_eq!(manager.cwd_for_tests(id), Some(expected_dir.as_path()));
+            assert_eq!(manager.startup_command_for_tests(id), None);
+        }
+    }
+    drop(manager);
+
+    // Normal refresh tracks the focused plain split, not the original Qwen
+    // runtime. Serializing after that refresh must still retain checkout ownership.
+    app.reconcile_orchestration();
+    let snapshot = app.snapshot_state();
+    assert!(snapshot.orchestration.sessions.iter().any(|session| {
+        session.provider == crate::orchestration::AgentProvider::QwenCode
+            && session.panel_id.is_none()
+    }));
+    drop(app);
+    let decoded = serde_json::from_slice(&serde_json::to_vec(&snapshot).unwrap()).unwrap();
+    let mut restarted = super::TerminalApp::build(
+        &egui::Context::default(),
+        None,
+        Some(decoded),
+        None,
+        false,
+        false,
+    );
+    let manager = restarted.ws().pty_manager();
+    let manager = manager.lock().unwrap();
+    for ((_, _, runtimes), expected_dir) in panes.iter().copied().zip([&retained, &nested]) {
+        for id in runtimes {
+            assert_eq!(manager.cwd_for_tests(id), Some(expected_dir.as_path()));
+            assert_eq!(manager.startup_command_for_tests(id), None);
+        }
+    }
+    drop(manager);
+
+    let (panel_id, leaves, runtimes) = panes[0];
+    let crate::panel::CanvasPanel::Terminal(panel) =
+        restarted.ws_mut().panel_mut(panel_id).unwrap();
+    panel.focus_next_leaf();
+    assert_eq!(panel.focused_leaf_id(), leaves[0]);
+    assert!(!panel.close_focused_leaf_with_fixture_alias_ack());
+    assert_eq!(panel.root_leaf_id(), leaves[1]);
+    assert_eq!(panel.to_saved().agent_command, None);
+    assert_eq!(panel.focused_runtime_session_id(), Some(runtimes[1]));
+    restarted.reconcile_orchestration();
+    let snapshot = restarted.snapshot_state();
+    drop(restarted);
+
+    let decoded = serde_json::from_slice(&serde_json::to_vec(&snapshot).unwrap()).unwrap();
+    let reopened = super::TerminalApp::build(
+        &egui::Context::default(),
+        None,
+        Some(decoded),
+        None,
+        false,
+        false,
+    );
+    let panel = reopened.ws().panel(panel_id).unwrap();
+    assert_eq!(panel.all_runtime_session_ids(), [runtimes[1]]);
+    let manager = reopened.ws().pty_manager();
+    let manager = manager.lock().unwrap();
+    assert_eq!(manager.cwd_for_tests(runtimes[1]), Some(retained.as_path()));
+    assert_eq!(manager.startup_command_for_tests(runtimes[1]), None);
+    drop(manager);
+    drop(reopened);
+    drop(workspace);
+    fs::remove_dir_all(repo).unwrap();
+}
+
 fn unique_temp_dir(name: &str) -> std::path::PathBuf {
     let path = std::env::temp_dir().join(format!("{name}-{}", Uuid::new_v4()));
     fs::create_dir_all(&path).unwrap();

@@ -292,7 +292,13 @@ impl TerminalApp {
             let local_device_id = saved.local_device_id.clone();
             let mut workspaces = Vec::new();
             for workspace in saved.workspaces {
-                let workspace = Workspace::from_saved(workspace, egui_ctx);
+                let workspace = Workspace::from_saved_with_qwen_worktree(
+                    workspace,
+                    egui_ctx,
+                    |workspace_id, panel_id, cwd| {
+                        orchestration.restored_qwen_worktree(workspace_id, panel_id, cwd)
+                    },
+                );
                 // Las sesiones restauradas vienen detached: se atachean recién
                 // al primer frame, así que instalar el spawner acá alcanza
                 // para que se enganchen contra el daemon.

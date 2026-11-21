@@ -592,6 +592,42 @@ impl TerminalPanel {
         self.with_pty(|pty| pty.current_cwd()).flatten()
     }
 
+    /// Both new panes and splits inherit a reported directory first. A shell
+    /// or TUI without OSC 7 can still pass on its configured checkout.
+    pub(crate) fn inheritable_cwd(&self, manager: &Mutex<PtyManager>) -> Option<PathBuf> {
+        self.current_cwd()
+            .map(PathBuf::from)
+            .filter(|path| path.is_dir())
+            .or_else(|| Self::existing_configured_cwd(manager, self.focused_runtime_session_id()?))
+    }
+
+    fn existing_configured_cwd(manager: &Mutex<PtyManager>, runtime_id: Uuid) -> Option<PathBuf> {
+        let configured = manager.lock().ok()?.spec(runtime_id)?.cwd.clone()?;
+        configured.is_dir().then_some(configured)
+    }
+
+    /// Directory snapshots for worktree operations. A detached layout record
+    /// alone is not proof of a live terminal; inspect each attached runtime.
+    pub(crate) fn live_leaf_cwds(&self, manager: &Mutex<PtyManager>) -> Vec<PathBuf> {
+        self.active_leaf_ids()
+            .into_iter()
+            .filter_map(|leaf| {
+                let session = self.leaf_session(leaf)?;
+                let handle = session.session_handle()?;
+                let reported = {
+                    let handle = handle.lock().ok()?;
+                    if !handle.alive() {
+                        return None;
+                    }
+                    handle.current_cwd().map(PathBuf::from)
+                };
+                reported.filter(|path| path.is_dir()).or_else(|| {
+                    Self::existing_configured_cwd(manager, session.runtime_session_id()?)
+                })
+            })
+            .collect()
+    }
+
     pub fn set_share_scope(&mut self, scope: PanelShareScope) {
         self.share_scope = scope;
     }
@@ -849,11 +885,8 @@ impl TerminalPanel {
         rows: u16,
     ) {
         let inherited_cwd = self
-            .current_cwd()
-            .map(PathBuf::from)
-            .filter(|path| path.is_dir())
-            .or_else(|| cwd.map(Path::to_path_buf))
-            .or_else(|| self.session_cwd.clone());
+            .inheritable_cwd(&pty_manager)
+            .or_else(|| cwd.map(Path::to_path_buf));
         let inherited_workspace_id = self.workspace_id.or(workspace_id);
         if self.workspace_id.is_none() {
             self.workspace_id = inherited_workspace_id;
@@ -1691,6 +1724,11 @@ impl TerminalPanel {
 
     fn resume_command_for_leaf(&self, leaf: crate::terminal::split_tree::LeafId) -> Option<String> {
         let command = self.leaf_agent_commands.get(&leaf)?;
+        // An interactive Qwen launch requires a new explicit user action. A
+        // saved pane can reattach, but a fresh PTY must not run it again.
+        if Some(command.trim()) == AgentProvider::QwenCode.launch_command() {
+            return None;
+        }
         let provider = AgentProvider::detect(command).unwrap_or_default();
         match self.leaf_agent_session_ids.get(&leaf) {
             Some(session_id) => {
@@ -3235,6 +3273,115 @@ mod persistence_tests {
     }
 
     #[test]
+    fn worktree_activity_includes_an_unfocused_live_leaf_without_osc7() {
+        let checkout =
+            std::env::temp_dir().join(format!("tc protected worktree {}", Uuid::new_v4()));
+        std::fs::create_dir(&checkout).unwrap();
+        let root = Uuid::new_v4();
+        let mut tree = SplitNode::leaf(root);
+        let focused = tree.split(root, Axis::Horizontal).unwrap();
+        let live_runtime = Uuid::new_v4();
+        let unattached_runtime = Uuid::new_v4();
+        let state = split_state(
+            root,
+            focused,
+            &tree,
+            &[(root, live_runtime), (focused, unattached_runtime)],
+        );
+        let manager = Arc::new(Mutex::new(PtyManager::new_for_tests()));
+        let panel = TerminalPanel::from_saved(
+            state,
+            &egui::Context::default(),
+            Some(&checkout),
+            Uuid::new_v4(),
+            Arc::clone(&manager),
+        );
+        assert!(panel.live_leaf_cwds(&manager).is_empty());
+        {
+            let mut manager = manager.lock().unwrap();
+            manager.set_remote_spawner(Box::new(|_, _, _, _, id| {
+                Ok((
+                    id.unwrap(),
+                    crate::terminal::pty::PtyHandle::for_persistence_tests(b""),
+                ))
+            }));
+            manager.attach_detached(live_runtime, 80, 24).unwrap();
+        }
+        assert_eq!(panel.focused_runtime_session_id(), Some(unattached_runtime));
+        assert_eq!(
+            panel.live_leaf_cwds(&manager).as_slice(),
+            std::slice::from_ref(&checkout)
+        );
+        manager.lock().unwrap().close(live_runtime);
+        assert!(panel.live_leaf_cwds(&manager).is_empty());
+        std::fs::remove_dir(checkout).unwrap();
+    }
+
+    #[test]
+    fn restoring_a_qwen_pane_does_not_start_the_cli() {
+        let leaf = Uuid::new_v4();
+        let tree = SplitNode::leaf(leaf);
+        let mut saved = split_state(leaf, leaf, &tree, &[]);
+        saved.agent_command = Some("qwen".to_owned());
+        let manager = Arc::new(Mutex::new(PtyManager::new_for_tests()));
+        let panel = TerminalPanel::from_saved(
+            saved,
+            &egui::Context::default(),
+            Some(Path::new("/tmp")),
+            Uuid::new_v4(),
+            Arc::clone(&manager),
+        );
+
+        assert_eq!(panel.agent_command(), Some("qwen"));
+        assert_eq!(panel.resume_command_for_leaf(leaf), None);
+        let runtime = panel.all_runtime_session_ids()[0];
+        assert_eq!(
+            manager.lock().unwrap().startup_command_for_tests(runtime),
+            None
+        );
+    }
+
+    #[test]
+    fn qwen_split_without_shell_cwd_stays_in_checkout_then_falls_back() {
+        let dir = std::env::temp_dir().join(format!("tc qwen split {}", Uuid::new_v4()));
+        let checkout = dir.join("selected worktree");
+        std::fs::create_dir_all(&checkout).unwrap();
+        let leaf = Uuid::new_v4();
+        let mut saved = split_state(leaf, leaf, &SplitNode::leaf(leaf), &[]);
+        saved.agent_command = Some("qwen".to_owned());
+        let workspace = Uuid::new_v4();
+        let manager = Arc::new(Mutex::new(PtyManager::new_for_tests()));
+        let mut panel = TerminalPanel::from_saved(
+            saved,
+            &egui::Context::default(),
+            Some(&checkout),
+            workspace,
+            Arc::clone(&manager),
+        );
+
+        for expected in [&checkout, &checkout, &dir] {
+            if expected == &dir {
+                std::fs::remove_dir(&checkout).unwrap();
+            }
+            assert_eq!(panel.current_cwd(), None);
+            assert!(panel.split_focused_with_fixture_alias_ack(
+                Axis::Vertical,
+                Arc::clone(&manager),
+                Some(&dir),
+                workspace,
+                80,
+                24,
+            ));
+            let runtime = panel.focused_runtime_session_id().unwrap();
+            let manager = manager.lock().unwrap();
+            let spec = manager.spec(runtime).unwrap();
+            assert_eq!(spec.cwd.as_deref(), Some(expected.as_path()));
+            assert!(spec.startup_command.is_none());
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn split_round_trip_keeps_agent_resume_metadata_per_leaf() {
         let root_leaf = Uuid::new_v4();
         let mut tree = SplitNode::leaf(root_leaf);
@@ -3730,7 +3877,7 @@ impl TerminalPanel {
     }
 
     #[cfg(test)]
-    fn close_focused_leaf_with_fixture_alias_ack(&mut self) -> bool {
+    pub(crate) fn close_focused_leaf_with_fixture_alias_ack(&mut self) -> bool {
         let workspace = self.workspace_id.unwrap();
         self.pending_hook_mutation = Some(PendingHookMutation {
             snapshot: self.hook_mutation_snapshot(workspace),
