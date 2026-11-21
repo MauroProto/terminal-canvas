@@ -2923,7 +2923,7 @@ fn split_resize_ids_return_none_for_stale_indexes() {
 
 #[cfg(unix)]
 #[test]
-fn qwen_cold_layout_keeps_split_identity_after_reconciliation() {
+fn qwen_cold_layout_keeps_checkout_even_after_closing_original_leaf() {
     use crate::terminal::split_tree::{Axis, SplitNode};
     use serde_json::json;
 
@@ -3036,7 +3036,7 @@ fn qwen_cold_layout_keeps_split_identity_after_reconciliation() {
     }));
     drop(app);
     let decoded = serde_json::from_slice(&serde_json::to_vec(&snapshot).unwrap()).unwrap();
-    let restarted = super::TerminalApp::build(
+    let mut restarted = super::TerminalApp::build(
         &egui::Context::default(),
         None,
         Some(decoded),
@@ -3046,14 +3046,44 @@ fn qwen_cold_layout_keeps_split_identity_after_reconciliation() {
     );
     let manager = restarted.ws().pty_manager();
     let manager = manager.lock().unwrap();
-    for ((_, _, runtimes), expected_dir) in panes.into_iter().zip([&retained, &nested]) {
+    for ((_, _, runtimes), expected_dir) in panes.iter().copied().zip([&retained, &nested]) {
         for id in runtimes {
             assert_eq!(manager.cwd_for_tests(id), Some(expected_dir.as_path()));
             assert_eq!(manager.startup_command_for_tests(id), None);
         }
     }
     drop(manager);
+
+    let (panel_id, leaves, runtimes) = panes[0];
+    let crate::panel::CanvasPanel::Terminal(panel) =
+        restarted.ws_mut().panel_mut(panel_id).unwrap();
+    panel.focus_next_leaf();
+    assert_eq!(panel.focused_leaf_id(), leaves[0]);
+    assert!(!panel.close_focused_leaf_with_fixture_alias_ack());
+    assert_eq!(panel.root_leaf_id(), leaves[1]);
+    assert_eq!(panel.to_saved().agent_command, None);
+    assert_eq!(panel.focused_runtime_session_id(), Some(runtimes[1]));
+    restarted.reconcile_orchestration();
+    let snapshot = restarted.snapshot_state();
     drop(restarted);
+
+    let decoded = serde_json::from_slice(&serde_json::to_vec(&snapshot).unwrap()).unwrap();
+    let reopened = super::TerminalApp::build(
+        &egui::Context::default(),
+        None,
+        Some(decoded),
+        None,
+        false,
+        false,
+    );
+    let panel = reopened.ws().panel(panel_id).unwrap();
+    assert_eq!(panel.all_runtime_session_ids(), [runtimes[1]]);
+    let manager = reopened.ws().pty_manager();
+    let manager = manager.lock().unwrap();
+    assert_eq!(manager.cwd_for_tests(runtimes[1]), Some(retained.as_path()));
+    assert_eq!(manager.startup_command_for_tests(runtimes[1]), None);
+    drop(manager);
+    drop(reopened);
     drop(workspace);
     fs::remove_dir_all(repo).unwrap();
 }

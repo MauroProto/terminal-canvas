@@ -3877,7 +3877,7 @@ impl TerminalPanel {
     }
 
     #[cfg(test)]
-    fn close_focused_leaf_with_fixture_alias_ack(&mut self) -> bool {
+    pub(crate) fn close_focused_leaf_with_fixture_alias_ack(&mut self) -> bool {
         let workspace = self.workspace_id.unwrap();
         self.pending_hook_mutation = Some(PendingHookMutation {
             snapshot: self.hook_mutation_snapshot(workspace),

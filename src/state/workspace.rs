@@ -111,16 +111,13 @@ impl Workspace {
         let pty_manager = Arc::new(Mutex::new(PtyManager::new()));
         let mut panels = Vec::new();
         for panel in saved_panels {
-            let managed_qwen_cwd = if panel.agent_command.as_deref()
-                == crate::orchestration::AgentProvider::QwenCode.launch_command()
-            {
-                cwd.as_deref().and_then(|workspace_cwd| {
-                    let panel_id = Uuid::parse_str(&panel.id).ok()?;
-                    restored_worktree(workspace_id, panel_id, workspace_cwd)
-                })
-            } else {
-                None
-            };
+            // Checkout ownership belongs to the pane, not its root leaf. If
+            // that leaf was closed, an ordinary surviving shell can still
+            // reopen in the same validated worktree without relaunching Qwen.
+            let managed_qwen_cwd = cwd.as_deref().and_then(|workspace_cwd| {
+                let panel_id = Uuid::parse_str(&panel.id).ok()?;
+                restored_worktree(workspace_id, panel_id, workspace_cwd)
+            });
             panels.push(CanvasPanel::Terminal(TerminalPanel::from_saved(
                 panel,
                 ctx,
