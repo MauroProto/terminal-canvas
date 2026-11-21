@@ -272,6 +272,9 @@ pub struct AgentSessionMeta {
     pub session_id: Uuid,
     #[serde(default)]
     pub panel_id: Option<Uuid>,
+    /// Stable origin of a managed Qwen checkout; panel_id tracks the focused leaf.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    qwen_worktree_panel_id: Option<Uuid>,
     #[serde(default)]
     pub runtime_session_id: Option<Uuid>,
     pub workspace_id: Uuid,
@@ -544,8 +547,17 @@ impl Orchestrator {
     }
 
     pub fn from_saved(state: Option<OrchestrationState>) -> Self {
+        let mut state = state.unwrap_or_default();
+        for session in &mut state.sessions {
+            if session.provider == AgentProvider::QwenCode && session.worktree_path.is_some() {
+                // Legacy saves only knew the current binding. Preserve it
+                // before normal reconciliation moves to another split.
+                session.qwen_worktree_panel_id =
+                    session.qwen_worktree_panel_id.or(session.panel_id);
+            }
+        }
         Self {
-            state: state.unwrap_or_default(),
+            state,
             last_git_inspect_at: HashMap::new(),
             git_inspector: GitInspector::default(),
             worktree_creator: WorktreeCreator::default(),
@@ -697,7 +709,7 @@ impl Orchestrator {
         let session = self.state.sessions.iter().find(|session| {
             session.provider == AgentProvider::QwenCode
                 && session.workspace_id == workspace_id
-                && session.panel_id == Some(panel_id)
+                && session.qwen_worktree_panel_id == Some(panel_id)
         })?;
         let repo_root = session.repo_root.as_deref()?;
         let worktree = session.worktree_path.as_deref()?;
@@ -909,6 +921,7 @@ impl Orchestrator {
         self.state.sessions.push(AgentSessionMeta {
             session_id,
             panel_id: Some(panel_id),
+            qwen_worktree_panel_id: None,
             runtime_session_id,
             workspace_id,
             provider,
@@ -1176,6 +1189,7 @@ impl Orchestrator {
         self.state.sessions.push(AgentSessionMeta {
             session_id,
             panel_id: None,
+            qwen_worktree_panel_id: None,
             runtime_session_id: None,
             workspace_id: request.workspace_id,
             provider: request.provider,
@@ -1316,6 +1330,9 @@ impl Orchestrator {
             .find(|session| session.session_id == session_id)
         {
             session.panel_id = Some(panel_id);
+            if session.provider == AgentProvider::QwenCode && session.worktree_path.is_some() {
+                session.qwen_worktree_panel_id.get_or_insert(panel_id);
+            }
             session.runtime_session_id = runtime_session_id;
             session.status = AgentStatus::Running;
             session.last_activity_at = Utc::now();

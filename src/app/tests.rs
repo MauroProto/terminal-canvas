@@ -2923,7 +2923,7 @@ fn split_resize_ids_return_none_for_stale_indexes() {
 
 #[cfg(unix)]
 #[test]
-fn qwen_cold_layout_keeps_split_identity_and_valid_checkout_without_relaunch() {
+fn qwen_cold_layout_keeps_split_identity_after_reconciliation() {
     use crate::terminal::split_tree::{Axis, SplitNode};
     use serde_json::json;
 
@@ -3000,7 +3000,7 @@ fn qwen_cold_layout_keeps_split_identity_and_valid_checkout_without_relaunch() {
         "orchestration": {"sessions": sessions}
     });
     let decoded = serde_json::from_slice(&serde_json::to_vec(&snapshot).unwrap()).unwrap();
-    let app = super::TerminalApp::build(
+    let mut app = super::TerminalApp::build(
         &egui::Context::default(),
         None,
         Some(decoded),
@@ -3012,7 +3012,8 @@ fn qwen_cold_layout_keeps_split_identity_and_valid_checkout_without_relaunch() {
     assert_eq!(restored.id, workspace_id);
     let manager = restored.pty_manager();
     let manager = manager.lock().unwrap();
-    for ((panel_id, leaves, runtimes), expected_dir) in panes.into_iter().zip([&retained, &nested])
+    for ((panel_id, leaves, runtimes), expected_dir) in
+        panes.iter().copied().zip([&retained, &nested])
     {
         let panel = restored.panel(panel_id).unwrap();
         assert_eq!(panel.leaf_ids(), leaves);
@@ -3024,7 +3025,35 @@ fn qwen_cold_layout_keeps_split_identity_and_valid_checkout_without_relaunch() {
         }
     }
     drop(manager);
+
+    // Normal refresh tracks the focused plain split, not the original Qwen
+    // runtime. Serializing after that refresh must still retain checkout ownership.
+    app.reconcile_orchestration();
+    let snapshot = app.snapshot_state();
+    assert!(snapshot.orchestration.sessions.iter().any(|session| {
+        session.provider == crate::orchestration::AgentProvider::QwenCode
+            && session.panel_id.is_none()
+    }));
     drop(app);
+    let decoded = serde_json::from_slice(&serde_json::to_vec(&snapshot).unwrap()).unwrap();
+    let restarted = super::TerminalApp::build(
+        &egui::Context::default(),
+        None,
+        Some(decoded),
+        None,
+        false,
+        false,
+    );
+    let manager = restarted.ws().pty_manager();
+    let manager = manager.lock().unwrap();
+    for ((_, _, runtimes), expected_dir) in panes.into_iter().zip([&retained, &nested]) {
+        for id in runtimes {
+            assert_eq!(manager.cwd_for_tests(id), Some(expected_dir.as_path()));
+            assert_eq!(manager.startup_command_for_tests(id), None);
+        }
+    }
+    drop(manager);
+    drop(restarted);
     drop(workspace);
     fs::remove_dir_all(repo).unwrap();
 }

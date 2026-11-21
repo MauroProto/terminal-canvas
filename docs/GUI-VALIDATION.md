@@ -49,7 +49,9 @@ They check that the manual dialog can select it or offer its install hint, but
 a captured-page draft offers neither. The cold-layout test restores two
 split panes, checks that their four runtime identities stay distinct, and
 compares the built PTY specs: the retained managed worktree is used, the
-missing worktree falls back to the workspace, and neither starts Qwen.
+missing worktree falls back to the workspace, and neither starts Qwen. The split
+fixture also checks that a plain shell inherits the selected checkout before
+OSC 7 is available, and falls back to the workspace if that checkout is gone.
 
 ### Real daemon and the interactive Qwen launcher
 

@@ -852,8 +852,18 @@ impl TerminalPanel {
             .current_cwd()
             .map(PathBuf::from)
             .filter(|path| path.is_dir())
-            .or_else(|| cwd.map(Path::to_path_buf))
-            .or_else(|| self.session_cwd.clone());
+            // Apps that take over the terminal (like Qwen) and some shells
+            // never send OSC 7. Keep the focused leaf's checkout in that case.
+            .or_else(|| {
+                let configured = pty_manager
+                    .lock()
+                    .ok()?
+                    .spec(self.focused_runtime_session_id()?)?
+                    .cwd
+                    .clone();
+                configured.filter(|path| path.is_dir())
+            })
+            .or_else(|| cwd.map(Path::to_path_buf));
         let inherited_workspace_id = self.workspace_id.or(workspace_id);
         if self.workspace_id.is_none() {
             self.workspace_id = inherited_workspace_id;
@@ -3261,6 +3271,46 @@ mod persistence_tests {
             manager.lock().unwrap().startup_command_for_tests(runtime),
             None
         );
+    }
+
+    #[test]
+    fn qwen_split_without_shell_cwd_stays_in_checkout_then_falls_back() {
+        let dir = std::env::temp_dir().join(format!("tc qwen split {}", Uuid::new_v4()));
+        let checkout = dir.join("selected worktree");
+        std::fs::create_dir_all(&checkout).unwrap();
+        let leaf = Uuid::new_v4();
+        let mut saved = split_state(leaf, leaf, &SplitNode::leaf(leaf), &[]);
+        saved.agent_command = Some("qwen".to_owned());
+        let workspace = Uuid::new_v4();
+        let manager = Arc::new(Mutex::new(PtyManager::new_for_tests()));
+        let mut panel = TerminalPanel::from_saved(
+            saved,
+            &egui::Context::default(),
+            Some(&checkout),
+            workspace,
+            Arc::clone(&manager),
+        );
+
+        for expected in [&checkout, &checkout, &dir] {
+            if expected == &dir {
+                std::fs::remove_dir(&checkout).unwrap();
+            }
+            assert_eq!(panel.current_cwd(), None);
+            assert!(panel.split_focused_with_fixture_alias_ack(
+                Axis::Vertical,
+                Arc::clone(&manager),
+                Some(&dir),
+                workspace,
+                80,
+                24,
+            ));
+            let runtime = panel.focused_runtime_session_id().unwrap();
+            let manager = manager.lock().unwrap();
+            let spec = manager.spec(runtime).unwrap();
+            assert_eq!(spec.cwd.as_deref(), Some(expected.as_path()));
+            assert!(spec.startup_command.is_none());
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
