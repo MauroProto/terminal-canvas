@@ -204,17 +204,14 @@ impl Workspace {
         // El foco lo asigna bring_to_front al final; escribirlo acá dejaría
         // dos paneles enfocados hasta esa llamada.
         //
-        // Herencia de cwd: primero el pedido explícito, después el cwd que el
-        // shell del panel enfocado reportó vía OSC 7 (si existe el dir), y al
-        // final el cwd del workspace.
-        let focused_cwd = self
-            .focused_panel()
-            .and_then(|panel| panel.current_cwd())
-            .filter(|cwd| Path::new(cwd).is_dir());
-        let cwd: Option<PathBuf> = request
+        // El pedido explícito gana. Las terminales nuevas y los splits usan
+        // la misma herencia para mantener el checkout de la hoja enfocada.
+        let cwd = request
             .cwd
             .clone()
-            .or_else(|| focused_cwd.map(PathBuf::from))
+            .or_else(|| match self.focused_panel()? {
+                CanvasPanel::Terminal(panel) => panel.inheritable_cwd(&self.pty_manager),
+            })
             .or_else(|| self.cwd.clone());
         // Recordamos con qué comando arrancó para poder reanudar la
         // conversación del agente si la app se reinicia.
@@ -910,6 +907,67 @@ mod tests {
             workspace.folder_path_label(),
             Some(path.to_string_lossy().as_ref())
         );
+    }
+
+    #[test]
+    fn new_terminal_keeps_focused_checkout_without_osc7() {
+        use super::TerminalSpawnRequest;
+
+        let ctx = egui::Context::default();
+        let root = unique_temp_dir("workspace default");
+        let checkout = root.join("selected worktree");
+        let explicit = root.join("other checkout");
+        for dir in [&checkout, &explicit] {
+            fs::create_dir(dir).unwrap();
+        }
+        let mut workspace = Workspace::from_folder(root.clone());
+        workspace
+            .pty_manager()
+            .lock()
+            .unwrap()
+            .set_remote_spawner(Box::new(|_, _, _, _, id| {
+                Ok((
+                    id.unwrap_or_else(Uuid::new_v4),
+                    crate::terminal::pty::PtyHandle::for_persistence_tests(b""),
+                ))
+            }));
+        let source = workspace.spawn_terminal_with_request(
+            &ctx,
+            TerminalSpawnRequest {
+                cwd: Some(checkout.clone()),
+                title: Some("Qwen Code".to_owned()),
+                ..TerminalSpawnRequest::default()
+            },
+        );
+        assert_eq!(workspace.focused_panel().unwrap().current_cwd(), None);
+        let inherited =
+            workspace.spawn_terminal_with_request(&ctx, TerminalSpawnRequest::default());
+        workspace.bring_to_front(source.panel_id);
+        let overridden = workspace.spawn_terminal_with_request(
+            &ctx,
+            TerminalSpawnRequest {
+                cwd: Some(explicit.clone()),
+                ..TerminalSpawnRequest::default()
+            },
+        );
+        workspace.bring_to_front(inherited.panel_id);
+        fs::remove_dir(&checkout).unwrap();
+        let fallback = workspace.spawn_terminal_with_request(&ctx, TerminalSpawnRequest::default());
+
+        let manager = workspace.pty_manager();
+        let manager = manager.lock().unwrap();
+        for (terminal, dir) in [
+            (inherited, &checkout),
+            (overridden, &explicit),
+            (fallback, &root),
+        ] {
+            let spec = manager.spec(terminal.runtime_session_id.unwrap()).unwrap();
+            assert_eq!(spec.cwd.as_deref(), Some(dir.as_path()));
+            assert!(spec.startup_command.is_none());
+        }
+        drop(manager);
+        drop(workspace);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

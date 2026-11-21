@@ -592,6 +592,42 @@ impl TerminalPanel {
         self.with_pty(|pty| pty.current_cwd()).flatten()
     }
 
+    /// Both new panes and splits inherit a reported directory first. A shell
+    /// or TUI without OSC 7 can still pass on its configured checkout.
+    pub(crate) fn inheritable_cwd(&self, manager: &Mutex<PtyManager>) -> Option<PathBuf> {
+        self.current_cwd()
+            .map(PathBuf::from)
+            .filter(|path| path.is_dir())
+            .or_else(|| Self::existing_configured_cwd(manager, self.focused_runtime_session_id()?))
+    }
+
+    fn existing_configured_cwd(manager: &Mutex<PtyManager>, runtime_id: Uuid) -> Option<PathBuf> {
+        let configured = manager.lock().ok()?.spec(runtime_id)?.cwd.clone()?;
+        configured.is_dir().then_some(configured)
+    }
+
+    /// Directory snapshots for worktree operations. A detached layout record
+    /// alone is not proof of a live terminal; inspect each attached runtime.
+    pub(crate) fn live_leaf_cwds(&self, manager: &Mutex<PtyManager>) -> Vec<PathBuf> {
+        self.active_leaf_ids()
+            .into_iter()
+            .filter_map(|leaf| {
+                let session = self.leaf_session(leaf)?;
+                let handle = session.session_handle()?;
+                let reported = {
+                    let handle = handle.lock().ok()?;
+                    if !handle.alive() {
+                        return None;
+                    }
+                    handle.current_cwd().map(PathBuf::from)
+                };
+                reported.filter(|path| path.is_dir()).or_else(|| {
+                    Self::existing_configured_cwd(manager, session.runtime_session_id()?)
+                })
+            })
+            .collect()
+    }
+
     pub fn set_share_scope(&mut self, scope: PanelShareScope) {
         self.share_scope = scope;
     }
@@ -849,20 +885,7 @@ impl TerminalPanel {
         rows: u16,
     ) {
         let inherited_cwd = self
-            .current_cwd()
-            .map(PathBuf::from)
-            .filter(|path| path.is_dir())
-            // Apps that take over the terminal (like Qwen) and some shells
-            // never send OSC 7. Keep the focused leaf's checkout in that case.
-            .or_else(|| {
-                let configured = pty_manager
-                    .lock()
-                    .ok()?
-                    .spec(self.focused_runtime_session_id()?)?
-                    .cwd
-                    .clone();
-                configured.filter(|path| path.is_dir())
-            })
+            .inheritable_cwd(&pty_manager)
             .or_else(|| cwd.map(Path::to_path_buf));
         let inherited_workspace_id = self.workspace_id.or(workspace_id);
         if self.workspace_id.is_none() {
@@ -3247,6 +3270,51 @@ mod persistence_tests {
                 .detached_session_count(),
             2
         );
+    }
+
+    #[test]
+    fn worktree_activity_includes_an_unfocused_live_leaf_without_osc7() {
+        let checkout =
+            std::env::temp_dir().join(format!("tc protected worktree {}", Uuid::new_v4()));
+        std::fs::create_dir(&checkout).unwrap();
+        let root = Uuid::new_v4();
+        let mut tree = SplitNode::leaf(root);
+        let focused = tree.split(root, Axis::Horizontal).unwrap();
+        let live_runtime = Uuid::new_v4();
+        let unattached_runtime = Uuid::new_v4();
+        let state = split_state(
+            root,
+            focused,
+            &tree,
+            &[(root, live_runtime), (focused, unattached_runtime)],
+        );
+        let manager = Arc::new(Mutex::new(PtyManager::new_for_tests()));
+        let panel = TerminalPanel::from_saved(
+            state,
+            &egui::Context::default(),
+            Some(&checkout),
+            Uuid::new_v4(),
+            Arc::clone(&manager),
+        );
+        assert!(panel.live_leaf_cwds(&manager).is_empty());
+        {
+            let mut manager = manager.lock().unwrap();
+            manager.set_remote_spawner(Box::new(|_, _, _, _, id| {
+                Ok((
+                    id.unwrap(),
+                    crate::terminal::pty::PtyHandle::for_persistence_tests(b""),
+                ))
+            }));
+            manager.attach_detached(live_runtime, 80, 24).unwrap();
+        }
+        assert_eq!(panel.focused_runtime_session_id(), Some(unattached_runtime));
+        assert_eq!(
+            panel.live_leaf_cwds(&manager).as_slice(),
+            std::slice::from_ref(&checkout)
+        );
+        manager.lock().unwrap().close(live_runtime);
+        assert!(panel.live_leaf_cwds(&manager).is_empty());
+        std::fs::remove_dir(checkout).unwrap();
     }
 
     #[test]

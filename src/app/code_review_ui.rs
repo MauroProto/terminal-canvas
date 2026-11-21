@@ -1117,9 +1117,7 @@ impl TerminalApp {
         ui.add_space(4.0);
     }
 
-    /// Pide el borrado al worker. `git worktree remove` borra un árbol de
-    /// trabajo entero y en un repo grande tarda segundos: hacerlo acá
-    /// congelaba la ventana.
+    /// Encola el movimiento del worktree, con una instantánea de directorios activos.
     fn queue_worktree_move(&mut self, path: &Path, restore: bool) {
         let Some(state) = self.code_review.as_ref() else {
             return;
@@ -1127,9 +1125,10 @@ impl TerminalApp {
         let repo_root = state.repo_root.clone();
         let mut live_paths = Vec::new();
         for workspace in &self.workspaces {
+            let manager = workspace.pty_manager();
             for panel in &workspace.panels {
                 if panel.is_alive() {
-                    live_paths.extend(panel.live_leaf_cwds());
+                    live_paths.extend(panel.live_leaf_cwds(&manager));
                     if let Some(cwd) = &workspace.cwd {
                         live_paths.push(cwd.clone());
                     }
